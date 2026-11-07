@@ -14,15 +14,13 @@
 * Что не входит в профиль - расширение производителя ``x.*``.
 
 * Трассы - ``visalab.core.trace.Trace`` (ось X, ось Y, единицы, метаданные), ключ вида Kind.TRACE.
-
-Профиль ВАЦ будет добавлен вместе с его драйвером.
 """
 from __future__ import annotations
 
 from .core.params import Kind
 from .core.profile import ActionSlot, Profile, Slot
 
-__all__ = ["POWER_SUPPLY", "FUNCTION_GENERATOR", "SIGNAL_GENERATOR", "POWER_METER", "SPECTRUM_ANALYZER", "PROFILES"]
+__all__ = ["POWER_SUPPLY", "FUNCTION_GENERATOR", "SIGNAL_GENERATOR", "POWER_METER", "SPECTRUM_ANALYZER", "NETWORK_ANALYZER", "PROFILES"]
 
 F, I, B, E, S, T = Kind.FLOAT, Kind.INT, Kind.BOOL, Kind.ENUM, Kind.STR, Kind.TRACE
 SOURCES = ("INT", "EXT")
@@ -215,5 +213,45 @@ SPECTRUM_ANALYZER = Profile(
     ),
 )
 
+# ------------------------------------------------------------------------ ВАЦ
+NETWORK_ANALYZER = Profile(
+    "network_analyzer", "Векторный анализатор цепей",
+    doc="""Трасса ``trace`` - Trace(x в Hz, y в единицах формата: MLOG - dB, PHASE/UPHASE - deg,
+    GDELAY - s, SWR/LIN_MAG/REAL/IMAG - без единиц), публикуется после каждой ЗАВЕРШЁННОЙ развёртки.
+    Поэтому у ключа ``trace`` единица в профиле пустая, а настоящая - в ``Trace.y_unit``.
+    Драйвер работает с одним измерением (S-параметром) первого канала.""",
+    slots=(
+        Slot("trace", T, "", required=True, readonly=True),
+        Slot("meas.continuous", B, required=True),
+        Slot("meas.armed", B, readonly=True),
+        Slot("sparam", E, required=True, choices=("S11", "S21", "S12", "S22")),
+        Slot("format", E, required=True,
+             choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")),
+        Slot("freq.start", F, "Hz", required=True),
+        Slot("freq.stop", F, "Hz", required=True),
+        Slot("freq.center", F, "Hz"),
+        Slot("freq.span", F, "Hz"),
+        Slot("sweep.points", I, required=True),
+        Slot("sweep.time", F, "s"),
+        Slot("sweep.time_auto", B),
+        Slot("bw.if", F, "Hz", required=True, doc="полоса ПЧ"),
+        Slot("source.power", F, "dBm", required=True),
+        Slot("rf.output", B, doc="мощность источника включена"),
+        Slot("avg.state", B),
+        Slot("avg.count", I),
+        Slot("cal.state", B, readonly=None, doc="коррекция (калибровка) включена"),
+        Slot("marker.state", B),
+        Slot("marker.freq", F, "Hz"),
+        Slot("marker.value", F, "", readonly=True, doc="значение трассы в маркере, единицы - как у трассы"),
+    ),
+    actions=(
+        ActionSlot("single", doc="одна развёртка"),
+        ActionSlot("abort"),
+        ActionSlot("marker_peak", doc="маркер на максимум"),
+        ActionSlot("marker_min", doc="маркер на минимум"),
+        ActionSlot("reset"),
+    ),
+)
+
 PROFILES = {p.name: p for p in (POWER_SUPPLY, FUNCTION_GENERATOR, SIGNAL_GENERATOR, POWER_METER,
-                                SPECTRUM_ANALYZER)}
+                                SPECTRUM_ANALYZER, NETWORK_ANALYZER)}

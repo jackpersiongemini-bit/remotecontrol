@@ -9,6 +9,7 @@
 | СВЧ-генератор Keysight PSG E8267D | `signal_generator` | `drivers/keysight_e8267d.py` | `sim/rf_generator_sim.py` | PSG SCPI Command Reference E8251-90356 |
 | СВЧ-генератор R&S SMF100A | `signal_generator` | `drivers/rs_smf100a.py` | `sim/rf_generator_sim.py` | R&S SMF100A Operating Manual |
 | Анализатор спектра Agilent PSA E4446A (E4440A...E4448A) | `spectrum_analyzer` | `drivers/agilent_e4446a.py` | `sim/agilent_e4446a_sim.py` | PSA User's and Programmer's Reference Vol.1 (E4440-90607) |
+| Векторный анализатор Keysight PNA-L N5231A (N5230C, N5232A, N5222A) | `network_analyzer` | `drivers/keysight_n5231a.py` | `sim/keysight_n5231a_sim.py` | PNA Programming Commands (справка PNA) |
 | Датчик мощности Keysight U2021XA | `power_meter` | `drivers/keysight_u2021xa.py` | `sim/keysight_u2021xa_sim.py` | U2020 X-Series Programming Guide (U2021-90003) |
 
 Модель по `*IDN?` не определяется и не проверяется: она задаётся явно (`--model e8267d=E8267D-544`,
@@ -55,6 +56,16 @@ proxy.supports("pulse.width")       # необязательная функци�
 * Связанные «авто»-величины (RBW, VBW, время развёртки, старт/стоп) перечитываются после каждой записи.
 * Маркер: `marker.state`, `marker.freq`, `marker.level`, действие `marker_peak`.
 
+### Векторный анализатор
+
+Тот же принцип, что у анализатора спектра: однократные развёртки (`SENS1:SWE:MODE SING;*OPC`), наружу
+только целая трасса `Trace` (x в Hz, y в единицах формата: MLOG - dB, PHASE - deg, GDELAY - s, остальные без единиц).
+
+* Снаружи стандартные `sparam` (S11/S21/S12/S22), `format`, `freq.start/stop/center/span`, `sweep.points`,
+  `bw.if`, `source.power`, усреднение, маркер (`marker.value`, `marker_peak`, `marker_min`).
+* Драйвер работает с первым измерением канала 1 (`CALC1:PAR:CAT:EXT?`) и ничего не удаляет; если измерений
+  нет, создаёт `VL_MEAS` (S11) в окне 1. Смена S-параметра - `CALC1:PAR:MOD:EXT`, калибровку не трогаем.
+
 ### Ваттметр: измерение с запуском по уровню
 
 Результаты всегда в dBm: `meas.power` (среднее, в стробе при `detector = NORMAL`), `meas.peak`, `meas.ptav` (dB).
@@ -88,6 +99,7 @@ python run_gui.py --sdg "USB0::..." --sdg-model SDG2042X
 python run_gui.py --e8267d sim --smf100a sim                 # СВЧ-генераторы на симуляторах
 python run_gui.py --u2021xa sim                               # датчик мощности на симуляторе
 python run_gui.py --e4446a sim                                # анализатор спектра на симуляторе
+python run_gui.py --pna sim                                   # векторный анализатор на симуляторе
 python run_gui.py --sdg 192.168.0.3     # по LAN (VXI-11): то же, что TCPIP0::192.168.0.3::INSTR
 python run_gui.py --sdg 192.168.0.3:5025  # сырой сокет: TCPIP0::192.168.0.3::5025::SOCKET
 python run_gui.py --e8267d "GPIB0::19::INSTR" --model e8267d=E8267D-544
@@ -170,3 +182,6 @@ python -m pytest -q                     # тесты без железа
   (таймаут на обнуление 30 с).
 * E4446A (по мануалу E4440-90607): время чтения трассы 8192 точки в ASCII (таймаут 5 с), что `*OPC`
   после `INIT` ловит конец развёртки (в т.ч. с усреднением), формат ответа `DET?`.
+* N5231A (по справке PNA, без PDF): что `*OPC` после `SENS1:SWE:MODE SING` ловит конец развёртки
+  (с усреднением тоже), формат ответа `CALC1:PAR:CAT:EXT?` (`"имя,S21"`), что `CALC1:PAR:MOD:EXT` не сбрасывает
+  калибровку, предел `SENS1:SWE:POIN` (16001). Ось X считается линейной (`SENS1:SWE:TYPE LIN`).

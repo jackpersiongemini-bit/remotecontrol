@@ -35,6 +35,7 @@ DEVICES = {
     "smf100a": ("smf100a", "СВЧ-генератор R&S SMF100A", None),
     "u2021xa": ("u2021xa", "Датчик мощности Keysight U2021XA", None),
     "e4446a": ("e4446a", "Анализатор спектра Agilent E4446A", "E4446A"),
+    "pna": ("pna", "ВАЦ Keysight PNA-L N5231A", "N5231A"),
 }
 
 

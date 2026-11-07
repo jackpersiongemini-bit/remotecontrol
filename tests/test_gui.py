@@ -105,3 +105,20 @@ def test_spectrum_window_plots_trace(qtbot):
     plot.resize(600, 320)
     plot.grab()                     # отрисовка без исключений
     win.close()
+
+
+def test_vna_window_plots_trace(qtbot):
+    from visalab.drivers import KeysightPNA
+    from visalab.gui.widgets import TracePlot
+    from visalab.sim import KeysightPNASim
+    proxy = InstrumentProxy(KeysightPNA, SimTransport(KeysightPNASim()))
+    win = InstrumentWindow(proxy)
+    qtbot.addWidget(win)
+    plot = next(iter(win.findChildren(TracePlot)))
+    with qtbot.waitSignal(proxy.param_updated, timeout=5000,
+                          check_params_cb=lambda k, v: k == "trace" and v is not None):
+        proxy.open()
+    qtbot.waitUntil(lambda: plot.trace is not None, timeout=3000)
+    plot.resize(600, 320)
+    plot.grab()
+    win.close()

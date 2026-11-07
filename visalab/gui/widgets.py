@@ -174,7 +174,7 @@ class TracePlot(QWidget, ParamWidget):
         super().__init__(parent)
         self.bind(proxy, spec)
         self.trace = None
-        for key in ("marker.level", "marker.state", "ref_level", "scale_div"):   # перерисовать
+        for key in ("marker.level", "marker.value", "marker.state", "ref_level", "scale_div"):
             if proxy.supports(key):
                 proxy.subscribe(key, lambda _v: self.update())
         self.setMinimumSize(520, 300)
@@ -227,14 +227,15 @@ class TracePlot(QWidget, ParamWidget):
         p.drawText(QPointF(4, top + h / 2), t.y_unit)
         p.setPen(QPen(QColor("#e0a020"), 1.4))
         p.drawPath(path)
-        mx, my = self.proxy.value("marker.freq"), self.proxy.value("marker.level")
+        mx = self.proxy.value("marker.freq")
+        my = self.proxy.value("marker.level", self.proxy.value("marker.value"))
         if self.proxy.value("marker.state") and mx is not None and my is not None and sx:
             px, py = left + (mx - x0) * sx, top + h * (y1 - min(max(my, y0), y1)) / (y1 - y0)
             p.setPen(QPen(QColor("#d64545"), 2))
             p.drawLine(QPointF(px - 6, py - 10), QPointF(px, py))
             p.drawLine(QPointF(px + 6, py - 10), QPointF(px, py))
             p.drawText(QPointF(min(px + 8, right - 150), max(top + 12, py - 12)),
-                       f"{si_format(mx, 'Hz')}  {my:.2f} dBm")
+                       f"{si_format(mx, 'Hz')}  {my:.3g} {t.y_unit}")
 
 
 def make_widget(proxy: InstrumentProxy, spec: Param) -> QWidget:
