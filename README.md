@@ -78,7 +78,9 @@ proxy.subscribe("meas.power", on_power)   # приходит после кажд
 
 ```bash
 pip install -r requirements.txt
-python run_gui.py                       # SDG и источник на симуляторах
+python run_gui.py                       # все приборы из lab.json (адреса лаборатории)
+python run_gui.py --e4446a lab          # один прибор, адрес из lab.json
+python run_gui.py --sdg sim --psu sim   # SDG и источник на симуляторах
 python run_gui.py --list                # найти адреса USB-приборов
 python run_gui.py --sdg "USB0::0xF4EC::...::INSTR" --psu "USB0::0x2EC7::...::INSTR"
 python run_gui.py --only psu --psu "USB0::..." --psu-model IT6322

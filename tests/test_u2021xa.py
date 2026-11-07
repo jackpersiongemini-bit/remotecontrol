@@ -24,7 +24,8 @@ def test_connect_sets_units_and_feeds_without_reset(pm):
     drv, sim, rec = pm
     assert "*RST" not in sim.history
     assert all(u == "DBM" for n, u in sim.units.items() if n <= 3)
-    assert sim.feeds[2] == "POW:PEAK ON SWEEP1" and sim.feeds[3] == "POW:PTAV ON SWEEP1"
+    assert sim.feeds[2] == "POW:PEAK" and sim.feeds[3] == "POW:PTAV"     # свободный счёт: без строба
+    assert not rec.errors
     assert rec.values["detector"] == "NORMAL" and rec.values["trig.source"] == "IMM"
     assert rec.values["meas.continuous"] is True and sim.cfg["cont"] is True   # свободный счёт
 
@@ -117,3 +118,26 @@ def test_zero_uses_long_timeout(pm):
     drv, sim, rec = pm
     drv.run_action("zero")
     assert sim.zeroed and drv.transport.timeout_ms == drv.TIMEOUT_MS
+
+
+def test_free_run_normal_mode_no_conflict(pm):
+    """Ошибка с прибора: свободный счёт + NORMal давал -221 на FEED "... ON SWEEP1"."""
+    drv, sim, rec = pm
+    setp(drv, rec, "detector", "AVERAGE")
+    assert setp(drv, rec, "detector", "NORMAL") is PStatus.WRITTEN
+    assert not rec.errors and sim.feeds[1] == "POW:AVER" and sim.feeds[2] == "POW:PEAK"
+    sim.set_signal(on_dbm=0.0, width=100e-6, period=1e-3)
+    drv.poll()
+    assert rec.values["meas.peak"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_gate_feeds_follow_trigger_source(pm):
+    drv, sim, rec = pm
+    setp(drv, rec, "trig.level", -10.0)
+    setp(drv, rec, "trig.source", "INT")
+    assert sim.feeds[1] == "POW:AVER ON SWEEP1" and sim.feeds[3] == "POW:PTAV ON SWEEP1"
+    setp(drv, rec, "trig.source", "IMM")
+    assert sim.feeds[1] == "POW:AVER" and not rec.errors
+    setp(drv, rec, "trig.source", "EXT")
+    setp(drv, rec, "detector", "AVERAGE")              # EXT + AVER разрешено, строб у среднего остаётся
+    assert sim.feeds[1] == "POW:AVER ON SWEEP1" and not rec.errors

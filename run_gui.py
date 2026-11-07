@@ -1,6 +1,8 @@
 """Запуск окон приборов.
 
-    python run_gui.py                                   # генератор SDG и источник на симуляторах
+    python run_gui.py                                   # все приборы из lab.json (если нет - SDG и источник на симуляторах)
+    python run_gui.py --e4446a lab                      # один прибор, адрес из lab.json
+    python run_gui.py --sdg sim --psu sim               # симуляторы
     python run_gui.py --sdg USB0::0xF4EC::0x1102::SDG2XXXX::INSTR --psu sim
     python run_gui.py --e8267d sim --smf100a sim        # СВЧ-генераторы на симуляторах
     python run_gui.py --sdg 192.168.0.3                 # по LAN: = TCPIP0::192.168.0.3::INSTR
@@ -9,13 +11,15 @@
     python run_gui.py --list                            # показать ресурсы VISA
 
 Каждый прибор - своё окно, свой поток, общение только сигналами Qt.
-Если ни один прибор не указан, открываются SDG и источник на симуляторах.
+Если ни один прибор не указан, открываются все приборы из lab.json.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication
 
@@ -44,6 +48,17 @@ def _pairs(items: list[str], what: str) -> dict[str, str]:
     return out
 
 
+def _load_lab(path: str) -> dict[str, dict]:
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    data = json.loads(p.read_text(encoding="utf-8"))
+    unknown = [k for k in data if not k.startswith("_") and k not in DEVICES]
+    if unknown:
+        raise SystemExit(f"{path}: неизвестные приборы {unknown}, есть {sorted(DEVICES)}")
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for name, (kind, title, _) in DEVICES.items():
@@ -57,6 +72,8 @@ def main(argv=None) -> int:
                     help="пауза между командами прибору (по умолчанию: sdg 0.05, остальные 0)")
     ap.add_argument("--sdg-delay", type=float, help="то же, что --delay sdg=СЕК")
     ap.add_argument("--psu-delay", type=float, help="то же, что --delay psu=СЕК")
+    ap.add_argument("--lab", default=str(Path(__file__).with_name("lab.json")),
+                    help="файл адресов лаборатории (по умолчанию lab.json рядом со скриптом)")
     ap.add_argument("--only", choices=sorted(DEVICES), help="открыть только этот прибор")
     ap.add_argument("--backend", default="", help="бэкенд pyvisa: '' (NI/Keysight VISA) или '@py'")
     ap.add_argument("--latency", type=float, default=0.005, help="задержка симулятора, с")
@@ -81,9 +98,19 @@ def main(argv=None) -> int:
     if args.psu_delay is not None:
         delays["psu"] = args.psu_delay
 
+    lab = _load_lab(args.lab)
     addresses = {n: getattr(args, n) for n in DEVICES if getattr(args, n) is not None}
-    if not addresses:
-        addresses = {"sdg": "sim", "psu": "sim"}
+    if not addresses:            # без аргументов - все приборы из lab.json, иначе SDG и источник на симуляторах
+        addresses = {n: "lab" for n in lab} or {"sdg": "sim", "psu": "sim"}
+    for name, addr in list(addresses.items()):
+        if addr == "lab":
+            if name not in lab:
+                raise SystemExit(f"--{name} lab: в {args.lab} нет адреса для {name}")
+            addresses[name] = lab[name]["address"]
+            if "model" in lab[name]:
+                models.setdefault(name, lab[name]["model"])
+            if "delay" in lab[name]:
+                delays.setdefault(name, float(lab[name]["delay"]))
     if args.only:
         addresses = {args.only: addresses.get(args.only, "sim")}
 

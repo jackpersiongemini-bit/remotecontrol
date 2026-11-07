@@ -9,7 +9,8 @@
   Непрерывный сигнал перепада не даёт - запуска нет, измерение ждёт;
 * EXT - ``sim.fire_external()``; BUS - ``*TRG``; HOLD - только ``TRIG:IMM``.
 * ``INIT`` перекрываемая: ``*OPC`` взводит бит OPC только по окончании измерения.
-Конфликты: INT при DET:FUNC AVER и TRIG:SLOP не при INT/EXT -> -221; FETC? без данных -> -230.
+Конфликты -221: INT при DET:FUNC AVER, TRIG:SLOP не при INT/EXT, FEED с ``ON SWEEP`` не при INT/EXT,
+FEED PEAK/PTAV при AVER. FETC? без данных -> -230.
 """
 from __future__ import annotations
 
@@ -235,7 +236,12 @@ class KeysightU2021XASim(SimInstrument):
         self.units[int(g[0])] = {"DBM": "DBM", "W": "W"}[a.strip().upper()]
 
     def _feed_set(self, a, g):
-        self.feeds[int(g[0])] = a.strip().strip('"').upper()
+        feed = a.strip().strip('"').upper()
+        if "ON SWEEP" in feed and self.cfg["src"] not in ("INT", "EXT"):
+            raise SimError(-221, "Settings conflict", ESR_EXE)        # как на приборе (проверено)
+        if self.cfg["det"] == "AVER" and ("PEAK" in feed or "PTAV" in feed):
+            raise SimError(-221, "Settings conflict", ESR_EXE)
+        self.feeds[int(g[0])] = feed
 
     def _fetch(self, a, g):
         n = int(g[0])

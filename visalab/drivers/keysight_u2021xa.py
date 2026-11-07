@@ -9,14 +9,15 @@
   ``TRIG:SLOP POS|NEG`` (только при INT/EXT, иначе -221), ``TRIG:DEL`` (-1...1 с),
   ``TRIG:HOLD`` (1 мкс...0.4 с);
 * строб 1: ``SWE1:OFFS:TIME`` (-1...1 с), ``SWE1:TIME`` (0...1 с);
-* результаты: блоки CALC1..3 с ``CALC<n>:FEED1 "POW:AVER|PEAK|PTAV ON SWEEP1"``, чтение ``FETC<n>?``;
+* результаты: блоки CALC1..3 с ``CALC<n>:FEED1 "POW:AVER|PEAK|PTAV[ ON SWEEP1]"``, чтение ``FETC<n>?``.
+  ``ON SWEEP1`` (строб) разрешён только при запуске INT/EXT, PEAK/PTAV - только в NORMal;
 * ``INITiate`` - перекрываемая команда: ``INIT;*OPC`` взводит бит OPC регистра ESR по окончании
   измерения. Драйвер ждёт этот бит в опросе, не блокируя поток запросом (при запуске по уровню
   сигнала может не быть сколько угодно долго);
 * ``CAL:ZERO:AUTO ONCE`` / ``CAL:AUTO ONCE`` + ``*OPC?`` (несколько секунд).
 
 Что драйвер меняет в приборе при подключении (без *RST): единицы CALC1..3 в dBm и
-назначение CALC1..3 (среднее/пик/пик-среднее в стробе 1) - чтобы стандартные ключи
+назначение CALC1..3 (среднее/пик/пик-среднее; в стробе 1 при запуске INT/EXT) - чтобы стандартные ключи
 ``meas.power``/``meas.peak``/``meas.ptav`` всегда значили одно и то же.
 """
 from __future__ import annotations
@@ -32,9 +33,11 @@ __all__ = ["KeysightU2021XA"]
 F, I, B, E = Kind.FLOAT, Kind.INT, Kind.BOOL, Kind.ENUM
 
 #: CALC-блок -> стандартный ключ и назначение в режиме NORMal
-FEEDS = {1: ("meas.power", "POW:AVER ON SWEEP1"),
-         2: ("meas.peak", "POW:PEAK ON SWEEP1"),
-         3: ("meas.ptav", "POW:PTAV ON SWEEP1")}
+FEEDS = {1: ("meas.power", "POW:AVER"),
+         2: ("meas.peak", "POW:PEAK"),
+         3: ("meas.ptav", "POW:PTAV")}
+#: по мануалу ``... ON SWEEP<n>`` (строб) разрешён только при TRIG:SOUR INT или EXT, иначе -221
+GATED_SOURCES = ("INT", "EXT")
 RESULT_KEYS = tuple(k for k, _ in FEEDS.values())
 CAL_TIMEOUT_MS = 30000
 
@@ -115,7 +118,9 @@ class KeysightU2021XA(VISAInstrument):
         self._results = dict.fromkeys(RESULT_KEYS)
         for n in FEEDS:
             self.write(f"UNIT{n}:POW DBM")
-        self._configure_feeds(self.query("DET:FUNC?").strip().upper().startswith("NORM"))
+        det = "NORMAL" if self.query("DET:FUNC?").strip().upper().startswith("NORM") else "AVERAGE"
+        src = self._params["trig.source"].from_scpi(self.query("TRIG:SOUR?"))
+        self._configure_feeds(det, src)
         self.opc_latched = False
 
     def on_disconnecting(self) -> None:
@@ -123,12 +128,15 @@ class KeysightU2021XA(VISAInstrument):
             self.write("ABOR")
             self._armed = False
 
-    def _configure_feeds(self, normal: bool) -> None:
-        if normal:
-            for n, (_, feed) in FEEDS.items():
-                self.write(f'CALC{n}:FEED1 "{feed}"')
-        else:
-            self.write('CALC1:FEED1 "POW:AVER"')
+    def _configure_feeds(self, detector: str, source: str) -> None:
+        """Назначение CALC1..3 под режим (правила мануала U2020X):
+        PEAK/PTAV - только при DET NORM; ``ON SWEEP1`` (строб) - только при TRIG:SOUR INT/EXT.
+        В свободном счёте NORMAL даёт среднее и пик без строба."""
+        gate = " ON SWEEP1" if source in GATED_SOURCES else ""
+        for n, (_, feed) in FEEDS.items():
+            if detector != "NORMAL" and n > 1:
+                break
+            self.write(f'CALC{n}:FEED1 "{feed}{gate}"')
 
     @property
     def _normal(self) -> bool:
@@ -146,23 +154,35 @@ class KeysightU2021XA(VISAInstrument):
             return
         was_armed = self._armed
         self._abort()                            # настройки меняем при остановленном измерении
-        if key == "trig.source" and value == "INT" and not self._normal:
-            # запуск по уровню возможен только в режиме NORMal (иначе -221)
-            self.write("DET:FUNC NORM")
-            self._configure_feeds(True)
-            self._values["detector"] = "NORMAL"
-        if key == "detector" and value == "AVERAGE" and self._values.get("trig.source") == "INT":
-            self.write("TRIG:SOUR IMM")          # обратный конфликт: AVER + INT
-            self._values["trig.source"] = "IMM"
-        super().write_param(spec, value)
-        if key == "detector":
-            self._configure_feeds(value == "NORMAL")
         if key in ("trig.source", "detector"):
-            self._values[key] = value
-            self._results = dict.fromkeys(RESULT_KEYS)
-            self._apply_run_mode()
-        elif was_armed:
+            self._change_mode(spec, value)
+            return
+        super().write_param(spec, value)
+        if was_armed:
             self._arm()
+
+    def _change_mode(self, spec: Param, value: Any) -> None:
+        """Смена запуска/режима в порядке, при котором прибор не даёт -221:
+        INT требует DET NORM; AVER требует запуск не INT; строб в FEED требует INT/EXT."""
+        det = self._values.get("detector", "NORMAL")
+        src = self._values.get("trig.source", "IMM")
+        if spec.key == "detector":
+            new_det = value
+            new_src = "IMM" if value == "AVERAGE" and src == "INT" else src
+        else:
+            new_src = value
+            new_det = "NORMAL" if value == "INT" else det
+        if src in GATED_SOURCES and new_src not in GATED_SOURCES:
+            self._configure_feeds(det, new_src)  # снять строб, пока источник ещё INT/EXT
+        if spec.key == "detector" and new_src != src:
+            self.write("TRIG:SOUR IMM")
+        if spec.key == "trig.source" and new_det != det:
+            self.write("DET:FUNC NORM")
+        super().write_param(spec, value)
+        self._values["detector"], self._values["trig.source"] = new_det, new_src
+        self._configure_feeds(new_det, new_src)
+        self._results = dict.fromkeys(RESULT_KEYS)
+        self._apply_run_mode()
 
     def read_param_raw(self, spec: Param) -> Any:
         if spec.key == "meas.continuous":
