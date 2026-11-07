@@ -134,10 +134,53 @@ class ToggleButton(QPushButton):
         self.setText(self._text + ("" if value is None else ("  ON" if value else "  OFF")))
 
 
+class OnOffButtons(QWidget):
+    """Отдельные кнопки ON и OFF + состояние выхода (подсвечена та, что сейчас на приборе)."""
+
+    def __init__(self, proxy: InstrumentProxy, key: str, text: str, parent=None):
+        super().__init__(parent)
+        self.proxy, self.key = proxy, key
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel(text)
+        self.state = QLabel("—")
+        self.state.setMinimumWidth(40)
+        self.on_btn = QPushButton("ON")
+        self.off_btn = QPushButton("OFF")
+        for b, v in ((self.on_btn, True), (self.off_btn, False)):
+            b.setCheckable(True)
+            b.setProperty("role", "toggle")
+            b.setMinimumHeight(36)
+            b.clicked.connect(lambda _=False, v=v: self._send(v))
+        self.off_btn.setStyleSheet("QPushButton:checked { background: #616161; color: white; font-weight: bold; }")
+        lay.addWidget(self.label)
+        lay.addWidget(self.state)
+        lay.addWidget(self.on_btn, 1)
+        lay.addWidget(self.off_btn, 1)
+        self.setToolTip(key)
+        proxy.subscribe(key, self._on_value)
+        self._on_value(proxy.value(key))
+
+    def _send(self, value: bool) -> None:
+        self._on_value(self.proxy.value(self.key))   # подсветка - только по ответу прибора
+        self.proxy.set(self.key, value)
+
+    def _on_value(self, value) -> None:
+        known = value is not None
+        self.on_btn.setEnabled(known)
+        self.off_btn.setEnabled(known)
+        self.on_btn.setChecked(value is True)
+        self.off_btn.setChecked(value is False)
+        self.state.setText("—" if not known else ("ON" if value else "OFF"))
+        self.state.setStyleSheet("color: #2e7d32; font-weight: bold;" if value else "")
+
+
 class Readout(QLabel):
     def __init__(self, proxy: InstrumentProxy, key: str, digits: int = 5, role: str = "readout", parent=None):
         super().__init__("—", parent)
-        self.unit = proxy.params[key].unit
+        spec = proxy.params[key]
+        self.unit = spec.unit
+        self.labels = {"HIZ": "High-Z", "50": "50 Ω", **{t: l for t, l in WAVES}}
         self.digits = digits
         self.setProperty("role", role)
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -150,7 +193,7 @@ class Readout(QLabel):
         if value is None:
             self.setText("—")
         elif not isinstance(value, (int, float)) or isinstance(value, bool):
-            self.setText(str(value))
+            self.setText(self.labels.get(str(value), str(value)))
         elif self.unit in ("dBm", "dB"):
             self.setText(f"{value:.{max(1, self.digits - 3)}f} {self.unit}")
         else:
@@ -396,21 +439,24 @@ class FuncGenWindow(QuickWindow):
         for n in range(1, proxy.channels + 1):
             box = QGroupBox(f"CH{n}  (50 Ω)")
             g = QGridLayout(box)
-            g.addWidget(QLabel("Waveform"), 0, 0)
-            g.addWidget(EnumBox(proxy, f"ch{n}.wave", WAVES), 0, 1)
-            g.addWidget(QLabel("Frequency"), 1, 0)
-            g.addWidget(SpinField(proxy, f"ch{n}.frequency", "Hz", decimals=3, step=100.0), 1, 1)
-            g.addWidget(QLabel("Amplitude"), 2, 0)
-            g.addWidget(SpinField(proxy, f"ch{n}.amplitude", "Vpp", decimals=3, step=0.1), 2, 1)
-            g.addWidget(QLabel("Offset"), 3, 0)
-            g.addWidget(SpinField(proxy, f"ch{n}.offset", "V", decimals=3, step=0.1), 3, 1)
-            g.addWidget(QLabel("Phase"), 4, 0)
-            g.addWidget(SpinField(proxy, f"ch{n}.phase", "deg", decimals=1, step=10.0), 4, 1)
-            g.addWidget(QLabel("Duty"), 5, 0)
-            g.addWidget(SpinField(proxy, f"ch{n}.duty", "%", decimals=1, step=5.0), 5, 1)
-            out = ToggleButton(proxy, f"ch{n}.output", "Output")
-            out.setMinimumHeight(40)
-            g.addWidget(out, 6, 0, 1, 2)
+            hdr_set, hdr_act = QLabel("Set"), QLabel("Actual")
+            for h in (hdr_set, hdr_act):
+                h.setStyleSheet("color: gray;")
+            g.addWidget(hdr_set, 0, 1)
+            g.addWidget(hdr_act, 0, 2, Qt.AlignmentFlag.AlignRight)
+            rows = [("Waveform", EnumBox(proxy, f"ch{n}.wave", WAVES), "wave"),
+                    ("Frequency", SpinField(proxy, f"ch{n}.frequency", "Hz", decimals=3, step=100.0), "frequency"),
+                    ("Amplitude", SpinField(proxy, f"ch{n}.amplitude", "Vpp", decimals=3, step=0.1), "amplitude"),
+                    ("Offset", SpinField(proxy, f"ch{n}.offset", "V", decimals=3, step=0.1), "offset"),
+                    ("Phase", SpinField(proxy, f"ch{n}.phase", "deg", decimals=1, step=10.0), "phase"),
+                    ("Duty", SpinField(proxy, f"ch{n}.duty", "%", decimals=1, step=5.0), "duty"),
+                    ("Load", None, "load")]
+            for r, (label, editor, suffix) in enumerate(rows, start=1):
+                g.addWidget(QLabel(label), r, 0)
+                if editor is not None:
+                    g.addWidget(editor, r, 1)
+                g.addWidget(Readout(proxy, f"ch{n}.{suffix}", digits=7), r, 2)
+            g.addWidget(OnOffButtons(proxy, f"ch{n}.output", "Output"), len(rows) + 1, 0, 1, 3)
             row.addWidget(box)
         self.body.addLayout(row)
 

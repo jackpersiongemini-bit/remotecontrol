@@ -101,3 +101,20 @@ def test_power_meter_modes(qtbot, settings):
     _wait_value(qtbot, proxy, "trig.source", lambda v: v == "IMM")
     assert proxy.value("meas.continuous") is True
     win.close()
+
+
+def test_sdg_on_off_buttons_and_readouts(qtbot, settings):
+    from visalab.quick import OnOffButtons, Readout
+    proxy, win = _open(qtbot, FuncGenWindow, SiglentSDG, SiglentSDGSim(), settings)
+    onoff = next(w for w in win.findChildren(OnOffButtons) if w.key == "ch1.output")
+    assert onoff.off_btn.isChecked() and not onoff.on_btn.isChecked()
+    onoff.on_btn.click()
+    _wait_value(qtbot, proxy, "ch1.output", lambda v: v is True)
+    assert onoff.on_btn.isChecked() and onoff.state.text() == "ON"
+    onoff.off_btn.click()
+    _wait_value(qtbot, proxy, "ch1.output", lambda v: v is False)
+    assert onoff.off_btn.isChecked()
+    texts = {w.toolTip(): w.text() for w in win.findChildren(Readout)}
+    assert texts["ch1.wave"] == "Sine" and texts["ch1.frequency"] == "1 kHz"
+    qtbot.waitUntil(lambda: {w.toolTip(): w.text() for w in win.findChildren(Readout)}["ch1.load"] == "50 Ω")
+    win.close()
