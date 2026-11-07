@@ -70,3 +70,20 @@ def test_rf_generator_windows_identical(qtbot):
                         sorted(w.spec.key for w in win.findChildren(NumberField))))
         win.close()
     assert layouts[0] == layouts[1]
+
+
+def test_power_meter_window_updates_reading(qtbot):
+    from visalab.drivers import KeysightU2021XA
+    from visalab.gui.widgets import Readout
+    from visalab.sim import KeysightU2021XASim
+    sim = KeysightU2021XASim()
+    sim.set_signal(on_dbm=-3.0, width=None)
+    proxy = InstrumentProxy(KeysightU2021XA, SimTransport(sim))
+    win = InstrumentWindow(proxy)
+    qtbot.addWidget(win)
+    with qtbot.waitSignal(proxy.param_updated, timeout=5000,
+                          check_params_cb=lambda k, v: k == "meas.power" and v is not None):
+        proxy.open()
+    label = _field(win, Readout, "meas.power")
+    qtbot.waitUntil(lambda: label.text().startswith("-3"), timeout=3000)
+    win.close()

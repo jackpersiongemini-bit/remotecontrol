@@ -8,6 +8,7 @@
 | Источник ITECH IT6300 (IT6322: CH1/CH2 30 В 3 А, CH3 5 В 3 А) | `power_supply` | `drivers/itech_it6300.py` | `sim/itech_it6300_sim.py` | PSupply.pdf (IT6300 Programming Guide V1.1) |
 | СВЧ-генератор Keysight PSG E8267D | `signal_generator` | `drivers/keysight_e8267d.py` | `sim/rf_generator_sim.py` | PSG SCPI Command Reference E8251-90356 |
 | СВЧ-генератор R&S SMF100A | `signal_generator` | `drivers/rs_smf100a.py` | `sim/rf_generator_sim.py` | R&S SMF100A Operating Manual |
+| Датчик мощности Keysight U2021XA | `power_meter` | `drivers/keysight_u2021xa.py` | `sim/keysight_u2021xa_sim.py` | U2020 X-Series Programming Guide (U2021-90003) |
 
 Модель по `*IDN?` не определяется и не проверяется: она задаётся явно (`--model e8267d=E8267D-544`,
 `--sdg-model`, `--psu-model`, таблицы `MODELS` в `drivers/__init__.py`). Без модели пределы мягкие,
@@ -38,7 +39,26 @@ proxy.supports("pulse.width")       # необязательная функци�
 `tests/test_profiles.py` прогоняет каждый драйвер из `DRIVERS` на его симуляторе и проверяет контракт;
 `tests/test_rf_generators.py` проверяет, что один и тот же сценарий даёт один и тот же результат на обоих генераторах.
 
-Профили анализатора спектра (E4446A), ваттметра (U2021XA) и ВАЦ (N5231A) появятся вместе с их драйверами.
+Профили анализатора спектра (E4446A) и ВАЦ (N5231A) появятся вместе с их драйверами.
+
+### Ваттметр: измерение с запуском по уровню
+
+Результаты всегда в dBm: `meas.power` (среднее, в стробе при `detector = NORMAL`), `meas.peak`, `meas.ptav` (dB).
+
+```python
+proxy.set("trig.level", -10.0)       # dBm
+proxy.set("gate.start", 20e-6)       # строб от момента запуска
+proxy.set("gate.length", 100e-6)
+proxy.set("trig.source", "INT")      # по уровню; драйвер сам переведёт датчик в NORMal
+proxy.subscribe("meas.power", on_power)   # приходит после каждого запуска
+```
+
+* `trig.source = IMM` + `meas.continuous = True` - свободный счёт, результат при каждом опросе.
+* Любой другой запуск - драйвер посылает `INIT;*OPC` и ждёт бит OPC в `*ESR?` при опросе. Запроса,
+  который висит до прихода запуска, нет: без сигнала окно не зависает и связь не рвётся
+  (`meas.armed = True` - ждём). После измерения, если `meas.continuous`, взводится снова.
+* `single` - одно измерение, `trigger` - программный запуск (`trig.source = BUS`), `abort`, `zero`, `calibrate`.
+* Конфликты прибора (-221: INT при AVERage, наклон фронта не при INT/EXT) драйвер обходит сам.
 
 ## Запуск
 
@@ -50,6 +70,7 @@ python run_gui.py --sdg "USB0::0xF4EC::...::INSTR" --psu "USB0::0x2EC7::...::INS
 python run_gui.py --only psu --psu "USB0::..." --psu-model IT6322
 python run_gui.py --sdg "USB0::..." --sdg-model SDG2042X
 python run_gui.py --e8267d sim --smf100a sim                 # СВЧ-генераторы на симуляторах
+python run_gui.py --u2021xa sim                               # датчик мощности на симуляторе
 python run_gui.py --sdg 192.168.0.3     # по LAN (VXI-11): то же, что TCPIP0::192.168.0.3::INSTR
 python run_gui.py --sdg 192.168.0.3:5025  # сырой сокет: TCPIP0::192.168.0.3::5025::SOCKET
 python run_gui.py --e8267d "GPIB0::19::INSTR" --model e8267d=E8267D-544
@@ -127,3 +148,6 @@ python -m pytest -q                     # тесты без железа
   PSG SCPI Command Reference и SMF100A Operating Manual. На приборе проверить в первую очередь
   `:PULM:INT:PER/PWID` (нужна опция UNU/UNW), `:ROSC:SOUR?`, ответ `POW:ALC?` у SMF100A (`AUTO`).
   FM и ΦM на приборе дают -221 Settings conflict (проверено), поэтому драйвер выключает мешающий режим сам.
+* U2021XA (по мануалу U2021-90003): проверить формат ответа `TRIG:SOUR?` при INT (`INT` или `INT1`, оба понимаются),
+  что `INIT;*OPC` действительно взводит OPC по окончании измерения по запуску, и время `CAL:ZERO:AUTO ONCE`
+  (таймаут на обнуление 30 с).

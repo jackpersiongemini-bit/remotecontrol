@@ -133,6 +133,7 @@ class VISAInstrument(QObject):
         self._quiet = False            # не логировать трафик опроса
         self.log_polling = False
         self.idn = ""
+        self.opc_latched = False       # см. read_esr()
         self._timer = QTimer(self)     # переедет в поток вместе с self
         self._timer.setInterval(self.POLL_INTERVAL_MS)
         self._timer.timeout.connect(self._on_poll)
@@ -471,9 +472,18 @@ class VISAInstrument(QObject):
         else:
             self.param_status.emit(key, PStatus.COERCED, f"запрошено {value}, установлено {actual}")
 
-    def _check_errors(self, context: str = "") -> list[tuple[int, str]]:
-        """*ESR? -> очередь ошибок. Возвращает и публикует найденные ошибки."""
+    def read_esr(self) -> int:
+        """*ESR? (регистр при чтении сбрасывается). Бит OPC запоминается в ``opc_latched``,
+        чтобы ожидание ``*OPC`` драйвером не терялось из-за проверки ошибок после записи."""
         esr = self.query_int("*ESR?")
+        if esr & 0x01:
+            self.opc_latched = True
+        return esr
+
+    def _check_errors(self, context: str = "", esr: int | None = None) -> list[tuple[int, str]]:
+        """*ESR? -> очередь ошибок. Возвращает и публикует найденные ошибки."""
+        if esr is None:
+            esr = self.read_esr()
         if not esr & self.ESE_MASK:
             return []
         errors = self.read_error_queue()

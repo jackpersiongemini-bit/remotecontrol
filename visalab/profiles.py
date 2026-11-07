@@ -5,7 +5,7 @@
 
 Соглашения
 ----------
-* Единицы - СИ без префиксов: Hz, V, A, W, s, dBm, %, deg, rad. Префиксы (k, M, G)
+* Единицы - СИ без префиксов: Hz, V, A, W, s, dBm, dB, %, deg, rad. Префиксы (k, M, G)
   только в отображении.
 * Логические значения - bool (True/False), а не "ON"/"1".
 * ENUM - стандартные токены, перечисленные здесь. Перевод в токены прибора делает
@@ -13,7 +13,7 @@
 * Канальные ключи ``ch{n}.*`` нумеруются с 1.
 * Что не входит в профиль - расширение производителя ``x.*``.
 
-Профили анализатора спектра, ваттметра и ВАЦ будут добавлены вместе с их драйверами
+Профили анализатора спектра и ВАЦ будут добавлены вместе с их драйверами
 (им нужен ещё стандартный тип данных для трасс).
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from __future__ import annotations
 from .core.params import Kind
 from .core.profile import ActionSlot, Profile, Slot
 
-__all__ = ["POWER_SUPPLY", "FUNCTION_GENERATOR", "SIGNAL_GENERATOR", "PROFILES"]
+__all__ = ["POWER_SUPPLY", "FUNCTION_GENERATOR", "SIGNAL_GENERATOR", "POWER_METER", "PROFILES"]
 
 F, I, B, E, S = Kind.FLOAT, Kind.INT, Kind.BOOL, Kind.ENUM, Kind.STR
 SOURCES = ("INT", "EXT")
@@ -125,4 +125,52 @@ SIGNAL_GENERATOR = Profile(
     ),
 )
 
-PROFILES = {p.name: p for p in (POWER_SUPPLY, FUNCTION_GENERATOR, SIGNAL_GENERATOR)}
+# ------------------------------------------------------------------ ваттметр
+POWER_METER = Profile(
+    "power_meter", "Измеритель мощности (ваттметр / датчик)",
+    doc="""Результаты всегда в dBm (отношение пик/среднее - в dB), независимо от настроек прибора.
+
+    Цикл измерения:
+    * trig.source = IMM и meas.continuous = True - свободный счёт, результат обновляется при опросе;
+    * любой другой источник запуска (INT - по уровню сигнала, EXT, BUS) - драйвер взводит
+      однократное измерение, ждёт его завершения без блокирующих запросов (meas.armed = True),
+      публикует результат и, если meas.continuous, взводит снова;
+    * действие single - одно измерение по текущему запуску, abort - отменить ожидание.
+    """,
+    slots=(
+        Slot("meas.power", F, "dBm", required=True, readonly=True,
+             doc="основной результат: средняя мощность (в стробе, если detector = NORMAL)"),
+        Slot("meas.peak", F, "dBm", readonly=True, doc="пиковая мощность в стробе"),
+        Slot("meas.ptav", F, "dB", readonly=True, doc="пик/среднее в стробе"),
+        Slot("meas.continuous", B, required=True, doc="повторять измерения автоматически"),
+        Slot("meas.armed", B, readonly=True, doc="измерение взведено, ждём запуск"),
+        Slot("freq", F, "Hz", required=True, doc="частота сигнала для поправки датчика"),
+        Slot("avg.state", B, doc="усреднение включено"),
+        Slot("avg.count", I, doc="число усреднений"),
+        Slot("avg.auto", B, doc="число усреднений выбирается прибором"),
+        Slot("offset", F, "dB", doc="поправка (аттенюатор/ответвитель) в dB"),
+        Slot("offset.state", B),
+        Slot("detector", E, choices=("AVERAGE", "NORMAL"),
+             doc="AVERAGE - только средняя мощность; NORMAL - пик/среднее, строб, запуск"),
+        Slot("video_bw", E, choices=("OFF", "LOW", "MED", "HIGH")),
+        Slot("trig.source", E, choices=("IMM", "INT", "EXT", "BUS", "HOLD"),
+             doc="IMM - свободный счёт, INT - по уровню входного сигнала"),
+        Slot("trig.level", F, "dBm"),
+        Slot("trig.level_auto", B),
+        Slot("trig.slope", E, choices=("POS", "NEG")),
+        Slot("trig.delay", F, "s"),
+        Slot("trig.holdoff", F, "s"),
+        Slot("gate.start", F, "s", doc="начало строба от момента запуска"),
+        Slot("gate.length", F, "s", doc="длительность строба"),
+    ),
+    actions=(
+        ActionSlot("zero", required=True, doc="обнуление датчика (вход без сигнала!)"),
+        ActionSlot("calibrate", doc="внутренняя калибровка"),
+        ActionSlot("single", doc="одно измерение по текущему источнику запуска"),
+        ActionSlot("abort", doc="отменить ожидание запуска"),
+        ActionSlot("trigger", doc="программный запуск (trig.source = BUS)"),
+        ActionSlot("reset"),
+    ),
+)
+
+PROFILES = {p.name: p for p in (POWER_SUPPLY, FUNCTION_GENERATOR, SIGNAL_GENERATOR, POWER_METER)}

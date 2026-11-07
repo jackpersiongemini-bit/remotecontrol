@@ -18,6 +18,7 @@ def test_driver_conforms_to_profile(make, kind):
     assert drv.PROFILE.problems(drv.params, drv.actions, drv.channels) == []
     required = drv.PROFILE.keys(drv.channels, required_only=True)
     assert set(required) <= drv.capabilities
+    drv.poll()                                             # измерения появляются при опросе
     for key in required:                                   # обязательное читается
         assert rec.values.get(key) is not None, key
     assert not rec.errors and not rec.comm
@@ -27,6 +28,8 @@ def test_driver_conforms_to_profile(make, kind):
 def test_all_off_is_universal(make, kind):
     """Действие all_off одинаково для любого источника сигнала/питания."""
     drv, sim, rec = make(*DRIVERS[kind])
+    if "all_off" not in drv.PROFILE.expand_actions(drv.channels):
+        pytest.skip("у класса нет выходов")
     outputs = [k for k in drv.capabilities if k.endswith(".output") and not k.startswith("mod.")]
     for k in outputs:
         drv.set_param(k, True); flush(drv)
