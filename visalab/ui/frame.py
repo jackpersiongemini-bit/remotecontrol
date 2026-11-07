@@ -62,12 +62,12 @@ class FrameTitleBar(TitleBar):
 class FramelessFrame(FramelessWindow):
     """Окно без системной рамки. Содержимое кладётся в ``self.body`` (QVBoxLayout)."""
 
-    def __init__(self, title: str, subtitle: str = "", parent=None):
+    def __init__(self, title: str, subtitle: str = "", parent=None, style: str = STYLE):
         super().__init__(parent)
         self.setTitleBar(FrameTitleBar(self))
         self.setObjectName("frameRoot")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(style)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, self.titleBar.height(), 1, 1)
         outer.setSpacing(0)

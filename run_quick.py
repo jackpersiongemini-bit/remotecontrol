@@ -1,4 +1,4 @@
-"""Временный фронтенд: простые окна приборов (visalab/quick.py).
+"""Временный фронтенд: все приборы в одном окне (visalab/quick.py).
 
     python run_quick.py                       # приборы из lab.json: SDG, источник, СВЧ-генератор, ваттметр
     python run_quick.py --sim                 # все четыре на симуляторах
@@ -6,7 +6,7 @@
     python run_quick.py --rf smf100a=192.168.0.3   # СВЧ-генератор другой модели
     python run_quick.py --ini my.ini          # другой файл настроек
 
-Настройки (пресеты SDG, обход блокировки CH3, положение окон) - в ini-файле QSettings,
+Настройки (пресеты SDG, обход блокировки CH3, положение окна) - в ini-файле QSettings,
 по умолчанию visalab_quick.ini рядом со скриптом.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import QApplication
 from run_gui import DEVICES, _load_lab
 from visalab.core import InstrumentProxy
 from visalab.drivers import DRIVERS, MODELS, make_transport
-from visalab.quick import WINDOWS
+from visalab.quick import WINDOWS, LabWindow
 
 HERE = Path(__file__).resolve().parent
 #: ключ командной строки -> имя прибора в DEVICES / lab.json
@@ -68,8 +68,8 @@ def main(argv=None) -> int:
 
     app = QApplication(sys.argv[:1])
     settings = QSettings(args.ini, QSettings.Format.IniFormat)
-    windows = []
-    for i, (name, address) in enumerate(wanted.items()):
+    panels = []
+    for name, address in wanted.items():
         kind, _title, model_name = DEVICES[name]
         delay = None
         if address == "lab":
@@ -82,14 +82,13 @@ def main(argv=None) -> int:
         proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency),
                                 model=MODELS[kind].get(model_name) if model_name else None,
                                 command_delay_s=None if delay is None else float(delay))
-        win = WINDOWS[kind](proxy, title=_english(kind), settings=settings)
-        if settings.value(f"{win.KIND}/geometry") is None:
-            win.move(40 + i * 60, 40 + i * 60)
-        win.show()
-        if not args.no_connect:
-            proxy.open()
-        windows.append(win)
-    app.aboutToQuit.connect(lambda: [w.proxy.shutdown() for w in windows])
+        panels.append(WINDOWS[kind](proxy, title=_english(kind), settings=settings))
+    win = LabWindow(panels, settings)
+    win.show()
+    if not args.no_connect:
+        for p in panels:
+            p.proxy.open()
+    app.aboutToQuit.connect(lambda: [p.proxy.shutdown() for p in panels])
     return app.exec()
 
 
