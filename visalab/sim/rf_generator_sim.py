@@ -20,7 +20,7 @@ class RFGenSim(SimInstrument):
     LIMITS: dict[str, tuple[float, float]] = {}
     #: допустимые токены ENUM (вход -> что хранить/возвращать)
     ENUM_TOKENS: dict[str, dict[str, str]] = {}
-    #: взаимоисключающие (включение одного выключает другое)
+    #: взаимоисключающие: включить второй при включённом первом = ошибка -221
     EXCLUSIVE = (("fm", "pm"),)
 
     def reset(self) -> None:
@@ -47,13 +47,12 @@ class RFGenSim(SimInstrument):
                 self.s[cell] = self.num(args, lo, hi)
             elif typ == "b":
                 on = self.boolean(args)
-                self.s[cell] = on
-                if on:
+                if on:   # как на приборе: -221 Settings conflict, состояние не меняется
                     for a, b in self.EXCLUSIVE:
-                        if cell == f"{a}.state":
-                            self.s[f"{b}.state"] = False
-                        elif cell == f"{b}.state":
-                            self.s[f"{a}.state"] = False
+                        other = f"{b}.state" if cell == f"{a}.state" else f"{a}.state" if cell == f"{b}.state" else None
+                        if other and self.s[other]:
+                            raise SimError(-221, "Settings conflict", ESR_EXE)
+                self.s[cell] = on
             else:
                 token = args.strip().upper()
                 table = self.ENUM_TOKENS.get(cell, {})

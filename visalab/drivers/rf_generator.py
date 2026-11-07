@@ -95,7 +95,19 @@ class RFSignalGenerator(VISAInstrument):
         return [Action("all_off", "Выключить ВЧ"),
                 Action("reset", "Сброс *RST", confirm="Сбросить генератор к заводским настройкам?")]
 
+    #: взаимоисключающие режимы: прибор отвечает -221 "Settings conflict", если включить
+    #: второй при включённом первом. Драйвер сам выключает мешающий режим перед включением.
+    EXCLUSIVE = {"fm.state": ("pm.state",), "pm.state": ("fm.state",)}
+
     # --------------------------------------------------------------- хуки
+    def write_param(self, spec: Param, value: Any) -> None:
+        if value is True:
+            for other in self.EXCLUSIVE.get(spec.key, ()):
+                o = self._params.get(other)
+                if o is not None and o.write:
+                    self.write(o.write.format(value=o.to_scpi(False)))
+        super().write_param(spec, value)
+
     def run_custom_action(self, name: str, args: tuple) -> Any:
         if name == "all_off":
             spec = self._params["rf.output"]

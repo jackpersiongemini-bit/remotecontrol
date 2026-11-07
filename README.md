@@ -125,5 +125,5 @@ python -m pytest -q                     # тесты без железа
 * У SDG проверить, отвечает ли модель на `SYST:ERR?` (в этом мануале команды нет).
 * E8267D и SMF100A сделаны без доступа к PDF (сеть среды сборки их не скачивает): команды по
   PSG SCPI Command Reference и SMF100A Operating Manual. На приборе проверить в первую очередь
-  `:PULM:INT:PER/PWID` (нужна опция UNU/UNW), `:ROSC:SOUR?`, ответ `POW:ALC?` у SMF100A (`AUTO`)
-  и что включение FM выключает ΦM, а не даёт ошибку конфликта.
+  `:PULM:INT:PER/PWID` (нужна опция UNU/UNW), `:ROSC:SOUR?`, ответ `POW:ALC?` у SMF100A (`AUTO`).
+  FM и ΦM на приборе дают -221 Settings conflict (проверено), поэтому драйвер выключает мешающий режим сам.

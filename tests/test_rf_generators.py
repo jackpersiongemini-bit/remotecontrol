@@ -79,6 +79,15 @@ def test_fm_and_pm_exclusive(gen):
     drv.set_param("fm.state", True); flush(drv)
     drv.set_param("pm.state", True); flush(drv)
     assert rec.values["pm.state"] is True and rec.values["fm.state"] is False   # перечитано
+    assert rec.last_status("pm.state")[0] is PStatus.WRITTEN and not rec.errors   # без -221
+
+
+def test_sim_reports_settings_conflict(gen):
+    """Прибор (симулятор) сам режим не выключает: прямой SCPI даёт -221."""
+    drv, sim, rec = gen
+    sim.s["fm.state"] = True
+    drv.raw_write(drv.params["pm.state"].write.format(value="1"))
+    assert rec.errors and rec.errors[0][0] == -221 and sim.s["pm.state"] is False
 
 
 def test_range_check_by_model(make):
