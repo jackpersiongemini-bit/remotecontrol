@@ -6,10 +6,12 @@
 import re
 
 from ..core.transport import PyVisaTransport, SimTransport, Transport
+from ..sim.agilent_e4446a_sim import AgilentPSASim
 from ..sim.itech_it6300_sim import ItechIT6300Sim
 from ..sim.keysight_u2021xa_sim import KeysightU2021XASim
 from ..sim.rf_generator_sim import KeysightE8267DSim, RSSMF100ASim
 from ..sim.siglent_sdg_sim import SiglentSDGSim
+from .agilent_e4446a import PSA_MODELS, AgilentPSA
 from .itech_it6300 import IT6300_MODELS, ItechIT6300
 from .keysight_e8267d import E8267D_MODELS, KeysightE8267D
 from .keysight_u2021xa import KeysightU2021XA
@@ -22,10 +24,11 @@ DRIVERS = {
     "e8267d": (KeysightE8267D, KeysightE8267DSim),
     "smf100a": (RSSMF100A, RSSMF100ASim),
     "u2021xa": (KeysightU2021XA, KeysightU2021XASim),
+    "e4446a": (AgilentPSA, AgilentPSASim),
 }
 
 #: модели (пределы проверки) по типу драйвера
-MODELS = {"sdg": SDG_MODELS, "it6300": IT6300_MODELS, "e8267d": E8267D_MODELS, "smf100a": SMF100A_MODELS, "u2021xa": {}}
+MODELS = {"sdg": SDG_MODELS, "it6300": IT6300_MODELS, "e8267d": E8267D_MODELS, "smf100a": SMF100A_MODELS, "u2021xa": {}, "e4446a": PSA_MODELS}
 
 
 _IP_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?$")
@@ -53,4 +56,4 @@ def make_transport(kind: str, address: str | None, backend: str = "", latency_s:
     return PyVisaTransport(normalize_address(address), backend=backend)
 
 
-__all__ = ["DRIVERS", "MODELS", "make_transport", "normalize_address", "SiglentSDG", "ItechIT6300", "KeysightE8267D", "RSSMF100A", "KeysightU2021XA"]
+__all__ = ["DRIVERS", "MODELS", "make_transport", "normalize_address", "SiglentSDG", "ItechIT6300", "KeysightE8267D", "RSSMF100A", "KeysightU2021XA", "AgilentPSA"]

@@ -87,3 +87,21 @@ def test_power_meter_window_updates_reading(qtbot):
     label = _field(win, Readout, "meas.power")
     qtbot.waitUntil(lambda: label.text().startswith("-3"), timeout=3000)
     win.close()
+
+
+def test_spectrum_window_plots_trace(qtbot):
+    from visalab.drivers import AgilentPSA
+    from visalab.gui.widgets import TracePlot
+    from visalab.sim import AgilentPSASim
+    sim = AgilentPSASim()
+    proxy = InstrumentProxy(AgilentPSA, SimTransport(sim))
+    win = InstrumentWindow(proxy)
+    qtbot.addWidget(win)
+    plot = next(iter(win.findChildren(TracePlot)))
+    with qtbot.waitSignal(proxy.param_updated, timeout=5000,
+                          check_params_cb=lambda k, v: k == "trace" and v is not None):
+        proxy.open()
+    qtbot.waitUntil(lambda: plot.trace is not None, timeout=3000)
+    plot.resize(600, 320)
+    plot.grab()                     # отрисовка без исключений
+    win.close()

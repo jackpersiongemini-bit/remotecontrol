@@ -480,6 +480,27 @@ class VISAInstrument(QObject):
             self.opc_latched = True
         return esr
 
+    # ---- однократное измерение с ожиданием окончания без блокировки потока ----
+    # INIT (и многие измерительные команды) - перекрываемые: *OPC после них взводит бит OPC
+    # в ESR, когда измерение закончилось. Драйвер взводит измерение arm_opc() и в опросе
+    # спрашивает opc_done(). Так ожидание запуска/развёртки сколь угодно долгое и не
+    # приводит к таймауту и обрыву связи.
+    def arm_opc(self, *commands: str) -> None:
+        self.read_esr()               # сбросить старый OPC
+        self.opc_latched = False
+        for c in commands:
+            self.write(c)
+        self.write("*OPC")
+
+    def opc_done(self, context: str = "измерение") -> bool:
+        esr = self.read_esr()
+        if esr & self.ESE_MASK:
+            self._check_errors(context=context, esr=esr)
+        if self.opc_latched:
+            self.opc_latched = False
+            return True
+        return False
+
     def _check_errors(self, context: str = "", esr: int | None = None) -> list[tuple[int, str]]:
         """*ESR? -> очередь ошибок. Возвращает и публикует найденные ошибки."""
         if esr is None:

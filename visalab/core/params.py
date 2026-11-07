@@ -38,6 +38,7 @@ class Kind(Enum):
     BOOL = "bool"
     ENUM = "enum"
     STR = "str"
+    TRACE = "trace"     # значение - visalab.core.trace.Trace (только чтение)
 
 
 @dataclass(frozen=True)

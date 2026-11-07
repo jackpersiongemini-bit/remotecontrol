@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QComboBox, QLabel, QLineEdit, QPushButton, QWidget
+from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PyQt6.QtWidgets import QComboBox, QLabel, QLineEdit, QPushButton, QSizePolicy, QWidget
 
 from ..core.params import Kind, Param, PStatus
 from ..core.proxy import InstrumentProxy
@@ -162,7 +163,83 @@ class Readout(QLabel, ParamWidget):
             self.setText(str(value))
 
 
+class TracePlot(QWidget, ParamWidget):
+    """График трассы (visalab.core.trace.Trace) без внешних библиотек.
+
+    Шкала Y - от опорного уровня вниз на 10 делений (как на экране анализатора), если у
+    прибора есть ref_level/scale_div; иначе - по данным.
+    """
+
+    def __init__(self, proxy, spec, parent=None):
+        super().__init__(parent)
+        self.bind(proxy, spec)
+        self.trace = None
+        for key in ("marker.level", "marker.state", "ref_level", "scale_div"):   # перерисовать
+            if proxy.supports(key):
+                proxy.subscribe(key, lambda _v: self.update())
+        self.setMinimumSize(520, 300)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def show_value(self, value):
+        self.trace = value
+        self.update()
+
+    def _y_range(self) -> tuple[float, float]:
+        ref, div = self.proxy.value("ref_level"), self.proxy.value("scale_div")
+        if ref is not None and div:
+            return ref - 10 * div, ref
+        ys = self.trace.y
+        lo, hi = min(ys), max(ys)
+        return (lo - 1, hi + 1) if hi - lo < 1e-9 else (lo, hi)
+
+    def paintEvent(self, event):  # noqa: N802 - Qt
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = self.palette()
+        p.fillRect(self.rect(), pal.base())
+        left, top, right, bottom = 64, 10, self.width() - 12, self.height() - 26
+        w, h = max(1, right - left), max(1, bottom - top)
+        grid = QPen(QColor(128, 128, 128, 70))
+        p.setPen(grid)
+        for i in range(11):
+            y = top + h * i / 10
+            p.drawLine(QPointF(left, y), QPointF(right, y))
+            x = left + w * i / 10
+            p.drawLine(QPointF(x, top), QPointF(x, bottom))
+        p.setPen(pal.text().color())
+        if not self.trace or len(self.trace) < 2:
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "нет трассы")
+            return
+        t = self.trace
+        y0, y1 = self._y_range()
+        x0, x1 = t.x[0], t.x[-1]
+        sx = w / (x1 - x0) if x1 != x0 else 0.0
+        path = QPainterPath()
+        for i, (xv, yv) in enumerate(zip(t.x, t.y)):
+            px = left + (xv - x0) * sx if sx else left + w * i / (len(t) - 1)
+            py = top + h * (y1 - min(max(yv, y0), y1)) / (y1 - y0)
+            path.moveTo(px, py) if i == 0 else path.lineTo(px, py)
+        p.drawText(QPointF(4, top + 10), f"{y1:.1f}")
+        p.drawText(QPointF(4, bottom), f"{y0:.1f}")
+        p.drawText(QPointF(left, self.height() - 6), si_format(x0, t.x_unit))
+        txt = si_format(x1, t.x_unit)
+        p.drawText(QPointF(right - p.fontMetrics().horizontalAdvance(txt), self.height() - 6), txt)
+        p.drawText(QPointF(4, top + h / 2), t.y_unit)
+        p.setPen(QPen(QColor("#e0a020"), 1.4))
+        p.drawPath(path)
+        mx, my = self.proxy.value("marker.freq"), self.proxy.value("marker.level")
+        if self.proxy.value("marker.state") and mx is not None and my is not None and sx:
+            px, py = left + (mx - x0) * sx, top + h * (y1 - min(max(my, y0), y1)) / (y1 - y0)
+            p.setPen(QPen(QColor("#d64545"), 2))
+            p.drawLine(QPointF(px - 6, py - 10), QPointF(px, py))
+            p.drawLine(QPointF(px + 6, py - 10), QPointF(px, py))
+            p.drawText(QPointF(min(px + 8, right - 150), max(top + 12, py - 12)),
+                       f"{si_format(mx, 'Hz')}  {my:.2f} dBm")
+
+
 def make_widget(proxy: InstrumentProxy, spec: Param) -> QWidget:
+    if spec.kind is Kind.TRACE:
+        return TracePlot(proxy, spec)
     if spec.readonly:
         return Readout(proxy, spec)
     if spec.kind is Kind.BOOL:

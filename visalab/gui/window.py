@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QCheckBox, QDockWidget, QFormLayout, QGridLayout, Q
                              QPlainTextEdit, QPushButton, QScrollArea, QTabWidget, QVBoxLayout,
                              QWidget)
 
-from ..core.params import ConnectionState
+from ..core.params import ConnectionState, Kind
 from ..core.proxy import InstrumentProxy
 from .widgets import STYLE, make_widget
 
@@ -100,6 +100,9 @@ class InstrumentWindow(QMainWindow):
                 form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
                 for spec in specs:
                     w = make_widget(self.proxy, spec)
+                    if spec.kind is Kind.TRACE:      # график - на всю ширину группы
+                        form.addRow(w)
+                        continue
                     w.setMinimumWidth(130)
                     form.addRow(spec.label + (f", {spec.unit}" if spec.unit and spec.readonly is False else ""), w)
                 grid.addWidget(box, i // self.GROUP_COLUMNS, i % self.GROUP_COLUMNS,

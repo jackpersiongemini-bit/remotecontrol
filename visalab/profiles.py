@@ -13,17 +13,18 @@
 * Канальные ключи ``ch{n}.*`` нумеруются с 1.
 * Что не входит в профиль - расширение производителя ``x.*``.
 
-Профили анализатора спектра и ВАЦ будут добавлены вместе с их драйверами
-(им нужен ещё стандартный тип данных для трасс).
+* Трассы - ``visalab.core.trace.Trace`` (ось X, ось Y, единицы, метаданные), ключ вида Kind.TRACE.
+
+Профиль ВАЦ будет добавлен вместе с его драйвером.
 """
 from __future__ import annotations
 
 from .core.params import Kind
 from .core.profile import ActionSlot, Profile, Slot
 
-__all__ = ["POWER_SUPPLY", "FUNCTION_GENERATOR", "SIGNAL_GENERATOR", "POWER_METER", "PROFILES"]
+__all__ = ["POWER_SUPPLY", "FUNCTION_GENERATOR", "SIGNAL_GENERATOR", "POWER_METER", "SPECTRUM_ANALYZER", "PROFILES"]
 
-F, I, B, E, S = Kind.FLOAT, Kind.INT, Kind.BOOL, Kind.ENUM, Kind.STR
+F, I, B, E, S, T = Kind.FLOAT, Kind.INT, Kind.BOOL, Kind.ENUM, Kind.STR, Kind.TRACE
 SOURCES = ("INT", "EXT")
 TRIG_SOURCES = ("INT", "EXT", "MAN")
 
@@ -173,4 +174,46 @@ POWER_METER = Profile(
     ),
 )
 
-PROFILES = {p.name: p for p in (POWER_SUPPLY, FUNCTION_GENERATOR, SIGNAL_GENERATOR, POWER_METER)}
+# ---------------------------------------------------------- анализатор спектра
+SPECTRUM_ANALYZER = Profile(
+    "spectrum_analyzer", "Анализатор спектра",
+    doc="""Трасса ``trace`` - Trace(x в Hz, y в dBm), публикуется после КАЖДОЙ завершённой развёртки
+    (драйвер не читает недорисованную трассу). meas.continuous - развёртки подряд,
+    действие single - одна развёртка. Маркер перечитывается вместе с трассой.""",
+    slots=(
+        Slot("trace", T, "dBm", required=True, readonly=True, doc="последняя завершённая развёртка"),
+        Slot("meas.continuous", B, required=True),
+        Slot("meas.armed", B, readonly=True, doc="развёртка идёт, ждём окончания"),
+        Slot("freq.center", F, "Hz", required=True),
+        Slot("freq.span", F, "Hz", required=True),
+        Slot("freq.start", F, "Hz"),
+        Slot("freq.stop", F, "Hz"),
+        Slot("bw.res", F, "Hz", required=True, doc="RBW"),
+        Slot("bw.res_auto", B),
+        Slot("bw.video", F, "Hz", doc="VBW"),
+        Slot("bw.video_auto", B),
+        Slot("ref_level", F, "dBm", required=True),
+        Slot("scale_div", F, "dB", doc="дБ на деление"),
+        Slot("atten", F, "dB", doc="входной аттенюатор"),
+        Slot("atten_auto", B),
+        Slot("sweep.time", F, "s"),
+        Slot("sweep.time_auto", B),
+        Slot("sweep.points", I),
+        Slot("detector", E, choices=("NORMAL", "PEAK", "NEG_PEAK", "SAMPLE", "AVERAGE", "RMS", "QPEAK")),
+        Slot("avg.state", B),
+        Slot("avg.count", I),
+        Slot("ref.source", E, readonly=None, choices=("INT", "EXT")),
+        Slot("marker.state", B),
+        Slot("marker.freq", F, "Hz"),
+        Slot("marker.level", F, "dBm", readonly=True),
+    ),
+    actions=(
+        ActionSlot("single", doc="одна развёртка"),
+        ActionSlot("abort", doc="прервать развёртку"),
+        ActionSlot("marker_peak", doc="маркер на максимум"),
+        ActionSlot("reset"),
+    ),
+)
+
+PROFILES = {p.name: p for p in (POWER_SUPPLY, FUNCTION_GENERATOR, SIGNAL_GENERATOR, POWER_METER,
+                                SPECTRUM_ANALYZER)}

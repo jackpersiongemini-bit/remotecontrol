@@ -8,6 +8,7 @@
 | Источник ITECH IT6300 (IT6322: CH1/CH2 30 В 3 А, CH3 5 В 3 А) | `power_supply` | `drivers/itech_it6300.py` | `sim/itech_it6300_sim.py` | PSupply.pdf (IT6300 Programming Guide V1.1) |
 | СВЧ-генератор Keysight PSG E8267D | `signal_generator` | `drivers/keysight_e8267d.py` | `sim/rf_generator_sim.py` | PSG SCPI Command Reference E8251-90356 |
 | СВЧ-генератор R&S SMF100A | `signal_generator` | `drivers/rs_smf100a.py` | `sim/rf_generator_sim.py` | R&S SMF100A Operating Manual |
+| Анализатор спектра Agilent PSA E4446A (E4440A...E4448A) | `spectrum_analyzer` | `drivers/agilent_e4446a.py` | `sim/agilent_e4446a_sim.py` | PSA User's and Programmer's Reference Vol.1 (E4440-90607) |
 | Датчик мощности Keysight U2021XA | `power_meter` | `drivers/keysight_u2021xa.py` | `sim/keysight_u2021xa_sim.py` | U2020 X-Series Programming Guide (U2021-90003) |
 
 Модель по `*IDN?` не определяется и не проверяется: она задаётся явно (`--model e8267d=E8267D-544`,
@@ -39,7 +40,20 @@ proxy.supports("pulse.width")       # необязательная функци�
 `tests/test_profiles.py` прогоняет каждый драйвер из `DRIVERS` на его симуляторе и проверяет контракт;
 `tests/test_rf_generators.py` проверяет, что один и тот же сценарий даёт один и тот же результат на обоих генераторах.
 
-Профили анализатора спектра (E4446A) и ВАЦ (N5231A) появятся вместе с их драйверами.
+Профиль ВАЦ (N5231A) появится вместе с его драйвером.
+
+### Трассы и анализатор спектра
+
+Трасса - стандартный объект `visalab.core.Trace` (`x`, `y`, `x_unit`, `y_unit`, `meta` с RBW/VBW/детектором),
+приходит обычным `param_updated("trace", Trace)`. Окно рисует её само (`TracePlot`, без внешних библиотек).
+
+* Драйвер ведёт анализатор однократными развёртками (`INIT:CONT OFF`, `INIT;*OPC`) и публикует трассу
+  только после окончания развёртки: недорисованная трасса наружу не уходит. Долгая развёртка не считается
+  обрывом связи. `meas.continuous` - развёртки подряд, `single` - одна.
+* Любое изменение настройки прерывает идущую развёртку и запускает новую: трасса всегда соответствует
+  текущим условиям, они же записаны в `trace.meta`.
+* Связанные «авто»-величины (RBW, VBW, время развёртки, старт/стоп) перечитываются после каждой записи.
+* Маркер: `marker.state`, `marker.freq`, `marker.level`, действие `marker_peak`.
 
 ### Ваттметр: измерение с запуском по уровню
 
@@ -71,6 +85,7 @@ python run_gui.py --only psu --psu "USB0::..." --psu-model IT6322
 python run_gui.py --sdg "USB0::..." --sdg-model SDG2042X
 python run_gui.py --e8267d sim --smf100a sim                 # СВЧ-генераторы на симуляторах
 python run_gui.py --u2021xa sim                               # датчик мощности на симуляторе
+python run_gui.py --e4446a sim                                # анализатор спектра на симуляторе
 python run_gui.py --sdg 192.168.0.3     # по LAN (VXI-11): то же, что TCPIP0::192.168.0.3::INSTR
 python run_gui.py --sdg 192.168.0.3:5025  # сырой сокет: TCPIP0::192.168.0.3::5025::SOCKET
 python run_gui.py --e8267d "GPIB0::19::INSTR" --model e8267d=E8267D-544
@@ -151,3 +166,5 @@ python -m pytest -q                     # тесты без железа
 * U2021XA (по мануалу U2021-90003): проверить формат ответа `TRIG:SOUR?` при INT (`INT` или `INT1`, оба понимаются),
   что `INIT;*OPC` действительно взводит OPC по окончании измерения по запуску, и время `CAL:ZERO:AUTO ONCE`
   (таймаут на обнуление 30 с).
+* E4446A (по мануалу E4440-90607): время чтения трассы 8192 точки в ASCII (таймаут 5 с), что `*OPC`
+  после `INIT` ловит конец развёртки (в т.ч. с усреднением), формат ответа `DET?`.

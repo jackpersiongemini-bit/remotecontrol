@@ -30,6 +30,7 @@ DEVICES = {
     "e8267d": ("e8267d", "СВЧ-генератор Keysight E8267D", None),
     "smf100a": ("smf100a", "СВЧ-генератор R&S SMF100A", None),
     "u2021xa": ("u2021xa", "Датчик мощности Keysight U2021XA", None),
+    "e4446a": ("e4446a", "Анализатор спектра Agilent E4446A", "E4446A"),
 }
 
 

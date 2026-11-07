@@ -192,10 +192,7 @@ class KeysightU2021XA(VISAInstrument):
                 self._arm()
 
     def _arm(self) -> None:
-        self.read_esr()                  # сбросить старый OPC
-        self.opc_latched = False
-        self.write("INIT")
-        self.write("*OPC")
+        self.arm_opc("INIT")
         self._set_armed(True)
 
     def _abort(self) -> None:
@@ -224,11 +221,7 @@ class KeysightU2021XA(VISAInstrument):
             return
         if not self._armed:
             return
-        esr = self.read_esr()
-        if esr & self.ESE_MASK:
-            self._check_errors(context="измерение", esr=esr)
-        if self.opc_latched:
-            self.opc_latched = False
+        if self.opc_done():
             self._set_armed(False)
             self._fetch()
             if self._continuous:
