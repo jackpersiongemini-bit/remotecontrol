@@ -1,0 +1,10 @@
+IP GEN 192.168.0.3
+IP Analyzer 192.168.0.20
+PNA 192.168.0.11
+u2021xa USB0::0x2A8D::0x7F18::MY56040018::0::INSTR   
+--sdg "USB0::0xF4ED::0xEE3A::NDG10GAX2R0308::0::INSTR" --psu "USB0::0xFFFF::0x6300::800570020807170002::0::INSTR"
+Запуск свободный + regime peak:
+17:37:30  ОШИБКА ПРИБОРА -221: Settings conflict;CALC1:FEED1 ""POW:AVER ON SWEEP1""<NL+END><Err> [detector]
+17:37:30  ОШИБКА ПРИБОРА -221: Settings conflict;CALC2:FEED1 ""POW:PEAK ON SWEEP1""<NL+END><Err> [detector]
+17:37:30  ОШИБКА ПРИБОРА -221: Settings conflict;CALC3:FEED1 ""POW:PTAV ON SWEEP1""<NL+END><Err> [detector]
+17:37:30  detector: error — Settings conflict;CALC1:FEED1 ""POW:AVER ON SWEEP1""<NL+END><Err>; Settings conflict;CALC2:FEED1 ""POW:PEAK ON SWEEP1""<NL+END><Err>; Settings conflict;CALC3:FEED1 ""POW:PTAV ON SWEEP1""<NL+END><Err>
