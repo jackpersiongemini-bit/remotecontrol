@@ -2,7 +2,7 @@
 
 * ``RFGenWindow``      - СВЧ-генератор (E8267D / SMF100A): частота, мощность, выход, кнопки модуляции;
 * ``PSUWindow``        - источник IT6300: 3 канала, уставки U/I, измерения, выходы,
-  CH3 включается только при потреблении CH1 и CH2 (с флажком обхода);
+  CH1 включается только при потреблении CH2 и CH3 (с флажком обхода);
 * ``FuncGenWindow``    - генератор SDG: форма/частота/амплитуда/смещение/фаза, выходы всегда 50 Ом,
   пресеты (при применении отправляется только то, что отличается);
 * ``PowerMeterWindow`` - датчик U2021XA: режим Free run / Level, уровень запуска, частота, результат.
@@ -402,11 +402,11 @@ class RFGenWindow(QuickWindow):
 
 # ================================================================= источник
 class PSUWindow(QuickWindow):
-    """3 канала. CH3 можно включить, только если CH1 и CH2 потребляют ток (или включён обход)."""
+    """3 канала. CH1 можно включить, только если CH2 и CH3 потребляют ток (или включён обход)."""
 
     KIND = "power_supply"
-    GATED = 3                 # канал с блокировкой
-    GATE_BY = (1, 2)          # чьё потребление нужно
+    GATED = 1                 # канал с блокировкой
+    GATE_BY = (2, 3)          # чьё потребление нужно
 
     def __init__(self, proxy, title="Power Supply", settings=None, parent=None):
         super().__init__(proxy, title, settings, parent)
@@ -461,11 +461,11 @@ class PSUWindow(QuickWindow):
         self.body.addStretch(1)
 
         s = self.settings
-        self.bypass.setChecked(str(s.value(f"{self.KIND}/bypass_interlock", "false")).lower() == "true")
+        self.bypass.setChecked(str(s.value(f"{self.KIND}/bypass_ch{self.GATED}_interlock", "false")).lower() == "true")
         self.threshold.setValue(float(s.value(f"{self.KIND}/interlock_min_mA", 1.0)))
         self.bypass.toggled.connect(self._update_gate)
         self.threshold.valueChanged.connect(self._update_gate)
-        if n_ch >= self.GATED:
+        if n_ch >= max(self.GATED, *self.GATE_BY):
             for n in (*self.GATE_BY, self.GATED):
                 proxy.subscribe(f"ch{n}.meas_i", lambda _v: self._update_gate())
                 proxy.subscribe(f"ch{n}.output", lambda _v: self._update_gate())
@@ -499,7 +499,7 @@ class PSUWindow(QuickWindow):
             _repolish(self.gate_label)
 
     def save_settings(self) -> None:
-        self.settings.setValue(f"{self.KIND}/bypass_interlock", self.bypass.isChecked())
+        self.settings.setValue(f"{self.KIND}/bypass_ch{self.GATED}_interlock", self.bypass.isChecked())
         self.settings.setValue(f"{self.KIND}/interlock_min_mA", self.threshold.value())
 
 
