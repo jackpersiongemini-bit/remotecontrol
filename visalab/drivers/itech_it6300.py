@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from ..core.instrument import VISAInstrument
@@ -45,7 +45,6 @@ COMBINE = ("NONE", "SER", "PAR", "TRAC")
 
 class ItechIT6300(VISAInstrument):
     NAME = "ITECH IT6300"
-    IDN_PATTERN = r"ITECH.*IT63\d\d"
     POLL_INTERVAL_MS = 500
 
     def __init__(self, transport, model: IT6300Model | None = None, parent=None):
@@ -99,18 +98,6 @@ class ItechIT6300(VISAInstrument):
         ]
 
     # --------------------------------------------------------------- хуки
-    def check_identity(self, idn: str) -> None:
-        super().check_identity(idn)
-        m = re.search(r"IT63\d\d", idn, re.I)
-        model = IT6300_MODELS.get(m.group(0).upper()) if m else None
-        if model and model != self.model:
-            self.model = model
-            for n, (umax, imax) in enumerate(model.ratings, start=1):
-                for suffix, mx in (("voltage", umax), ("current", imax), ("vlimit", umax), ("ovp_level", umax * 1.1)):
-                    key = f"ch{n}.{suffix}"
-                    self._params[key] = replace(self._params[key], maximum=mx)
-        self.scpi_log.emit("--", f"Модель: {self.model.name}")
-
     def on_connected(self) -> None:
         self.write("SYST:REM")
 

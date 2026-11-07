@@ -34,6 +34,8 @@ class SimInstrument:
     ERR_UNDEFINED = (-113, "Undefined header")
     ERR_RANGE = (-222, "Data out of range")
     ERR_PARAM = (-224, "Illegal parameter value")
+    #: повторять заголовок в ответах на общие запросы ("*ESR 0"), как Siglent
+    ECHO_COMMON_HEADER = False
 
     def __init__(self):
         self.powered = True
@@ -112,7 +114,11 @@ class SimInstrument:
                 self.error(*self.ERR_UNDEFINED, ESR_CME)
                 return None
             try:
-                return fn(args, m.groups())
+                ans = fn(args, m.groups())
+                if (is_query and ans is not None and self.ECHO_COMMON_HEADER
+                        and header.startswith("*") and header.upper() != "*IDN"):
+                    ans = f"{header.upper()} {ans}"
+                return ans
             except SimError as exc:
                 self.error(exc.code, exc.message, exc.esr_bit)
             except (ValueError, IndexError, KeyError):

@@ -14,7 +14,7 @@ def psu(make):
 
 def test_connect(psu):
     drv, sim, rec = psu
-    assert drv.state is ConnectionState.CONNECTED and drv.model.name == "IT6322"
+    assert drv.state is ConnectionState.CONNECTED and drv.model.name == "IT6322"   # по умолчанию
     assert sim.remote and "*RST" not in sim.history
     assert rec.values["ch3.vlimit"] == 5.0 and rec.values["combine"] == "NONE"
 

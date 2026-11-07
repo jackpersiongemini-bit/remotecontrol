@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import QApplication
 
 from visalab.core import InstrumentProxy
 from visalab.drivers import DRIVERS, make_transport
+from visalab.drivers.itech_it6300 import IT6300_MODELS
+from visalab.drivers.siglent_sdg import SDG_MODELS
 from visalab.gui.window import InstrumentWindow
 
 TITLES = {"sdg": "Генератор Siglent SDG", "it6300": "Источник питания ITECH IT6300"}
@@ -26,6 +28,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sdg", default="sim", help="VISA-адрес генератора или 'sim'")
     ap.add_argument("--psu", default="sim", help="VISA-адрес источника или 'sim'")
+    ap.add_argument("--sdg-model", choices=sorted(SDG_MODELS), help="модель генератора (пределы проверки)")
+    ap.add_argument("--psu-model", choices=sorted(IT6300_MODELS), default="IT6322", help="модель источника")
     ap.add_argument("--only", choices=("sdg", "psu"), help="открыть только один прибор")
     ap.add_argument("--backend", default="", help="бэкенд pyvisa: '' (NI/Keysight VISA) или '@py'")
     ap.add_argument("--latency", type=float, default=0.005, help="задержка симулятора, с")
@@ -47,7 +51,8 @@ def main(argv=None) -> int:
     windows = []
     for i, (kind, address) in enumerate(wanted):
         driver_cls, _ = DRIVERS[kind]
-        proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency))
+        model = (SDG_MODELS.get(args.sdg_model) if kind == "sdg" else IT6300_MODELS[args.psu_model])
+        proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency), model=model)
         win = InstrumentWindow(proxy, TITLES[kind])
         win.resize(1000, 720)
         win.move(40 + i * 60, 40 + i * 60)

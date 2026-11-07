@@ -36,6 +36,7 @@ class SiglentSDGSim(SimInstrument):
     IDN = "Siglent Technologies,SDG2042X,SDG2XSIM000001,2.01.01.35R3"
     MAX_FREQ = 40e6
     CMR_SUPPORTED = False
+    ECHO_COMMON_HEADER = True    # "*ESR 0", "*OPC 1" - как в мануале
 
     def __init__(self, idn: str | None = None, max_freq: float | None = None):
         if idn:

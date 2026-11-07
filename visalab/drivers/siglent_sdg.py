@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from ..core.instrument import VISAInstrument
@@ -32,8 +32,9 @@ class SDGModel:
     has_cmr: bool = False        # поддержка CMR? (по таблице мануала)
 
 
-#: Профили по *IDN?. Неизвестная модель -> DEFAULT (проверка диапазона мягкая,
-#: окончательное слово за прибором: обратное чтение покажет округление).
+#: Профили моделей: выбираются явно (run_gui.py --sdg-model). Без выбора - DEFAULT
+#: (проверка диапазона мягкая, окончательное слово за прибором: обратное чтение
+#: покажет округление).
 SDG_MODELS: dict[str, SDGModel] = {
     "SDG1032X": SDGModel("SDG1032X", 2, 30e6),
     "SDG1062X": SDGModel("SDG1062X", 2, 60e6),
@@ -98,7 +99,7 @@ def parse_siglent_response(response: str) -> tuple[list[str], dict[str, str], li
 
 class SiglentSDG(VISAInstrument):
     NAME = "Siglent SDG"
-    IDN_PATTERN = r"SDG"
+    STRIP_RESPONSE_HEADER = True   # "*ESR 1", "C1:SYNC OFF"
     ERROR_QUERY = None           # SYST:ERR? в этом мануале нет
 
     # (ключ-суффикс, подпись, тип, единица, код в BSWV, extra)
@@ -206,18 +207,6 @@ class SiglentSDG(VISAInstrument):
         return acts
 
     # --------------------------------------------------------------- хуки
-    def check_identity(self, idn: str) -> None:
-        super().check_identity(idn)
-        m = re.search(r"SDG\d+[A-Z]*", idn, re.I)
-        model = SDG_MODELS.get(m.group(0).upper()) if m else None
-        if model and model != self.model:
-            self.model = model
-            # каналы не меняем (окно уже построено), обновляем пределы проверки
-            for key, p in list(self._params.items()):
-                if key.endswith(".frequency"):
-                    self._params[key] = replace(p, maximum=model.max_freq)
-        self.scpi_log.emit("--", f"Модель: {self.model.name}")
-
     def write_param(self, spec: Param, value: Any) -> None:
         if "{type}" in spec.write:
             ch = spec.key.split(".")[0]

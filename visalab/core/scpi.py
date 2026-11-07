@@ -12,7 +12,7 @@ from functools import lru_cache
 __all__ = [
     "parse_number", "format_number", "parse_bool", "format_bool",
     "split_units", "split_header", "compile_pattern", "match_header",
-    "si_format", "si_parse", "SI_PREFIXES",
+    "si_format", "si_parse", "SI_PREFIXES", "strip_response_header",
 ]
 
 # --------------------------------------------------------------------- числа
@@ -81,6 +81,17 @@ def format_bool(value: bool, on: str = "1", off: str = "0") -> str:
 
 
 # ---------------------------------------------------------- разбор сообщений
+
+# Заголовок, который часть приборов (Siglent) повторяет в ответе:
+# "*ESR 1", "C1:SYNC OFF", "CMR 0", "C1:BSWV WVTP,SINE". Только верхний регистр,
+# поэтому "Siglent Technologies,..." не задевается.
+_ECHO_HEADER_RE = re.compile(r"^\s*(?:C\d+\s*:\s*)?\*?[A-Z][A-Z0-9_]*(?::[A-Z][A-Z0-9_]*)*\s+(?=\S)")
+
+
+def strip_response_header(answer: str) -> str:
+    """``"*ESR 1"`` -> ``"1"``, ``"C1:OUTP ON,LOAD,HZ"`` -> ``"ON,LOAD,HZ"``, ``"1"`` -> ``"1"``."""
+    return _ECHO_HEADER_RE.sub("", answer, count=1).strip()
+
 
 def split_units(message: str) -> list[str]:
     """Делит SCPI-сообщение на единицы по ``;`` с учётом кавычек."""

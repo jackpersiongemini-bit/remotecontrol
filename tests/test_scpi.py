@@ -1,7 +1,8 @@
 import pytest
 
 from visalab.core.scpi import (compile_pattern, match_header, parse_bool, parse_number,
-                               si_format, si_parse, split_header, split_units, format_number)
+                               si_format, si_parse, split_header, split_units, format_number,
+                               strip_response_header)
 
 
 @pytest.mark.parametrize("text,value", [
@@ -54,3 +55,12 @@ def test_si():
     assert si_parse("1,5 kHz", "Hz") == pytest.approx(1500)
     assert si_parse("20m", "V") == pytest.approx(0.02)
     assert si_parse("3") == 3
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("*ESR 1", "1"), ("*OPC 1", "1"), ("CMR 0", "0"), ("C1:SYNC OFF", "OFF"),
+    ("C1: OUTP ON,LOAD,HZ", "ON,LOAD,HZ"), ("C2:BSWV WVTP,SINE,FRQ,100HZ", "WVTP,SINE,FRQ,100HZ"),
+    ("1", "1"), ("Siglent Technologies,SDG2042X,X,1", "Siglent Technologies,SDG2042X,X,1"),
+])
+def test_strip_response_header(raw, clean):
+    assert strip_response_header(raw) == clean

@@ -7,7 +7,7 @@
 | Генератор Siglent SDG (2 канала, по умолчанию SDG2042X) | `visalab/drivers/siglent_sdg.py` | `visalab/sim/siglent_sdg_sim.py` | PGen.pdf (SDG Series Programming Guide) |
 | Источник ITECH IT6300 (IT6322: CH1/CH2 30 В 3 А, CH3 5 В 3 А) | `visalab/drivers/itech_it6300.py` | `visalab/sim/itech_it6300_sim.py` | PSupply.pdf (IT6300 Programming Guide V1.1) |
 
-Модель уточняется автоматически по `*IDN?` при подключении (таблицы `SDG_MODELS`, `IT6300_MODELS`).
+Модель по `*IDN?` не определяется и не проверяется: она задаётся явно (`--sdg-model`, `--psu-model`, таблицы `SDG_MODELS`, `IT6300_MODELS`). Без `--sdg-model` пределы генератора мягкие, и окончательное слово остаётся за прибором.
 
 ## Запуск
 
@@ -16,7 +16,8 @@ pip install -r requirements.txt
 python run_gui.py                       # оба прибора на симуляторах
 python run_gui.py --list                # найти адреса USB-приборов
 python run_gui.py --sdg "USB0::0xF4EC::...::INSTR" --psu "USB0::0x2EC7::...::INSTR"
-python run_gui.py --only psu --psu "USB0::..."
+python run_gui.py --only psu --psu "USB0::..." --psu-model IT6322
+python run_gui.py --sdg "USB0::..." --sdg-model SDG2042X
 python -m pytest -q                     # тесты без железа
 ```
 
@@ -63,7 +64,8 @@ python -m pytest -q                     # тесты без железа
 
 ## Как добавить новый прибор
 
-1. `visalab/drivers/<прибор>.py`: класс от `VISAInstrument`, задать `NAME`, `IDN_PATTERN`,
+1. `visalab/drivers/<прибор>.py`: класс от `VISAInstrument`, задать `NAME`,
+   `STRIP_RESPONSE_HEADER = True`, если прибор повторяет заголовок в ответе (`*ESR 1`),
    `build_params()` (список `Param`), `build_actions()`.
 2. Хуки по необходимости: `read_group()` (один запрос → много параметров), `select_channel()`,
    `read_error_queue()`, `write_param()`/`read_param_raw()` для нестандартных команд,

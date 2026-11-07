@@ -33,9 +33,9 @@ def make(qapp):
     """make(DriverCls, SimCls, **transport_kw) -> (driver, sim, recorder); уже подключён."""
     created = []
 
-    def factory(driver_cls, sim_cls, connect=True, sim=None, **kw):
+    def factory(driver_cls, sim_cls, connect=True, sim=None, driver_kw=None, **kw):
         sim = sim or sim_cls()
-        drv = driver_cls(SimTransport(sim, **kw))
+        drv = driver_cls(SimTransport(sim, **kw), **(driver_kw or {}))
         rec = Recorder(drv)
         if connect:
             drv.open_connection()

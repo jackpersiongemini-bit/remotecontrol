@@ -2,7 +2,7 @@ import pytest
 
 from visalab.core import ConnectionState, PStatus
 from visalab.drivers import SiglentSDG
-from visalab.drivers.siglent_sdg import parse_siglent_response
+from visalab.drivers.siglent_sdg import SDG_MODELS, parse_siglent_response
 from visalab.sim import SiglentSDGSim
 
 from conftest import flush
@@ -10,7 +10,7 @@ from conftest import flush
 
 @pytest.fixture
 def sdg(make):
-    return make(SiglentSDG, SiglentSDGSim)
+    return make(SiglentSDG, SiglentSDGSim, driver_kw={"model": SDG_MODELS["SDG2042X"]})
 
 
 def test_parser():
@@ -25,7 +25,7 @@ def test_parser():
 def test_connect_reads_state_without_reset(sdg):
     drv, sim, rec = sdg
     assert drv.state is ConnectionState.CONNECTED
-    assert drv.model.name == "SDG2042X"
+    assert drv.model.name == "SDG2042X"           # модель задана явно, не по *IDN?
     assert "*RST" not in sim.history
     assert rec.values["C1.frequency"] == 1000.0
     assert rec.values["C1.wave"] == "SINE"
@@ -127,3 +127,19 @@ def test_output_and_all_off(sdg):
     assert sim.ch[1]["OUTP"]["STATE"] == "ON" and rec.values["C1.output"] is True
     drv.run_action("all_off", ())
     assert rec.values["C1.output"] is False
+
+
+def test_response_header_is_stripped(sdg):
+    """SDG отвечает "*ESR 1" и "C1:SYNC OFF" - драйвер должен понимать это."""
+    drv, sim, rec = sdg
+    sim.write("*ESR?")
+    assert sim.read().startswith("*ESR ")          # симулятор ведёт себя как прибор
+    drv.raw_write("BLAH 1")                        # CME -> *ESR 32
+    assert rec.errors and not rec.comm             # *ESR? разобран, а не упал
+    assert drv.query_int("*OPC?") == 1
+    assert drv.query("C1:SYNC?") == "OFF"
+
+
+def test_unknown_idn_is_not_an_error(make):
+    drv, sim, rec = make(SiglentSDG, SiglentSDGSim, sim=SiglentSDGSim(idn="ACME,XYZ,1,1"))
+    assert drv.state is ConnectionState.CONNECTED and not rec.comm

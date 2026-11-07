@@ -18,7 +18,7 @@
 
 Как написать драйвер нового прибора
 -----------------------------------
-1. Унаследоваться от ``VISAInstrument``, задать ``NAME``, ``IDN_PATTERN``.
+1. Унаследоваться от ``VISAInstrument``, задать ``NAME``.
 2. Реализовать ``build_params()`` (список :class:`Param`) и при необходимости
    ``build_actions()``.
 3. Если прибор возвращает несколько параметров одним запросом - ``read_group()``.
@@ -30,14 +30,13 @@ from __future__ import annotations
 
 import functools
 import logging
-import re
 import traceback
 from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
 from .params import Action, ConnectionState, Param, PStatus
-from .scpi import parse_number
+from .scpi import parse_number, strip_response_header
 from .transport import Transport, TransportError, TransportTimeout
 
 log = logging.getLogger(__name__)
@@ -82,8 +81,8 @@ def guarded(fn: Callable) -> Callable:
 class VISAInstrument(QObject):
     # ------------------------------------------------------------ метаданные
     NAME: str = "Generic SCPI"
-    #: регулярное выражение, которому должен соответствовать *IDN?
-    IDN_PATTERN: str | None = None
+    #: прибор повторяет заголовок команды в ответе ("*ESR 1") - снимать его
+    STRIP_RESPONSE_HEADER: bool = False
     #: маска *ESE: QYE|DDE|EXE|CME
     ESE_MASK: int = 0x3C
     POLL_INTERVAL_MS: int = 500
@@ -154,6 +153,8 @@ class VISAInstrument(QObject):
         if not self._quiet:
             self.scpi_log.emit(">>", command)
         answer = self.transport.query(command).strip()
+        if self.STRIP_RESPONSE_HEADER:
+            answer = strip_response_header(answer)
         if not self._quiet:
             self.scpi_log.emit("<<", answer)
         return answer
@@ -172,9 +173,7 @@ class VISAInstrument(QObject):
         """Перед закрытием (например, вернуть прибор в LOCAL)."""
 
     def check_identity(self, idn: str) -> None:
-        """Проверяет *IDN?. Можно переопределить, чтобы выбрать профиль модели."""
-        if self.IDN_PATTERN and not re.search(self.IDN_PATTERN, idn, re.I):
-            self.comm_error.emit(f"{self.NAME}: неожиданный *IDN? '{idn}', проверьте адрес")
+        """Хук после *IDN?. По умолчанию ничего не проверяет: модель задаётся явно в конфиге."""
 
     def select_channel(self, channel: int) -> None:
         """Выбор канала перед канальной командой (по умолчанию не нужен)."""
