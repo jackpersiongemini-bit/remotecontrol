@@ -437,7 +437,8 @@ class VISAInstrument(QObject):
             self._pending.clear()
             return
         while self._pending:
-            key, value = self._pending.popitem()
+            key = next(iter(self._pending))          # в порядке запросов (форма до частоты и т.п.)
+            value = self._pending.pop(key)
             try:
                 self._apply(key, value)
             except TransportError as exc:
