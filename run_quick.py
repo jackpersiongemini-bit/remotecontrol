@@ -6,7 +6,7 @@
     python run_quick.py --rf smf100a=192.168.0.3   # СВЧ-генератор другой модели
     python run_quick.py --ini my.ini          # другой файл настроек
 
-Настройки (пресеты SDG, обход блокировки CH3, положение окна) - в ini-файле QSettings,
+Настройки (пресеты SDG, обход блокировки CH1, положение окна) - в ini-файле QSettings,
 по умолчанию visalab_quick.ini рядом со скриптом.
 """
 from __future__ import annotations

@@ -44,23 +44,24 @@ def test_rf_window(qtbot, settings, drv, sim_cls):
     win.shutdown()
 
 
-def test_psu_ch3_interlock(qtbot, settings):
+def test_psu_ch1_interlock(qtbot, settings):
     sim = ItechIT6300Sim()
     proxy, win = _open(qtbot, PSUWindow, ItechIT6300, sim, settings)
     win.threshold.setValue(1.0)
     win.bypass.setChecked(False)
-    assert not win.outputs[3].isEnabled()                       # CH1/CH2 ничего не потребляют
+    assert not win.outputs[1].isEnabled()                       # CH2/CH3 ничего не потребляют
+    assert win.outputs[2].isEnabled() and win.outputs[3].isEnabled()
     win.bypass.setChecked(True)
-    assert win.outputs[3].isEnabled()
+    assert win.outputs[1].isEnabled()
     win.bypass.setChecked(False)
-    # нагрузка на CH1 и CH2 -> потребление есть -> CH3 разрешён
-    for n in (1, 2):
+    # нагрузка на CH2 и CH3 -> потребление есть -> CH1 разрешён
+    for n in (2, 3):
         sim.set_load(n, 100.0)
         proxy.set(f"ch{n}.voltage", 5.0)
         proxy.set(f"ch{n}.output", True)
     _wait_value(qtbot, proxy, "ch2.meas_i", lambda v: (v or 0) > 1e-3)
-    _wait_value(qtbot, proxy, "ch1.meas_i", lambda v: (v or 0) > 1e-3)
-    qtbot.waitUntil(win.outputs[3].isEnabled, timeout=3000)
+    _wait_value(qtbot, proxy, "ch3.meas_i", lambda v: (v or 0) > 1e-3)
+    qtbot.waitUntil(win.outputs[1].isEnabled, timeout=3000)
     win.shutdown()
     s = QSettings(settings.fileName(), QSettings.Format.IniFormat)
     assert s.value("power_supply/interlock_min_mA") is not None
