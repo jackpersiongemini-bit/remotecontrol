@@ -17,23 +17,80 @@ import json
 from typing import Any
 
 from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
-                             QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton, QRadioButton,
+from PyQt6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QGroupBox,
+                             QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton, QRadioButton, QScrollArea,
                              QVBoxLayout, QWidget)
 
 from .core.params import ConnectionState, PStatus
 from .core.proxy import InstrumentProxy
 from .core.scpi import si_format
+from .ui.frame import FramelessFrame
 
-__all__ = ["RFGenWindow", "PSUWindow", "FuncGenWindow", "PowerMeterWindow", "WINDOWS"]
+__all__ = ["RFGenWindow", "PSUWindow", "FuncGenWindow", "PowerMeterWindow", "LabWindow", "WINDOWS"]
 
-STYLE = """
-QPushButton[role="toggle"]:checked { background: #2e7d32; color: white; font-weight: bold; }
-QDoubleSpinBox[pstatus="writing"] { border: 1px solid #c9a227; }
-QDoubleSpinBox[pstatus="coerced"] { border: 1px solid #d9822b; }
-QDoubleSpinBox[pstatus="invalid"], QDoubleSpinBox[pstatus="error"] { border: 1px solid #d64545; }
-QLabel[role="readout"] { font-family: monospace; font-size: 14pt; }
-QLabel[role="big"] { font-family: monospace; font-size: 26pt; }
+ACCENT = "#e0a020"
+STYLE = f"""
+QWidget {{ color: #d6dbe1; font-size: 10pt; }}
+QWidget#frameRoot, QWidget#labBody, QScrollArea, QScrollArea > QWidget > QWidget {{ background: #11151b; }}
+QWidget#frameRoot {{ border: 1px solid #2a313b; }}
+QToolTip {{ background: #222a33; color: #d6dbe1; border: 1px solid #30363d; }}
+
+/* заголовок окна и верхняя панель */
+QWidget#titleBar {{ background: #0b0e12; }}
+QLabel#titleText {{ background: transparent; font-weight: 600; padding-left: 6px; }}
+QLabel#titleSub {{ background: transparent; color: #7a828e; padding-left: 8px; }}
+QFrame#labBar {{ background: #161b22; border-bottom: 1px solid #2a313b; }}
+QStatusBar, QLabel#statusLine {{ background: #0b0e12; color: #7a828e; padding: 2px 8px; }}
+
+/* карточки приборов */
+QFrame#card {{ background: #1a2029; border: 1px solid #2a313b; border-radius: 10px; }}
+QFrame#card QLabel, QFrame#card QCheckBox, QFrame#card QRadioButton {{ background: transparent; }}
+QLabel#cardTitle {{ font-size: 12pt; font-weight: 600; }}
+QLabel#cardState {{ color: #7a828e; padding-left: 6px; }}
+QLabel#cardMessage {{ color: #7a828e; font-size: 9pt; }}
+QLabel#cardMessage[error="true"] {{ color: #f85149; }}
+QLabel#led {{ border-radius: 6px; min-width: 12px; max-width: 12px; min-height: 12px; max-height: 12px; }}
+QLabel#colHeader {{ color: #7a828e; font-size: 8.5pt; }}
+QLabel[warn="true"] {{ color: #d9822b; }}
+QLabel[dim="true"] {{ color: #7a828e; }}
+
+QGroupBox {{ background: #151a21; border: 1px solid #2a313b; border-radius: 8px; margin-top: 14px; padding: 8px 6px 6px 6px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {ACCENT}; font-weight: 600; }}
+
+/* кнопки */
+QPushButton {{ background: #252d38; border: 1px solid #343d4a; border-radius: 6px; padding: 5px 14px; }}
+QPushButton:hover {{ border-color: #4b5562; background: #2b3440; }}
+QPushButton:pressed {{ background: #1f262f; }}
+QPushButton:disabled {{ color: #565e69; background: #1d232b; border-color: #2a313b; }}
+QPushButton#connectBtn {{ padding: 4px 12px; }}
+QPushButton[role="toggle"]:checked {{ background: #238636; border-color: #2ea043; color: white; font-weight: 600; }}
+QPushButton[role="off"]:checked {{ background: #4a515c; border-color: #5d6571; color: white; font-weight: 600; }}
+QPushButton[role="danger"] {{ background: #5a1f1d; border-color: #7d2a26; color: #ffd7d5; font-weight: 600; }}
+QPushButton[role="danger"]:hover {{ background: #6e2522; }}
+
+/* поля */
+QDoubleSpinBox, QComboBox {{ background: #0f1318; border: 1px solid #343d4a; border-radius: 5px; padding: 3px 6px; min-height: 22px; }}
+QDoubleSpinBox:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
+QDoubleSpinBox:disabled, QComboBox:disabled {{ color: #565e69; border-color: #252c35; }}
+QDoubleSpinBox[pstatus="writing"] {{ border-color: #c9a227; }}
+QDoubleSpinBox[pstatus="coerced"] {{ border-color: #d9822b; }}
+QDoubleSpinBox[pstatus="invalid"], QDoubleSpinBox[pstatus="error"] {{ border-color: #f85149; }}
+QComboBox QAbstractItemView {{ background: #1a2029; border: 1px solid #343d4a; selection-background-color: #2b3440; }}
+
+QRadioButton::indicator, QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid #4b5562; background: #0f1318; }}
+QRadioButton::indicator {{ border-radius: 8px; }}
+QCheckBox::indicator {{ border-radius: 3px; }}
+QRadioButton::indicator:checked, QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QRadioButton:disabled, QCheckBox:disabled {{ color: #565e69; }}
+QScrollBar:vertical {{ background: #11151b; width: 10px; }}
+QScrollBar::handle:vertical {{ background: #2b3440; border-radius: 5px; min-height: 30px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+
+/* вывод */
+QLabel[role="readout"] {{ font-family: "Consolas", "DejaVu Sans Mono", monospace; font-size: 13pt; color: {ACCENT}; }}
+QLabel[role="big"] {{ font-family: "Consolas", "DejaVu Sans Mono", monospace; font-size: 30pt; color: {ACCENT};
+                     background: #0f1318; border: 1px solid #2a313b; border-radius: 8px; padding: 6px 14px; }}
+QLabel[on="true"] {{ color: #3fb950; font-weight: 600; }}
 """
 
 _STATE_TEXT = {
@@ -68,8 +125,9 @@ class SpinField(QDoubleSpinBox):
         self.setSingleStep(step)
         self.setSuffix(f" {suffix}" if suffix else "")
         self.setKeyboardTracking(False)
+        self.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)   # шаг - колесом и стрелками
         self.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.setMinimumWidth(150)
+        self.setMinimumWidth(120)
         self.setToolTip(key)
         self.setEnabled(False)
         self._shown: float | None = None
@@ -149,10 +207,10 @@ class OnOffButtons(QWidget):
         self.off_btn = QPushButton("OFF")
         for b, v in ((self.on_btn, True), (self.off_btn, False)):
             b.setCheckable(True)
-            b.setProperty("role", "toggle")
-            b.setMinimumHeight(36)
+            b.setProperty("role", "toggle" if v else "off")
+            b.setMinimumHeight(34)
             b.clicked.connect(lambda _=False, v=v: self._send(v))
-        self.off_btn.setStyleSheet("QPushButton:checked { background: #616161; color: white; font-weight: bold; }")
+        self.off_btn.setProperty("role", "off")
         lay.addWidget(self.label)
         lay.addWidget(self.state)
         lay.addWidget(self.on_btn, 1)
@@ -172,7 +230,8 @@ class OnOffButtons(QWidget):
         self.on_btn.setChecked(value is True)
         self.off_btn.setChecked(value is False)
         self.state.setText("—" if not known else ("ON" if value else "OFF"))
-        self.state.setStyleSheet("color: #2e7d32; font-weight: bold;" if value else "")
+        self.state.setProperty("on", bool(value))
+        _repolish(self.state)
 
 
 class Readout(QLabel):
@@ -185,7 +244,7 @@ class Readout(QLabel):
         self.setProperty("role", role)
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.setMinimumWidth(130)
+        self.setMinimumWidth(90)
         self.setToolTip(key)
         proxy.subscribe(key, self._on_value)
 
@@ -220,47 +279,69 @@ class EnumBox(QComboBox):
         self.blockSignals(False)
 
 
-# ====================================================================== окно
-class QuickWindow(QWidget):
-    """Общее: строка подключения, строка сообщений, геометрия в QSettings, корректное закрытие."""
+# ================================================================= панель
+_LED = {
+    ConnectionState.DISCONNECTED: "#7a828e",
+    ConnectionState.CONNECTING: "#d0a630",
+    ConnectionState.CONNECTED: "#3fb950",
+    ConnectionState.ERROR: "#f85149",
+}
+
+
+class QuickWindow(QFrame):
+    """Карточка одного прибора: заголовок (индикатор, название, Connect), тело, строка сообщений.
+
+    Карточки собираются в одно окно ``LabWindow``. ``shutdown()`` сохраняет настройки
+    и закрывает прибор.
+    """
 
     KIND = "base"
 
     def __init__(self, proxy: InstrumentProxy, title: str, settings: QSettings, parent=None):
         super().__init__(parent)
         self.proxy, self.settings = proxy, settings
+        self.title = title
+        self.setObjectName("card")
         self.setWindowTitle(f"{title} — {proxy.address}")
-        self.setStyleSheet(STYLE)
         self.root = QVBoxLayout(self)
+        self.root.setContentsMargins(14, 10, 14, 10)
+        self.root.setSpacing(8)
         bar = QHBoxLayout()
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self._toggle_connection)
+        self.led = QLabel()
+        self.led.setObjectName("led")
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("cardTitle")
         self.state_label = QLabel()
-        self.idn_label = QLabel()
-        self.idn_label.setStyleSheet("color: gray;")
-        bar.addWidget(self.connect_btn)
+        self.state_label.setObjectName("cardState")
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setObjectName("connectBtn")
+        self.connect_btn.clicked.connect(self._toggle_connection)
+        bar.addWidget(self.led)
+        bar.addWidget(self.title_label)
         bar.addWidget(self.state_label)
         bar.addStretch(1)
-        bar.addWidget(self.idn_label)
+        bar.addWidget(self.connect_btn)
         self.root.addLayout(bar)
         self.body = QVBoxLayout()
+        self.body.setSpacing(8)
         self.root.addLayout(self.body, 1)
         self.message = QLabel("")
+        self.message.setObjectName("cardMessage")
         self.message.setWordWrap(True)
         self.root.addWidget(self.message)
+        self.idn_label = self.title_label            # IDN - в подсказке заголовка
 
         proxy.state_changed.connect(self._on_state)
-        proxy.identified.connect(self.idn_label.setText)
+        proxy.identified.connect(lambda idn: self.title_label.setToolTip(f"{idn}\n{proxy.address}"))
         proxy.instrument_error.connect(lambda c, m: self.show_message(f"Instrument error {c}: {m}", True))
         proxy.comm_error.connect(lambda m: self.show_message(m, True))
         proxy.param_status.connect(self._on_param_status)
+        self.title_label.setToolTip(proxy.address)
         self._on_state(proxy.state)
-        geo = settings.value(f"{self.KIND}/geometry")
-        if geo is not None:
-            self.restoreGeometry(geo)
 
     def show_message(self, text: str, error: bool = False) -> None:
-        self.message.setStyleSheet("color: #d64545;" if error else "color: gray;")
+        self.message.setProperty("error", error)
+        _repolish(self.message)
         self.message.setText(text)
 
     def _on_param_status(self, key: str, status: PStatus, message: str) -> None:
@@ -275,15 +356,14 @@ class QuickWindow(QWidget):
 
     def _on_state(self, state: ConnectionState) -> None:
         self.state_label.setText(_STATE_TEXT[state])
+        self.led.setStyleSheet(f"background: {_LED[state]};")
         busy = state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
         self.connect_btn.setText("Disconnect" if busy else "Connect")
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt
-        self.settings.setValue(f"{self.KIND}/geometry", self.saveGeometry())
+    def shutdown(self) -> None:
         self.save_settings()
         self.settings.sync()
         self.proxy.shutdown()
-        super().closeEvent(event)
 
     def save_settings(self) -> None:
         """Переопределяется: сохранить своё в self.settings."""
@@ -368,13 +448,17 @@ class PSUWindow(QuickWindow):
         self.threshold.setToolTip("Minimum current that counts as consumption")
         self.gate_label = QLabel()
         self.all_off = QPushButton("All off")
+        self.all_off.setProperty("role", "danger")
         self.all_off.clicked.connect(lambda: self.proxy.action("all_off"))
         gate.addWidget(self.bypass)
+        gate.addSpacing(12)
         gate.addWidget(QLabel("min current"))
         gate.addWidget(self.threshold)
-        gate.addWidget(self.gate_label, 1)
+        gate.addStretch(1)
         gate.addWidget(self.all_off)
         self.body.addLayout(gate)
+        self.body.addWidget(self.gate_label)
+        self.body.addStretch(1)
 
         s = self.settings
         self.bypass.setChecked(str(s.value(f"{self.KIND}/bypass_interlock", "false")).lower() == "true")
@@ -406,11 +490,13 @@ class PSUWindow(QuickWindow):
         btn.setEnabled(known and (ok or is_on))           # выключить можно всегда
         if self.bypass.isChecked():
             self.gate_label.setText(f"CH{self.GATED} interlock bypassed")
-            self.gate_label.setStyleSheet("color: #d9822b;")
+            self.gate_label.setProperty("warn", True)
+            _repolish(self.gate_label)
         else:
-            self.gate_label.setText(f"CH{self.GATED} " + ("allowed" if ok else "locked: "
-                                    + " and ".join(f"CH{n}" for n in self.GATE_BY) + " must draw current"))
-            self.gate_label.setStyleSheet("color: gray;")
+            self.gate_label.setText(f"CH{self.GATED} " + ("allowed" if ok else "locked until "
+                                    + " and ".join(f"CH{n}" for n in self.GATE_BY) + " draw current"))
+            self.gate_label.setProperty("warn", False)
+            _repolish(self.gate_label)
 
     def save_settings(self) -> None:
         self.settings.setValue(f"{self.KIND}/bypass_interlock", self.bypass.isChecked())
@@ -441,7 +527,7 @@ class FuncGenWindow(QuickWindow):
             g = QGridLayout(box)
             hdr_set, hdr_act = QLabel("Set"), QLabel("Actual")
             for h in (hdr_set, hdr_act):
-                h.setStyleSheet("color: gray;")
+                h.setObjectName("colHeader")
             g.addWidget(hdr_set, 0, 1)
             g.addWidget(hdr_act, 0, 2, Qt.AlignmentFlag.AlignRight)
             rows = [("Waveform", EnumBox(proxy, f"ch{n}.wave", WAVES), "wave"),
@@ -660,3 +746,78 @@ WINDOWS = {
     "sdg": FuncGenWindow,
     "u2021xa": PowerMeterWindow,
 }
+
+
+# ============================================================ общее окно
+class LabWindow(FramelessFrame):
+    """Все приборы в одном окне (qframelesswindow): карточки 2x2 и общие кнопки сверху."""
+
+    #: где стоит карточка: (ряд, столбец)
+    PLACES = {"signal_generator": (0, 0), "power_meter": (0, 1),
+              "function_generator": (1, 0), "power_supply": (1, 1)}
+
+    def __init__(self, panels: list[QuickWindow], settings: QSettings, title: str = "Lab Control", parent=None):
+        super().__init__(title, "remote instrument control", parent, style=STYLE)
+        self.panels, self.settings = panels, settings
+
+        bar = QFrame()
+        bar.setObjectName("labBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 8, 12, 8)
+        self.connect_all = QPushButton("Connect all")
+        self.disconnect_all = QPushButton("Disconnect all")
+        self.outputs_off = QPushButton("ALL OUTPUTS OFF")
+        self.outputs_off.setProperty("role", "danger")
+        self.outputs_off.setToolTip("Switch off the outputs of every connected instrument")
+        self.connect_all.clicked.connect(lambda: [p.proxy.open() for p in panels if not p.proxy.is_connected])
+        self.disconnect_all.clicked.connect(lambda: [p.proxy.close() for p in panels])
+        self.outputs_off.clicked.connect(self.all_outputs_off)
+        row.addWidget(self.connect_all)
+        row.addWidget(self.disconnect_all)
+        row.addStretch(1)
+        row.addWidget(self.outputs_off)
+        self.body.addWidget(bar)
+
+        content = QWidget()
+        content.setObjectName("labBody")
+        grid = QGridLayout(content)
+        grid.setContentsMargins(12, 12, 12, 12)
+        grid.setSpacing(12)
+        extra = 2
+        for p in panels:
+            r, c = self.PLACES.get(p.KIND, (extra, 0))
+            if p.KIND not in self.PLACES:
+                extra += 1
+            grid.addWidget(p, r, c)
+        grid.setRowStretch(grid.rowCount(), 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        self.body.addWidget(scroll, 1)
+
+        for p in panels:
+            p.proxy.state_changed.connect(lambda s, p=p: self.show_message(f"{p.title}: {_STATE_TEXT[s]}",
+                                                                          s is ConnectionState.ERROR))
+        geo = settings.value("lab/geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(1600, 940)
+
+    def all_outputs_off(self) -> None:
+        n = 0
+        for p in self.panels:
+            if p.proxy.is_connected and p.proxy.supports("all_off"):
+                p.proxy.action("all_off")
+                n += 1
+        self.show_message(f"All outputs off: {n} instrument(s)")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt
+        self.settings.setValue("lab/geometry", self.saveGeometry())
+        for p in self.panels:
+            p.shutdown()
+        self.settings.sync()
+        super().closeEvent(event)

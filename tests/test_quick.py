@@ -41,7 +41,7 @@ def test_rf_window(qtbot, settings, drv, sim_cls):
     win.mod_buttons["am.state"].click()
     _wait_value(qtbot, proxy, "am.state", lambda v: v is True)
     assert {"mod.output", "am.state", "fm.state", "pm.state", "pulse.state"} <= set(win.mod_buttons)
-    win.close()
+    win.shutdown()
 
 
 def test_psu_ch3_interlock(qtbot, settings):
@@ -61,7 +61,7 @@ def test_psu_ch3_interlock(qtbot, settings):
     _wait_value(qtbot, proxy, "ch2.meas_i", lambda v: (v or 0) > 1e-3)
     _wait_value(qtbot, proxy, "ch1.meas_i", lambda v: (v or 0) > 1e-3)
     qtbot.waitUntil(win.outputs[3].isEnabled, timeout=3000)
-    win.close()
+    win.shutdown()
     s = QSettings(settings.fileName(), QSettings.Format.IniFormat)
     assert s.value("power_supply/interlock_min_mA") is not None
 
@@ -85,7 +85,7 @@ def test_sdg_load_forced_and_presets(qtbot, settings):
     writes = [h for h in sim.history[n:] if "?" not in h]
     assert len([w for w in writes if "BSWV" in w]) == 2, writes
     assert win.preset_changes("base") == []
-    win.close()
+    win.shutdown()
     # пресет сохранился в ini
     s = QSettings(settings.fileName(), QSettings.Format.IniFormat)
     assert "base" in s.value("function_generator/presets")
@@ -100,7 +100,7 @@ def test_power_meter_modes(qtbot, settings):
     win.free.click()
     _wait_value(qtbot, proxy, "trig.source", lambda v: v == "IMM")
     assert proxy.value("meas.continuous") is True
-    win.close()
+    win.shutdown()
 
 
 def test_sdg_on_off_buttons_and_readouts(qtbot, settings):
@@ -117,4 +117,24 @@ def test_sdg_on_off_buttons_and_readouts(qtbot, settings):
     texts = {w.toolTip(): w.text() for w in win.findChildren(Readout)}
     assert texts["ch1.wave"] == "Sine" and texts["ch1.frequency"] == "1 kHz"
     qtbot.waitUntil(lambda: {w.toolTip(): w.text() for w in win.findChildren(Readout)}["ch1.load"] == "50 Ω")
+    win.shutdown()
+
+
+def test_lab_window_holds_all_panels(qtbot, settings):
+    from visalab.quick import LabWindow
+    panels = []
+    for cls, drv, sim in ((RFGenWindow, KeysightE8267D, KeysightE8267DSim()), (PSUWindow, ItechIT6300, ItechIT6300Sim()),
+                          (FuncGenWindow, SiglentSDG, SiglentSDGSim()), (PowerMeterWindow, KeysightU2021XA, KeysightU2021XASim())):
+        panels.append(cls(InstrumentProxy(drv, SimTransport(sim)), settings=settings))
+    win = LabWindow(panels, settings)
+    qtbot.addWidget(win)
+    win.connect_all.click()
+    for p in panels:
+        qtbot.waitUntil(lambda p=p: p.proxy.is_connected, timeout=5000)
+    rf = panels[0].proxy
+    rf.set("rf.output", True)
+    _wait_value(qtbot, rf, "rf.output", lambda v: v is True)
+    win.outputs_off.click()
+    _wait_value(qtbot, rf, "rf.output", lambda v: v is False)
     win.close()
+    assert not any(p.proxy._thread.isRunning() for p in panels)
