@@ -35,6 +35,7 @@ class InstrumentProxy(QObject):
     _req_raw_query = pyqtSignal(str)
     _req_poll = pyqtSignal(int)
     _req_log_poll = pyqtSignal(bool)
+    _req_delay = pyqtSignal(float)
     _req_shutdown = pyqtSignal()
 
     # ------------------------------------------- события прибор -> GUI
@@ -75,7 +76,7 @@ class InstrumentProxy(QObject):
             (self._req_read, w.read_param), (self._req_action, w.run_action),
             (self._req_raw_write, w.raw_write), (self._req_raw_query, w.raw_query),
             (self._req_poll, w.set_poll_interval), (self._req_log_poll, w.set_log_polling),
-            (self._req_shutdown, w.shutdown),
+            (self._req_delay, w.set_command_delay), (self._req_shutdown, w.shutdown),
         ):
             sig.connect(slot, _Q)
         # события воркера -> внутренние обработчики (в GUI-потоке) -> сигналы прокси
@@ -116,6 +117,10 @@ class InstrumentProxy(QObject):
 
     def set_poll_interval(self, ms: int) -> None:
         self._req_poll.emit(int(ms))
+
+    def set_command_delay(self, seconds: float) -> None:
+        """Пауза между командами прибору, с (0 - без паузы)."""
+        self._req_delay.emit(float(seconds))
 
     def set_log_polling(self, on: bool) -> None:
         """Показывать ли в журнале трафик периодического опроса."""

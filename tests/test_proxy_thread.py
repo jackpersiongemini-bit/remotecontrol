@@ -58,3 +58,22 @@ def test_polling_updates_measurements(qtbot):
     sim.set_load(1, 1.0)            # 5 А > 3 А -> CC
     qtbot.waitUntil(lambda: proxy.value("ch1.mode") == "CC", timeout=3000)
     proxy.shutdown()
+
+
+def test_command_delay_spaces_out_commands(make):
+    from visalab.sim import SiglentSDGSim as S
+    from visalab.drivers import SiglentSDG as D
+    import time as _t
+    drv, sim, rec = make(D, S, driver_kw={"command_delay_s": 0.03})
+    stamps = []
+    orig = sim.write
+    sim.write = lambda m: (stamps.append(_t.monotonic()), orig(m))
+    for _ in range(5):
+        drv.query("*OPC?")
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert min(gaps) >= 0.029
+
+
+def test_sdg_has_default_delay():
+    from visalab.drivers import ItechIT6300 as P, SiglentSDG as D
+    assert D.COMMAND_DELAY_S == 0.05 and P.COMMAND_DELAY_S == 0.0

@@ -47,9 +47,10 @@ class ItechIT6300(VISAInstrument):
     NAME = "ITECH IT6300"
     POLL_INTERVAL_MS = 500
 
-    def __init__(self, transport, model: IT6300Model | None = None, parent=None):
+    def __init__(self, transport, model: IT6300Model | None = None, parent=None,
+                 command_delay_s: float | None = None):
         self.model = model or DEFAULT_MODEL
-        super().__init__(transport, parent)
+        super().__init__(transport, parent, command_delay_s)
 
     # ------------------------------------------------------------ описание
     def build_params(self):

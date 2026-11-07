@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import time
 import traceback
 from typing import Any, Callable, Iterable
 
@@ -91,6 +92,9 @@ class VISAInstrument(QObject):
     MAX_POLL_FAILURES: int = 3
     #: проверять ошибки прибора сразу после каждой записи пользователя
     CHECK_AFTER_WRITE: bool = True
+    #: минимальная пауза между обращениями к прибору, с (между любыми write/query).
+    #: Пауза выдерживается в потоке прибора, GUI при этом не блокируется.
+    COMMAND_DELAY_S: float = 0.0
     #: команда SCPI очереди ошибок (None - у прибора её нет)
     ERROR_QUERY: str | None = "SYST:ERR?"
 
@@ -106,9 +110,12 @@ class VISAInstrument(QObject):
     sync_done = pyqtSignal()
     raw_response = pyqtSignal(str, str)           # запрос, ответ (консоль)
 
-    def __init__(self, transport: Transport, parent: QObject | None = None):
+    def __init__(self, transport: Transport, parent: QObject | None = None,
+                 command_delay_s: float | None = None):
         super().__init__(parent)
         self.transport = transport
+        self.command_delay_s = self.COMMAND_DELAY_S if command_delay_s is None else float(command_delay_s)
+        self._last_io = 0.0
         self._params: dict[str, Param] = {p.key: p for p in self.build_params()}
         self._actions: dict[str, Action] = {a.name: a for a in self.build_actions()}
         self._values: dict[str, Any] = {}
@@ -144,15 +151,30 @@ class VISAInstrument(QObject):
 
     # ================================================== низкоуровневый обмен
     # Вызывать только из потока прибора (из слотов и хуков).
+    def _pace(self) -> None:
+        """Выдерживает command_delay_s с момента предыдущего обращения к прибору."""
+        if self.command_delay_s > 0:
+            wait = self._last_io + self.command_delay_s - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+
     def write(self, command: str) -> None:
         if not self._quiet:
             self.scpi_log.emit(">>", command)
-        self.transport.write(command)
+        self._pace()
+        try:
+            self.transport.write(command)
+        finally:
+            self._last_io = time.monotonic()
 
     def query(self, command: str) -> str:
         if not self._quiet:
             self.scpi_log.emit(">>", command)
-        answer = self.transport.query(command).strip()
+        self._pace()
+        try:
+            answer = self.transport.query(command).strip()
+        finally:
+            self._last_io = time.monotonic()
         if self.STRIP_RESPONSE_HEADER:
             answer = strip_response_header(answer)
         if not self._quiet:
@@ -303,6 +325,10 @@ class VISAInstrument(QObject):
     @guarded
     def set_poll_interval(self, ms: int) -> None:
         self._timer.setInterval(max(50, int(ms)))
+
+    @pyqtSlot(float)
+    def set_command_delay(self, seconds: float) -> None:
+        self.command_delay_s = max(0.0, float(seconds))
 
     @pyqtSlot(bool)
     def set_log_polling(self, on: bool) -> None:

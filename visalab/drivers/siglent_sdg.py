@@ -100,6 +100,9 @@ def parse_siglent_response(response: str) -> tuple[list[str], dict[str, str], li
 class SiglentSDG(VISAInstrument):
     NAME = "Siglent SDG"
     STRIP_RESPONSE_HEADER = True   # "*ESR 1", "C1:SYNC OFF"
+    #: SDG по USB может терять команды, идущие подряд без паузы. 50 мс - стартовое
+    #: значение, подбирается на приборе (run_gui.py --sdg-delay).
+    COMMAND_DELAY_S = 0.05
     ERROR_QUERY = None           # SYST:ERR? в этом мануале нет
 
     # (ключ-суффикс, подпись, тип, единица, код в BSWV, extra)
@@ -131,9 +134,10 @@ class SiglentSDG(VISAInstrument):
         ("burst_delay", "Задержка", Kind.FLOAT, "s", "DLAY", {"minimum": 0.0}),
     )
 
-    def __init__(self, transport, model: SDGModel | None = None, parent=None):
+    def __init__(self, transport, model: SDGModel | None = None, parent=None,
+                 command_delay_s: float | None = None):
         self.model = model or DEFAULT_MODEL
-        super().__init__(transport, parent)
+        super().__init__(transport, parent, command_delay_s)
 
     # ------------------------------------------------------------ описание
     def build_params(self):
