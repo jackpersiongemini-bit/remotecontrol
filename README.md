@@ -1,23 +1,57 @@
 # visalab — фоновый слой приборов на pyvisa + PyQt6
 
-Стандартизованный фундамент для управления приборами и первые два драйвера:
+Стандартизованный фундамент для управления приборами и драйверы:
 
-| Прибор | Драйвер | Симулятор | Мануал |
-|---|---|---|---|
-| Генератор Siglent SDG (2 канала, по умолчанию SDG2042X) | `visalab/drivers/siglent_sdg.py` | `visalab/sim/siglent_sdg_sim.py` | PGen.pdf (SDG Series Programming Guide) |
-| Источник ITECH IT6300 (IT6322: CH1/CH2 30 В 3 А, CH3 5 В 3 А) | `visalab/drivers/itech_it6300.py` | `visalab/sim/itech_it6300_sim.py` | PSupply.pdf (IT6300 Programming Guide V1.1) |
+| Прибор | Профиль | Драйвер | Симулятор | Мануал |
+|---|---|---|---|---|
+| Генератор Siglent SDG (2 канала) | `function_generator` | `drivers/siglent_sdg.py` | `sim/siglent_sdg_sim.py` | PGen.pdf (SDG Series Programming Guide) |
+| Источник ITECH IT6300 (IT6322: CH1/CH2 30 В 3 А, CH3 5 В 3 А) | `power_supply` | `drivers/itech_it6300.py` | `sim/itech_it6300_sim.py` | PSupply.pdf (IT6300 Programming Guide V1.1) |
+| СВЧ-генератор Keysight PSG E8267D | `signal_generator` | `drivers/keysight_e8267d.py` | `sim/rf_generator_sim.py` | PSG SCPI Command Reference E8251-90356 |
+| СВЧ-генератор R&S SMF100A | `signal_generator` | `drivers/rs_smf100a.py` | `sim/rf_generator_sim.py` | R&S SMF100A Operating Manual |
 
-Модель по `*IDN?` не определяется и не проверяется: она задаётся явно (`--sdg-model`, `--psu-model`, таблицы `SDG_MODELS`, `IT6300_MODELS`). Без `--sdg-model` пределы генератора мягкие, и окончательное слово остаётся за прибором.
+Модель по `*IDN?` не определяется и не проверяется: она задаётся явно (`--model e8267d=E8267D-544`,
+`--sdg-model`, `--psu-model`, таблицы `MODELS` в `drivers/__init__.py`). Без модели пределы мягкие,
+и окончательное слово остаётся за прибором.
+
+## Профили: прибор как «чёрный ящик»
+
+Снаружи прибор виден только через **профиль своего класса** (`visalab/profiles.py`): имена ключей,
+тип, единицы СИ, токены ENUM, имена действий. Как драйвер переводит это в SCPI, его внутреннее дело.
+Поэтому E8267D и SMF100A для GUI и сценариев неотличимы: те же ключи, те же сигналы, одинаковое окно.
+
+```python
+proxy.set("rf.frequency", 10e9)     # одинаково для E8267D (":FREQ ...") и SMF100A ("FREQ ...")
+proxy.set("am.source", "EXT")       # E8267D получит "EXT1", SMF100A - "EXT"
+proxy.set("am.freq", 1e3)           # E8267D: ":AM:INT:FREQ", SMF100A: общий "LFO:FREQ"
+proxy.action("all_off")             # есть у каждого источника сигнала и питания
+proxy.supports("pulse.width")       # необязательная функция профиля: есть ли у этого прибора
+```
+
+Правила (проверяются при создании драйвера, нарушение = `ProfileError`, драйвер не запустится):
+
+* ключ драйвера - либо ключ профиля, либо расширение производителя `x.*` (например `x.beep`, `x.copy_1_to_2`);
+* ключ профиля имеет у драйвера тот же тип, единицу и режим (чтение/запись), ENUM - только токены профиля;
+* обязательные ключи и действия профиля есть у каждого драйвера класса;
+* единицы без префиксов: Hz, V, A, W, s, dBm, %, deg, rad; логические значения - `True/False`;
+* канальные ключи - `ch1.*`, `ch2.*`... (у SDG были `C1.*`, теперь `ch1.*`).
+
+`tests/test_profiles.py` прогоняет каждый драйвер из `DRIVERS` на его симуляторе и проверяет контракт;
+`tests/test_rf_generators.py` проверяет, что один и тот же сценарий даёт один и тот же результат на обоих генераторах.
+
+Профили анализатора спектра (E4446A), ваттметра (U2021XA) и ВАЦ (N5231A) появятся вместе с их драйверами.
 
 ## Запуск
 
 ```bash
 pip install -r requirements.txt
-python run_gui.py                       # оба прибора на симуляторах
+python run_gui.py                       # SDG и источник на симуляторах
 python run_gui.py --list                # найти адреса USB-приборов
 python run_gui.py --sdg "USB0::0xF4EC::...::INSTR" --psu "USB0::0x2EC7::...::INSTR"
 python run_gui.py --only psu --psu "USB0::..." --psu-model IT6322
 python run_gui.py --sdg "USB0::..." --sdg-model SDG2042X
+python run_gui.py --e8267d sim --smf100a sim                 # СВЧ-генераторы на симуляторах
+python run_gui.py --e8267d "GPIB0::19::INSTR" --model e8267d=E8267D-544
+python run_gui.py --delay sdg=0.1      # пауза 100 мс между командами генератора
 python -m pytest -q                     # тесты без железа
 ```
 
@@ -67,9 +101,12 @@ python -m pytest -q                     # тесты без железа
 
 ## Как добавить новый прибор
 
-1. `visalab/drivers/<прибор>.py`: класс от `VISAInstrument`, задать `NAME`,
+0. Если класса прибора ещё нет, сначала профиль в `visalab/profiles.py`.
+1. `visalab/drivers/<прибор>.py`: класс от `VISAInstrument`, задать `NAME`, `PROFILE`,
    `STRIP_RESPONSE_HEADER = True`, если прибор повторяет заголовок в ответе (`*ESR 1`),
-   `build_params()` (список `Param`), `build_actions()`.
+   `build_params()` (список `Param` с ключами профиля), `build_actions()`. Токены прибора,
+   отличные от стандартных, переводятся через `Param.enum_map`. Для СВЧ-генератора достаточно
+   унаследоваться от `RFSignalGenerator` и заполнить таблицу `COMMANDS`.
 2. Хуки по необходимости: `read_group()` (один запрос → много параметров), `select_channel()`,
    `read_error_queue()`, `write_param()`/`read_param_raw()` для нестандартных команд,
    `on_connected()`/`on_disconnecting()`, `poll()`.
@@ -84,3 +121,7 @@ python -m pytest -q                     # тесты без железа
 * Формат ответа `MEAS:VOLT:ALL?` (разделитель) и биты `STAT:QUES:INST:ISUMn:COND?` (CV=бит0, CC=бит1, OV=бит9)
   взяты из мануала, на приборе стоит проверить.
 * У SDG проверить, отвечает ли модель на `SYST:ERR?` (в этом мануале команды нет).
+* E8267D и SMF100A сделаны без доступа к PDF (сеть среды сборки их не скачивает): команды по
+  PSG SCPI Command Reference и SMF100A Operating Manual. На приборе проверить в первую очередь
+  `:PULM:INT:PER/PWID` (нужна опция UNU/UNW), `:ROSC:SOUR?`, ответ `POW:ALC?` у SMF100A (`AUTO`)
+  и что включение FM выключает ΦM, а не даёт ошибку конфликта.

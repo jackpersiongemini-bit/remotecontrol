@@ -20,13 +20,13 @@ def test_worker_runs_in_own_thread_and_gui_is_not_blocked(qtbot):
         proxy.open()
         assert time.perf_counter() - t0 < 0.05      # open() не ждёт прибор
     assert proxy.state is ConnectionState.CONNECTED
-    assert proxy.value("C1.frequency") == 1000.0
+    assert proxy.value("ch1.frequency") == 1000.0
 
     got = []
-    proxy.subscribe("C2.frequency", got.append)
+    proxy.subscribe("ch2.frequency", got.append)
     with qtbot.waitSignal(proxy.param_status, timeout=5000,
-                          check_params_cb=lambda k, s, m: k == "C2.frequency" and s is PStatus.WRITTEN):
-        proxy.set("C2.frequency", 12345.0)
+                          check_params_cb=lambda k, s, m: k == "ch2.frequency" and s is PStatus.WRITTEN):
+        proxy.set("ch2.frequency", 12345.0)
     assert got[-1] == 12345.0 and sim.ch[2]["BSWV"]["FRQ"] == 12345.0
     proxy.shutdown()
     assert not proxy._thread.isRunning() and proxy.state is ConnectionState.DISCONNECTED

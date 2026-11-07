@@ -61,6 +61,10 @@ class InstrumentProxy(QObject):
         # Метаданные неизменяемы (frozen dataclass), их безопасно читать из GUI.
         self.params: dict[str, Param] = dict(self._worker.params)
         self.actions: dict[str, Action] = dict(self._worker.actions)
+        #: класс прибора и поддерживаемые ключи профиля - то, на что опирается GUI
+        self.profile = self._worker.PROFILE
+        self.channels = self._worker.channels
+        self.capabilities: frozenset[str] = self._worker.capabilities
         self.state = ConnectionState.DISCONNECTED
         self.idn = ""
         self._values: dict[str, Any] = {}
@@ -125,6 +129,10 @@ class InstrumentProxy(QObject):
     def set_log_polling(self, on: bool) -> None:
         """Показывать ли в журнале трафик периодического опроса."""
         self._req_log_poll.emit(bool(on))
+
+    def supports(self, key: str) -> bool:
+        """Есть ли у прибора этот параметр/действие (стандартный ключ профиля или x.*)."""
+        return key in self.params or key in self.actions
 
     def value(self, key: str, default: Any = None) -> Any:
         """Последнее известное значение (кэш в GUI-потоке, без обращения к прибору)."""

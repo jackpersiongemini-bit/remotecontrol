@@ -18,7 +18,8 @@
 
 Как написать драйвер нового прибора
 -----------------------------------
-1. Унаследоваться от ``VISAInstrument``, задать ``NAME``.
+1. Унаследоваться от ``VISAInstrument``, задать ``NAME`` и ``PROFILE`` (класс прибора,
+   см. ``visalab/profiles.py``). Ключи и действия - только из профиля или ``x.*``.
 2. Реализовать ``build_params()`` (список :class:`Param`) и при необходимости
    ``build_actions()``.
 3. Если прибор возвращает несколько параметров одним запросом - ``read_group()``.
@@ -37,6 +38,7 @@ from typing import Any, Callable, Iterable
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
 from .params import Action, ConnectionState, Param, PStatus
+from .profile import Profile
 from .scpi import parse_number, strip_response_header
 from .transport import Transport, TransportError, TransportTimeout
 
@@ -82,6 +84,9 @@ def guarded(fn: Callable) -> Callable:
 class VISAInstrument(QObject):
     # ------------------------------------------------------------ метаданные
     NAME: str = "Generic SCPI"
+    #: профиль класса приборов (внешний контракт). Драйвер, не соответствующий
+    #: профилю, не создаётся (ProfileError) - так «чёрный ящик» проверяется всегда.
+    PROFILE: Profile | None = None
     #: прибор повторяет заголовок команды в ответе ("*ESR 1") - снимать его
     STRIP_RESPONSE_HEADER: bool = False
     #: маска *ESE: QYE|DDE|EXE|CME
@@ -118,6 +123,8 @@ class VISAInstrument(QObject):
         self._last_io = 0.0
         self._params: dict[str, Param] = {p.key: p for p in self.build_params()}
         self._actions: dict[str, Action] = {a.name: a for a in self.build_actions()}
+        if self.PROFILE is not None:
+            self.PROFILE.check(self._params, self._actions, self.channels, who=self.NAME)
         self._values: dict[str, Any] = {}
         self._state = ConnectionState.DISCONNECTED
         self._pending: dict[str, Any] = {}
@@ -136,6 +143,18 @@ class VISAInstrument(QObject):
 
     def build_actions(self) -> Iterable[Action]:
         return [Action("reset", "Сброс *RST", confirm="Сбросить прибор к заводским настройкам?")]
+
+    @property
+    def channels(self) -> int:
+        """Число каналов (для раскрытия ``ch{n}.*`` профиля)."""
+        return 1
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Какие ключи профиля этот прибор поддерживает."""
+        if self.PROFILE is None:
+            return frozenset()
+        return frozenset(self.PROFILE.expand(self.channels)) & frozenset(self._params)
 
     @property
     def params(self) -> dict[str, Param]:

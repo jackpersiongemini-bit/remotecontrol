@@ -19,6 +19,7 @@ from typing import Any
 from ..core.instrument import VISAInstrument
 from ..core.params import Action, Kind, Param, PStatus
 from ..core.scpi import parse_bool, parse_number
+from ..profiles import FUNCTION_GENERATOR
 
 __all__ = ["SiglentSDG", "SDGModel", "SDG_MODELS", "parse_siglent_response"]
 
@@ -99,6 +100,7 @@ def parse_siglent_response(response: str) -> tuple[list[str], dict[str, str], li
 
 class SiglentSDG(VISAInstrument):
     NAME = "Siglent SDG"
+    PROFILE = FUNCTION_GENERATOR
     STRIP_RESPONSE_HEADER = True   # "*ESR 1", "C1:SYNC OFF"
     #: SDG по USB может терять команды, идущие подряд без паузы. 50 мс - стартовое
     #: значение, подбирается на приборе (run_gui.py --sdg-delay).
@@ -113,7 +115,7 @@ class SiglentSDG(VISAInstrument):
         ("offset", "Смещение", Kind.FLOAT, "V", "OFST", {}),
         ("high", "Верхний уровень", Kind.FLOAT, "V", "HLEV", {}),
         ("low", "Нижний уровень", Kind.FLOAT, "V", "LLEV", {}),
-        ("phase", "Фаза", Kind.FLOAT, "°", "PHSE", {"minimum": 0.0, "maximum": 360.0}),
+        ("phase", "Фаза", Kind.FLOAT, "deg", "PHSE", {"minimum": 0.0, "maximum": 360.0}),
         ("duty", "Скважность", Kind.FLOAT, "%", "DUTY", {"minimum": 0.0, "maximum": 100.0}),
         ("symmetry", "Симметрия", Kind.FLOAT, "%", "SYM", {"minimum": 0.0, "maximum": 100.0}),
         ("width", "Длительность имп.", Kind.FLOAT, "s", "WIDTH", {"minimum": 0.0}),
@@ -139,64 +141,70 @@ class SiglentSDG(VISAInstrument):
         self.model = model or DEFAULT_MODEL
         super().__init__(transport, parent, command_delay_s)
 
+    @property
+    def channels(self) -> int:
+        return self.model.channels
+
     # ------------------------------------------------------------ описание
     def build_params(self):
         params: list[Param] = []
         m = self.model
         for ch in range(1, m.channels + 1):
-            c = f"C{ch}"
+            c = f"C{ch}"          # префикс SCPI
+            k = f"ch{ch}"         # префикс ключа профиля
             tab = f"CH{ch}"
             for suffix, label, kind, unit, code, extra in self._BSWV:
                 if suffix == "frequency":
                     extra = {**extra, "maximum": m.max_freq}
                 params.append(Param(
-                    f"{c}.{suffix}", label, kind, unit, section=f"{tab}/Сигнал",
+                    f"{k}.{suffix}", label, kind, unit, section=f"{tab}/Сигнал",
                     group=f"{c}:BSWV", write=f"{c}:BSWV {code},{{value}}", meta={"code": code}, **extra))
-            outp_keys = (f"{c}.amplitude", f"{c}.high", f"{c}.low", f"{c}.offset")
+            outp_keys = (f"{k}.amplitude", f"{k}.high", f"{k}.low", f"{k}.offset")
             params += [
-                Param(f"{c}.output", "Выход", Kind.BOOL, section=f"{tab}/Выход", group=f"{c}:OUTP",
+                Param(f"{k}.output", "Выход", Kind.BOOL, section=f"{tab}/Выход", group=f"{c}:OUTP",
                       write=f"{c}:OUTP {{value}}", bool_tokens=("ON", "OFF")),
-                Param(f"{c}.load", "Нагрузка", Kind.ENUM, section=f"{tab}/Выход", group=f"{c}:OUTP",
-                      write=f"{c}:OUTP LOAD,{{value}}", choices=("50", "HZ"), labels=("50 Ом", "High-Z"),
-                      also_read=outp_keys),
-                Param(f"{c}.polarity", "Полярность", Kind.ENUM, section=f"{tab}/Выход", group=f"{c}:OUTP",
-                      write=f"{c}:OUTP PLRT,{{value}}", choices=("NOR", "INVT"), labels=("Норм.", "Инв.")),
-                Param(f"{c}.sync", "Синхровыход", Kind.BOOL, section=f"{tab}/Выход",
+                Param(f"{k}.load", "Нагрузка", Kind.ENUM, section=f"{tab}/Выход", group=f"{c}:OUTP",
+                      write=f"{c}:OUTP LOAD,{{value}}", choices=("50", "HIZ"), labels=("50 Ом", "High-Z"),
+                      enum_map=(("HIZ", "HZ"),), also_read=outp_keys),
+                Param(f"{k}.polarity", "Полярность", Kind.ENUM, section=f"{tab}/Выход", group=f"{c}:OUTP",
+                      write=f"{c}:OUTP PLRT,{{value}}", choices=("NORM", "INV"), labels=("Норм.", "Инв."),
+                      enum_map=(("NORM", "NOR"), ("INV", "INVT"))),
+                Param(f"{k}.sync", "Синхровыход", Kind.BOOL, section=f"{tab}/Выход",
                       query=f"{c}:SYNC?", write=f"{c}:SYNC {{value}}", bool_tokens=("ON", "OFF")),
             ]
             # взаимоисключающие режимы: после переключения перечитать остальные
-            states = (f"{c}.mod_state", f"{c}.sweep_state", f"{c}.burst_state")
+            states = (f"{k}.mod_state", f"{k}.sweep_state", f"{k}.burst_state")
             mod_group = f"{c}:MDWV"
             params += [
-                Param(f"{c}.mod_state", "Модуляция", Kind.BOOL, section=f"{tab}/Модуляция", group=mod_group,
+                Param(f"{k}.mod_state", "Модуляция", Kind.BOOL, section=f"{tab}/Модуляция", group=mod_group,
                       write=f"{c}:MDWV STATE,{{value}}", bool_tokens=("ON", "OFF"),
                       also_read=tuple(k for k in states if not k.endswith("mod_state"))),
-                Param(f"{c}.mod_type", "Тип", Kind.ENUM, section=f"{tab}/Модуляция", group=mod_group,
+                Param(f"{k}.mod_type", "Тип", Kind.ENUM, section=f"{tab}/Модуляция", group=mod_group,
                       write=f"{c}:MDWV {{value}}", choices=MOD_TYPES),
-                Param(f"{c}.mod_source", "Источник", Kind.ENUM, section=f"{tab}/Модуляция", group=mod_group,
+                Param(f"{k}.mod_source", "Источник", Kind.ENUM, section=f"{tab}/Модуляция", group=mod_group,
                       write=f"{c}:MDWV {{type}},SRC,{{value}}", choices=("INT", "EXT")),
-                Param(f"{c}.mod_shape", "Форма мод.", Kind.ENUM, section=f"{tab}/Модуляция", group=mod_group,
+                Param(f"{k}.mod_shape", "Форма мод.", Kind.ENUM, section=f"{tab}/Модуляция", group=mod_group,
                       write=f"{c}:MDWV {{type}},MDSP,{{value}}",
                       choices=("SINE", "SQUARE", "TRIANGLE", "UPRAMP", "DNRAMP", "NOISE", "ARB")),
-                Param(f"{c}.mod_freq", "Частота мод.", Kind.FLOAT, "Hz", section=f"{tab}/Модуляция",
+                Param(f"{k}.mod_freq", "Частота мод.", Kind.FLOAT, "Hz", section=f"{tab}/Модуляция",
                       group=mod_group, write=f"{c}:MDWV {{type}},FRQ,{{value}}", minimum=0.0),
-                Param(f"{c}.mod_depth", "Глубина AM", Kind.FLOAT, "%", section=f"{tab}/Модуляция",
+                Param(f"{k}.mod_depth", "Глубина AM", Kind.FLOAT, "%", section=f"{tab}/Модуляция",
                       group=mod_group, write=f"{c}:MDWV AM,DEPTH,{{value}}", minimum=0.0, maximum=120.0),
-                Param(f"{c}.mod_dev", "Девиация FM/PM", Kind.FLOAT, "", section=f"{tab}/Модуляция",
+                Param(f"{k}.mod_dev", "Девиация FM/PM", Kind.FLOAT, "", section=f"{tab}/Модуляция",
                       group=mod_group, write=f"{c}:MDWV {{type}},DEVI,{{value}}", minimum=0.0),
-                Param(f"{c}.sweep_state", "Свип", Kind.BOOL, section=f"{tab}/Свип", group=f"{c}:SWWV",
+                Param(f"{k}.sweep_state", "Свип", Kind.BOOL, section=f"{tab}/Свип", group=f"{c}:SWWV",
                       write=f"{c}:SWWV STATE,{{value}}", bool_tokens=("ON", "OFF"),
                       also_read=tuple(k for k in states if not k.endswith("sweep_state"))),
             ]
             for suffix, label, kind, unit, code, extra in self._SWWV:
-                params.append(Param(f"{c}.{suffix}", label, kind, unit, section=f"{tab}/Свип",
+                params.append(Param(f"{k}.{suffix}", label, kind, unit, section=f"{tab}/Свип",
                                     group=f"{c}:SWWV", write=f"{c}:SWWV {code},{{value}}",
                                     meta={"code": code}, **extra))
-            params.append(Param(f"{c}.burst_state", "Пакет", Kind.BOOL, section=f"{tab}/Пакет",
+            params.append(Param(f"{k}.burst_state", "Пакет", Kind.BOOL, section=f"{tab}/Пакет",
                                 group=f"{c}:BTWV", write=f"{c}:BTWV STATE,{{value}}", bool_tokens=("ON", "OFF"),
                                 also_read=tuple(k for k in states if not k.endswith("burst_state"))))
             for suffix, label, kind, unit, code, extra in self._BTWV:
-                params.append(Param(f"{c}.{suffix}", label, kind, unit, section=f"{tab}/Пакет",
+                params.append(Param(f"{k}.{suffix}", label, kind, unit, section=f"{tab}/Пакет",
                                     group=f"{c}:BTWV", write=f"{c}:BTWV {code},{{value}}",
                                     meta={"code": code}, **extra))
         return params
@@ -207,7 +215,7 @@ class SiglentSDG(VISAInstrument):
         for ch in range(1, self.model.channels + 1):
             acts.append(Action(f"trigger_{ch}", f"Ручной триггер CH{ch}"))
         if self.model.channels >= 2:
-            acts.append(Action("copy_1_to_2", "Копировать CH1 → CH2"))
+            acts.append(Action("x.copy_1_to_2", "Копировать CH1 → CH2"))   # расширение Siglent
         return acts
 
     # --------------------------------------------------------------- хуки
@@ -231,7 +239,8 @@ class SiglentSDG(VISAInstrument):
         return spec.from_scpi(lead[0])
 
     def read_group(self, group: str) -> dict[str, Any]:
-        ch, cmd = group.split(":")
+        ch, cmd = group.split(":")           # "C1", "BSWV"
+        ch = f"ch{ch[1:]}"                   # -> префикс ключа профиля
         lead, pairs, prefixes = parse_siglent_response(self.query(f"{group}?"))
         out: dict[str, Any] = {}
 
@@ -287,19 +296,19 @@ class SiglentSDG(VISAInstrument):
         if name == "all_off":
             for ch in range(1, self.model.channels + 1):
                 self.write(f"C{ch}:OUTP OFF")
-            self._read_keys([f"C{ch}.output" for ch in range(1, self.model.channels + 1)])
+            self._read_keys([f"ch{ch}.output" for ch in range(1, self.model.channels + 1)])
             return None
         if name.startswith("trigger_"):
             ch = int(name.rsplit("_", 1)[1])
-            self._read_keys([f"C{ch}.burst_state", f"C{ch}.sweep_state"])
-            if self._values.get(f"C{ch}.burst_state"):
+            self._read_keys([f"ch{ch}.burst_state", f"ch{ch}.sweep_state"])
+            if self._values.get(f"ch{ch}.burst_state"):
                 self.write(f"C{ch}:BTWV MTRIG")
-            elif self._values.get(f"C{ch}.sweep_state"):
+            elif self._values.get(f"ch{ch}.sweep_state"):
                 self.write(f"C{ch}:SWWV MTRIG")
             else:
                 raise ValueError(f"CH{ch}: ни свип, ни пакет не включены")
             return None
-        if name == "copy_1_to_2":
+        if name == "x.copy_1_to_2":
             self.write("PACP C2,C1")
             self._sync_all()
             return None

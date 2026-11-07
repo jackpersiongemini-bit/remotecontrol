@@ -20,6 +20,7 @@ from typing import Any
 from ..core.instrument import VISAInstrument
 from ..core.params import Action, Kind, Param
 from ..core.scpi import parse_number
+from ..profiles import POWER_SUPPLY
 
 __all__ = ["ItechIT6300", "IT6300Model", "IT6300_MODELS"]
 
@@ -45,12 +46,17 @@ COMBINE = ("NONE", "SER", "PAR", "TRAC")
 
 class ItechIT6300(VISAInstrument):
     NAME = "ITECH IT6300"
+    PROFILE = POWER_SUPPLY
     POLL_INTERVAL_MS = 500
 
     def __init__(self, transport, model: IT6300Model | None = None, parent=None,
                  command_delay_s: float | None = None):
         self.model = model or DEFAULT_MODEL
         super().__init__(transport, parent, command_delay_s)
+
+    @property
+    def channels(self) -> int:
+        return len(self.model.ratings)
 
     # ------------------------------------------------------------ описание
     def build_params(self):
@@ -68,7 +74,8 @@ class ItechIT6300(VISAInstrument):
                 Param(f"{k}.meas_v", "Измер. U", Kind.FLOAT, "V", section=sec, group="MEAS", poll=True),
                 Param(f"{k}.meas_i", "Измер. I", Kind.FLOAT, "A", section=sec, group="MEAS", poll=True),
                 Param(f"{k}.meas_p", "Измер. P", Kind.FLOAT, "W", section=sec, group="MEAS", poll=True),
-                Param(f"{k}.mode", "Режим", Kind.STR, section=sec, group="COND", poll=True),
+                Param(f"{k}.mode", "Режим", Kind.ENUM, section=sec, group="COND", poll=True,
+                      choices=("CV", "CC", "OFF")),
                 Param(f"{k}.ovp_tripped", "OVP сработала", Kind.BOOL, section=sec, group="COND", poll=True),
                 Param(f"{k}.ovp_state", "OVP вкл.", Kind.BOOL, section=f"Защита/CH{n}", channel=n,
                       query="VOLT:PROT:STAT?", write="VOLT:PROT:STAT {value}"),
@@ -95,7 +102,7 @@ class ItechIT6300(VISAInstrument):
             Action("all_off", "Выключить все выходы"),
             Action("clear_ovp", "Сбросить OVP"),
             Action("reset", "Сброс *RST", confirm="Сброс выключит выходы и вернёт уставки по умолчанию. Продолжить?"),
-            Action("beep", "Звуковой сигнал"),
+            Action("x.beep", "Звуковой сигнал"),   # расширение ITECH
         ]
 
     # --------------------------------------------------------------- хуки
@@ -139,7 +146,7 @@ class ItechIT6300(VISAInstrument):
         elif group == "COND":
             for n in range(1, n_ch + 1):
                 cond = self.query_int(f"STAT:QUES:INST:ISUM{n}:COND?")
-                out[f"ch{n}.mode"] = "CC" if cond & COND_CC else "CV" if cond & COND_CV else "—"
+                out[f"ch{n}.mode"] = "CC" if cond & COND_CC else "CV" if cond & COND_CV else "OFF"
                 out[f"ch{n}.ovp_tripped"] = bool(cond & COND_OV)
         else:
             raise NotImplementedError(group)
@@ -157,7 +164,7 @@ class ItechIT6300(VISAInstrument):
                 self.write("VOLT:PROT:CLE")
             self._read_keys([f"ch{n}.ovp_tripped" for n in channels])
             return None
-        if name == "beep":
+        if name == "x.beep":
             self.write("SYST:BEEP")
             return None
         return super().run_custom_action(name, args)

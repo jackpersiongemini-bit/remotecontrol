@@ -27,26 +27,26 @@ def test_connect_reads_state_without_reset(sdg):
     assert drv.state is ConnectionState.CONNECTED
     assert drv.model.name == "SDG2042X"           # модель задана явно, не по *IDN?
     assert "*RST" not in sim.history
-    assert rec.values["C1.frequency"] == 1000.0
-    assert rec.values["C1.wave"] == "SINE"
-    assert rec.values["C1.duty"] is None          # у синуса нет скважности
-    assert rec.values["C2.load"] == "HZ"
+    assert rec.values["ch1.frequency"] == 1000.0
+    assert rec.values["ch1.wave"] == "SINE"
+    assert rec.values["ch1.duty"] is None          # у синуса нет скважности
+    assert rec.values["ch2.load"] == "HIZ"           # стандартный токен профиля (у SDG "HZ")
 
 
 def test_set_frequency(sdg):
     drv, sim, rec = sdg
-    drv.set_param("C1.frequency", 2.5e6)
+    drv.set_param("ch1.frequency", 2.5e6)
     flush(drv)
     assert sim.ch[1]["BSWV"]["FRQ"] == 2.5e6
     assert "C1:BSWV FRQ,2500000" in sim.history
-    assert rec.last_status("C1.frequency")[0] is PStatus.WRITTEN
-    assert rec.values["C1.frequency"] == 2.5e6
+    assert rec.last_status("ch1.frequency")[0] is PStatus.WRITTEN
+    assert rec.values["ch1.frequency"] == 2.5e6
 
 
 def test_writes_are_coalesced(sdg):
     drv, sim, rec = sdg
     for f in (1e3, 2e3, 3e3, 4e3):
-        drv.set_param("C1.frequency", f)
+        drv.set_param("ch1.frequency", f)
     flush(drv)
     assert [h for h in sim.history if h.startswith("C1:BSWV FRQ")] == ["C1:BSWV FRQ,4000"]
 
@@ -54,48 +54,48 @@ def test_writes_are_coalesced(sdg):
 def test_out_of_model_range_is_rejected_before_sending(sdg):
     drv, sim, rec = sdg
     n = len(sim.history)
-    drv.set_param("C1.frequency", 100e6)          # > 40 МГц у SDG2042X
+    drv.set_param("ch1.frequency", 100e6)          # > 40 МГц у SDG2042X
     flush(drv)
-    assert rec.last_status("C1.frequency")[0] is PStatus.INVALID
+    assert rec.last_status("ch1.frequency")[0] is PStatus.INVALID
     assert not any("FRQ" in h for h in sim.history[n:])
 
 
 def test_coerced_amplitude_on_50_ohm(sdg):
     drv, sim, rec = sdg
-    drv.set_param("C1.load", "50")
+    drv.set_param("ch1.load", "50")
     flush(drv)
-    drv.set_param("C1.amplitude", 15)             # прибор ограничит до 10 Vpp
+    drv.set_param("ch1.amplitude", 15)             # прибор ограничит до 10 Vpp
     flush(drv)
-    status, msg = rec.last_status("C1.amplitude")
-    assert status is PStatus.COERCED and rec.values["C1.amplitude"] == 10.0
+    status, msg = rec.last_status("ch1.amplitude")
+    assert status is PStatus.COERCED and rec.values["ch1.amplitude"] == 10.0
 
 
 def test_modes_are_exclusive(sdg):
     drv, sim, rec = sdg
-    drv.set_param("C1.mod_state", True)
+    drv.set_param("ch1.mod_state", True)
     flush(drv)
-    assert rec.values["C1.mod_state"] is True and rec.values["C1.mod_type"] == "AM"
-    drv.set_param("C1.sweep_state", True)
+    assert rec.values["ch1.mod_state"] is True and rec.values["ch1.mod_type"] == "AM"
+    drv.set_param("ch1.sweep_state", True)
     flush(drv)
-    assert rec.values["C1.sweep_state"] is True
-    assert rec.values["C1.mod_state"] is False    # перечитано через also_read
+    assert rec.values["ch1.sweep_state"] is True
+    assert rec.values["ch1.mod_state"] is False    # перечитано через also_read
 
 
 def test_mod_freq_uses_current_type(sdg):
     drv, sim, rec = sdg
-    drv.set_param("C1.mod_state", True); flush(drv)
-    drv.set_param("C1.mod_type", "FM"); flush(drv)
-    drv.set_param("C1.mod_freq", 250); flush(drv)
+    drv.set_param("ch1.mod_state", True); flush(drv)
+    drv.set_param("ch1.mod_type", "FM"); flush(drv)
+    drv.set_param("ch1.mod_freq", 250); flush(drv)
     assert "C1:MDWV FM,FRQ,250" in sim.history
-    assert rec.values["C1.mod_freq"] == 250
+    assert rec.values["ch1.mod_freq"] == 250
 
 
 def test_burst_infinite(sdg):
     drv, sim, rec = sdg
-    drv.set_param("C2.burst_state", True); flush(drv)
-    drv.set_param("C2.burst_cycles", "INF"); flush(drv)
-    assert rec.values["C2.burst_cycles"] == "INF"
-    assert rec.last_status("C2.burst_cycles")[0] is PStatus.WRITTEN
+    drv.set_param("ch2.burst_state", True); flush(drv)
+    drv.set_param("ch2.burst_cycles", "INF"); flush(drv)
+    assert rec.values["ch2.burst_cycles"] == "INF"
+    assert rec.last_status("ch2.burst_cycles")[0] is PStatus.WRITTEN
 
 
 def test_instrument_error_from_esr(sdg):
@@ -108,10 +108,10 @@ def test_instrument_error_from_esr(sdg):
 
 def test_error_param_marks_status(sdg):
     drv, sim, rec = sdg
-    drv.set_param("C1.wave", "NOISE"); flush(drv)
-    drv.set_param("C1.sweep_state", True); flush(drv)   # свип с шумом запрещён
-    assert rec.last_status("C1.sweep_state")[0] is PStatus.ERROR
-    assert rec.values["C1.sweep_state"] is False
+    drv.set_param("ch1.wave", "NOISE"); flush(drv)
+    drv.set_param("ch1.sweep_state", True); flush(drv)   # свип с шумом запрещён
+    assert rec.last_status("ch1.sweep_state")[0] is PStatus.ERROR
+    assert rec.values["ch1.sweep_state"] is False
 
 
 def test_trigger_without_mode_reports(sdg):
@@ -123,10 +123,10 @@ def test_trigger_without_mode_reports(sdg):
 
 def test_output_and_all_off(sdg):
     drv, sim, rec = sdg
-    drv.set_param("C1.output", True); flush(drv)
-    assert sim.ch[1]["OUTP"]["STATE"] == "ON" and rec.values["C1.output"] is True
+    drv.set_param("ch1.output", True); flush(drv)
+    assert sim.ch[1]["OUTP"]["STATE"] == "ON" and rec.values["ch1.output"] is True
     drv.run_action("all_off", ())
-    assert rec.values["C1.output"] is False
+    assert rec.values["ch1.output"] is False
 
 
 def test_response_header_is_stripped(sdg):

@@ -42,7 +42,7 @@ def test_bad_input_marks_invalid_without_sending(qtbot):
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):
         proxy.open()
-    field = _field(win, NumberField, "C1.frequency")
+    field = _field(win, NumberField, "ch1.frequency")
     n = len(sim.history)
     field.setText("abc")
     field.returnPressed.emit()
@@ -50,3 +50,23 @@ def test_bad_input_marks_invalid_without_sending(qtbot):
     qtbot.wait(50)
     assert not any("FRQ" in h for h in sim.history[n:])
     win.close()
+
+
+def test_rf_generator_windows_identical(qtbot):
+    """Окна E8267D и SMF100A строятся из профиля: одинаковые вкладки и поля."""
+    from visalab.drivers import KeysightE8267D, RSSMF100A
+    from visalab.sim import KeysightE8267DSim, RSSMF100ASim
+    layouts = []
+    for drv, sim_cls in ((KeysightE8267D, KeysightE8267DSim), (RSSMF100A, RSSMF100ASim)):
+        sim = sim_cls()
+        proxy = InstrumentProxy(drv, SimTransport(sim))
+        win = InstrumentWindow(proxy)
+        qtbot.addWidget(win)
+        with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+            proxy.open()
+        field = _field(win, NumberField, "rf.frequency")
+        assert field.text() == "1 GHz"
+        layouts.append(([win.tabs.tabText(i) for i in range(win.tabs.count())],
+                        sorted(w.spec.key for w in win.findChildren(NumberField))))
+        win.close()
+    assert layouts[0] == layouts[1]

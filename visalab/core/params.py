@@ -54,7 +54,10 @@ class Param:
              (драйвер реализует ``read_group``)
     channel  номер канала, если перед командой нужно выбрать канал
              (драйвер реализует ``select_channel``)
-    choices  допустимые токены для ENUM (как их понимает прибор)
+    choices  допустимые значения ENUM - стандартные токены профиля класса приборов
+    enum_map перевод стандартного токена в токен прибора: ``(("HIZ", "HZ"), ...)``.
+             Чего нет в карте, уходит в прибор как есть. При чтении ответ прибора
+             переводится обратно (несколько токенов прибора могут давать один стандартный).
     labels   подписи для choices в GUI
     poll     читать периодически (измерения, состояние CV/CC)
     tolerance относительный допуск при сверке записанного и прочитанного
@@ -79,6 +82,7 @@ class Param:
     #: ключи, которые прибор может изменить при записи этого параметра
     #: (например, включение свипа выключает модуляцию) - перечитываются после записи
     also_read: tuple[str, ...] = ()
+    enum_map: tuple[tuple[str, str], ...] = ()
     meta: dict = field(default_factory=dict, compare=False, hash=False)
 
     @property
@@ -112,6 +116,9 @@ class Param:
             return format_number(value)
         if self.kind is Kind.BOOL:
             return format_bool(value, *self.bool_tokens)
+        if self.kind is Kind.ENUM and self.enum_map:
+            token = str(value).upper()
+            return next((dev for std, dev in self.enum_map if std == token), str(value))
         return str(value)
 
     def from_scpi(self, raw: str) -> Any:
@@ -123,7 +130,11 @@ class Param:
         if self.kind is Kind.BOOL:
             return parse_bool(raw)
         if self.kind is Kind.ENUM:
-            return raw.strip('"').upper()
+            token = raw.strip('"').upper()
+            for std, dev in self.enum_map:
+                if dev.upper() == token:
+                    return std
+            return token
         return raw.strip('"')
 
     def same(self, a: Any, b: Any) -> bool:
