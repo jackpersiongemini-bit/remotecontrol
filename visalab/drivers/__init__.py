@@ -3,6 +3,8 @@
 Чтобы добавить прибор, допишите строку в DRIVERS - GUI и run_gui.py подхватят его.
 Класс прибора (профиль) задаётся в самом драйвере: ``Driver.PROFILE``.
 """
+import re
+
 from ..core.transport import PyVisaTransport, SimTransport, Transport
 from ..sim.itech_it6300_sim import ItechIT6300Sim
 from ..sim.rf_generator_sim import KeysightE8267DSim, RSSMF100ASim
@@ -23,12 +25,29 @@ DRIVERS = {
 MODELS = {"sdg": SDG_MODELS, "it6300": IT6300_MODELS, "e8267d": E8267D_MODELS, "smf100a": SMF100A_MODELS}
 
 
+_IP_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?$")
+
+
+def normalize_address(address: str) -> str:
+    """Короткая запись LAN-адреса -> VISA-ресурс.
+
+    ``192.168.0.3``      -> ``TCPIP0::192.168.0.3::INSTR``         (VXI-11, есть serial poll)
+    ``192.168.0.3:5025`` -> ``TCPIP0::192.168.0.3::5025::SOCKET``  (сырой сокет, статус через *STB?)
+    Всё остальное (USB0::..., GPIB0::..., TCPIP0::...) возвращается как есть.
+    """
+    m = _IP_RE.match(address.strip())
+    if not m:
+        return address
+    ip, port = m.groups()
+    return f"TCPIP0::{ip}::{port}::SOCKET" if port else f"TCPIP0::{ip}::INSTR"
+
+
 def make_transport(kind: str, address: str | None, backend: str = "", latency_s: float = 0.0) -> Transport:
     """address=None или "sim" -> симулятор, иначе pyvisa."""
     _, sim_cls = DRIVERS[kind]
     if address in (None, "", "sim"):
         return SimTransport(sim_cls(), address=f"SIM::{kind.upper()}::INSTR", latency_s=latency_s)
-    return PyVisaTransport(address, backend=backend)
+    return PyVisaTransport(normalize_address(address), backend=backend)
 
 
-__all__ = ["DRIVERS", "MODELS", "make_transport", "SiglentSDG", "ItechIT6300", "KeysightE8267D", "RSSMF100A"]
+__all__ = ["DRIVERS", "MODELS", "make_transport", "normalize_address", "SiglentSDG", "ItechIT6300", "KeysightE8267D", "RSSMF100A"]

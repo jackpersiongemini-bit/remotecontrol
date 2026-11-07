@@ -64,3 +64,11 @@ def test_si():
 ])
 def test_strip_response_header(raw, clean):
     assert strip_response_header(raw) == clean
+
+
+def test_lan_address_shortcut():
+    from visalab.drivers import make_transport, normalize_address
+    assert normalize_address("192.168.0.3") == "TCPIP0::192.168.0.3::INSTR"
+    assert normalize_address("192.168.0.3:5025") == "TCPIP0::192.168.0.3::5025::SOCKET"
+    assert normalize_address("USB0::0xF4EC::0x1102::X::INSTR") == "USB0::0xF4EC::0x1102::X::INSTR"
+    assert make_transport("sdg", "192.168.0.3").address == "TCPIP0::192.168.0.3::INSTR"

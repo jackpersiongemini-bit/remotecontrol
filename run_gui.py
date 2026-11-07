@@ -3,6 +3,7 @@
     python run_gui.py                                   # генератор SDG и источник на симуляторах
     python run_gui.py --sdg USB0::0xF4EC::0x1102::SDG2XXXX::INSTR --psu sim
     python run_gui.py --e8267d sim --smf100a sim        # СВЧ-генераторы на симуляторах
+    python run_gui.py --sdg 192.168.0.3                 # по LAN: = TCPIP0::192.168.0.3::INSTR
     python run_gui.py --e8267d GPIB0::19::INSTR --model e8267d=E8267D-544
     python run_gui.py --delay sdg=0.1                   # пауза между командами, с
     python run_gui.py --list                            # показать ресурсы VISA
@@ -44,7 +45,7 @@ def _pairs(items: list[str], what: str) -> dict[str, str]:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for name, (kind, title, _) in DEVICES.items():
-        ap.add_argument(f"--{name}", metavar="АДРЕС", help=f"{title}: VISA-адрес или 'sim'")
+        ap.add_argument(f"--{name}", metavar="АДРЕС", help=f"{title}: VISA-адрес, IP (192.168.0.3 или 192.168.0.3:5025) или 'sim'")
     ap.add_argument("--model", action="append", default=[], metavar="ПРИБОР=МОДЕЛЬ",
                     help="модель (пределы проверки): " + "; ".join(
                         f"{n}: {', '.join(sorted(MODELS[k]))}" for n, (k, _, _) in DEVICES.items()))

@@ -50,6 +50,8 @@ python run_gui.py --sdg "USB0::0xF4EC::...::INSTR" --psu "USB0::0x2EC7::...::INS
 python run_gui.py --only psu --psu "USB0::..." --psu-model IT6322
 python run_gui.py --sdg "USB0::..." --sdg-model SDG2042X
 python run_gui.py --e8267d sim --smf100a sim                 # СВЧ-генераторы на симуляторах
+python run_gui.py --sdg 192.168.0.3     # по LAN (VXI-11): то же, что TCPIP0::192.168.0.3::INSTR
+python run_gui.py --sdg 192.168.0.3:5025  # сырой сокет: TCPIP0::192.168.0.3::5025::SOCKET
 python run_gui.py --e8267d "GPIB0::19::INSTR" --model e8267d=E8267D-544
 python run_gui.py --delay sdg=0.1      # пауза 100 мс между командами генератора
 python -m pytest -q                     # тесты без железа
