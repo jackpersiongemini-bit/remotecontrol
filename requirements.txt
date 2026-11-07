@@ -1,5 +1,6 @@
 PyQt6>=6.5
 pyvisa>=1.13
 # pyvisa-py      # если нет NI-VISA / Keysight IO Libraries (тогда --backend @py, для USB нужен pyusb)
+PyQt6-Frameless-Window>=0.4  # окна без системной рамки (visalab.ui, run_ui.py)
 pytest>=7
 pytest-qt>=4.2
