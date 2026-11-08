@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtWidgets import QCheckBox
+from PyQt6.QtWidgets import QCheckBox, QSizePolicy
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
@@ -98,9 +98,10 @@ class RFGenWindow(InstrumentWindow):
                 outs.append(w)
         self.top_lines = [PanelLine("OUT", *outs), self.preset_line()]
         self.freq_spin = PSpinBox(proxy, "rf.frequency", ("k", "M", "G"))
-        self.freq_hold = QCheckBox("HOLD")
+        self.freq_hold = QCheckBox()                  # только квадратик: смысл - в подсказке
+        self.freq_hold.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.freq_hold.setObjectName("hold")
-        self.freq_hold.setToolTip("Presets keep the current frequency (only POW and MOD are applied)")
+        self.freq_hold.setToolTip("HOLD: presets keep the current frequency (only POW and MOD are applied)")
         self.freq_hold.setCursor(Qt.CursorShape.PointingHandCursor)
         self.freq_hold.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.freq_hold.setChecked(self.settings.value(f"{self._prefix}/FREQ_HOLD", False, type=bool))

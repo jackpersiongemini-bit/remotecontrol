@@ -800,7 +800,7 @@ class Panel(QFrame):
         }
         Panel PLineEdit:focus, Panel PSpinBox:focus { border-color: $UI_COLOR_TEXT_MUTED; }
         Panel PSpinBox { padding: 0 0 0 0; }
-        Panel QCheckBox { spacing: 6px; color: $UI_COLOR_TEXT_MUTED; padding: 0 4px; }
+        Panel QCheckBox { spacing: 0; padding: 0; color: $UI_COLOR_TEXT_MUTED; }
         Panel QCheckBox::indicator {
             width: 14px; height: 14px; border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER_LIGHT;
             border-radius: 3px; background: $UI_COLOR_BACKGROUND;
