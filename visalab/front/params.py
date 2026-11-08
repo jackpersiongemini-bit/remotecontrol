@@ -458,8 +458,8 @@ class PTabBar(QTabBar):
             if bg:
                 p.setBrush(QColor(bg))
                 p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-            if on:                        # режим включён: тонкая рамка + толстая нижняя граница
-                paint_indicator(p, rect, UI_COLOR_TEXT_INVERSE if (selected or hover) else UI_COLOR_TEXT_MUTED)
+            if on and not selected:       # режим включён (у выбранной видно по STAT): рамка + толстая граница
+                paint_indicator(p, rect, UI_COLOR_TEXT_INVERSE if hover else UI_COLOR_TEXT_MUTED)
             fg = UI_COLOR_TEXT_INVERSE if (hover or selected) else \
                 UI_COLOR_TEXT_MUTED if on else UI_COLOR_BORDER_LIGHT
             font = QFont(self.font())
