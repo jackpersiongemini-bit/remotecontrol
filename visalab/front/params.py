@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
-from PyQt6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout,
+from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, PStatus
@@ -198,40 +198,50 @@ class PBGroup(QWidget):
 
     selected = pyqtSignal(int)
 
-    def __init__(self, names: list[str] | tuple[str, ...] = (), parent=None):
+    def __init__(self, names: list[str] | tuple[str, ...] = (), columns: int = 0, parent=None):
         super().__init__(parent)
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
-        self.group_layout = QHBoxLayout(self)
+        self.columns = columns                   # 0 - в одну строку, иначе сетка
+        self.group_layout = QGridLayout(self)
         self.group_layout.setContentsMargins(0, 0, 0, 0)
         self.group_layout.setSpacing(4)
+        self._buttons: list[QPushButton] = []
         for name in names:
             self.add_button(name)
         self._group.idClicked.connect(self.selected)
 
     def buttons(self) -> list[QPushButton]:
-        return [self._group.button(i) for i in range(len(self._group.buttons()))]
+        return list(self._buttons)
 
-    def add_button(self, name: str, index: int | None = None) -> QPushButton:
+    def _relayout(self) -> None:
+        for b in self._buttons:
+            self.group_layout.removeWidget(b)
+        for i, b in enumerate(self._buttons):
+            r, c = divmod(i, self.columns) if self.columns else (0, i)
+            self.group_layout.addWidget(b, r, c)
+
+    def add_button(self, name: str) -> QPushButton:
         b = QPushButton(name)
         b.setObjectName("chip")
         b.setCheckable(True)
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
-        n = len(self._group.buttons())
-        self._group.addButton(b, n)
-        self.group_layout.insertWidget(n if index is None else index, b)
+        self._group.addButton(b, len(self._buttons))
+        self._buttons.append(b)
+        self._relayout()
         return b
 
     def remove_button(self, index: int) -> None:
-        b = self._group.button(index)
-        if b is None:
+        if not 0 <= index < len(self._buttons):
             return
-        for old in range(index + 1, len(self._group.buttons())):
-            self._group.setId(self._group.button(old), old - 1)
+        b = self._buttons.pop(index)
         self._group.removeButton(b)
+        for i, other in enumerate(self._buttons):
+            self._group.setId(other, i)
         self.group_layout.removeWidget(b)
         b.deleteLater()
+        self._relayout()
 
     def checked_index(self) -> int:
         return self._group.checkedId()
@@ -339,7 +349,7 @@ class Panel(QFrame):
         }
         Panel PSButton[state="true"], Panel PSButton[state="on"] { color: $UI_COLOR_SUCCESS_HOVER; }
         Panel PSButton:disabled, Panel PLineEdit:disabled { color: $UI_COLOR_BORDER; }
-        Panel QPushButton#chip { padding: 0 10px; }
+        Panel QPushButton#chip { padding: 2px 8px; min-height: 0; max-height: 1000px; }
         Panel QPushButton#chip:checked {
             background-color: $UI_COLOR_TEXT_MUTED;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;

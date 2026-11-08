@@ -17,7 +17,8 @@ from .theme import (OFF, ON, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_CO
                     UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss)
 
-__all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel",
+__all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
+           "CustomExpandButton",
            "CustomOnButton", "CustomSyncButton", "CustomInitButton"]
 
 
@@ -277,3 +278,35 @@ class CustomSyncButton(IconButtonBase):
         p.drawLine(QLineF(cx - ln, y2, cx + ln, y2))
         p.drawLine(QLineF(cx - ln, y2, cx - ln + a, y2 - a))
         p.drawLine(QLineF(cx - ln, y2, cx - ln + a, y2 + a))
+
+
+class CustomExpandButton(IconButtonBase):
+    """Шеврон: вниз - развернуть, вверх - свернуть (свойство ``expanded``)."""
+
+    expanded = False
+
+    def set_expanded(self, on: bool) -> None:
+        self.expanded = bool(on)
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy, a = self.width() / 2, self.height() / 2, 4.0
+        d = -a / 2 if self.expanded else a / 2
+        p.drawLine(QLineF(cx - a, cy - d, cx, cy + d))
+        p.drawLine(QLineF(cx, cy + d, cx + a, cy - d))
+
+
+def short_address(address: str) -> str:
+    """Короткая подпись VISA-адреса: IP для TCPIP, серийный номер для USB."""
+    parts = [p for p in address.split("::") if p]
+    if not parts:
+        return address
+    head = parts[0].upper()
+    if head.startswith("TCPIP") and len(parts) >= 2:
+        return parts[1]
+    if head.startswith("USB") and len(parts) >= 4:
+        return parts[3]
+    return address

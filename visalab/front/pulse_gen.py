@@ -15,23 +15,25 @@ import re
 from typing import Any
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout
+from PyQt6.QtWidgets import QPushButton, QVBoxLayout, QWidget
 
 from ..core.params import ConnectionState
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
 from .params import PBGroup, PLabel, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
-from .window import (AddressLabel, CustomInitButton, CustomOnButton, CustomSyncButton, ErrorIndicator,
-                     StatusIndicator, Window)
+from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomOnButton, CustomSyncButton,
+                     ErrorIndicator, StatusIndicator, Window, short_address)
 
 __all__ = ["PulseGenWindow", "PULSE_PRESETS", "ROWS"]
 
 PULSE_PRESETS = ((400e-3, 30e-6),)
 
-#: строки таблицы: (подпись, ключ без "chN.", фабрика виджета, сохранять в ini)
+#: параметры канала: (подпись, ключ без "chN.", фабрика виджета, сохранять в ini).
+#: OUT показывается наверху (всегда), остальное - в сворачиваемой таблице.
 ROWS = (
-    ("OUT", "output", lambda p, k: PSButton(p, k, {"OFF": False, "ON": True}), True),
+    ("OUT", "output", lambda p, k: PSButton(p, k, {f"{k[:3].upper()} OFF": False, f"{k[:3].upper()} ON": True}),
+     True),
     ("TYPE", "wave", lambda p, k: PSButton(p, k, {"PULSE": "PULSE"}), True),
     ("DUTY", "duty", lambda p, k: PNLabel(p, k, "%"), False),
     ("PERI", "period", lambda p, k: PLineEdit(p, k, "s"), True),
@@ -48,15 +50,14 @@ def _fmt(value: float) -> str:
 
 
 class PresetGroup(PBGroup):
-    """Пары (period, width) в QSettings (JSON). Подпись чипа: «400 ms · 30 µs»."""
+    """Пары (period, width) в QSettings (JSON). Чип в две строки: период / ширина."""
 
-    def __init__(self, settings: QSettings, key: str, defaults=PULSE_PRESETS, parent=None):
-        super().__init__(parent=parent)
+    def __init__(self, settings: QSettings, key: str, defaults=PULSE_PRESETS, columns: int = 3, parent=None):
+        super().__init__(columns=columns, parent=parent)
         self.settings, self.key = settings, key
         self.data: list[tuple[float, float]] = []
         for preset in self._load(defaults):
             self._append(preset)
-        self.group_layout.addStretch()
 
     def _load(self, defaults):
         raw = self.settings.value(self.key)
@@ -71,7 +72,7 @@ class PresetGroup(PBGroup):
         self.settings.setValue(self.key, json.dumps(self.data, separators=(",", ":")))
 
     def _append(self, preset):
-        b = self.add_button(f"{_fmt(preset[0])} · {_fmt(preset[1])}")
+        b = self.add_button(f"{_fmt(preset[0])}\n{_fmt(preset[1])}")
         b.setToolTip(f"PERI {_fmt(preset[0])}\nWID {_fmt(preset[1])}")
         self.data.append(preset)
 
@@ -122,25 +123,44 @@ class PulseGenWindow(Window):
         self.init_button = CustomInitButton()
         self.init_button.setToolTip("Reset (*RST) and restore saved values")
         self.init_button.clicked.connect(self._init)
-        self.address = AddressLabel(proxy.address)
+        self.address = AddressLabel(short_address(proxy.address))
+        self.address.setToolTip(proxy.address)
         self.status_indicator = StatusIndicator()
         self.error_indicator = ErrorIndicator()
         for i, w in enumerate((self.on_button, self.sync_button, self.init_button, self.address,
                                self.status_indicator, self.error_indicator)):
             bar.insert_widget(w, i)
+        bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает адрес
+        self.expand_button = CustomExpandButton()
+        self.expand_button.setToolTip("Show / hide all parameters")
+        self.expand_button.clicked.connect(lambda: self.set_expanded(not self.expand_button.expanded))
+        bar.insert_control_widget(self.expand_button)
 
-        # ---------------------------------------------------------- пресеты
+        # ---------------------------------------------------------- виджеты каналов
+        for n in range(1, nch + 1):
+            self.channels.append({name: make(proxy, f"ch{n}.{name}") for _t, name, make, _s in ROWS
+                                  if proxy.supports(f"ch{n}.{name}")})
+
+        # ---------------------------------------------------------- верх: выходы и пресеты
+        outputs = [ch["output"] for ch in self.channels if "output" in ch]
         self.presets = PresetGroup(settings, f"{self._prefix}/PULSE_PRESETS")
         self.presets.selected.connect(self._apply_preset)
         self.add_button = self._tool("+", "Add preset from CH1 PERI / WID", self._add_preset)
         self.remove_button = self._tool("−", "Remove selected preset", self.presets.remove_selected)
-        preset_line = PanelLine("PRST", self.presets, self.add_button, self.remove_button)
-        self.preset_panel = Panel(PanelTable(preset_line))
+        tools = QWidget()
+        tl = QVBoxLayout(tools)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(4)
+        tl.addWidget(self.add_button)
+        tl.addWidget(self.remove_button)
+        tl.addStretch()
+        top = PanelTable(PanelLine("OUT", *outputs), PanelLine("PRST", self.presets, tools))
+        self.preset_panel = Panel(top)
+        for w in outputs:
+            w.setMinimumWidth(UI_COLUMN_WIDTH_PX)
+        top.lines[1].line_layout.setAlignment(top.lines[1]._name, Qt.AlignmentFlag.AlignTop)
 
-        # ---------------------------------------------------------- таблица
-        for n in range(1, nch + 1):
-            self.channels.append({name: make(proxy, f"ch{n}.{name}") for _t, name, make, _s in ROWS
-                                  if proxy.supports(f"ch{n}.{name}")})
+        # ---------------------------------------------------------- таблица (сворачивается)
         heads = []
         for n in range(1, nch + 1):
             h = PLabel(text=f"CH{n}")
@@ -148,7 +168,7 @@ class PulseGenWindow(Window):
             heads.append(h)
         lines = [PanelLine("", *heads)]
         for title_, name, _m, _s in ROWS:
-            if all(name in ch for ch in self.channels):
+            if name != "output" and all(name in ch for ch in self.channels):
                 lines.append(PanelLine(title_, *(ch[name] for ch in self.channels)))
         self.parameter_panel = Panel(PanelTable(*lines), column_width=UI_COLUMN_WIDTH_PX)
 
@@ -158,6 +178,7 @@ class PulseGenWindow(Window):
         lay.addWidget(self.preset_panel)
         lay.addWidget(self.parameter_panel)
         lay.addStretch()
+        self._layout = lay
 
         # ---------------------------------------------------------- состояние
         keys = [w.key for ch in self.channels for w in ch.values()]
@@ -174,8 +195,17 @@ class PulseGenWindow(Window):
 
         self.address.setMinimumWidth(self.address.sizeHint().width())
         self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.sizeHint().width()))
-        self.adjustSize()
-        self.recall_size(self.sizeHint().expandedTo(QSize(360, 300)))
+        self.recall_size(QSize(self.minimumWidth(), 0))
+        self.set_expanded(settings.value(f"{self._prefix}/EXPANDED", False, type=bool))
+
+    # ------------------------------------------------------------ вид
+    def set_expanded(self, on: bool) -> None:
+        """Полный вид - с таблицей всех параметров; обычный - только выходы и пресеты."""
+        self.expand_button.set_expanded(on)
+        self.parameter_panel.setVisible(on)
+        self.settings.setValue(f"{self._prefix}/EXPANDED", bool(on))
+        self._layout.activate()
+        self.setFixedHeight(self._layout.sizeHint().height())
 
     @staticmethod
     def _tool(text, tip, slot) -> QPushButton:
@@ -204,9 +234,10 @@ class PulseGenWindow(Window):
     def restore(self) -> None:
         """Отправить сохранённые значения (только отличающиеся от текущих)."""
         widgets = self._saved_widgets()
-        # сначала форма (от неё зависят PERI/WID/DLY), выходы - последними
-        rank = {"wave": 0, "output": 2}
-        for w in sorted(widgets, key=lambda w: rank.get(w.key.split(".", 1)[1], 1)):
+        # форма (от неё зависят PERI/WID/DLY) -> нагрузка (пересчитывает уровни, поэтому до HLVL/LLVL)
+        # -> остальное -> выходы последними
+        rank = {"wave": 0, "load": 1, "output": 3}
+        for w in sorted(widgets, key=lambda w: rank.get(w.key.split(".", 1)[1], 2)):
             raw = self.settings.value(self._settings_key(w.key))
             if raw is None:
                 continue
