@@ -41,10 +41,10 @@ def test_line_edit_and_cycle_button(qtbot, opened):
     ch1["high"].editingFinished.emit()
     _wait(qtbot, proxy, "ch1.high", lambda v: v == pytest.approx(1.5))
     assert isinstance(ch1["output"], PSButton)
-    assert ch1["output"].text() == "OFF"
+    assert ch1["output"].text() == "CH1 OFF"
     ch1["output"].click()
     _wait(qtbot, proxy, "ch1.output", lambda v: v is True)
-    qtbot.waitUntil(lambda: ch1["output"].text() == "ON")
+    qtbot.waitUntil(lambda: ch1["output"].text() == "CH1 ON")
     before = proxy.value("ch1.load")
     ch1["load"].click()                                  # HiZ <-> 50 Ω
     _wait(qtbot, proxy, "ch1.load", lambda v: v != before)
@@ -83,3 +83,29 @@ def test_init_restores_saved_values(qtbot, opened, settings):
     _wait(qtbot, proxy, "ch2.delay", lambda v: v == pytest.approx(1e-6))
     _wait(qtbot, proxy, "ch1.low", lambda v: v == pytest.approx(-1.0))
     _wait(qtbot, proxy, "ch1.wave", lambda v: v == "PULSE")
+
+
+def test_collapsible_table_and_short_address(qtbot, opened, settings):
+    from visalab.front.window import short_address
+    sim, proxy, win = opened
+    assert not win.parameter_panel.isVisibleTo(win)          # обычный вид: только выходы и пресеты
+    assert win.channels[0]["output"].isVisibleTo(win)
+    small = win.height()
+    win.set_expanded(True)
+    assert win.parameter_panel.isVisibleTo(win) and win.height() > small
+    assert settings.value(f"{win._prefix}/EXPANDED", type=bool) is True
+    assert short_address("TCPIP0::192.168.0.5::INSTR") == "192.168.0.5"
+    assert short_address("USB0::0xF4EC::0x1102::SDG2XAAQ::INSTR") == "SDG2XAAQ"
+
+
+def test_restore_order_load_before_levels(qtbot, opened, settings):
+    sim, proxy, win = opened
+    sent = []
+    orig = proxy.set
+    proxy.set = lambda k, v: (sent.append(k), orig(k, v))
+    pre = win._prefix
+    settings.setValue(f"{pre}/CH1.HIGH", 3.0)
+    settings.setValue(f"{pre}/CH1.LOAD", "50" if proxy.value("ch1.load") != "50" else "HIZ")
+    settings.setValue(f"{pre}/CH1.OUTPUT", True)
+    win.restore()
+    assert sent.index("ch1.load") < sent.index("ch1.high") < sent.index("ch1.output")
