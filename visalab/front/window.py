@@ -219,7 +219,7 @@ class IconButtonBase(QPushButton):
     def _pen(self, p: QPainter) -> None:
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         pen = QPen(self._icon_color)
-        pen.setWidth(TITLE_BAR_BUTTON_LINE_WIDTH)
+        pen.setWidthF(TITLE_BAR_BUTTON_LINE_WIDTH)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
