@@ -144,6 +144,9 @@ class LNumber(QLineEdit):
     def _update_unit(self, value) -> None:
         """Пустое поле с подсказкой - без единицы (подсказке нужно место); при вводе единица видна."""
         show = not (self.hint and value is None and not self.hasFocus())
+        # подсказка пустого поля - по центру, число - справа
+        self.setAlignment((Qt.AlignmentFlag.AlignRight if show else Qt.AlignmentFlag.AlignHCenter)
+                          | Qt.AlignmentFlag.AlignVCenter)
         if self.unit_button.isVisibleTo(self) != show or self.unit_button.isHidden() == show:
             self.unit_button.setVisible(show)
             w = max(self.unit_button.sizeHint().width(), 26) if show else 0
@@ -603,10 +606,6 @@ class PowerMeterWindow(InstrumentWindow):
         # CAL: график поправки, выбор таблицы (CSV), автокалибровка, GAIN, DUTY, итог, датчик
         self.cal_dir = Path(s.fileName()).resolve().parent / "calibrations"
         self.cal_points: list[tuple[float, float]] = []
-        self.cal_value = QLabel("")
-        self.cal_value.setObjectName("calValue")
-        self.cal_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.cal_value.setToolTip("Table value at the sensor frequency (dB)")
         self.cal_plot = CalPlot()
         self.cal_plot.setToolTip("Calibration table: correction vs frequency; line - sensor frequency")
         self.cal_choice = PChoice([("NONE", "")])
@@ -640,7 +639,7 @@ class PowerMeterWindow(InstrumentWindow):
         plot_line = PanelLine("", self.cal_plot)
         plot_line._name.hide()
         # выбранная таблица и есть «поправка включена»; NONE - без таблицы
-        cal = [plot_line, PanelLine("TABL", self.cal_choice, self.cal_value),
+        cal = [plot_line, PanelLine("TABL", self.cal_choice),
                PanelLine("ACAL", self.acal_start, self.acal_stop, self.acal_points, self.acal_run),
                PanelLine("GAIN", self.gain_on, self.gain), PanelLine("DUTY", self.duty_src, self.duty)]
         if sup("offset"):
@@ -787,10 +786,6 @@ class PowerMeterWindow(InstrumentWindow):
 
     def apply_correction(self) -> None:
         """Записать итоговую поправку в прибор (offset), если она изменилась."""
-        parts = self.correction_parts()
-        freq = self.proxy.value("freq")
-        self.cal_value.setText(f"{parts['cal']:+.3g} dB" if self.cal_points else "")
-        self.cal_value.setToolTip(f"Table value at {si_format(freq, 'Hz', 6)}" if freq else "")
         if self.duty_src.value in ("CH1", "CH2"):
             self.duty.setReadOnly(True)
             duty = self.duty_value()
