@@ -81,6 +81,7 @@ class SourceField(PLineEdit):
         b = self.unit_button
         if b is None:
             return
+        b.setStyleSheet("text-align: left;")             # единица и мелкий текст - от одной линии
         b.ensurePolished()
         w = max(b.sizeHint().width(), 26)
         b.setGeometry(2, 2, w, max(int(self.height() * 0.5) - 2, 0))
