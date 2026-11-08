@@ -65,6 +65,10 @@ def test_preset_add_apply_and_eqphase(qtbot, opened):
         _wait(qtbot, proxy, f"ch{n}.period", lambda v: v == pytest.approx(2e-3))
         _wait(qtbot, proxy, f"ch{n}.width", lambda v: v == pytest.approx(50e-6))
     assert sim.eqphase_count > eq0
+    assert win.presets.find(2e-3, 50e-6) == 0            # последний использованный - первый
+    win._apply_preset(1)
+    assert win.presets.find(2e-3, 50e-6) == 1
+    idx = 1
     # пресеты сохраняются в ini и удаляются
     win.presets.set_checked(idx)
     assert win.presets.remove_selected()
