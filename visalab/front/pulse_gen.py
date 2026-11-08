@@ -14,35 +14,77 @@ import math
 import re
 from typing import Any
 
-from PyQt6.QtCore import QSettings, QSize, Qt
+from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QFrame, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
-from ..core.params import ConnectionState
+from ..core.params import ConnectionState, Kind
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
 from .params import PBGroup, PLabel, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
-from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
-from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomOnButton, CustomSyncButton,
+from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
+from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, Switch,
                      ErrorIndicator, StatusIndicator, Window, short_address)
 
 __all__ = ["PulseGenWindow", "PULSE_PRESETS", "ROWS"]
 
 PULSE_PRESETS = ((400e-3, 30e-6, "PULSE"),)       # (PERI, WID, форма)
 
-#: параметры канала: (подпись, ключ без "chN.", фабрика виджета, сохранять в ini).
-#: OUT показывается наверху (всегда), остальное - в сворачиваемой таблице.
-ROWS = (
-    ("OUT", "output", lambda p, k: PSButton(p, k, {f"{k[:3].upper()} OFF": False, f"{k[:3].upper()} ON": True}),
-     True),
-    ("TYPE", "wave", lambda p, k: PSButton(p, k, {c: c for c in (p.params[k].choices or ("PULSE",))}), True),
-    ("DUTY", "duty", lambda p, k: PNLabel(p, k, "%"), False),
-    ("PERI", "period", lambda p, k: PLineEdit(p, k, "s"), True),
-    ("WID", "width", lambda p, k: PLineEdit(p, k, "s"), True),
-    ("HLVL", "high", lambda p, k: PLineEdit(p, k, "V"), True),
-    ("LLVL", "low", lambda p, k: PLineEdit(p, k, "V"), True),
-    ("DLY", "delay", lambda p, k: PLineEdit(p, k, "s"), True),
-    ("LOAD", "load", lambda p, k: PSButton(p, k, {"50 Ω": "50", "HiZ": "HIZ"}), True),
+def _auto(proxy: InstrumentProxy, key: str):
+    """Виджет по типу параметра: BOOL - OFF/ON, ENUM - список, число/строка - поле."""
+    spec = proxy.params[key]
+    if spec.kind is Kind.BOOL:
+        return PSButton(proxy, key, [("OFF", False), ("ON", True)])
+    if spec.kind is Kind.ENUM:
+        return PSButton(proxy, key, [(c, c) for c in spec.choices])
+    return PLineEdit(proxy, key)
+
+
+#: строка: (подпись, ключ без "chN.", фабрика виджета, сохранять в ini)
+OUTPUT_ROW = ("OUT", "output",
+              lambda p, k: PSButton(p, k, {f"{k[:3].upper()} OFF": False, f"{k[:3].upper()} ON": True}), True)
+
+#: вкладки развёрнутой таблицы: (название, ключ включения режима или None, строки)
+PAGES = (
+    ("MAIN", None, (
+        ("TYPE", "wave", _auto, True),
+        ("DUTY", "duty", lambda p, k: PNLabel(p, k, "%"), False),
+        ("PERI", "period", _auto, True),
+        ("WID", "width", _auto, True),
+        ("HLVL", "high", _auto, True),
+        ("LLVL", "low", _auto, True),
+        ("DLY", "delay", _auto, True),
+        ("LOAD", "load", lambda p, k: PSButton(p, k, {"50 Ω": "50", "HiZ": "HIZ"}), True),
+    )),
+    ("MOD", "mod_state", (
+        ("STAT", "mod_state", _auto, True),
+        ("TYPE", "mod_type", _auto, True),
+        ("SRC", "mod_source", _auto, True),
+        ("SHP", "mod_shape", _auto, True),
+        ("FRQ", "mod_freq", _auto, True),
+        ("DEPT", "mod_depth", _auto, True),
+        ("DEVI", "mod_dev", _auto, True),
+    )),
+    ("SWP", "sweep_state", (
+        ("STAT", "sweep_state", _auto, True),
+        ("TIME", "sweep_time", _auto, True),
+        ("STRT", "sweep_start", _auto, True),
+        ("STOP", "sweep_stop", _auto, True),
+        ("MODE", "sweep_mode", _auto, True),
+        ("DIR", "sweep_dir", _auto, True),
+        ("TRIG", "sweep_trig", _auto, True),
+    )),
+    ("BRST", "burst_state", (
+        ("STAT", "burst_state", _auto, True),
+        ("MODE", "burst_mode", _auto, True),
+        ("PER", "burst_period", _auto, True),
+        ("CYC", "burst_cycles", _auto, True),
+        ("TRIG", "burst_trig", _auto, True),
+        ("DLY", "burst_delay", _auto, True),
+    )),
 )
+ROWS = (OUTPUT_ROW,) + tuple(row for _t, _s, rows in PAGES for row in rows)
+#: порядок восстановления: форма -> нагрузка (до уровней) -> остальное -> включение режимов -> выходы
+RESTORE_RANK = {"wave": 0, "load": 1, "mod_state": 3, "sweep_state": 3, "burst_state": 3, "output": 4}
 
 
 def _fmt(value: float) -> str:
@@ -140,8 +182,9 @@ PRESET_GAP = 4
 class HScrollArea(QScrollArea):
     """Одна строка с прокруткой вбок без полосы, листается колесом мыши."""
 
-    def __init__(self, widget: QWidget, parent=None):
+    def __init__(self, widget: QWidget, height: int = PRESET_HEIGHT, parent=None):
         super().__init__(parent)
+        self._height = height
         self.setObjectName("hscroll")
         self.setWidget(widget)
         self.setWidgetResizable(True)
@@ -149,11 +192,11 @@ class HScrollArea(QScrollArea):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(PRESET_HEIGHT)
+        self.setFixedHeight(height)
         self.setMinimumWidth(1)
 
     def sizeHint(self):  # noqa: N802 - Qt
-        return QSize(1, PRESET_HEIGHT)
+        return QSize(1, self._height)
 
     def wheelEvent(self, e):  # noqa: N802 - Qt
         bar = self.horizontalScrollBar()
@@ -173,7 +216,7 @@ class PulseGenWindow(Window):
 
         # ---------------------------------------------------------- заголовок
         bar = self.titleBar
-        self.on_button = CustomOnButton()
+        self.on_button = Switch()
         self.on_button.setToolTip("Connect / disconnect")
         self.on_button.set_status(OFF)
         self.on_button.clicked.connect(self._toggle_connection)
@@ -221,17 +264,44 @@ class PulseGenWindow(Window):
             w.setMinimumWidth(UI_COLUMN_WIDTH_PX)
         top.lines[1].line_layout.setAlignment(top.lines[1]._name, Qt.AlignmentFlag.AlignTop)
 
-        # ---------------------------------------------------------- таблица (сворачивается)
-        heads = []
-        for n in range(1, nch + 1):
-            h = PLabel(text=f"CH{n}")
-            h.setObjectName("heading")
-            heads.append(h)
-        lines = [PanelLine("", *heads)]
-        for title_, name, _m, _s in ROWS:
-            if name != "output" and all(name in ch for ch in self.channels):
-                lines.append(PanelLine(title_, *(ch[name] for ch in self.channels)))
-        self.parameter_panel = Panel(PanelTable(*lines), column_width=UI_COLUMN_WIDTH_PX)
+        # ---------------------------------------------------------- вкладки и таблицы (сворачиваются)
+        self.tabs = PBGroup()
+        self.tabs.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.pages: list[PanelTable] = []
+        self._page_states: list[str | None] = []
+        for title_, state, rows in PAGES:
+            present = [r for r in rows if all(r[1] in ch for ch in self.channels)]
+            if not present:
+                continue
+            heads = []
+            for n in range(1, nch + 1):
+                h = PLabel(text=f"CH{n}")
+                h.setObjectName("heading")
+                heads.append(h)
+            lines = [PanelLine("", *heads)]
+            lines += [PanelLine(t, *(ch[name] for ch in self.channels)) for t, name, _m, _s in present]
+            self.pages.append(PanelTable(*lines))
+            self._page_states.append(state)
+            tab = self.tabs.add_button(title_)
+            tab.setObjectName("tab")
+            tab.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.tabs.selected.connect(self.set_page)
+        self.tab_scroll = HScrollArea(self.tabs, UI_CONTROL_HEIGHT_PX)
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(8)
+        bl.addWidget(self.tab_scroll)
+        for page in self.pages:
+            bl.addWidget(page)
+        self.parameter_panel = Panel(body)
+        label_w = 0
+        for page in self.pages:
+            page.build(UI_COLUMN_WIDTH_PX)
+            label_w = max(label_w, page.lines[0]._name.width(), *(ln.label_hint() for ln in page.lines))
+        for page in self.pages:
+            for ln in page.lines:
+                ln.set_label_width(label_w)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
@@ -255,10 +325,12 @@ class PulseGenWindow(Window):
         self._on_state(proxy.state)
 
         self.address.setMinimumWidth(self.address.sizeHint().width())
-        self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.sizeHint().width()))
+        self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.minimumSize().width()))
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.recall_size(QSize(self.minimumWidth(), 0))
+        self.set_page(settings.value(f"{self._prefix}/TAB", 0, type=int), fit=False)
         self.set_expanded(settings.value(f"{self._prefix}/EXPANDED", False, type=bool))
+        self._update_tabs()
 
     # ------------------------------------------------------------ вид
     def set_expanded(self, on: bool) -> None:
@@ -266,8 +338,39 @@ class PulseGenWindow(Window):
         self.expand_button.set_expanded(on)
         self.parameter_panel.setVisible(on)
         self.settings.setValue(f"{self._prefix}/EXPANDED", bool(on))
+        self._fit_height()
+
+    def _fit_height(self, again: bool = True) -> None:
+        """Высота окна - по содержимому (вложенные раскладки пересчитываются не сразу)."""
+        for w in (self.parameter_panel, self.parameter_panel.table, self.preset_panel):
+            if w.layout():
+                w.layout().invalidate()
+        self._layout.invalidate()
         self._layout.activate()
         self.setFixedHeight(self._layout.sizeHint().height())
+        if again:
+            QTimer.singleShot(0, lambda: self._fit_height(False))
+
+    def set_page(self, index: int, fit: bool = True) -> None:
+        """Показать вкладку таблицы (MAIN / MOD / SWP / BRST)."""
+        index = index if 0 <= index < len(self.pages) else 0
+        for i, page in enumerate(self.pages):
+            page.setVisible(i == index)
+        self.tabs.set_checked(index)
+        self.tab_scroll.ensureWidgetVisible(self.tabs.buttons()[index], 0, 0)
+        self.settings.setValue(f"{self._prefix}/TAB", index)
+        if fit:
+            self._fit_height()
+
+    def _update_tabs(self) -> None:
+        """Вкладка режима инвертирована, если режим включён хотя бы на одном канале."""
+        for tab, state in zip(self.tabs.buttons(), self._page_states):
+            on = bool(state) and any(self.proxy.value(f"ch{n}.{state}") is True
+                                     for n in range(1, len(self.channels) + 1))
+            if tab.property("on") != on:
+                tab.setProperty("on", on)
+                tab.style().unpolish(tab)
+                tab.style().polish(tab)
 
     @staticmethod
     def _tool(text, tip, slot, height=None) -> QPushButton:
@@ -304,6 +407,8 @@ class PulseGenWindow(Window):
         return [w for ch in self.channels for name, w in ch.items() if name in saved]
 
     def _on_param(self, key: str, value: Any) -> None:
+        if key.endswith("_state"):
+            self._update_tabs()
         if self._resetting:              # после *RST прибор отдаёт заводские значения - не сохранять
             return
         if value is not None and any(w.key == key for w in self._saved_widgets()):
@@ -313,9 +418,8 @@ class PulseGenWindow(Window):
         """Отправить сохранённые значения (только отличающиеся от текущих)."""
         widgets = self._saved_widgets()
         # форма (от неё зависят PERI/WID/DLY) -> нагрузка (пересчитывает уровни, поэтому до HLVL/LLVL)
-        # -> остальное -> выходы последними
-        rank = {"wave": 0, "load": 1, "output": 3}
-        for w in sorted(widgets, key=lambda w: rank.get(w.key.split(".", 1)[1], 2)):
+        # -> остальное -> включение режимов -> выходы последними
+        for w in sorted(widgets, key=lambda w: RESTORE_RANK.get(w.key.split(".", 1)[1], 2)):
             raw = self.settings.value(self._settings_key(w.key))
             if raw is None:
                 continue

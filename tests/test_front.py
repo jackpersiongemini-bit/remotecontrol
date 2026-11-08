@@ -153,3 +153,33 @@ def test_wave_type_menu_and_preset_wave(qtbot, opened):
     _wait(qtbot, proxy, "ch1.wave", lambda v: v == "PULSE")
     _wait(qtbot, proxy, "ch1.width", lambda v: v == pytest.approx(10e-6))
     assert win.presets.buttons()[win.presets.find(1e-3, 10e-6)].text().startswith("PULSE\n")
+
+
+def test_unit_dropdown_value_left(qtbot, opened):
+    from PyQt6.QtCore import Qt
+    sim, proxy, win = opened
+    per = win.channels[0]["period"]
+    per.set_value(2e-3)
+    _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(2e-3))
+    qtbot.waitUntil(lambda: per.text() == "2")
+    assert per.unit_button.text() == "ms" and per.alignment() & Qt.AlignmentFlag.AlignLeft
+    per.set_prefix("µ")                                   # показ в µs, значение то же
+    assert per.text() == "2000" and per.unit_button.text() == "µs"
+    per.setText("1500")                                   # ввод - в выбранной единице
+    per.setModified(True)
+    per.editingFinished.emit()
+    _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(1.5e-3))
+
+
+def test_mode_tabs_and_switch(qtbot, opened):
+    from visalab.front.theme import ON
+    sim, proxy, win = opened
+    assert [b.text() for b in win.tabs.buttons()] == ["MAIN", "MOD", "SWP", "BRST"]
+    win.set_expanded(True)
+    win.set_page(3)
+    assert win.pages[3].isVisibleTo(win) and not win.pages[0].isVisibleTo(win)
+    assert not win.tabs.buttons()[3].property("on")
+    win.channels[0]["burst_state"].click()
+    _wait(qtbot, proxy, "ch1.burst_state", lambda v: v is True)
+    qtbot.waitUntil(lambda: win.tabs.buttons()[3].property("on") is True)
+    assert win.on_button.status() == ON and win.on_button.isChecked()
