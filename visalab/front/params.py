@@ -355,16 +355,20 @@ class Panel(QFrame):
         Panel PLineEdit[readOnly="true"], Panel PLabel {
             background-color: transparent; border-color: transparent;
         }
-        Panel PSButton:hover, Panel QPushButton#chip:hover, Panel QPushButton#tool:hover {
-            background-color: $UI_COLOR_TEXT_MUTED;
+        Panel PSButton[state="true"], Panel PSButton[state="on"] {
+            background-color: $UI_COLOR_INVERT;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             color: $UI_COLOR_TEXT_INVERSE;
         }
-        Panel PSButton[state="true"], Panel PSButton[state="on"] { color: $UI_COLOR_SUCCESS_HOVER; }
+        Panel PSButton:hover, Panel QPushButton#chip:hover, Panel QPushButton#tool:hover {
+            background-color: $UI_COLOR_INVERT_HOVER;
+            font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+            color: $UI_COLOR_TEXT_INVERSE;
+        }
         Panel PSButton:disabled, Panel PLineEdit:disabled { color: $UI_COLOR_BORDER; }
         Panel QPushButton#chip { padding: 2px 8px; min-height: 0; max-height: 1000px; }
         Panel QPushButton#chip:checked {
-            background-color: $UI_COLOR_TEXT_MUTED;
+            background-color: $UI_COLOR_INVERT;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             color: $UI_COLOR_TEXT_INVERSE;
         }
@@ -375,8 +379,8 @@ class Panel(QFrame):
         Panel QPushButton#tool[half="true"] { min-height: 0; max-height: 1000px; }
         QMenu#psmenu { border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 4px; }
         QMenu#psmenu::item { padding: 4px 12px; border-radius: ${UI_BORDER_RADIUS_PX}px; }
-        QMenu#psmenu::item:selected { background-color: $UI_COLOR_TEXT_MUTED; color: $UI_COLOR_TEXT_INVERSE; }
-        QMenu#psmenu::item:checked { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_SUCCESS_HOVER; }
+        QMenu#psmenu::item:selected { background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE; }
+        QMenu#psmenu::item:checked { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         QMenu#psmenu::indicator { width: 0; }
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }

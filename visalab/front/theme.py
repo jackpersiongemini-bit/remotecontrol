@@ -18,7 +18,9 @@ TOKENS = {
     "UI_COLOR_CONTROL": "#2b2b2b",         # заголовок окна
     "UI_COLOR_BORDER": "#444444",
     "UI_COLOR_TEXT": "#f2f2f2",
-    "UI_COLOR_TEXT_MUTED": "#e6e6e6",      # текст в панелях и фон под hover/checked
+    "UI_COLOR_TEXT_MUTED": "#e6e6e6",      # текст в панелях
+    "UI_COLOR_INVERT": "#b8b8b8",          # инверсия: выбранный пресет, включённый канал
+    "UI_COLOR_INVERT_HOVER": "#9a9a9a",    # инверсия при наведении
     "UI_COLOR_TEXT_INVERSE": "#222222",
     "UI_COLOR_ACCENT": "#f2f2f2",
     "UI_COLOR_SUCCESS": "#2e9d4f",
