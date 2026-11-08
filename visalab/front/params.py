@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
-from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout,
+from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, PStatus
@@ -159,6 +159,19 @@ class PSButton(QPushButton, _Bound):
         _repolish(self)
 
     def next_value(self) -> None:
+        """2 варианта - переключение по клику; больше - выпадающий список под кнопкой."""
+        if len(self._data) > 2:
+            menu = QMenu(self)
+            menu.setObjectName("psmenu")
+            current = self._index(self._value)
+            for i, name in enumerate(self._names):
+                act = menu.addAction(name)
+                act.setCheckable(True)
+                act.setChecked(i == current)
+                act.triggered.connect(lambda _=False, v=self._data[i]: self.set_value(v))
+            menu.setMinimumWidth(self.width())
+            menu.popup(self.mapToGlobal(self.rect().bottomLeft()))
+            return
         i = self._index(self._value)
         self.set_value(self._data[(i + 1) % len(self._data)], force=len(self._data) == 1)
 
@@ -360,6 +373,11 @@ class Panel(QFrame):
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
         }
         Panel QPushButton#tool[half="true"] { min-height: 0; max-height: 1000px; }
+        QMenu#psmenu { border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 4px; }
+        QMenu#psmenu::item { padding: 4px 12px; border-radius: ${UI_BORDER_RADIUS_PX}px; }
+        QMenu#psmenu::item:selected { background-color: $UI_COLOR_TEXT_MUTED; color: $UI_COLOR_TEXT_INVERSE; }
+        QMenu#psmenu::item:checked { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_SUCCESS_HOVER; }
+        QMenu#psmenu::indicator { width: 0; }
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }
     """)
