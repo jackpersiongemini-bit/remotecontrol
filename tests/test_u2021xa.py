@@ -141,3 +141,30 @@ def test_gate_feeds_follow_trigger_source(pm):
     setp(drv, rec, "trig.source", "EXT")
     setp(drv, rec, "detector", "AVERAGE")              # EXT + AVER разрешено, строб у среднего остаётся
     assert sim.feeds[1] == "POW:AVER ON SWEEP1" and not rec.errors
+
+
+def test_float_block_roundtrip():
+    from visalab.core.transport import float_block, parse_float_block
+    vals = [-10.0, 1.5, -120.25]
+    assert parse_float_block(float_block(vals).encode("latin-1")) == vals
+
+
+def test_time_domain_trace(pm):
+    """Временная область: TRAC:STAT ON -> DET NORM, свободный счёт по одному измерению, трасса 1000 точек."""
+    drv, sim, rec = pm
+    sim.set_signal(on_dbm=0.0, width=100e-6, period=1e-3, off_dbm=-60)
+    assert setp(drv, rec, "detector", "AVERAGE") is PStatus.WRITTEN
+    assert setp(drv, rec, "trace.state", True) is PStatus.WRITTEN
+    assert rec.values["detector"] == "NORMAL" and sim.cfg["det"] == "NORM"
+    assert sim.cfg["cont"] is False                    # трасса только при INIT:CONT OFF
+    assert setp(drv, rec, "trace.time", 1e-3) is PStatus.WRITTEN
+    assert setp(drv, rec, "trace.offset", -100e-6) is PStatus.WRITTEN
+    drv.poll()
+    t = rec.values["trace"]
+    assert len(t) == 1000 and t.x[0] == pytest.approx(-100e-6) and t.x[-1] == pytest.approx(900e-6)
+    assert max(t.y) == pytest.approx(0.0, abs=0.01) and min(t.y) == pytest.approx(-60.0, abs=0.01)
+    on = [x for x, y in zip(t.x, t.y) if y > -30]
+    assert on[0] == pytest.approx(0.0, abs=2e-6) and on[-1] == pytest.approx(100e-6, abs=2e-6)
+    assert setp(drv, rec, "detector", "AVERAGE") is PStatus.WRITTEN   # трасса выключается сама
+    assert rec.values["trace.state"] is False and sim.cfg["trac"] is False
+    assert not rec.errors

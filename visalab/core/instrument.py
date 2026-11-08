@@ -201,6 +201,19 @@ class VISAInstrument(QObject):
             self.scpi_log.emit("<<", answer)
         return answer
 
+    def query_float_block(self, command: str) -> list[float]:
+        """Запрос двоичного блока float32 (трасса); в журнал - только число точек."""
+        if not self._quiet:
+            self.scpi_log.emit(">>", command)
+        self._pace()
+        try:
+            values = self.transport.query_float_block(command)
+        finally:
+            self._last_io = time.monotonic()
+        if not self._quiet:
+            self.scpi_log.emit("<<", f"<{len(values)} points>")
+        return values
+
     def query_float(self, command: str) -> float:
         return parse_number(self.query(command))
 

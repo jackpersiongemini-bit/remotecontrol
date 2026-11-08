@@ -135,13 +135,26 @@ def test_zero_needs_confirmation(qtbot, pm):
     assert win.zero_button.text() == "ZERO"
 
 
-def test_time_tab_indicator(qtbot, pm):
+def test_time_domain_trace(qtbot, pm):
     proxy, win, _s = pm
-    proxy.set("detector", "NORMAL")
-    qtbot.waitUntil(lambda: win.tabs.is_on(2), timeout=5000)
     proxy.set("detector", "AVERAGE")
-    qtbot.waitUntil(lambda: not win.tabs.is_on(2), timeout=5000)
-
+    _wait(qtbot, proxy, "detector", lambda v: v == "AVERAGE")
+    proxy.set("trace.state", True)                      # сам переводит датчик в NORMAL
+    _wait(qtbot, proxy, "trace.state", lambda v: v is True)
+    _wait(qtbot, proxy, "detector", lambda v: v == "NORMAL")
+    proxy.set("trace.time", 2e-3)
+    _wait(qtbot, proxy, "trace.time", lambda v: v == pytest.approx(2e-3))
+    qtbot.waitUntil(lambda: win.plot.trace is not None and win.plot.trace.x[-1] == pytest.approx(2e-3),
+                    timeout=5000)
+    t = win.plot.trace
+    assert len(t) == 1000 and t.x_unit == "s"
+    assert max(t.y) == pytest.approx(-10.0, abs=0.01)    # импульс симулятора -10 dBm
+    qtbot.waitUntil(lambda: win.tabs.is_on(2), timeout=5000)
+    win.plot.resize(400, 200)
+    win.plot.grab()                                     # отрисовка без ошибок
+    proxy.set("detector", "AVERAGE")                    # трасса только в NORMAL - выключается
+    _wait(qtbot, proxy, "trace.state", lambda v: v is False)
+    qtbot.waitUntil(lambda: win.plot.trace is None and not win.tabs.is_on(2), timeout=5000)
 
 def test_pm_launcher_with_sdg(qtbot, tmp_path, monkeypatch):
     import run_power_meter

@@ -14,7 +14,11 @@
 * ``INITiate`` - перекрываемая команда: ``INIT;*OPC`` взводит бит OPC регистра ESR по окончании
   измерения. Драйвер ждёт этот бит в опросе, не блокируя поток запросом (при запуске по уровню
   сигнала может не быть сколько угодно долго);
-* ``CAL:ZERO:AUTO ONCE`` / ``CAL:AUTO ONCE`` + ``*OPC?`` (несколько секунд).
+* ``CAL:ZERO:AUTO ONCE`` / ``CAL:AUTO ONCE`` + ``*OPC?`` (несколько секунд);
+* временная область: ``TRAC:STAT ON`` (только DET NORM и INIT:CONT OFF), ``SENS:TRAC:TIME`` (25 нс...1 с),
+  ``SENS:TRAC:OFFS:TIME`` (-1...1 с от задержанного запуска), ``TRAC:UNIT DBM``; после каждого измерения
+  ``TRAC:DATA? MRES`` - 1000 точек двоичным блоком float32. При включённой трассе свободный счёт
+  идёт по одному измерению (INIT;*OPC), а не INIT:CONT ON.
 
 Что драйвер меняет в приборе при подключении (без *RST): единицы CALC1..3 в dBm и
 назначение CALC1..3 (среднее/пик/пик-среднее; в стробе 1 при запуске INT/EXT) - чтобы стандартные ключи
@@ -26,6 +30,7 @@ from typing import Any
 
 from ..core.instrument import VISAInstrument
 from ..core.params import Action, Kind, Param
+from ..core.trace import Trace
 from ..profiles import POWER_METER
 
 __all__ = ["KeysightU2021XA"]
@@ -38,7 +43,8 @@ FEEDS = {1: ("meas.power", "POW:AVER"),
          3: ("meas.ptav", "POW:PTAV")}
 #: по мануалу ``... ON SWEEP<n>`` (строб) разрешён только при TRIG:SOUR INT или EXT, иначе -221
 GATED_SOURCES = ("INT", "EXT")
-RESULT_KEYS = tuple(k for k, _ in FEEDS.values())
+RESULT_KEYS = tuple(k for k, _ in FEEDS.values()) + ("trace",)
+TRACE_RES = "MRES"                     # 1000 точек
 CAL_TIMEOUT_MS = 30000
 
 
@@ -61,6 +67,7 @@ class KeysightU2021XA(VISAInstrument):
             Param("meas.power", "Средняя мощность", F, "dBm", section=meas, group="MEAS"),
             Param("meas.peak", "Пиковая мощность", F, "dBm", section=meas, group="MEAS"),
             Param("meas.ptav", "Пик / среднее", F, "dB", section=meas, group="MEAS"),
+            Param("trace", "Мощность во времени", Kind.TRACE, "dBm", section=meas, group="MEAS"),
             Param("meas.armed", "Ждём запуск", B, section=meas, query="<virtual>"),
             Param("meas.continuous", "Непрерывно", B, section=trig, query="<virtual>", write="<virtual>"),
             Param("trig.source", "Запуск", E, section=trig, query="TRIG:SOUR?", write="TRIG:SOUR {value}",
@@ -83,6 +90,11 @@ class KeysightU2021XA(VISAInstrument):
                   write="SWE1:OFFS:TIME {value}", minimum=-1.0, maximum=1.0, tolerance=1e-4),
             Param("gate.length", "Длина строба", F, "s", section=trig, query="SWE1:TIME?",
                   write="SWE1:TIME {value}", minimum=0.0, maximum=1.0, tolerance=1e-4),
+            Param("trace.state", "Трасса", B, section=trig, query="TRAC:STAT?", write="TRAC:STAT {value}"),
+            Param("trace.time", "Длительность трассы", F, "s", section=trig, query="SENS:TRAC:TIME?",
+                  write="SENS:TRAC:TIME {value}", minimum=25e-9, maximum=1.0, tolerance=1e-4),
+            Param("trace.offset", "Начало трассы", F, "s", section=trig, query="SENS:TRAC:OFFS:TIME?",
+                  write="SENS:TRAC:OFFS:TIME {value}", minimum=-1.0, maximum=1.0, tolerance=1e-4),
             Param("freq", "Частота сигнала", F, "Hz", section=sens, query="FREQ?", write="FREQ {value}",
                   minimum=1e3, maximum=1000e9, tolerance=1e-9),
             Param("detector", "Режим", E, section=sens, query="DET:FUNC?", write="DET:FUNC {value}",
@@ -118,6 +130,7 @@ class KeysightU2021XA(VISAInstrument):
         self._results = dict.fromkeys(RESULT_KEYS)
         for n in FEEDS:
             self.write(f"UNIT{n}:POW DBM")
+        self.write("TRAC:UNIT DBM")
         det = "NORMAL" if self.query("DET:FUNC?").strip().upper().startswith("NORM") else "AVERAGE"
         src = self._params["trig.source"].from_scpi(self.query("TRIG:SOUR?"))
         self._configure_feeds(det, src)
@@ -143,6 +156,10 @@ class KeysightU2021XA(VISAInstrument):
         return self._values.get("detector") == "NORMAL"
 
     @property
+    def _tracing(self) -> bool:
+        return self._values.get("trace.state") is True
+
+    @property
     def _free_run(self) -> bool:
         return self._values.get("trig.source", "IMM") == "IMM"
 
@@ -157,9 +174,25 @@ class KeysightU2021XA(VISAInstrument):
         if key in ("trig.source", "detector"):
             self._change_mode(spec, value)
             return
+        if key == "trace.state":
+            self._set_tracing(bool(value))
+            return
         super().write_param(spec, value)
         if was_armed:
             self._arm()
+
+    def _set_tracing(self, on: bool) -> None:
+        """Трасса требует DET NORM и INIT:CONT OFF: режим датчика переключается сам."""
+        if on and not self._normal:
+            self._change_mode(self._params["detector"], "NORMAL")
+            self._publish("detector", "NORMAL")
+        self.write("INIT:CONT OFF")
+        super().write_param(self._params["trace.state"], on)
+        self._values["trace.state"] = on
+        if not on:
+            self._results["trace"] = None
+            self._publish("trace", None)
+        self._apply_run_mode()
 
     def _change_mode(self, spec: Param, value: Any) -> None:
         """Смена запуска/режима в порядке, при котором прибор не даёт -221:
@@ -174,6 +207,10 @@ class KeysightU2021XA(VISAInstrument):
             new_det = "NORMAL" if value == "INT" else det
         if src in GATED_SOURCES and new_src not in GATED_SOURCES:
             self._configure_feeds(det, new_src)  # снять строб, пока источник ещё INT/EXT
+        if new_det == "AVERAGE" and self._tracing:   # трасса только в NORMal
+            self.write("TRAC:STAT OFF")
+            self._values["trace.state"] = False
+            self._publish("trace.state", False)
         if spec.key == "detector" and new_src != src:
             self.write("TRIG:SOUR IMM")
         if spec.key == "trig.source" and new_det != det:
@@ -204,7 +241,7 @@ class KeysightU2021XA(VISAInstrument):
     def _apply_run_mode(self) -> None:
         """Свободный счёт - INIT:CONT ON и чтение при опросе; иначе - взвод по одному."""
         self._abort()
-        if self._free_run and self._continuous:
+        if self._free_run and self._continuous and not self._tracing:
             self.write("INIT:CONT ON")
         else:
             self.write("INIT:CONT OFF")
@@ -231,12 +268,24 @@ class KeysightU2021XA(VISAInstrument):
         for n, (key, _) in FEEDS.items():
             if key in keys:
                 out[key] = self.query_float(f"FETC{n}?")
+        if self._tracing and self._normal:
+            out["trace"] = self._read_trace()
         self._results = out
         for k, v in out.items():
             self._publish(k, v)
 
+    def _read_trace(self) -> Trace | None:
+        y = self.query_float_block(f"TRAC:DATA? {TRACE_RES}")
+        if not y:
+            return None
+        start = float(self._values.get("trace.offset") or 0.0)
+        length = float(self._values.get("trace.time") or 100e-6)
+        meta = {"trigger": self._values.get("trig.source"), "delay": self._values.get("trig.delay"),
+                "gate": (self._values.get("gate.start"), self._values.get("gate.length"))}
+        return Trace.linear(start, start + length, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
+
     def poll(self) -> None:
-        if self._free_run and self._continuous:
+        if self._free_run and self._continuous and not self._tracing:
             self._fetch()
             return
         if not self._armed:

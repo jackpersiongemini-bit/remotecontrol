@@ -5,7 +5,8 @@ PTAV, клик - следующая) слева сверху, под ней за
 сколько добавляет поправка (CAL, клик - вкладка CAL).
 
 Вкладки: MAIN (частота, усреднение, запуск), CAL (таблица калибровки по частоте, GAIN, DUTY,
-обнуление и калибровка датчика), TIME (детектор, задержка, строб, пик и пик/среднее).
+обнуление и калибровка датчика), TIME - режим временной области: график мощности от времени
+(трасса датчика после каждого измерения, строб на графике) и его настройки.
 
 Поправка считается в окне и пишется в прибор как offset (CORR:GAIN2), поэтому все показания
 прибора уже исправлены:  P = Pизм + CAL(f) − GAIN + 10·lg(100 / DUTY).
@@ -21,19 +22,22 @@ import json
 import math
 from typing import Any
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QAbstractItemView, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                              QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..core.params import ConnectionState, Kind
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format, si_parse
+from ..core.trace import Trace
 from . import instrument_window as _iw
 from .instrument_window import LINKS, InstrumentWindow
 from .params import IndicatorButton, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
-from .theme import UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, render_qss
+from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
+                    UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
 
-__all__ = ["PowerMeterWindow", "PowerReadout", "CalTable", "saved_connection", "interpolate"]
+__all__ = ["PowerMeterWindow", "PowerReadout", "TracePlot", "CalTable", "saved_connection", "interpolate"]
 
 CONNECTION_GROUP = "CONNECTION/POWER_METER"
 OFFSET_LIMIT = 100.0                    # CORR:GAIN2: ±100 dB
@@ -429,9 +433,121 @@ class PowerReadout(QFrame):
         self.cal_button.setText("CAL " + ("---" if cal is None else f"{cal:+.2f} dB"))
 
 
+
+# ---------------------------------------------------------------- график временной области
+class TracePlot(QWidget):
+    """Мощность от времени: сетка, трасса, строб (полупрозрачная полоса), курсор под мышью."""
+
+    DIVS_X, DIVS_Y = 10, 6
+    DB_PER_DIV = 10.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.trace: Trace | None = None
+        self.gate: tuple[float, float] | None = None
+        self._mouse: QPointF | None = None
+        self.setMouseTracking(True)
+        self.setMinimumHeight(180)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def set_trace(self, trace: Trace | None) -> None:
+        self.trace = trace if isinstance(trace, Trace) and len(trace) > 1 else None
+        self.update()
+
+    def set_gate(self, start, length) -> None:
+        self.gate = (float(start), float(length)) if isinstance(start, (int, float)) and \
+            isinstance(length, (int, float)) and length > 0 else None
+        self.update()
+
+    def y_range(self) -> tuple[float, float]:
+        """Сверху - максимум трассы, округлённый вверх до 10 dB; шкала 10 dB / дел."""
+        top = math.ceil(max(self.trace.y) / 10.0) * 10.0 if self.trace else 0.0
+        return top - self.DIVS_Y * self.DB_PER_DIV, top
+
+    def _plot_rect(self) -> QRectF:
+        return QRectF(self.rect()).adjusted(6, 6, -6, -20)
+
+    def mouseMoveEvent(self, e):  # noqa: N802 - Qt
+        self._mouse = e.position()
+        self.update()
+
+    def leaveEvent(self, e):  # noqa: N802 - Qt
+        self._mouse = None
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(UI_COLOR_BACKGROUND))
+        p.drawRoundedRect(QRectF(self.rect()), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+        r = self._plot_rect()
+        font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
+        font.setPointSizeF(8)
+        p.setFont(font)
+        grid = QPen(QColor(UI_COLOR_BORDER), 1)
+        p.setPen(grid)
+        for i in range(self.DIVS_X + 1):
+            x = r.left() + r.width() * i / self.DIVS_X
+            p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+        for i in range(self.DIVS_Y + 1):
+            y = r.top() + r.height() * i / self.DIVS_Y
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+        muted = QColor(UI_COLOR_BORDER_LIGHT)
+        t = self.trace
+        if t is None:
+            p.setPen(muted)
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "NO TRACE")
+            return
+        x0, x1 = t.x[0], t.x[-1]
+        lo, hi = self.y_range()
+
+        def px(x):
+            return r.left() + (x - x0) / (x1 - x0) * r.width() if x1 != x0 else r.left()
+
+        def py(y):
+            return r.bottom() - (min(max(y, lo), hi) - lo) / (hi - lo) * r.height()
+
+        if self.gate:                                  # строб
+            g0, g1 = max(px(self.gate[0]), r.left()), min(px(self.gate[0] + self.gate[1]), r.right())
+            if g1 > g0:
+                band = QColor(UI_COLOR_INVERT)
+                band.setAlpha(40)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(band)
+                p.drawRect(QRectF(g0, r.top(), g1 - g0, r.height()))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath(QPointF(px(t.x[0]), py(t.y[0])))
+        for x, y in zip(t.x[1:], t.y[1:]):
+            path.lineTo(px(x), py(y))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
+        p.drawPath(path)
+        # подписи: верх шкалы и дБ/дел слева сверху, время по краям снизу
+        p.setPen(muted)
+        p.drawText(QRectF(r.left() + 3, r.top() + 1, r.width(), 14), Qt.AlignmentFlag.AlignLeft,
+                   f"{hi:g} dBm  {self.DB_PER_DIV:g} dB/div")
+        bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 14)
+        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, "s", 4))
+        p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, 's', 3)}/div")
+        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, "s", 4))
+        m = self._mouse
+        if m is not None and r.contains(m):              # курсор: точка трассы под мышью
+            i = min(range(len(t)), key=lambda k: abs(px(t.x[k]) - m.x()))
+            cx, cy = px(t.x[i]), py(t.y[i])
+            p.setPen(QPen(muted, 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(cx, r.top()), QPointF(cx, r.bottom()))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(UI_COLOR_TEXT))
+            p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
+            p.setPen(QColor(UI_COLOR_TEXT))
+            p.drawText(QRectF(r.left(), r.top() + 1, r.width() - 3, 14), Qt.AlignmentFlag.AlignRight,
+                       f"{si_format(t.x[i], 's', 4)}  {t.y[i]:.2f} dBm")
+
+
 # ---------------------------------------------------------------- окно
 #: порядок восстановления: детектор (меняет запуск) -> запуск -> остальное -> непрерывный счёт
-RESTORE_RANK = {"detector": 0, "trig.source": 1, "meas.continuous": 4}
+RESTORE_RANK = {"detector": 0, "trig.source": 1, "trace.state": 3, "meas.continuous": 4}
 
 
 class PowerMeterWindow(InstrumentWindow):
@@ -527,25 +643,27 @@ class PowerMeterWindow(InstrumentWindow):
             cal.append(PanelLine("SENS", *acts))
         self.page_specs.append(("CAL", ("offset.state",) if sup("offset.state") else (), PanelTable(*cal)))
 
-        # TIME
-        time_ = add((("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
-                     ("DLY", "trig.delay", None), ("HOLD", "trig.holdoff", None), ("GSTR", "gate.start", None),
-                     ("GLEN", "gate.length", None), ("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
-        self.page_specs.append(("TIME", (), PanelTable(*time_)))
-        self._time_tab = len(self.page_specs) - 1
+        # TIME: режим временной области - график мощности от времени и его настройки
+        self.plot = TracePlot()
+        self.plot.setToolTip("Power vs time after each measurement; shaded band - gate")
+        plot_line = PanelLine("", self.plot)
+        plot_line._name.hide()
+        time_ = add((("TRAC", "trace.state", None), ("TLEN", "trace.time", None), ("TOFS", "trace.offset", None),
+                     ("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
+                     ("DLY", "trig.delay", None), ("GSTR", "gate.start", None), ("GLEN", "gate.length", None),
+                     ("HOLD", "trig.holdoff", None), ("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
+        self.page_specs.append(("TIME", ("trace.state",) if sup("trace.state") else (),
+                                PanelTable(plot_line, *time_)))
 
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
 
     # ------------------------------------------------------------ вкладки
-    def _update_tabs(self) -> None:
-        super()._update_tabs()
-        if hasattr(self, "_time_tab"):
-            self.tabs.set_on(self._time_tab, self.proxy.value("detector") == "NORMAL")
-
     def on_param(self, key: str, value: Any) -> None:
-        if key == "detector":
-            self._update_tabs()
+        if key == "trace":
+            self.plot.set_trace(value)
+        elif key in ("gate.start", "gate.length"):
+            self.plot.set_gate(self.proxy.value("gate.start"), self.proxy.value("gate.length"))
         elif key == "freq":
             self.apply_correction()
 

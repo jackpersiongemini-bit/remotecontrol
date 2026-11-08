@@ -164,6 +164,11 @@ POWER_METER = Profile(
         Slot("trig.holdoff", F, "s"),
         Slot("gate.start", F, "s", doc="начало строба от момента запуска"),
         Slot("gate.length", F, "s", doc="длительность строба"),
+        Slot("trace", T, "dBm", readonly=True,
+             doc="мощность во времени (x - с от задержанного запуска), после каждого измерения при trace.state"),
+        Slot("trace.state", B, doc="режим временной области: снимать трассу (нужен detector = NORMAL)"),
+        Slot("trace.time", F, "s", doc="длительность трассы"),
+        Slot("trace.offset", F, "s", doc="начало трассы от задержанного запуска"),
     ),
     actions=(
         ActionSlot("zero", required=True, doc="обнуление датчика (вход без сигнала!)"),
