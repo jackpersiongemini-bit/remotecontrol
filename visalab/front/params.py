@@ -362,7 +362,7 @@ class PBGroup(QWidget):
             self.group_layout.addWidget(b, r, c)
 
     def add_button(self, name: str) -> QPushButton:
-        b = IndicatorButton(name)
+        b = QPushButton(name)                  # выбор (не включение) - инверсия, как у вкладки
         b.setObjectName("chip")
         b.setCheckable(True)
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -566,9 +566,9 @@ class Panel(QFrame):
         Panel PSButton:disabled, Panel PLineEdit:disabled { color: $UI_COLOR_BORDER; }
         Panel QPushButton#chip { padding: 2px 8px; min-height: 0; max-height: 1000px; }
         Panel QPushButton#chip:checked {
-            background-color: $UI_COLOR_BACKGROUND;
+            background-color: $UI_COLOR_INVERT;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-            color: $UI_COLOR_TEXT;
+            color: $UI_COLOR_TEXT_INVERSE;
         }
         Panel QPushButton#chip:checked:hover, Panel PSButton[state="true"]:hover, Panel PSButton[state="on"]:hover {
             background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE;
