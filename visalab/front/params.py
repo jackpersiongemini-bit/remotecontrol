@@ -1,6 +1,7 @@
 """Виджеты параметров в духе Parameter.py Алексея, но поверх InstrumentProxy.
 
 * ``PLineEdit`` - число с единицей (SI-префиксы при вводе и показе), запись по Enter/уходу фокуса;
+* ``PSpinBox``  - то же со стрелками: шаг - разряд под курсором (как ручка прибора);
 * ``PNLabel``   - то же, только показ;
 * ``PSButton``  - кнопка, клик переключает на следующий вариант ({"OFF": False, "ON": True});
 * ``PLabel``    - текст / значение прибора;
@@ -14,9 +15,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QObject, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QTabBar, QVBoxLayout,
+from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
+                             QLineEdit, QMenu, QPushButton, QTabBar, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
@@ -27,7 +29,7 @@ from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_
                     UI_CONTROL_HEIGHT_PX, render_qss)
 from .window import WriteState
 
-__all__ = ["PLineEdit", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
+__all__ = ["PLineEdit", "PSpinBox", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
            "WriteTracker"]
 
 _WSTATE = {PStatus.WRITING: "process", PStatus.ERROR: "error", PStatus.INVALID: "error",
@@ -72,7 +74,7 @@ class _Bound:
 
 
 #: префиксы, которые предлагает список единиц (порядок - по возрастанию)
-UNIT_PREFIXES = {"s": ("n", "µ", "m", ""), "Hz": ("", "k", "M"), "V": ("m", ""), "Vpp": ("m", ""),
+UNIT_PREFIXES = {"s": ("n", "µ", "m", ""), "Hz": ("", "k", "M", "G"), "V": ("m", ""), "Vpp": ("m", ""),
                  "A": ("m", ""), "W": ("m", "")}
 
 
@@ -225,6 +227,179 @@ class PLineEdit(QLineEdit, _Bound):
 
     def set_value(self, value: Any) -> bool:
         """Отправить значение, если оно отличается от текущего. True - если отправлено."""
+        if self._value is not None and self.spec.same(value, self._value):
+            return False
+        self.proxy.set(self.key, value)
+        return True
+
+
+class PSpinBox(QDoubleSpinBox, _Bound):
+    """Число со стрелками / колесом: шаг - разряд слева от курсора (как ручка прибора).
+
+    Единица - кнопка слева со списком префиксов (как у PLineEdit). Ввод с клавиатуры пишется
+    по Enter / уходу фокуса, шаг стрелкой или колесом - сразу.
+    """
+
+    def __init__(self, proxy: InstrumentProxy, key: str, prefixes: tuple[str, ...] | None = None, parent=None):
+        super().__init__(parent)
+        self.unit = proxy.params[key].unit
+        self.prefixes = prefixes or UNIT_PREFIXES.get(self.unit, ("",))
+        self.prefix = "" if "" in self.prefixes else self.prefixes[0]
+        self.pinned = False
+        self.setLocale(QLocale.c())
+        self.setKeyboardTracking(False)
+        self.setDecimals(9)
+        self.setRange(-1e15, 1e15)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        self.setCorrectionMode(QAbstractSpinBox.CorrectionMode.CorrectToPreviousValue)
+        self.unit_button: QPushButton | None = None
+        if self.unit:
+            b = QPushButton(self.unit, self)
+            b.setObjectName("unit")
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            if len(self.prefixes) > 1:
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(self._unit_menu)
+            else:
+                b.setProperty("static", True)
+            self.unit_button = b
+        self.bind(proxy, key)
+        self.editingFinished.connect(self.commit)
+        self._update_unit()
+
+    @property
+    def value_si(self):
+        return self._value
+
+    # -------------------------------------------------------- единица
+    def _factor(self) -> float:
+        return SI_PREFIXES[self.prefix] if self.prefix else 1.0
+
+    def _auto_prefix(self, value) -> None:
+        if self.pinned or not isinstance(value, (int, float)) or isinstance(value, bool) or not value:
+            return
+        chosen = self.prefixes[0]
+        for p in self.prefixes:
+            if abs(value) >= (SI_PREFIXES[p] if p else 1.0) * 0.9999999:
+                chosen = p
+        self.prefix = chosen
+
+    def _update_unit(self) -> None:
+        if self.unit_button is None:
+            return
+        self.unit_button.setText(f"{self.prefix}{self.unit}")
+        self._place_unit()
+
+    def _place_unit(self) -> None:
+        b = self.unit_button
+        if b is None:
+            return
+        b.ensurePolished()
+        w = max(b.sizeHint().width(), 26)
+        b.setGeometry(2, 2, w, max(self.height() - 4, 0))
+        self.lineEdit().setTextMargins(w, 0, 0, 0)
+
+    def resizeEvent(self, e):  # noqa: N802 - Qt
+        super().resizeEvent(e)
+        self._place_unit()
+
+    def _unit_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for p in self.prefixes:
+            act = menu.addAction(f"{p}{self.unit}")
+            act.setCheckable(True)
+            act.setChecked(p == self.prefix)
+            act.triggered.connect(lambda _=False, p=p: self.set_prefix(p))
+        menu.popup(self.unit_button.mapToGlobal(self.unit_button.rect().bottomLeft()))
+
+    def set_prefix(self, prefix: str) -> None:
+        self.prefix = prefix
+        self.pinned = True
+        self._update_unit()
+        self.show_value(self._value, force=True)
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        """Стрелки рисуются сами: QSS у кнопок спинбокса убирает стандартные."""
+        super().paintEvent(e)
+        from PyQt6.QtWidgets import QStyle, QStyleOptionSpinBox
+        opt = QStyleOptionSpinBox()
+        self.initStyleOption(opt)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(UI_COLOR_TEXT_MUTED if self.isEnabled() else UI_COLOR_BORDER_LIGHT))
+        pen.setWidthF(1.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        for sc, up in ((QStyle.SubControl.SC_SpinBoxUp, True), (QStyle.SubControl.SC_SpinBoxDown, False)):
+            r = QRectF(self.style().subControlRect(QStyle.ComplexControl.CC_SpinBox, opt, sc, self))
+            cx, cy, a = r.center().x(), r.center().y() + (1 if up else -1), 3.0
+            d = -a / 2 if up else a / 2
+            p.drawLine(QPointF(cx - a, cy - d), QPointF(cx, cy + d))
+            p.drawLine(QPointF(cx, cy + d), QPointF(cx + a, cy - d))
+
+    # -------------------------------------------------------- текст
+    def textFromValue(self, v: float) -> str:  # noqa: N802 - Qt
+        text = f"{v:.9f}".rstrip("0").rstrip(".")
+        return "0" if text in ("", "-0") else text
+
+    def valueFromText(self, text: str) -> float:  # noqa: N802 - Qt
+        try:
+            return float(text.strip().replace(",", "."))
+        except ValueError:
+            return self.value()
+
+    def show_value(self, value, force: bool = False):
+        if not force and self.hasFocus() and self.lineEdit().isModified():
+            return                                      # пользователь печатает
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not self.hasFocus():
+                self._auto_prefix(value)
+                self._update_unit()
+            self.blockSignals(True)
+            self.setValue(value / self._factor())
+            self.blockSignals(False)
+        else:
+            self.lineEdit().setText("")
+        self.lineEdit().setModified(False)
+
+    # -------------------------------------------------------- шаг и запись
+    def _digit_step(self) -> float:
+        """Шаг = разряд слева от курсора; курсор не в поле - единица текущего префикса."""
+        le = self.lineEdit()
+        if not self.hasFocus():
+            return 1.0
+        text, pos = le.text(), le.cursorPosition()
+        dot = text.find(".")
+        dot = len(text) if dot < 0 else dot
+        pos = max(pos, 1)
+        exp = dot - pos if pos <= dot else dot - pos + 1
+        return 10.0 ** exp
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802 - Qt
+        le = self.lineEdit()
+        from_end = len(le.text()) - le.cursorPosition()
+        self.blockSignals(True)
+        self.setValue(self.value() + steps * self._digit_step())
+        self.blockSignals(False)
+        le.setCursorPosition(max(len(le.text()) - from_end, 0))
+        self.commit(force=True)
+
+    def commit(self, force: bool = False) -> None:
+        if not force and not self.lineEdit().isModified():
+            return
+        self.lineEdit().setModified(False)
+        value = self.value() * self._factor()
+        try:
+            value = self.spec.validate(value)
+        except ValueError as exc:
+            self._on_status(PStatus.INVALID, str(exc))
+            self.show_value(self._value, force=True)
+            return
+        self.set_value(value)
+
+    def set_value(self, value: Any) -> bool:
         if self._value is not None and self.spec.same(value, self._value):
             return False
         self.proxy.set(self.key, value)
@@ -616,14 +791,21 @@ class Panel(QFrame):
         }
         Panel QLabel#lineName { padding-right: 6px; }
         Panel QLabel#heading { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT; }
-        Panel PLineEdit, Panel QLineEdit#cfg, Panel PSButton, Panel QPushButton#choice,
+        Panel PLineEdit, Panel PSpinBox, Panel QLineEdit#cfg, Panel PSButton, Panel QPushButton#choice,
         Panel QPushButton#chip, Panel QPushButton#tool {
             background-color: $UI_COLOR_BACKGROUND;
             min-height: ${UI_CONTROL_HEIGHT_PX}px; max-height: ${UI_CONTROL_HEIGHT_PX}px;
             padding: 0 6px;
             border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BACKGROUND;
         }
-        Panel PLineEdit:focus { border-color: $UI_COLOR_TEXT_MUTED; }
+        Panel PLineEdit:focus, Panel PSpinBox:focus { border-color: $UI_COLOR_TEXT_MUTED; }
+        Panel PSpinBox { padding: 0 0 0 0; }
+        Panel PSpinBox::up-button, Panel PSpinBox::down-button {
+            subcontrol-origin: border; width: 16px; border: none; background: transparent;
+        }
+        Panel PSpinBox::up-button { subcontrol-position: top right; }
+        Panel PSpinBox::down-button { subcontrol-position: bottom right; }
+        Panel PSpinBox::up-button:hover, Panel PSpinBox::down-button:hover { background: $UI_COLOR_INVERT_HOVER; }
         Panel PLineEdit[readOnly="true"], Panel PLabel {
             background-color: transparent; border-color: transparent;
         }
