@@ -190,7 +190,18 @@ class ErrorIndicator(WriteIndicator):
 
 
 class AddressLabel(QLabel):
-    pass
+    """Адрес прибора в заголовке; клик открывает настройки подключения."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
 
 
 # ------------------------------------------------------- кнопки-иконки

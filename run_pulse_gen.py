@@ -4,6 +4,8 @@
     python run_pulse_gen.py --sim           # симулятор
     python run_pulse_gen.py --address 192.168.0.5
     python run_pulse_gen.py --ini my.ini    # файл настроек (по умолчанию visalab_front.ini)
+
+Драйвер, модель и адрес можно поменять в окне: клик по адресу -> APPLY (сохраняется в ini).
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from run_gui import _load_lab
 from visalab.core import InstrumentProxy
 from visalab.drivers import DRIVERS, MODELS, make_transport
 from visalab.front import PulseGenWindow
+from visalab.front.pulse_gen import saved_connection
 
 HERE = Path(__file__).resolve().parent
 
@@ -35,25 +38,46 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    settings = QSettings(args.ini, QSettings.Format.IniFormat)
     lab = _load_lab(args.lab).get("sdg", {})
-    address, model, delay = args.address, None, None
+    saved = saved_connection(settings)            # выбранное в окне (клик по адресу -> APPLY)
+    kind, model, delay = saved["driver"] or "sdg", saved["model"] or None, None
     if args.sim:
         address = "sim"
-    elif address is None:
+    elif args.address:
+        address = args.address
+    elif saved["address"]:
+        address = saved["address"]
+    else:
         address = lab.get("address", "sim")
-        model, delay = lab.get("model"), lab.get("delay")
+        model, delay = model or lab.get("model"), lab.get("delay")
+    current: dict = {}
 
-    app = QApplication(sys.argv[:1])
-    settings = QSettings(args.ini, QSettings.Format.IniFormat)
-    driver_cls, _ = DRIVERS["sdg"]
-    proxy = InstrumentProxy(driver_cls, make_transport("sdg", address, args.backend, args.latency),
-                            model=MODELS["sdg"].get(model) if model else None,
-                            command_delay_s=None if delay is None else float(delay))
-    win = PulseGenWindow(proxy, settings)
-    win.show()
-    if not args.no_connect:
-        proxy.open()
-    app.aboutToQuit.connect(proxy.shutdown)
+    def build(kind: str, address: str, model: str | None, pos=None) -> None:
+        driver_cls, _ = DRIVERS[kind]
+        proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency),
+                                model=MODELS[kind].get(model) if model else None,
+                                command_delay_s=None if delay is None else float(delay))
+        win = PulseGenWindow(proxy, settings)
+        win.reconnect_requested.connect(reconnect)
+        if pos is not None:
+            win.move(pos)
+        win.show()
+        current.update(proxy=proxy, win=win)
+        if not args.no_connect:
+            proxy.open()
+
+    def reconnect(kind: str, address: str, model: str) -> None:
+        old_proxy, old_win = current["proxy"], current["win"]
+        pos = old_win.pos()
+        old_win.hide()
+        old_proxy.shutdown()
+        old_win.deleteLater()
+        build(kind, address, model or None, pos)
+
+    build(kind, address, model, None)
+    app.aboutToQuit.connect(lambda: current["proxy"].shutdown())
     return app.exec()
 
 

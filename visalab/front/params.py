@@ -27,7 +27,7 @@ from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_
                     UI_CONTROL_HEIGHT_PX, render_qss)
 from .window import WriteState
 
-__all__ = ["PLineEdit", "PNLabel", "PSButton", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
+__all__ = ["PLineEdit", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
            "WriteTracker"]
 
 _WSTATE = {PStatus.WRITING: "process", PStatus.ERROR: "error", PStatus.INVALID: "error",
@@ -339,6 +339,47 @@ class PSButton(IndicatorButton, _Bound):
         return True
 
 
+class PChoice(QPushButton):
+    """Выбор из списка без привязки к прибору (настройки окна): клик - меню под кнопкой."""
+
+    changed = pyqtSignal(object)
+
+    def __init__(self, choices, value=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("choice")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clicked.connect(self._menu)
+        self.set_choices(choices, value)
+
+    def set_choices(self, choices, value=None) -> None:
+        pairs = list(choices.items()) if isinstance(choices, dict) else list(choices)   # [(подпись, значение)]
+        self._names = tuple(n for n, _v in pairs)
+        self._data = tuple(v for _n, v in pairs)
+        self.set_value(value if value in self._data else (self._data[0] if self._data else None))
+
+    @property
+    def value(self):
+        return self._value
+
+    def set_value(self, value) -> None:
+        self._value = value
+        i = self._data.index(value) if value in self._data else -1
+        self.setText(self._names[i] if i >= 0 else "")
+        self.changed.emit(value)
+
+    def _menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for name, v in zip(self._names, self._data):
+            act = menu.addAction(name)
+            act.setCheckable(True)
+            act.setChecked(v == self._value)
+            act.triggered.connect(lambda _=False, v=v: self.set_value(v))
+        menu.setMinimumWidth(self.width())
+        menu.popup(self.mapToGlobal(self.rect().bottomLeft()))
+
+
 class PLabel(QLabel, _Bound):
     """Показ значения прибора (или просто текст, если ``proxy`` не задан)."""
 
@@ -575,7 +616,8 @@ class Panel(QFrame):
         }
         Panel QLabel#lineName { padding-right: 6px; }
         Panel QLabel#heading { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT; }
-        Panel PLineEdit, Panel PSButton, Panel QPushButton#chip, Panel QPushButton#tool {
+        Panel PLineEdit, Panel QLineEdit#cfg, Panel PSButton, Panel QPushButton#choice,
+        Panel QPushButton#chip, Panel QPushButton#tool {
             background-color: $UI_COLOR_BACKGROUND;
             min-height: ${UI_CONTROL_HEIGHT_PX}px; max-height: ${UI_CONTROL_HEIGHT_PX}px;
             padding: 0 6px;
@@ -590,7 +632,7 @@ class Panel(QFrame):
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             color: $UI_COLOR_TEXT;
         }
-        Panel PSButton:hover, Panel QPushButton#chip:hover, Panel QPushButton#tool:hover {
+        Panel PSButton:hover, Panel QPushButton#choice:hover, Panel QPushButton#chip:hover, Panel QPushButton#tool:hover {
             background-color: $UI_COLOR_INVERT_HOVER;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             color: $UI_COLOR_TEXT_INVERSE;

@@ -54,6 +54,7 @@ class InstrumentProxy(QObject):
                  parent: QObject | None = None, **driver_kwargs):
         super().__init__(parent)
         self.address = transport.address
+        self.driver_cls = driver_cls                      # для окна настроек подключения
         self._thread = QThread()
         self._thread.setObjectName(f"{driver_cls.NAME}@{transport.address}")
         self._worker = driver_cls(transport, **driver_kwargs)

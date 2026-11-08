@@ -15,19 +15,20 @@ import re
 import time
 from typing import Any
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
-from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
                              QVBoxLayout, QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
-from .params import PBGroup, PLabel, PTabBar, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
+from ..drivers import DRIVERS, MODELS
+from .params import PBGroup, PChoice, PLabel, PTabBar, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, Switch,
                      ErrorIndicator, Window, short_address)
 
-__all__ = ["PulseGenWindow", "PULSE_PRESETS", "ROWS"]
+__all__ = ["PulseGenWindow", "PULSE_PRESETS", "ROWS", "saved_connection"]
 
 PULSE_PRESETS = ((400e-3, 30e-6, "PULSE"),)       # (PERI, WID, форма)
 
@@ -206,7 +207,20 @@ class HScrollArea(QScrollArea):
         e.accept()
 
 
+#: группа настроек подключения окна в ini (драйвер, адрес, модель)
+CONNECTION_GROUP = "CONNECTION/PULSE_GEN"
+
+
+def saved_connection(settings: QSettings) -> dict[str, str]:
+    """Сохранённые в окне драйвер / адрес / модель (пустые строки - не задано)."""
+    return {k: str(settings.value(f"{CONNECTION_GROUP}/{k.upper()}", "") or "")
+            for k in ("driver", "address", "model")}
+
+
 class PulseGenWindow(Window):
+    #: APPLY в настройках подключения: (driver, address, model) - запускающий код пересоздаёт прокси
+    reconnect_requested = pyqtSignal(str, str, str)
+
     def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Pulse generator", parent=None):
         super().__init__(settings, parent)
         self.proxy = proxy
@@ -269,7 +283,7 @@ class PulseGenWindow(Window):
 
         # ---------------------------------------------------------- вкладки и таблицы (сворачиваются)
         self.tabs = PTabBar()
-        self._errors_shown = False
+        self._overlay: str | None = None        # вместо таблицы: "errors" / "connection"
         self.pages: list[PanelTable] = []
         self._page_states: list[str | None] = []
         for title_, state, rows in PAGES:
@@ -297,12 +311,14 @@ class PulseGenWindow(Window):
             bl.addWidget(page)
         self.error_page = self._build_error_page()
         bl.addWidget(self.error_page)
+        self.connection_page = self._build_connection_page()
+        bl.addWidget(self.connection_page)
         self.parameter_panel = Panel(body)
         label_w = 0
         for page in self.pages:
             page.build(UI_COLUMN_WIDTH_PX)
             label_w = max(label_w, page.lines[0]._name.width(), *(ln.label_hint() for ln in page.lines))
-        for page in self.pages:
+        for page in (*self.pages, self.connection_page):
             for ln in page.lines:
                 ln.set_label_width(label_w)
 
@@ -320,6 +336,7 @@ class PulseGenWindow(Window):
         self.tracker = WriteTracker(proxy, keys, names, self)
         self.tracker.changed.connect(self.error_indicator.set_items)
         self.error_indicator.clicked.connect(self.show_errors)
+        self.address.clicked.connect(self.show_connection)
         proxy.param_status.connect(self._log_status)
         proxy.state_changed.connect(self._on_state)
         proxy.sync_done.connect(self._on_sync_done)
@@ -342,7 +359,7 @@ class PulseGenWindow(Window):
         self._expanded = bool(on)
         self.expand_button.set_expanded(on)
         if not on:
-            self._errors_shown = False
+            self._overlay = None
         self._show_pages()
         self.settings.setValue(f"{self._prefix}/EXPANDED", bool(on))
         self._fit_height()
@@ -352,20 +369,21 @@ class PulseGenWindow(Window):
         self._fit_height()                # до показа раскладки считаются неточно
 
     def _show_pages(self) -> None:
-        errors = self._expanded and self._errors_shown
+        overlay = self._overlay if self._expanded else None
         for i, page in enumerate(self.pages):
-            page.setVisible(self._expanded and not errors and i == self.tabs.currentIndex())
-        self.error_page.setVisible(errors)
-        self.tabs.show_selection = self._expanded and not errors
+            page.setVisible(self._expanded and overlay is None and i == self.tabs.currentIndex())
+        self.error_page.setVisible(overlay == "errors")
+        self.connection_page.setVisible(overlay == "connection")
+        self.tabs.show_selection = self._expanded and overlay is None
         self.tabs.update()
 
     def _on_tab_clicked(self, index: int) -> None:
         """Клик по вкладке: из журнала ошибок - обратно к таблице; в свёрнутом окне - развернуть на ней."""
         if index < 0:
             return
-        if self._errors_shown:
-            self._errors_shown = False
-            self.set_page(index, fit=not self._expanded)
+        if self._overlay:                         # журнал / подключение -> обратно к таблице
+            self._overlay = None
+            self.set_page(index, fit=self._expanded)
         if not self._expanded:
             self.set_page(index, fit=False)
             self.set_expanded(True)
@@ -395,6 +413,58 @@ class PulseGenWindow(Window):
         page.hide()
         return page
 
+    # ------------------------------------------------------------ подключение
+    def _driver_kind(self) -> str:
+        for kind, (cls, _sim) in DRIVERS.items():
+            if cls is getattr(self.proxy, "driver_cls", None):
+                return kind
+        return "sdg"
+
+    def _build_connection_page(self) -> QWidget:
+        kind = self._driver_kind()
+        profile = DRIVERS[kind][0].PROFILE
+        saved = saved_connection(self.settings)
+        drivers = [(f"{k.upper()}", k) for k, (cls, _s) in DRIVERS.items() if cls.PROFILE is profile]
+        self.driver_choice = PChoice(drivers, kind)
+        self.driver_choice.setToolTip("Driver (instrument family)")
+        self.model_choice = PChoice([("AUTO", "")])
+        self.model_choice.setToolTip("Model (limits); AUTO - from *IDN?")
+        self.driver_choice.changed.connect(self._fill_models)
+        self._fill_models(kind, saved["model"])
+        address = "sim" if self.proxy.address.upper().startswith("SIM::") else self.proxy.address
+        self.address_edit = QLineEdit(saved["address"] or address)
+        self.address_edit.setObjectName("cfg")
+        self.address_edit.setPlaceholderText("192.168.0.5 / USB0::... / sim")
+        self.address_edit.setToolTip("VISA address: IP, IP:port, full VISA string, or sim")
+        self.address_edit.returnPressed.connect(self.apply_connection)
+        self.apply_button = self._tool("APPLY", "Save and reconnect with these settings", self.apply_connection)
+        self.apply_button.setProperty("wide", True)
+        table = PanelTable(PanelLine("DRV", self.driver_choice), PanelLine("MDL", self.model_choice),
+                           PanelLine("ADDR", self.address_edit), PanelLine("", self.apply_button))
+        table.lines[-1].line_layout.insertStretch(1)
+        table.hide()
+        return table
+
+    def _fill_models(self, kind, value: str = "") -> None:
+        models = [("AUTO", "")] + [(m, m) for m in MODELS.get(kind, {})]
+        self.model_choice.set_choices(models, value)
+
+    def show_connection(self) -> None:
+        """Клик по адресу: вместо таблицы - драйвер / модель / адрес (выход - вкладка или APPLY)."""
+        self._show_overlay("connection")
+
+    def apply_connection(self) -> None:
+        driver = self.driver_choice.value or self._driver_kind()
+        address = self.address_edit.text().strip() or "sim"
+        model = self.model_choice.value or ""
+        for k, v in (("DRIVER", driver), ("ADDRESS", address), ("MODEL", model)):
+            self.settings.setValue(f"{CONNECTION_GROUP}/{k}", v)
+        self.settings.sync()
+        self._overlay = None
+        self._show_pages()
+        self._fit_height()
+        self.reconnect_requested.emit(driver, address, model)
+
     def _log(self, name: str, detail: str) -> None:
         detail = (detail or "error").strip().splitlines()[0] if detail else "error"
         self.error_log.appendPlainText(f"{time.strftime('%H:%M:%S')}  {name}: {detail}")
@@ -405,7 +475,10 @@ class PulseGenWindow(Window):
 
     def show_errors(self) -> None:
         """Клик по индикатору ошибок: вместо таблицы - журнал (выход - вкладка или CLEAR)."""
-        self._errors_shown = True
+        self._show_overlay("errors")
+
+    def _show_overlay(self, name: str) -> None:
+        self._overlay = name
         if self._expanded:
             self._show_pages()
             self._fit_height()
@@ -415,7 +488,7 @@ class PulseGenWindow(Window):
     def clear_errors(self) -> None:
         self.error_log.clear()
         self.tracker.clear_errors()
-        self._errors_shown = False
+        self._overlay: str | None = None        # вместо таблицы: "errors" / "connection"
         self._show_pages()
         self._fit_height()
 
