@@ -59,7 +59,7 @@ def test_field_shows_measurement_and_setpoint(qtbot, psu):
     _wait(qtbot, proxy, "ch2.meas_v", lambda v: v == pytest.approx(5.0, abs=1e-3))
     f = win.tiles[2].fields["V"]
     qtbot.waitUntil(lambda: f.text() == "5", timeout=5000)        # покой: измерение в поле
-    assert f.side.text().startswith("5")                          # слева - уставка
+    assert f.side.text() == "5"                                  # мелко снизу слева - уставка
     proxy.set("ch2.output", False)
     qtbot.waitUntil(lambda: f.text() == "0", timeout=5000)        # выход выключен: измерено 0
     assert f.side.text().startswith("5")

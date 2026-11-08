@@ -54,15 +54,55 @@ class SourceField(PLineEdit):
     """Поле уставки, которое в покое показывает измерение.
 
     Привязано к ключу уставки (запись, проверка, цвет рамки - как у PLineEdit); ``meas_key`` -
-    измеренное значение для показа. ``side`` - мелкая подпись слева: уставка в покое,
-    измерение во время настройки."""
+    измеренное значение для показа. ``side`` - мелкий текст внутри поля, снизу слева, в тех же
+    единицах, что и основной: уставка в покое, измерение во время настройки."""
 
-    def __init__(self, proxy: InstrumentProxy, key: str, meas_key: str, side: QLabel, parent=None):
-        self.meas_key, self.side, self._meas = meas_key, side, None
+    side: QLabel | None = None
+
+    def __init__(self, proxy: InstrumentProxy, key: str, meas_key: str, parent=None):
+        self.meas_key, self._meas = meas_key, None
         super().__init__(proxy, key, digits=5, parent=parent)
+        self.side = QLabel("", self)
+        self.side.setObjectName("side")
+        self.side.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        f = self.side.font()
+        f.setPointSizeF(max(6.0, f.pointSizeF() * 0.75))
+        self.side.setFont(f)
+        self.setMinimumHeight(46)
         self.setCursor(Qt.CursorShape.IBeamCursor)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)   # не захватывать фокус при показе окна
         proxy.subscribe(meas_key, self._on_meas)
+        self._place_side()
+
+    def _side_text(self, value) -> str:
+        if not isinstance(value, (int, float)):
+            return "---"
+        return f"{value / self._factor():.{self.digits}g}"
+
+    def _place_unit(self) -> None:
+        """Единица - сверху слева, мелкий текст - под ней; число справа на всю высоту."""
+        b = self.unit_button
+        if b is None:
+            return
+        b.ensurePolished()
+        w = max(b.sizeHint().width(), 26)
+        b.setGeometry(2, 2, w, max(int(self.height() * 0.5) - 2, 0))
+        self.setTextMargins(w, 0, 0, 0)
+
+    def _set_side(self, value) -> None:
+        if self.side is not None:
+            self.side.setText(self._side_text(value))
+            self._place_side()
+
+    def _place_side(self) -> None:
+        if self.side is None:
+            return
+        self.side.adjustSize()
+        self.side.move(6, self.height() - self.side.height() - 2)
+
+    def resizeEvent(self, e):  # noqa: N802 - Qt
+        super().resizeEvent(e)
+        self._place_side()
 
     @property
     def measured(self):
@@ -75,14 +115,14 @@ class SourceField(PLineEdit):
     def show_value(self, value, force: bool = False):
         if self._editing() and not force:          # настройка: уставка - в подсказке, слева - измерение
             self.setPlaceholderText("" if value is None else f"{value / self._factor():.{self.digits}g}")
-            self.side.setText(_fmt(self._meas, self.unit))
+            self._set_side(self._meas)
             return
         shown = self._meas if self._meas is not None else None
         self._auto_prefix(shown)
         self._update_unit()
         self.setText("" if shown is None else f"{shown / self._factor():.{self.digits}g}")
         self.setModified(False)
-        self.side.setText(_fmt(value, self.unit))
+        self._set_side(value)
 
     def focusInEvent(self, e):  # noqa: N802 - Qt
         QLineEdit.focusInEvent(self, e)
@@ -101,6 +141,7 @@ class SourceTile(QFrame):
         SourceTile:hover { border-color: $UI_COLOR_BORDER; }
         SourceTile[wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         SourceTile[wstate="error"] { border-color: $UI_COLOR_ERROR; }
+        SourceTile QLabel#side { color: $UI_COLOR_BORDER_LIGHT; }
         SourceTile QLabel { background: transparent; color: $UI_COLOR_BORDER_LIGHT; padding: 0; }
         SourceTile QLabel#name { color: $UI_COLOR_TEXT; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         SourceTile QLabel#mode[mode="CC"] { color: $UI_COLOR_PROCESS; }
@@ -136,19 +177,10 @@ class SourceTile(QFrame):
         lay.addLayout(self.head)
         self.fields: dict[str, SourceField] = {}
         for q, set_key, meas_key in (("V", "voltage", "meas_v"), ("I", "current", "meas_i")):
-            side = QLabel("")
-            side.setObjectName("side")
-            side.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            side.setMinimumWidth(64)
-            f = SourceField(proxy, f"ch{n}.{set_key}", f"ch{n}.{meas_key}", side)
-            f.setToolTip(f"CH{n} {q}: measured; left - setpoint. Click to set")
+            f = SourceField(proxy, f"ch{n}.{set_key}", f"ch{n}.{meas_key}")
+            f.setToolTip(f"CH{n} {q}: measured; small text - setpoint. Click to set")
             self.fields[q] = f
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(6)
-            row.addWidget(side)
-            row.addWidget(f, 1)
-            lay.addLayout(row)
+            lay.addWidget(f)
 
         proxy.subscribe(self.key, self._on_value, self._on_status)
         for k in (f"ch{n}.mode", f"ch{n}.ovp_tripped"):
