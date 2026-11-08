@@ -211,6 +211,7 @@ class PulseGenWindow(Window):
         self.setWindowTitle(title)
         self._prefix = re.sub(r"\W+", "_", proxy.address).strip("_").upper() or "SDG"
         self._resetting = False
+        self._expanded = False
         nch = min(2, proxy.channels)
         self.channels: list[dict[str, Any]] = []
 
@@ -283,6 +284,7 @@ class PulseGenWindow(Window):
             self._page_states.append(state)
             self.tabs.addTab(title_)
         self.tabs.currentChanged.connect(self.set_page)
+        self.tabs.tabBarClicked.connect(self._on_tab_clicked)
         body = QWidget()
         bl = QVBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
@@ -330,11 +332,28 @@ class PulseGenWindow(Window):
 
     # ------------------------------------------------------------ вид
     def set_expanded(self, on: bool) -> None:
-        """Полный вид - с таблицей всех параметров; обычный - только выходы и пресеты."""
+        """Полный вид - вкладки с таблицами; обычный - выходы, пресеты и полоса вкладок-индикаторов."""
+        self._expanded = bool(on)
         self.expand_button.set_expanded(on)
-        self.parameter_panel.setVisible(on)
+        self.tabs.show_selection = self._expanded
+        self.tabs.update()
+        self._show_pages()
         self.settings.setValue(f"{self._prefix}/EXPANDED", bool(on))
         self._fit_height()
+
+    def showEvent(self, e):  # noqa: N802 - Qt
+        super().showEvent(e)
+        self._fit_height()                # до показа раскладки считаются неточно
+
+    def _show_pages(self) -> None:
+        for i, page in enumerate(self.pages):
+            page.setVisible(self._expanded and i == self.tabs.currentIndex())
+
+    def _on_tab_clicked(self, index: int) -> None:
+        """Клик по вкладке в свёрнутом окне разворачивает его сразу на ней."""
+        if index >= 0 and not self._expanded:
+            self.set_page(index, fit=False)
+            self.set_expanded(True)
 
     def _fit_height(self, again: bool = True) -> None:
         """Высота окна - по содержимому (вложенные раскладки пересчитываются не сразу)."""
@@ -345,17 +364,19 @@ class PulseGenWindow(Window):
         self._layout.activate()
         self.setFixedHeight(self._layout.sizeHint().height())
         if again:
-            QTimer.singleShot(0, lambda: self._fit_height(False))
+            QTimer.singleShot(0, self._fit_height_again)   # связанный метод: не сработает после удаления окна
+
+    def _fit_height_again(self) -> None:
+        self._fit_height(False)
 
     def set_page(self, index: int, fit: bool = True) -> None:
         """Показать вкладку таблицы (MAIN / MOD / SWP / BRST)."""
         index = index if 0 <= index < len(self.pages) else 0
-        for i, page in enumerate(self.pages):
-            page.setVisible(i == index)
         if self.tabs.currentIndex() != index:
             self.tabs.blockSignals(True)
             self.tabs.setCurrentIndex(index)
             self.tabs.blockSignals(False)
+        self._show_pages()
         self.settings.setValue(f"{self._prefix}/TAB", index)
         if fit:
             self._fit_height()

@@ -97,11 +97,19 @@ def test_init_restores_saved_values(qtbot, opened, settings):
 def test_collapsible_table_and_short_address(qtbot, opened, settings):
     from visalab.front.window import short_address
     sim, proxy, win = opened
-    assert not win.parameter_panel.isVisibleTo(win)          # обычный вид: только выходы и пресеты
+    assert not any(pg.isVisibleTo(win) for pg in win.pages)   # обычный вид: таблиц нет, вкладки - индикаторы
+    assert win.tabs.isVisibleTo(win) and not win.tabs.show_selection
     assert win.channels[0]["output"].isVisibleTo(win)
+    win.show()
+    qtbot.waitExposed(win)
+    qtbot.wait(50)
     small = win.height()
     win.set_expanded(True)
-    assert win.parameter_panel.isVisibleTo(win) and win.height() > small
+    assert win.pages[win.tabs.currentIndex()].isVisibleTo(win)
+    qtbot.waitUntil(lambda: win.height() > small)
+    win.set_expanded(False)
+    win._on_tab_clicked(2)                                   # клик по вкладке в свёрнутом - развернуть на ней
+    assert win._expanded and win.pages[2].isVisibleTo(win)
     assert settings.value(f"{win._prefix}/EXPANDED", type=bool) is True
     assert short_address("TCPIP0::192.168.0.5::INSTR") == "192.168.0.5"
     assert short_address("USB0::0xF4EC::0x1102::SDG2XAAQ::INSTR") == "SDG2XAAQ"

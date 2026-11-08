@@ -418,6 +418,7 @@ class PTabBar(QTabBar):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._on: set[int] = set()
         self._hover = -1
+        self.show_selection = True        # False - полоса только как индикаторы (свёрнутое окно)
 
     def set_on(self, index: int, on: bool) -> None:
         if on != (index in self._on):
@@ -452,7 +453,8 @@ class PTabBar(QTabBar):
         p.setPen(Qt.PenStyle.NoPen)
         for i in range(self.count()):
             rect = QRectF(self.tabRect(i)).adjusted(2.5, 0.5, -2.5, -0.5)
-            selected, on, hover = i == self.currentIndex(), i in self._on, i == self._hover
+            selected = self.show_selection and i == self.currentIndex()
+            on, hover = i in self._on, i == self._hover
             # фон: наведение и выбранная вкладка - инверсия
             bg = UI_COLOR_INVERT_HOVER if hover else UI_COLOR_INVERT if selected else None
             if bg:
