@@ -185,7 +185,8 @@ SPECTRUM_ANALYZER = Profile(
     "spectrum_analyzer", "Анализатор спектра",
     doc="""Трасса ``trace`` - Trace(x в Hz, y в dBm), публикуется после КАЖДОЙ завершённой развёртки
     (драйвер не читает недорисованную трассу). meas.continuous - развёртки подряд,
-    действие single - одна развёртка. Маркер перечитывается вместе с трассой.""",
+    действие single - одна развёртка. Маркер перечитывается вместе с трассой.
+    Нулевая полоса (freq.span == 0): x трассы - время в s от 0 до sweep.time, y - как обычно.""",
     slots=(
         Slot("trace", T, "dBm", required=True, readonly=True, doc="последняя завершённая развёртка"),
         Slot("meas.continuous", B, required=True),
@@ -209,6 +210,17 @@ SPECTRUM_ANALYZER = Profile(
         Slot("avg.state", B),
         Slot("avg.count", I),
         Slot("ref.source", E, readonly=None, choices=("INT", "EXT")),
+        Slot("ref_offset", F, "dB", doc="смещение опорного уровня (внешний усилитель / аттенюатор)"),
+        Slot("preamp", B, doc="внутренний предусилитель"),
+        Slot("input.coupling", E, choices=("AC", "DC")),
+        Slot("sweep.type", E, choices=("AUTO", "SWEPT", "FFT")),
+        Slot("trace.mode", E, choices=("WRITE", "MAXHOLD", "MINHOLD", "VIEW", "BLANK"),
+             doc="режим трассы 1; MAXHOLD / MINHOLD копят экстремум за развёртки"),
+        Slot("trig.source", E, choices=("FREE", "VIDEO", "EXT", "LINE"), doc="запуск развёртки"),
+        Slot("trig.level", F, "dBm", doc="уровень видеозапуска"),
+        Slot("trig.slope", E, choices=("POS", "NEG")),
+        Slot("trig.delay", F, "s", doc="задержка запуска (отрицательная - предзапуск)"),
+        Slot("trig.delay_state", B),
         Slot("marker.state", B),
         Slot("marker.freq", F, "Hz"),
         Slot("marker.level", F, "dBm", readonly=True),

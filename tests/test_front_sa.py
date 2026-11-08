@@ -37,11 +37,11 @@ def _wait(qtbot, proxy, key, pred):
 
 def test_layout_settings_only(qtbot, sa):
     proxy, win, _s = sa
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["FREQ", "BW", "AMPL", "SWP"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["FREQ", "BW", "AMPL", "SWP", "TRAC", "TRIG"]
     assert len(win.preset_panel.table.lines) == 1 and win.preset_panel.table.lines[0].name == "PRST"
     names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages for ln in p.lines}
     assert names["RBW"] == ["bw.res", "bw.res_auto"] and names["CENT"] == ["freq.center"]
-    assert not any("trace" in k or "marker" in k for ks in names.values() for k in ks)   # вывода информации нет
+    assert not any(k == "trace" or k.startswith("marker") for ks in names.values() for k in ks)   # вывода информации нет
 
 
 def test_edit_settings_and_auto_pair(qtbot, sa):
@@ -118,3 +118,28 @@ def test_sa_launcher(qtbot, tmp_path, monkeypatch):
     assert run_spectrum.main(["--sim", "--ini", str(tmp_path / "x.ini"), "--no-connect"]) == 0
     assert len(made) == 1
     made[0].proxy.shutdown()
+
+
+def test_zero_span_button_and_trigger_tabs(qtbot, sa):
+    proxy, win, settings = sa
+    names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages for ln in p.lines}
+    assert names["MODE"][:1] == ["trace.mode"] and names["DLY"] == ["trig.delay", "trig.delay_state"]
+    assert names["SRC"] == ["trig.source"] and names["TYPE"] == ["sweep.type"] and names["PRE"] == ["preamp"]
+    win.widgets["freq.center"].set_value(1e9)
+    win.widgets["freq.span"].set_value(50e6)
+    _wait(qtbot, proxy, "freq.span", lambda v: v == pytest.approx(50e6))
+    zero = next(w for p in win.pages for ln in p.lines for w in ln.widgets if type(w).__name__ == "ZeroSpan")
+    assert not zero.indicated()
+    zero.click()
+    _wait(qtbot, proxy, "freq.span", lambda v: v == 0)
+    qtbot.waitUntil(zero.indicated, timeout=5000)
+    proxy.set("sweep.time", 2e-3)
+    qtbot.waitUntil(lambda: proxy.value("trace") is not None and proxy.value("trace").x_unit == "s", timeout=5000)
+    zero.click()                                                     # возврат к прежнему обзору
+    _wait(qtbot, proxy, "freq.span", lambda v: v == pytest.approx(50e6))
+    qtbot.waitUntil(lambda: not zero.indicated(), timeout=5000)
+    assert float(settings.value(f"{win._prefix}/LAST_SPAN")) == pytest.approx(50e6)
+    win.widgets["trig.source"].set_value("VIDEO")
+    win.widgets["trace.mode"].set_value("MAXHOLD")
+    _wait(qtbot, proxy, "trig.source", lambda v: v == "VIDEO")
+    _wait(qtbot, proxy, "trace.mode", lambda v: v == "MAXHOLD")

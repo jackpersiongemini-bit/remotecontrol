@@ -7,44 +7,85 @@
 поэтому пресеты, сохранённые на приборе раньше или с другого компьютера, появляются сами.
 В ini лежит только порядок чипов (последние использованные - первыми).
 
-Вкладки: FREQ (центр, обзор, старт, стоп), BW (RBW, VBW), AMPL (опорный уровень, масштаб,
-аттенюатор, детектор), SWP (время, точки, усреднение, опора, непрерывно / одна развёртка).
+Вкладки: FREQ (центр, обзор, старт, стоп, ZERO - нулевая полоса одной кнопкой), BW (RBW, VBW),
+AMPL (опорный уровень и его смещение, масштаб, аттенюатор, детектор, предусилитель, связь входа),
+SWP (время, точки, тип развёртки, опора, непрерывно / одна развёртка), TRAC (режим трассы:
+clear-write / max hold / min hold / view / blank, усреднение), TRIG (источник, уровень, фронт, задержка).
 Окно знает только InstrumentProxy и ключи профиля spectrum_analyzer.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, Qt
 
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow, PresetGroup
-from .params import PLineEdit, PSButton, PanelLine, PanelTable
+from .params import IndicatorButton, PLineEdit, PSButton, PanelLine, PanelTable
 from .power_meter import ActionButton
 
-__all__ = ["SpectrumWindow", "StatePresets", "saved_connection"]
+__all__ = ["SpectrumWindow", "ZeroSpan", "StatePresets", "saved_connection"]
 
 CONNECTION_GROUP = "CONNECTION/SPECTRUM"
 AUTO = [("MAN", False), ("AUTO", True)]
 ONOFF = [("OFF", False), ("ON", True)]
 
-#: вкладки: (название, строки); строка - (подпись, ключ значения, ключ «авто» или None)
+#: вкладки: (название, строки); строка - (подпись, ключ значения, ключ второго виджета строки или None);
+#: второй виджет: ``*_auto`` - MAN / AUTO, другое булево - OFF / ON, не булево - поле
 PAGES = (
     ("FREQ", (("CENT", "freq.center", None), ("SPAN", "freq.span", None),
               ("STAR", "freq.start", None), ("STOP", "freq.stop", None))),
     ("BW", (("RBW", "bw.res", "bw.res_auto"), ("VBW", "bw.video", "bw.video_auto"))),
-    ("AMPL", (("RLEV", "ref_level", None), ("SDIV", "scale_div", None), ("ATT", "atten", "atten_auto"),
-              ("DET", "detector", None))),
+    ("AMPL", (("RLEV", "ref_level", None), ("ROFF", "ref_offset", None), ("SDIV", "scale_div", None),
+              ("ATT", "atten", "atten_auto"), ("DET", "detector", None), ("PRE", "preamp", None),
+              ("CPL", "input.coupling", None))),
     ("SWP", (("TIME", "sweep.time", "sweep.time_auto"), ("PTS", "sweep.points", None),
-             ("AVG", "avg.state", "avg.count"), ("REF", "ref.source", None))),
+             ("TYPE", "sweep.type", None), ("REF", "ref.source", None))),
+    ("TRAC", (("MODE", "trace.mode", None), ("AVG", "avg.state", "avg.count"))),
+    ("TRIG", (("SRC", "trig.source", None), ("LVL", "trig.level", None), ("SLOP", "trig.slope", None),
+              ("DLY", "trig.delay", "trig.delay_state"))),
 )
 NOT_SAVED = ("freq.start", "freq.stop")          # связаны с центром и обзором - после Init не восстанавливаем
 
 
 def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
+
+
+class ZeroSpan(IndicatorButton):
+    """Нулевая полоса одной кнопкой: включена, когда SPAN = 0. Повторный клик возвращает прежний обзор
+    (последний ненулевой, хранится в ini)."""
+
+    DEFAULT_SPAN = 1e6
+
+    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+        super().__init__("ZERO", parent)
+        self.proxy, self.settings, self._key = proxy, settings, f"{prefix}/LAST_SPAN"
+        self.setObjectName("choice")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Zero span: SPAN = 0, the trace becomes power versus time. Click again to restore the span")
+        self._span: float | None = None
+        self.last_span = float(settings.value(self._key, self.DEFAULT_SPAN, type=float)) or self.DEFAULT_SPAN
+        self.clicked.connect(self.toggle)
+        proxy.subscribe("freq.span", self._on_span)
+
+    def indicated(self) -> bool:
+        return self._span == 0
+
+    def _on_span(self, value) -> None:
+        self._span = value
+        if isinstance(value, (int, float)) and value > 0:
+            self.last_span = float(value)
+            self.settings.setValue(self._key, self.last_span)
+        self.update()
+
+    def toggle(self) -> None:
+        if not self.proxy.is_connected or self._span is None:
+            return
+        self.proxy.set("freq.span", self.last_span if self._span == 0 else 0.0)
 
 
 def _preset(name) -> tuple[str]:
@@ -130,13 +171,17 @@ class SpectrumWindow(InstrumentWindow):
                 w = make(key)
                 ws = [w]
                 if extra and sup(extra):
-                    ws.append(PSButton(proxy, extra, AUTO) if proxy.params[extra].kind.name == "BOOL"
-                              else make(extra))
+                    if proxy.params[extra].kind.name == "BOOL":
+                        ws.append(PSButton(proxy, extra, AUTO if extra.endswith("_auto") else ONOFF))
+                    else:
+                        ws.append(make(extra))
                 for x, k in zip(ws, (key, extra)):
                     self.widgets[k] = x
                     if k not in NOT_SAVED:
                         self.saved_widgets.append(x)
                 lines.append(PanelLine(name, *ws))
+            if title_ == "FREQ" and sup("freq.span"):
+                lines.append(PanelLine("ZERO", ZeroSpan(proxy, self.settings, self._prefix)))
             if title_ == "SWP":
                 if sup("meas.continuous"):
                     cont = PSButton(proxy, "meas.continuous", [("CONT", True), ("SINGLE", False)])
@@ -149,7 +194,7 @@ class SpectrumWindow(InstrumentWindow):
                 self.page_specs.append((title_, (), PanelTable(*lines)))
 
     def restore_rank(self, key: str) -> int:
-        return 1 if key.endswith("_auto") else 0
+        return 1 if key.endswith(("_auto", "_state")) else 0
 
     # ------------------------------------------------------------ пресеты = состояния в приборе
     def create_presets(self, key: str) -> PresetGroup:
