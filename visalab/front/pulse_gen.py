@@ -266,7 +266,7 @@ class PulseGenWindow(Window):
 
         # ---------------------------------------------------------- вкладки и таблицы (сворачиваются)
         self.tabs = PBGroup()
-        self.tabs.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.tabs.group_layout.setSpacing(4)
         self.pages: list[PanelTable] = []
         self._page_states: list[str | None] = []
         for title_, state, rows in PAGES:
@@ -284,7 +284,7 @@ class PulseGenWindow(Window):
             self._page_states.append(state)
             tab = self.tabs.add_button(title_)
             tab.setObjectName("tab")
-            tab.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            tab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)   # ровная полоса
         self.tabs.selected.connect(self.set_page)
         self.tab_scroll = HScrollArea(self.tabs, UI_CONTROL_HEIGHT_PX)
         body = QWidget()

@@ -472,20 +472,17 @@ class Panel(QFrame):
         QMenu#psmenu::item:checked { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         QMenu#psmenu::indicator { width: 0; }
         Panel QPushButton#tab {
-            background-color: $UI_COLOR_BACKGROUND; padding: 0 10px;
+            background-color: transparent; color: $UI_COLOR_BORDER_LIGHT; padding: 0 8px; border: none;
             min-height: ${UI_CONTROL_HEIGHT_PX}px; max-height: ${UI_CONTROL_HEIGHT_PX}px;
-            border: 2px solid transparent;
         }
-        Panel QPushButton#tab:hover {
-            background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE;
-        }
-        Panel QPushButton#tab[on="true"] {
-            background-color: $UI_COLOR_INVERT; color: $UI_COLOR_TEXT_INVERSE; font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-        }
+        Panel QPushButton#tab:hover { background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE; }
         Panel QPushButton#tab:checked {
-            border-color: $UI_COLOR_TEXT; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT;
+            background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_TEXT; font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
         }
-        Panel QPushButton#tab[on="true"]:checked { color: $UI_COLOR_TEXT_INVERSE; }
+        Panel QPushButton#tab[on="true"] { background-color: $UI_COLOR_INVERT; color: $UI_COLOR_TEXT_INVERSE; }
+        Panel QPushButton#tab[on="true"]:checked {
+            background-color: $UI_COLOR_TEXT_MUTED; font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+        }
         Panel QPushButton#unit {
             background-color: transparent; border: none; padding: 0 4px; min-height: 0;
             color: $UI_COLOR_BORDER_LIGHT; font-weight: normal;
