@@ -60,7 +60,7 @@ class WindowBar(TitleBar):
             b.hide()
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setFixedHeight(WINDOW_BAR_HEIGHT)
-        self.hBoxLayout.setContentsMargins(5, 5, 5, 5)
+        self.hBoxLayout.setContentsMargins(7, 7, 7, 7)
         self.hBoxLayout.setSpacing(5)
         self.setDoubleClickEnabled(False)
         self.title_label = QLabel(self)
@@ -157,7 +157,7 @@ class WriteIndicator(QWidget):
     def paintEvent(self, event):  # noqa: N802 - Qt
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        d = min(self.width(), self.height()) - 6
+        d = min(self.width(), self.height()) - 8
         p.setPen(QPen(QColor(UI_COLOR_PANEL), 1))
         p.setBrush(QColor(self.STATE_COLORS[self.state]))
         p.drawEllipse(QRectF((self.width() - d) / 2, (self.height() - d) / 2, d, d))
@@ -219,7 +219,7 @@ class IconButtonBase(QPushButton):
     def _pen(self, p: QPainter) -> None:
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         pen = QPen(self._icon_color)
-        pen.setWidth(TITLE_BAR_BUTTON_LINE_WIDTH)
+        pen.setWidthF(TITLE_BAR_BUTTON_LINE_WIDTH)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
