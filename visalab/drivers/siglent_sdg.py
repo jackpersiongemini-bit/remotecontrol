@@ -111,6 +111,7 @@ class SiglentSDG(VISAInstrument):
     _BSWV = (
         ("wave", "Форма", Kind.ENUM, "", "WVTP", {"choices": WAVES}),
         ("frequency", "Частота", Kind.FLOAT, "Hz", "FRQ", {"minimum": 1e-6}),
+        ("period", "Период", Kind.FLOAT, "s", "PERI", {"minimum": 0.0}),
         ("amplitude", "Амплитуда", Kind.FLOAT, "Vpp", "AMP", {"minimum": 0.0}),
         ("offset", "Смещение", Kind.FLOAT, "V", "OFST", {}),
         ("high", "Верхний уровень", Kind.FLOAT, "V", "HLEV", {}),
@@ -119,7 +120,11 @@ class SiglentSDG(VISAInstrument):
         ("duty", "Скважность", Kind.FLOAT, "%", "DUTY", {"minimum": 0.0, "maximum": 100.0}),
         ("symmetry", "Симметрия", Kind.FLOAT, "%", "SYM", {"minimum": 0.0, "maximum": 100.0}),
         ("width", "Длительность имп.", Kind.FLOAT, "s", "WIDTH", {"minimum": 0.0}),
+        ("delay", "Задержка имп.", Kind.FLOAT, "s", "DLY", {}),
     )
+    #: после изменения этих полей BSWV выравнивать фазы каналов (EQPHASE), как в PulseGen
+    PHASE_FIELDS = ("WVTP", "PERI", "FRQ", "WIDTH", "DUTY", "DLY")
+    AUTO_EQPHASE = True
     _SWWV = (
         ("sweep_time", "Время", Kind.FLOAT, "s", "TIME", {"minimum": 0.0}),
         ("sweep_start", "Старт", Kind.FLOAT, "Hz", "START", {"minimum": 0.0}),
@@ -155,7 +160,11 @@ class SiglentSDG(VISAInstrument):
             tab = f"CH{ch}"
             for suffix, label, kind, unit, code, extra in self._BSWV:
                 if suffix == "frequency":
-                    extra = {**extra, "maximum": m.max_freq}
+                    extra = {**extra, "maximum": m.max_freq, "also_read": (f"{k}.period",)}
+                elif suffix == "period":
+                    extra = {**extra, "also_read": (f"{k}.frequency", f"{k}.duty")}
+                elif suffix == "width":
+                    extra = {**extra, "also_read": (f"{k}.duty",)}
                 params.append(Param(
                     f"{k}.{suffix}", label, kind, unit, section=f"{tab}/Сигнал",
                     group=f"{c}:BSWV", write=f"{c}:BSWV {code},{{value}}", meta={"code": code}, **extra))
@@ -216,6 +225,7 @@ class SiglentSDG(VISAInstrument):
             acts.append(Action(f"trigger_{ch}", f"Ручной триггер CH{ch}"))
         if self.model.channels >= 2:
             acts.append(Action("x.copy_1_to_2", "Копировать CH1 → CH2"))   # расширение Siglent
+            acts.append(Action("align_phase", "Выровнять фазы (EQPHASE)"))
         return acts
 
     # --------------------------------------------------------------- хуки
@@ -230,6 +240,9 @@ class SiglentSDG(VISAInstrument):
         else:
             cmd = spec.write.format(value=spec.to_scpi(value))
         self.write(cmd)
+        if (self.AUTO_EQPHASE and self.model.channels >= 2 and spec.group and spec.group.endswith(":BSWV")
+                and spec.meta.get("code") in self.PHASE_FIELDS):
+            self.write("EQPHASE")
 
     def read_param_raw(self, spec: Param) -> Any:
         # SYNC: "C1:SYNC ON" (на части моделей "C1:SYNC ON,TYPE,CH1")
@@ -307,6 +320,9 @@ class SiglentSDG(VISAInstrument):
                 self.write(f"C{ch}:SWWV MTRIG")
             else:
                 raise ValueError(f"CH{ch}: ни свип, ни пакет не включены")
+            return None
+        if name == "align_phase":
+            self.write("EQPHASE")
             return None
         if name == "x.copy_1_to_2":
             self.write("PACP C2,C1")

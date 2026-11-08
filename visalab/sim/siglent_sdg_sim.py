@@ -54,7 +54,7 @@ class SiglentSDGSim(SimInstrument):
 
     def reset(self) -> None:
         base = {"WVTP": "SINE", "FRQ": 1000.0, "AMP": 4.0, "OFST": 0.0, "PHSE": 0.0,
-                "DUTY": 50.0, "SYM": 50.0, "WIDTH": 0.0002}
+                "DUTY": 50.0, "SYM": 50.0, "WIDTH": 0.0002, "DLY": 0.0}
         mod = {"STATE": "OFF", "TYPE": "AM",
                **{t: {f: ("INT" if f == "SRC" else "SINE" if f == "MDSP" else
                           100.0 if f in ("FRQ", "DEPTH", "KFRQ", "DEVI") else 10000.0)
@@ -77,6 +77,7 @@ class SiglentSDGSim(SimInstrument):
         self.on("C#:SWWV", self._swwv_set, self._swwv_get)
         self.on("C#:BTWV", self._btwv_set, self._btwv_get)
         self.on("PACP", self._pacp)
+        self.on("EQPHASE", lambda a, g: setattr(self, "eqphase_count", getattr(self, "eqphase_count", 0) + 1))
         if self.CMR_SUPPORTED:
             self.on("CMR", get=self._cmr_get)
 
@@ -163,6 +164,7 @@ class SiglentSDGSim(SimInstrument):
             f.append(("SYM", b["SYM"]))
         if w == "PULSE":
             f.append(("WIDTH", b["WIDTH"]))
+            f.append(("DLY", b.get("DLY", 0.0)))
         return f
 
     def _bswv_get(self, args, g):

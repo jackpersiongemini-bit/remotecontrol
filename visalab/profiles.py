@@ -60,6 +60,7 @@ FUNCTION_GENERATOR = Profile(
         Slot("ch{n}.wave", E, required=True,
              choices=("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "ARB", "DC")),
         Slot("ch{n}.frequency", F, "Hz", required=True),
+        Slot("ch{n}.period", F, "s", doc="период = 1/частота"),
         Slot("ch{n}.amplitude", F, "Vpp", required=True),
         Slot("ch{n}.offset", F, "V", required=True),
         Slot("ch{n}.high", F, "V"),
@@ -68,6 +69,7 @@ FUNCTION_GENERATOR = Profile(
         Slot("ch{n}.duty", F, "%"),
         Slot("ch{n}.symmetry", F, "%"),
         Slot("ch{n}.width", F, "s"),
+        Slot("ch{n}.delay", F, "s", doc="задержка импульса"),
         Slot("ch{n}.load", E, choices=("50", "HIZ"), doc="нагрузка, на которую пересчитывается амплитуда"),
         Slot("ch{n}.polarity", E, choices=("NORM", "INV")),
         Slot("ch{n}.sync", B, doc="синхровыход"),
@@ -96,6 +98,7 @@ FUNCTION_GENERATOR = Profile(
         ActionSlot("all_off", required=True),
         ActionSlot("reset"),
         ActionSlot("trigger_{n}", doc="ручной триггер свипа/пакета канала"),
+        ActionSlot("align_phase", doc="выровнять фазы каналов"),
     ),
 )
 

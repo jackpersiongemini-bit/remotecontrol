@@ -143,3 +143,23 @@ def test_response_header_is_stripped(sdg):
 def test_unknown_idn_is_not_an_error(make):
     drv, sim, rec = make(SiglentSDG, SiglentSDGSim, sim=SiglentSDGSim(idn="ACME,XYZ,1,1"))
     assert drv.state is ConnectionState.CONNECTED and not rec.comm
+
+
+def test_pulse_period_delay_and_eqphase(sdg):
+    drv, sim, rec = sdg
+    drv.set_param("ch1.wave", "PULSE")
+    drv.set_param("ch1.period", 0.4)
+    drv.set_param("ch1.width", 30e-6)
+    drv.set_param("ch1.delay", 1e-3)
+    flush(drv)
+    assert rec.values["ch1.period"] == pytest.approx(0.4)
+    assert rec.values["ch1.frequency"] == pytest.approx(2.5)          # перечитана вместе с периодом
+    assert rec.values["ch1.width"] == pytest.approx(30e-6)
+    assert rec.values["ch1.delay"] == pytest.approx(1e-3)
+    assert getattr(sim, "eqphase_count", 0) >= 4                      # после каждого фазового поля
+    n = sim.eqphase_count
+    drv.set_param("ch1.amplitude", 2.0)                               # амплитуда фазу не трогает
+    flush(drv)
+    assert sim.eqphase_count == n
+    drv.run_action("align_phase", ())
+    assert sim.eqphase_count == n + 1
