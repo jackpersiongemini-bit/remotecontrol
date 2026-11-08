@@ -65,10 +65,15 @@ def test_preset_add_apply_and_eqphase(qtbot, opened):
         _wait(qtbot, proxy, f"ch{n}.period", lambda v: v == pytest.approx(2e-3))
         _wait(qtbot, proxy, f"ch{n}.width", lambda v: v == pytest.approx(50e-6))
     assert sim.eqphase_count > eq0
-    assert win.presets.find(2e-3, 50e-6) == 0            # последний использованный - первый
-    win._apply_preset(1)
-    assert win.presets.find(2e-3, 50e-6) == 1
-    idx = 1
+    # на экране порядок не меняется, в ini - по последнему использованию
+    from visalab.front.pulse_gen import PresetGroup
+    screen = list(win.presets.data)
+    win._apply_preset(0)
+    assert win.presets.data == screen
+    assert win.presets.saved_order()[:2] == [screen[0], (2e-3, 50e-6)]
+    restarted = PresetGroup(win.presets.settings, win.presets.key)
+    assert restarted.data[:2] == [screen[0], (2e-3, 50e-6)]
+    idx = win.presets.find(2e-3, 50e-6)
     # пресеты сохраняются в ini и удаляются
     win.presets.set_checked(idx)
     assert win.presets.remove_selected()
@@ -113,3 +118,21 @@ def test_restore_order_load_before_levels(qtbot, opened, settings):
     settings.setValue(f"{pre}/CH1.OUTPUT", True)
     win.restore()
     assert sent.index("ch1.load") < sent.index("ch1.high") < sent.index("ch1.output")
+
+
+def test_presets_switch_with_arrow_keys(qtbot, opened):
+    from PyQt6.QtCore import Qt
+    sim, proxy, win = opened
+    win.show()
+    for i in range(12):
+        win.presets.add(1e-3 * (i + 1), 1e-6)       # первый - последний добавленный (12 ms)
+    order = list(win.presets.data)
+    assert not win.preset_scroll.horizontalScrollBar().isVisible()
+    win.presets.set_checked(0)
+    qtbot.keyClick(win, Qt.Key.Key_Right)
+    assert win.presets.checked_index() == 1 and win.presets.data == order    # без перестановки
+    _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(order[1][0]))
+    qtbot.keyClick(win, Qt.Key.Key_Left)
+    assert win.presets.checked_index() == 0
+    _wait(qtbot, proxy, "ch2.period", lambda v: v == pytest.approx(order[0][0]))
+    assert win.add_button.height() + win.remove_button.height() + 4 == win.preset_scroll.height()

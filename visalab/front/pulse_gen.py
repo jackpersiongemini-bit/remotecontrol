@@ -52,7 +52,9 @@ def _fmt(value: float) -> str:
 class PresetGroup(PBGroup):
     """Пары (period, width) в QSettings (JSON). Чип в две строки: период / ширина.
 
-    Порядок - по последнему использованию: применённый или добавленный пресет становится первым.
+    Порядок на экране за сеанс не меняется (иначе ← → переставляли бы соседей). Использование
+    запоминается, и в ini пресеты пишутся по последнему использованию - новый порядок виден
+    после перезапуска.
     """
 
     def __init__(self, settings: QSettings, key: str, defaults=PULSE_PRESETS, parent=None):
@@ -60,6 +62,7 @@ class PresetGroup(PBGroup):
         self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.settings, self.key = settings, key
         self.data: list[tuple[float, float]] = []
+        self._recent: list[tuple[float, float]] = []      # использованные за сеанс, последний - первый
         for preset in self._load(defaults):
             self._append(preset)
 
@@ -72,8 +75,13 @@ class PresetGroup(PBGroup):
         except (TypeError, ValueError):
             return [tuple(map(float, p)) for p in defaults]
 
+    def saved_order(self) -> list[tuple[float, float]]:
+        """Порядок для ini: использованные за сеанс (последний - первый), затем прочие как были."""
+        recent = [p for p in self._recent if p in self.data]
+        return recent + [p for p in self.data if p not in recent]
+
     def save(self) -> None:
-        self.settings.setValue(self.key, json.dumps(self.data, separators=(",", ":")))
+        self.settings.setValue(self.key, json.dumps(self.saved_order(), separators=(",", ":")))
 
     def _append(self, preset):
         self.add_button("")
@@ -85,13 +93,16 @@ class PresetGroup(PBGroup):
             b.setText(f"{_fmt(period)}\n{_fmt(width)}")
             b.setToolTip(f"PERI {_fmt(period)}\nWID {_fmt(width)}")
             b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            b.setFixedHeight(PRESET_HEIGHT)
 
     def touch(self, index: int) -> None:
-        """Переместить пресет в начало (последний использованный) и выделить."""
+        """Отметить пресет использованным и выделить (место на экране не меняется)."""
         if 0 <= index < len(self.data):
-            self.data.insert(0, self.data.pop(index))
-            self._refresh()
-            self.set_checked(0)
+            preset = self.data[index]
+            if preset in self._recent:
+                self._recent.remove(preset)
+            self._recent.insert(0, preset)
+            self.set_checked(index)
             self.save()
 
     def find(self, period: float, width: float) -> int:
@@ -118,8 +129,12 @@ class PresetGroup(PBGroup):
         return True
 
 
+PRESET_HEIGHT = 40          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
+PRESET_GAP = 4
+
+
 class HScrollArea(QScrollArea):
-    """Одна строка с горизонтальной прокруткой; колесо мыши листает вбок."""
+    """Одна строка с прокруткой вбок без полосы, листается колесом мыши."""
 
     def __init__(self, widget: QWidget, parent=None):
         super().__init__(parent)
@@ -128,16 +143,13 @@ class HScrollArea(QScrollArea):
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(PRESET_HEIGHT)
         self.setMinimumWidth(1)
 
     def sizeHint(self):  # noqa: N802 - Qt
-        h = self.widget().sizeHint().height() + self.horizontalScrollBar().sizeHint().height() + 2
-        return QSize(1, h)
-
-    def minimumSizeHint(self):  # noqa: N802 - Qt
-        return self.sizeHint()
+        return QSize(1, PRESET_HEIGHT)
 
     def wheelEvent(self, e):  # noqa: N802 - Qt
         bar = self.horizontalScrollBar()
@@ -190,15 +202,15 @@ class PulseGenWindow(Window):
         self.presets = PresetGroup(settings, f"{self._prefix}/PULSE_PRESETS")
         self.presets.selected.connect(self._apply_preset)
         self.preset_scroll = HScrollArea(self.presets)
-        self.add_button = self._tool("+", "Add preset from CH1 PERI / WID", self._add_preset)
-        self.remove_button = self._tool("−", "Remove selected preset", self.presets.remove_selected)
+        half = (PRESET_HEIGHT - PRESET_GAP) // 2
+        self.add_button = self._tool("+", "Add preset from CH1 PERI / WID", self._add_preset, half)
+        self.remove_button = self._tool("−", "Remove selected preset", self.presets.remove_selected, half)
         tools = QWidget()
         tl = QVBoxLayout(tools)
         tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(4)
+        tl.setSpacing(PRESET_GAP)
         tl.addWidget(self.add_button)
         tl.addWidget(self.remove_button)
-        tl.addStretch()
         top = PanelTable(PanelLine("OUT", *outputs), PanelLine("PRST", self.preset_scroll, tools))
         self.preset_panel = Panel(top)
         for w in outputs:
@@ -240,6 +252,7 @@ class PulseGenWindow(Window):
 
         self.address.setMinimumWidth(self.address.sizeHint().width())
         self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.sizeHint().width()))
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.recall_size(QSize(self.minimumWidth(), 0))
         self.set_expanded(settings.value(f"{self._prefix}/EXPANDED", False, type=bool))
 
@@ -253,14 +266,30 @@ class PulseGenWindow(Window):
         self.setFixedHeight(self._layout.sizeHint().height())
 
     @staticmethod
-    def _tool(text, tip, slot) -> QPushButton:
+    def _tool(text, tip, slot, height=None) -> QPushButton:
         b = QPushButton(text)
         b.setObjectName("tool")
+        if height:
+            b.setProperty("half", True)
+        if height:
+            b.setFixedHeight(height)
         b.setToolTip(tip)
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.clicked.connect(slot)
         return b
+
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        """← → - применить соседний пресет."""
+        if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right) and self.presets.data:
+            i = self.presets.checked_index()
+            step = -1 if e.key() == Qt.Key.Key_Left else 1
+            j = 0 if i < 0 else min(max(i + step, 0), len(self.presets.data) - 1)
+            if j != i:
+                self._apply_preset(j)
+            e.accept()
+            return
+        super().keyPressEvent(e)
 
     # ------------------------------------------------------------ сохранение
     def _settings_key(self, key: str) -> str:
@@ -315,11 +344,15 @@ class PulseGenWindow(Window):
         period, width = ch1["period"].value, ch1["width"].value
         if period is not None and width is not None:
             self.presets.add(period, width)
+            i = self.presets.checked_index()
+            if i >= 0:
+                self.preset_scroll.ensureWidgetVisible(self.presets.buttons()[i], 0, 0)
 
     def _apply_preset(self, index: int) -> None:
         period, width = self.presets.data[index]
         self.presets.touch(index)
-        self.preset_scroll.horizontalScrollBar().setValue(0)
+        self.preset_scroll.ensureWidgetVisible(self.presets.buttons()[index], 0, 0)
+        self.setFocus()                       # чтобы ← → сразу переключали пресеты
         for ch in self.channels:
             cur = ch["period"].value
             pairs = [(ch["period"], period), (ch["width"], width)]
