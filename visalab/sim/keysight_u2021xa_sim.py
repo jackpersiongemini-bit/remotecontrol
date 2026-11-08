@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 
+from ..core.transport import float_block
 from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
 
 __all__ = ["KeysightU2021XASim"]
@@ -35,12 +36,14 @@ class KeysightU2021XASim(SimInstrument):
     def reset(self) -> None:
         self.cfg = {"freq": 50e6, "det": "NORM", "vid": "OFF", "aver": True, "coun": 4, "coun_auto": True,
                     "gain2": 0.0, "gain2_stat": False, "src": "IMM", "lev": 0.0, "lev_auto": True,
-                    "slop": "POS", "del": 0.0, "hold": 1e-6, "offs": 0.0, "swe": 100e-6, "cont": False}
+                    "slop": "POS", "del": 0.0, "hold": 1e-6, "offs": 0.0, "swe": 100e-6, "cont": False,
+                    "trac": False, "trac_time": 100e-6, "trac_offs": 0.0, "trac_unit": "DBM"}
         self.units = {n: "DBM" for n in range(1, 5)}
         self.feeds = {n: "POW:AVER" for n in range(1, 5)}
         self.measuring = False
         self.opc_pending = False
         self.results: dict[int, float] | None = None
+        self.trace: list[float] | None = None
         self.zeroed = self.calibrated = False
         if not hasattr(self, "signal"):
             self.signal = {"on_dbm": -10.0, "off_dbm": -120.0, "period": 1e-3, "width": 100e-6}
@@ -87,7 +90,14 @@ class KeysightU2021XASim(SimInstrument):
         return {"AVER": _db(avg) + off, "PEAK": _db(peak) + off, "PTAV": _db(peak) - _db(avg),
                 "MIN": _db(min(avg, peak)) + off}
 
+    def _trace(self, n: int) -> list[float]:
+        c = self.cfg
+        off = c["gain2"] if c["gain2_stat"] else 0.0
+        t0, dt = c["del"] + c["trac_offs"], c["trac_time"] / (n - 1)
+        return [_db(self._power_at(t0 + i * dt)) + off for i in range(n)]
+
     def _complete(self, triggered: bool) -> None:
+        self.trace = self._trace(1000) if self.cfg["trac"] else None
         r = self._compute(triggered)
         self.results = {n: r[self.feeds[n].split(":")[1].split()[0][:4]] for n in self.feeds}
         self.measuring = False
@@ -152,6 +162,16 @@ class KeysightU2021XASim(SimInstrument):
         self.on("UNIT#:POWer", self._unit_set, lambda a, g: self.units[int(g[0])])
         self.on("CALCulate#:FEED[1]", self._feed_set, lambda a, g: f'"{self.feeds[int(g[0])]}"')
         self.on("FETCh#[:SCALar][:POWer:AC]", get=self._fetch)
+        self.on("TRACe[1]:STATe", self._trac_set, self._get("trac"))
+        self.on("[SENSe[1]:]TRACe:UNIT", self._enum("trac_unit", {"DBM": "DBM", "W": "W"}),
+                lambda a, g: self.cfg["trac_unit"])
+        self.on("TRACe[1]:UNIT", self._enum("trac_unit", {"DBM": "DBM", "W": "W"}),
+                lambda a, g: self.cfg["trac_unit"])
+        self.on("SENSe[1]:TRACe:TIME", self._norm_only(self._num("trac_time", 25e-9, 1)),
+                self._norm_only(self._get("trac_time")))
+        self.on("SENSe[1]:TRACe:OFFSet:TIME", self._norm_only(self._num("trac_offs", -1, 1)),
+                self._norm_only(self._get("trac_offs")))
+        self.on("TRACe[1][:DATA]", get=self._trac_data)
         self.on("CALibration[1]:ZERO:AUTO", lambda a, g: setattr(self, "zeroed", True))
         self.on("CALibration[1]:AUTO", lambda a, g: setattr(self, "calibrated", True))
 
@@ -242,6 +262,34 @@ class KeysightU2021XASim(SimInstrument):
         if self.cfg["det"] == "AVER" and ("PEAK" in feed or "PTAV" in feed):
             raise SimError(-221, "Settings conflict", ESR_EXE)
         self.feeds[int(g[0])] = feed
+
+    def _norm_only(self, fn):
+        def wrapped(a, g):
+            if self.cfg["det"] == "AVER":
+                raise SimError(-221, "Settings conflict", ESR_EXE)
+            return fn(a, g)
+        return wrapped
+
+    def _trac_set(self, a, g):
+        on = self.boolean(a)
+        if on and self.cfg["det"] == "AVER":
+            raise SimError(-221, "Settings conflict", ESR_EXE)
+        self.cfg["trac"] = on
+        self.trace = None
+
+    def _trac_data(self, a, g):
+        res = a.strip().upper()[:4]
+        n = {"HRES": 2000, "MRES": 1000, "LRES": 240}.get(res)
+        if n is None:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        if not self.cfg["trac"] or self.cfg["cont"]:
+            raise SimError(-221, "Settings conflict", ESR_EXE)
+        if self.trace is None or self.measuring:
+            raise SimError(-230, "Data corrupt or stale", ESR_EXE)
+        data = self.trace if n == len(self.trace) else self._trace(n)
+        if self.cfg["trac_unit"] == "W":
+            data = [10 ** ((v - 30) / 10) for v in data]
+        return float_block(data)
 
     def _fetch(self, a, g):
         n = int(g[0])

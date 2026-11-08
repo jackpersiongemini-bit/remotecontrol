@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import struct
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
@@ -17,7 +18,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-__all__ = ["TransportError", "TransportTimeout", "Transport", "PyVisaTransport", "SimTransport"]
+__all__ = ["TransportError", "TransportTimeout", "Transport", "PyVisaTransport", "SimTransport",
+           "parse_float_block", "float_block"]
 
 
 class TransportError(Exception):
@@ -26,6 +28,26 @@ class TransportError(Exception):
 
 class TransportTimeout(TransportError):
     """Прибор не ответил за отведённое время."""
+
+
+def float_block(values) -> str:
+    """IEEE 488.2 блок ``#<n><len><данные>`` из float32 big-endian (строка latin-1 - для симуляторов)."""
+    data = struct.pack(f">{len(values)}f", *values)
+    size = str(len(data))
+    return f"#{len(size)}{size}" + data.decode("latin-1")
+
+
+def parse_float_block(raw: bytes) -> list[float]:
+    """Разобрать IEEE 488.2 блок float32 big-endian (``#3400....``)."""
+    start = raw.find(b"#")
+    if start < 0 or len(raw) < start + 2:
+        raise TransportError("нет двоичного блока в ответе")
+    ndig = int(raw[start + 1:start + 2])
+    size = int(raw[start + 2:start + 2 + ndig])
+    data = raw[start + 2 + ndig:start + 2 + ndig + size]
+    if len(data) != size or size % 4:
+        raise TransportError(f"двоичный блок: ждали {size} байт, пришло {len(data)}")
+    return list(struct.unpack(f">{size // 4}f", data))
 
 
 class Transport(ABC):
@@ -54,6 +76,11 @@ class Transport(ABC):
     def query(self, message: str) -> str:
         self.write(message)
         return self.read()
+
+    def query_float_block(self, message: str) -> list[float]:
+        """Запрос с ответом - двоичным блоком float32 big-endian (TRAC:DATA? у U2020X)."""
+        self.write(message)
+        return parse_float_block(self.read().encode("latin-1"))
 
     @abstractmethod
     def read_stb(self) -> int: ...
@@ -144,6 +171,9 @@ class PyVisaTransport(Transport):
 
     def read(self) -> str:
         return self._call(self._res.read).strip()
+
+    def query_float_block(self, message: str) -> list[float]:
+        return list(self._call(lambda: self._res.query_binary_values(message, datatype="f", is_big_endian=True)))
 
     def read_stb(self) -> int:
         return int(self._call(self._res.read_stb))
