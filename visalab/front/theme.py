@@ -18,10 +18,11 @@ TOKENS = {
     "UI_COLOR_CONTROL": "#2b2b2b",         # заголовок окна
     "UI_COLOR_BORDER": "#444444",
     "UI_COLOR_BORDER_LIGHT": "#8a8a8a",    # единицы измерения в полях
+    "UI_COLOR_INDICATOR_FRAME": "#5a5a5a", # тонкая рамка вокруг «включённого» элемента
     "UI_COLOR_TEXT": "#f2f2f2",
     "UI_COLOR_TEXT_MUTED": "#e6e6e6",      # текст в панелях
-    "UI_COLOR_INVERT": "#b8b8b8",          # инверсия: выбранный пресет, включённый канал
-    "UI_COLOR_INVERT_HOVER": "#9a9a9a",    # инверсия при наведении
+    "UI_COLOR_INVERT": "#b8b8b8",          # инверсия
+    "UI_COLOR_INVERT_HOVER": "#9a9a9a",    # инверсия при наведении (единственное место инверсии)
     "UI_COLOR_TEXT_INVERSE": "#222222",
     "UI_COLOR_ACCENT": "#f2f2f2",
     "UI_COLOR_SUCCESS": "#2e9d4f",
@@ -33,6 +34,7 @@ TOKENS = {
     "UI_FONT_SIZE_PT": 10,
     "UI_FONT_WEIGHT_SEMIBOLD": 600,
     "UI_BORDER_WIDTH_PX": 1,
+    "UI_INDICATOR_WIDTH_PX": 4,            # толстая граница-индикатор «включено / выбрано»
     "UI_BORDER_RADIUS_PX": 6,
     "UI_TITLE_BAR_ITEM_SIZE_PX": 26,
     "UI_TITLE_BAR_WIDE_ITEM_SIZE_PX": 52,
