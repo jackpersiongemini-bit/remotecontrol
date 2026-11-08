@@ -29,7 +29,7 @@ def test_layout_tabs_and_favourites(qtbot, rf):
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["RF", "AM", "FM", "PM", "PULS"]
     assert [ln.name for ln in win.preset_panel.table.lines][:3] == ["OUT", "PRST", "FREQ"]
     assert win.freq_spin.key == "rf.frequency"
-    assert set(win.mod_spins) == {"PULSE", "AM", "FM", "PM"}
+    assert set(win.mod_spins) == {"PULSE", "FM", "PM"}          # AM - только на вкладке
 
 
 def test_preset_add_and_apply(qtbot, rf):
@@ -44,7 +44,7 @@ def test_preset_add_and_apply(qtbot, rf):
     _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(10e9))
     _wait(qtbot, proxy, "am.state", lambda v: v is True)
     _wait(qtbot, proxy, "mod.output", lambda v: v is True)
-    assert win.mod_line.name == "AM" and win.mod_spins["AM"].isVisibleTo(win)
+    assert win.mod_line.name == "PULS"                           # AM в избранном нет - строка не меняется
     assert win.current_mod() == "AM"
     qtbot.waitUntil(lambda: win.tabs.is_on(1))                  # вкладка AM - индикатор
     win.presets.add(5e9, -20.0, "PULSE")
