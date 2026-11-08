@@ -99,3 +99,18 @@ def test_rf_launcher(qtbot, tmp_path, monkeypatch):
     made[0].reconnect_requested.emit("smf100a", "sim", "")
     assert len(made) == 2 and made[1].driver_choice.value == "smf100a"
     made[1].proxy.shutdown()
+
+
+def test_freq_hold_keeps_frequency(qtbot, rf):
+    proxy, win, settings = rf
+    proxy.set("rf.frequency", 3e9)
+    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(3e9))
+    win.freq_hold.setChecked(True)
+    win.presets.add(7e9, -3.0, "CW")
+    win._apply_preset(win.presets.find(7e9, -3.0, "CW"))
+    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(-3.0))
+    assert proxy.value("rf.frequency") == pytest.approx(3e9)          # частота не тронута
+    assert settings.value(f"{win._prefix}/FREQ_HOLD", type=bool) is True
+    win.freq_hold.setChecked(False)
+    win._apply_preset(win.presets.find(7e9, -3.0, "CW"))
+    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(7e9))

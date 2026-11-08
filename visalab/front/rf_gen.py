@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtWidgets import QCheckBox
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
@@ -97,7 +98,14 @@ class RFGenWindow(InstrumentWindow):
                 outs.append(w)
         self.top_lines = [PanelLine("OUT", *outs), self.preset_line()]
         self.freq_spin = PSpinBox(proxy, "rf.frequency", ("k", "M", "G"))
-        self.top_lines.append(PanelLine("FREQ", self.freq_spin))
+        self.freq_hold = QCheckBox("HOLD")
+        self.freq_hold.setObjectName("hold")
+        self.freq_hold.setToolTip("Presets keep the current frequency (only POW and MOD are applied)")
+        self.freq_hold.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.freq_hold.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.freq_hold.setChecked(self.settings.value(f"{self._prefix}/FREQ_HOLD", False, type=bool))
+        self.freq_hold.toggled.connect(lambda on: self.settings.setValue(f"{self._prefix}/FREQ_HOLD", bool(on)))
+        self.top_lines.append(PanelLine("FREQ", self.freq_spin, self.freq_hold))
         self.mod_spins: dict[str, PSpinBox] = {}
         for mod, (_label, key) in MOD_RATE.items():
             if sup(key):
@@ -167,7 +175,8 @@ class RFGenWindow(InstrumentWindow):
     def apply_preset_values(self, preset: tuple) -> None:
         freq, power, mod = preset
         w = self.widgets
-        w["rf.frequency"].set_value(freq)
+        if not self.freq_hold.isChecked():          # HOLD - пресет частоту не меняет
+            w["rf.frequency"].set_value(freq)
         w["rf.power"].set_value(power)
         target = MOD_TYPES.get(mod)
         # сначала выключить лишние модуляции (FM и PM на многих приборах несовместимы), потом нужную
