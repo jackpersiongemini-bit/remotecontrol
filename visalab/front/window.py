@@ -8,7 +8,7 @@ from __future__ import annotations
 import textwrap
 from enum import Enum
 
-from PyQt6.QtCore import QEasingCurve, QLineF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty
+from PyQt6.QtCore import QEasingCurve, QLineF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import QAbstractButton, QLabel, QPushButton, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
@@ -172,11 +172,21 @@ class StatusIndicator(WriteIndicator):
 
 
 class ErrorIndicator(WriteIndicator):
-    """Только ошибки и их подробности."""
+    """Только ошибки и их подробности; клик открывает журнал ошибок."""
     EMPTY = "No errors"
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _filter(self, items):
         return [i for i in items if i[1] is WriteState.ERROR]
+
+    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
 
 
 class AddressLabel(QLabel):

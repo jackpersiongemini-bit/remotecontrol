@@ -233,3 +233,24 @@ def test_line_edit_placeholder_editing(qtbot, opened):
     field.clearFocus()                                                 # пусто - значение не меняется
     assert field.text() == "1.25"
     assert proxy.value("ch1.high") == pytest.approx(1.25)
+
+
+def test_error_log_opens_from_indicator(qtbot, opened):
+    _sim, proxy, win = opened
+    win.show()
+    qtbot.waitExposed(win)
+    assert not win._expanded
+    proxy.set("ch1.high", "abc")                             # неверное значение -> ошибка записи
+    qtbot.waitUntil(lambda: "CH1 HIGH" in win.error_log.toPlainText())
+    win.error_indicator.clicked.emit()
+    assert win._expanded and win.error_page.isVisible()
+    assert not any(p.isVisible() for p in win.pages)
+    win._on_tab_clicked(1)                                   # вкладка - выход из журнала
+    assert not win.error_page.isVisible() and win.pages[1].isVisible()
+    assert "CH1 HIGH" in win.error_log.toPlainText()         # журнал сохраняется
+    win.show_errors()
+    win.clear_button.click()                                 # CLEAR - очистить и выйти
+    assert win.error_log.toPlainText() == ""
+    assert not win.error_page.isVisible() and win.pages[1].isVisible()
+    from visalab.front.window import WriteState
+    assert win.error_indicator.state is not WriteState.ERROR

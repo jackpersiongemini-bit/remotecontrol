@@ -623,6 +623,12 @@ class Panel(QFrame):
         }
         Panel QPushButton#unit:hover { background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE; }
         Panel QPushButton#unit[static="true"]:hover { background-color: transparent; color: $UI_COLOR_BORDER_LIGHT; }
+        Panel QPlainTextEdit#errorLog {
+            background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_TEXT;
+            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BACKGROUND; border-radius: ${UI_BORDER_RADIUS_PX}px;
+            padding: 2px 4px;
+        }
+        Panel QPushButton#tool[wide="true"] { min-width: ${UI_COLUMN_WIDTH_PX}px; max-width: ${UI_COLUMN_WIDTH_PX}px; }
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }
     """)
@@ -675,6 +681,11 @@ class WriteTracker(QObject):
             self._state.pop("connection", None)
         elif state is ConnectionState.DISCONNECTED:
             self._state.clear()
+        self.emit()
+
+    def clear_errors(self) -> None:
+        """CLEAR в журнале: ошибки сброшены, индикатор гаснет до следующей."""
+        self._state = {k: v for k, v in self._state.items() if v[0] is not WriteState.ERROR}
         self.emit()
 
     def emit(self) -> None:
