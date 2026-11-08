@@ -186,9 +186,11 @@ class AgilentPSA(VISAInstrument):
         # Изменение настройки перезапускает развёртку: текущая трасса уже не про новые условия.
         was_armed = self._armed
         self._abort()
-        super().write_param(spec, value)
-        if was_armed or self._continuous:
-            self._start_sweep()
+        try:
+            super().write_param(spec, value)
+        finally:                                  # отказ записи не должен останавливать развёртки
+            if was_armed or self._continuous:
+                self._start_sweep()
 
     def read_param_raw(self, spec: Param) -> Any:
         key = spec.key

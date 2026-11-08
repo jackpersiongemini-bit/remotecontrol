@@ -93,3 +93,59 @@ def test_s11_return_loss_at_resonance(vna):
     f, y = min(zip(t.x, t.y), key=lambda p: p[1])
     assert f == pytest.approx(2e9, rel=1e-2) and y < -20
     assert math.isfinite(y)
+
+
+def test_all_measurements_formatted_and_complex(make):
+    sim = KeysightPNASim()
+    sim.meas["USER_S21"] = {"s": "S21", "fmt": "PHAS"}
+    sim.meas["USER_S12"] = {"s": "S12", "fmt": "MLIN"}
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    for k, v in (("freq.start", 1e9), ("freq.stop", 3e9), ("sweep.points", 201)):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
+    drv.poll()
+    assert rec.values["meas.count"] == 3 and not rec.errors and not rec.comm
+    assert [rec.values[f"m{n}.name"] for n in (1, 2, 3, 4)] == ["CH1_S11_1", "USER_S21", "USER_S12", None]
+    assert [rec.values[f"m{n}.sparam"] for n in (1, 2, 3)] == ["S11", "S21", "S12"]
+    assert [rec.values[f"m{n}.format"] for n in (1, 2, 3)] == ["MLOG", "PHASE", "LIN_MAG"]
+    assert rec.values["m4.trace"] is None and rec.values["m4.sdata"] is None
+    # форматированные данные: у каждого измерения свой формат и своя единица
+    assert [rec.values[f"m{n}.trace"].y_unit for n in (1, 2, 3)] == ["dB", "deg", ""]
+    assert all(len(rec.values[f"m{n}.trace"]) == 201 for n in (1, 2, 3))
+    assert rec.values["trace"] is rec.values["m1.trace"]                 # легаси-ключ = первое измерение
+    # комплексные данные: Re в y, Im в im; из них восстанавливается любой формат
+    s21 = rec.values["m2.sdata"]
+    assert s21.is_complex and len(s21.im) == 201 and s21.meta["format"] == "SDATA"
+    z = s21.complex_y()
+    assert math.degrees(__import__("cmath").phase(z[100])) == pytest.approx(rec.values["m2.trace"].y[100], abs=1e-6)
+    assert 20 * math.log10(abs(rec.values["m3.sdata"].complex_y()[100])) == pytest.approx(
+        20 * math.log10(rec.values["m3.trace"].y[100]), abs=1e-6)
+    assert rec.values["m1.sdata"].meta["sparam"] == "S11"
+
+
+def test_per_measurement_settings_and_limits(make):
+    sim = KeysightPNASim()
+    sim.meas["B"] = {"s": "S21", "fmt": "MLOG"}
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert setp(drv, rec, "m2.format", "PHASE") is PStatus.WRITTEN
+    assert sim.meas["B"]["fmt"] == "PHAS" and sim.meas["CH1_S11_1"]["fmt"] == "MLOG"    # первое не тронуто
+    assert setp(drv, rec, "m2.sparam", "S12") is PStatus.WRITTEN and sim.meas["B"]["s"] == "S12"
+    n = len(rec.errors)
+    assert setp(drv, rec, "m5.format", "PHASE") is PStatus.ERROR          # такого измерения нет
+    assert not rec.comm and len(rec.errors) >= n
+    drv.poll()
+    assert rec.values["m2.trace"].y_unit == "deg" and rec.values["m2.sparam"] == "S12"
+
+
+def test_measurements_change_on_instrument_and_complex_off(make):
+    sim = KeysightPNASim()
+    sim.meas["B"] = {"s": "S21", "fmt": "MLOG"}
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    drv.poll()
+    assert rec.values["meas.count"] == 2 and rec.values["m2.trace"] is not None
+    del sim.meas["B"]                                                     # пользователь удалил измерение на приборе
+    drv.poll()
+    assert rec.values["meas.count"] == 1 and rec.values["m2.trace"] is None and rec.values["m2.name"] is None
+    assert setp(drv, rec, "meas.complex", False) is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["m1.sdata"] is None and rec.values["m1.trace"] is not None
+    assert not any("SDATA" in c for c in sim.history[-6:])
