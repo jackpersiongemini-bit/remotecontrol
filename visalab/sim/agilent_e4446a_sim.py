@@ -8,7 +8,9 @@ RBW ~ полоса/100 (ряд 1-3), VBW = RBW, время развёртки и
 """
 from __future__ import annotations
 
+import copy
 import math
+import re
 
 from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
 
@@ -46,6 +48,7 @@ class AgilentPSASim(SimInstrument):
             self.signals: list[tuple[float, float]] = [(1e9, -20.0)]
             self.noise_dbm = -90.0
             self.hold_sweeps = False
+            self.files: dict[str, tuple[dict, dict]] = {}      # состояния в «памяти прибора»
         self._couple()
 
     # ------------------------------------------------------------ физика
@@ -136,6 +139,42 @@ class AgilentPSASim(SimInstrument):
         self.on("CALCulate:MARKer[1]:X", self._mk_x, self._mk_x_get)
         self.on("CALCulate:MARKer[1]:Y", get=self._mk_y)
         self.on("CALCulate:MARKer[1]:MAXimum", self._mk_max)
+        self.on("MMEMory:STORe:STATe", self._st_store)
+        self.on("MMEMory:LOAD:STATe", self._st_load)
+        self.on("MMEMory:CATalog", get=self._cat)
+        self.on("MMEMory:DELete", self._file_del)
+
+    # состояния (файлы .state)
+    @staticmethod
+    def _file_name(text: str, with_num: bool) -> str:
+        m = re.fullmatch(r'\s*1\s*,\s*"([^"]+)"\s*' if with_num else r'\s*"([^"]+)"\s*', text)
+        if not m:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        name = m.group(1)
+        return name if name.lower().endswith(".state") else name + ".state"
+
+    def _st_store(self, a, g):
+        self.files[self._file_name(a, True)] = (copy.deepcopy(self.c), copy.deepcopy(self.marker))
+
+    def _st_load(self, a, g):
+        name = self._file_name(a, True)
+        if name not in self.files:
+            raise SimError(-256, "File name not found", ESR_EXE)
+        c, marker = copy.deepcopy(self.files[name])
+        c["form"] = self.c["form"]                  # формат обмена в состояние не входит
+        self.c, self.marker = c, marker
+        self.sweeping = False
+        self._couple()
+
+    def _cat(self, a, g):
+        entries = ",".join(f'"{n},STAT,812"' for n in sorted(self.files))
+        return f"{812 * len(self.files)},1000000,{entries}" if entries else "0,1000000"
+
+    def _file_del(self, a, g):
+        name = self._file_name(a, False)
+        if name not in self.files:
+            raise SimError(-256, "File name not found", ESR_EXE)
+        del self.files[name]
 
     def _err(self, a, g):
         code, msg = self.errors.popleft() if self.errors else (0, "No error")

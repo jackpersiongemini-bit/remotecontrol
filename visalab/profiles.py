@@ -218,6 +218,10 @@ SPECTRUM_ANALYZER = Profile(
         ActionSlot("abort", doc="прервать развёртку"),
         ActionSlot("marker_peak", doc="маркер на максимум"),
         ActionSlot("reset"),
+        ActionSlot("state_list", doc="имена состояний в памяти прибора -> action_done('state_list', [имя, ...])"),
+        ActionSlot("state_save", doc="сохранить текущее состояние в памяти прибора: аргумент - имя"),
+        ActionSlot("state_recall", doc="вызвать состояние из памяти прибора: аргумент - имя"),
+        ActionSlot("state_delete", doc="удалить состояние из памяти прибора: аргумент - имя"),
     ),
 )
 
