@@ -18,7 +18,7 @@ import re
 import time
 from typing import Any, Callable
 
-from PyQt6.QtCore import QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
                              QSizePolicy, QVBoxLayout, QWidget)
 
@@ -417,8 +417,9 @@ class InstrumentWindow(Window):
 
     def _fit_height(self, again: bool = True) -> None:
         """Высота окна - по содержимому (вложенные раскладки пересчитываются не сразу)."""
-        for w in (self.parameter_panel, self.parameter_panel.table, self.preset_panel):
-            if w.layout():
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
+        for w in self.findChildren(QWidget):          # вложенные раскладки хранят старые размеры
+            if w.layout() is not None:
                 w.layout().invalidate()
         self._layout.invalidate()
         self._layout.activate()

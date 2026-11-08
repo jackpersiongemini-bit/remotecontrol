@@ -101,19 +101,32 @@ def test_correction_written_as_offset(qtbot, pm):
 
 def test_cal_table_editing(qtbot, pm):
     proxy, win, _s = pm
+    t = win.cal_table
     proxy.set("freq", 5e9)
     _wait(qtbot, proxy, "freq", lambda v: v == pytest.approx(5e9))
-    win.cal_table.add_button.click()
-    assert win.cal_table.points == [(5e9, 0.0)]
-    win.cal_table.table.item(0, 1).setText("1.5")
-    win.cal_table.table.item(0, 0).setText("2.4G")
-    assert win.cal_table.points == [(pytest.approx(2.4e9), 1.5)]
-    win.cal_table.table.item(0, 1).setText("abc")      # не число - остаётся как было
-    assert win.cal_table.points[0][1] == 1.5
-    win.cal_table.table.selectRow(0)
-    win.cal_table.remove_button.click()
-    assert win.cal_table.points == []
-
+    t.add_button.click()                                   # пустая строка ввода - частота датчика
+    assert t.points == [(5e9, 0.0)]
+    t.new_freq.setText("2.4")                              # в GHz
+    t.new_freq.setModified(True)
+    t.new_db.setText("1.5")
+    t.new_db.setModified(True)
+    t.add_button.click()
+    assert t.points == [(pytest.approx(2.4e9), 1.5), (5e9, 0.0)]
+    assert t.new_freq.value is None and t.new_freq.text() == ""       # строка ввода очищена
+    qtbot.waitUntil(lambda: len(t.rows) == 2)
+    fw, dw, _rm = t.rows[1]
+    dw.setText("abc")                                       # не число - остаётся как было
+    dw.setModified(True)
+    dw._commit()
+    assert t.points[1][1] == 0.0
+    fw.setText("1G")                                        # с префиксом; точка уходит наверх
+    fw.setModified(True)
+    fw._commit()
+    assert t.points == [(pytest.approx(1e9), 0.0), (pytest.approx(2.4e9), 1.5)]
+    qtbot.waitUntil(lambda: t.rows[0][0].value == pytest.approx(1e9))
+    t.rows[0][2].click()
+    assert t.points == [(pytest.approx(2.4e9), 1.5)]
+    qtbot.waitUntil(lambda: len(t.rows) == 1)
 
 def test_duty_from_pulse_generator(qtbot, pm, tmp_path):
     proxy, win, _s = pm
