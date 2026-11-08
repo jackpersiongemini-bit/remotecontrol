@@ -194,3 +194,15 @@ def test_mode_tabs_and_switch(qtbot, opened):
     win.tabs.setCurrentIndex(1)                            # клик по вкладке
     assert win.pages[1].isVisibleTo(win)
     assert win.on_button.status() == ON and win.on_button.isChecked()
+
+
+def test_clickable_widgets_have_pointer_cursor(qtbot, opened):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QAbstractButton, QTabBar
+    _sim, _proxy, win = opened
+    win.show()
+    assert not hasattr(win, "status_indicator")          # ход записи - цветом рамки поля
+    bad = [c for c in win.findChildren((QAbstractButton, QTabBar))
+           if c.isVisibleTo(win) and c.isEnabled() and c.property("static") is not True
+           and c.cursor().shape() != Qt.CursorShape.PointingHandCursor]
+    assert not bad, [(type(c).__name__, c.objectName()) for c in bad]

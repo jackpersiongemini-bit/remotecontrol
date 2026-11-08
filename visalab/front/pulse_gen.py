@@ -23,7 +23,7 @@ from ..core.scpi import si_format
 from .params import PBGroup, PLabel, PTabBar, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, Switch,
-                     ErrorIndicator, StatusIndicator, Window, short_address)
+                     ErrorIndicator, Window, short_address)
 
 __all__ = ["PulseGenWindow", "PULSE_PRESETS", "ROWS"]
 
@@ -229,10 +229,10 @@ class PulseGenWindow(Window):
         self.init_button.clicked.connect(self._init)
         self.address = AddressLabel(short_address(proxy.address))
         self.address.setToolTip(proxy.address)
-        self.status_indicator = StatusIndicator()
         self.error_indicator = ErrorIndicator()
+        # ход записи виден по цвету рамки самого поля; в заголовке остаётся только индикатор ошибок
         for i, w in enumerate((self.on_button, self.sync_button, self.init_button, self.address,
-                               self.status_indicator, self.error_indicator)):
+                               self.error_indicator)):
             bar.insert_widget(w, i)
         bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает адрес
         self.expand_button = CustomExpandButton()
@@ -313,7 +313,6 @@ class PulseGenWindow(Window):
         keys = [w.key for ch in self.channels for w in ch.values()]
         names = {k: k.upper().replace(".", " ") for k in keys}
         self.tracker = WriteTracker(proxy, keys, names, self)
-        self.tracker.changed.connect(self.status_indicator.set_items)
         self.tracker.changed.connect(self.error_indicator.set_items)
         proxy.state_changed.connect(self._on_state)
         proxy.sync_done.connect(self._on_sync_done)
