@@ -359,19 +359,7 @@ class Panel(QFrame):
             min-width: ${UI_CONTROL_HEIGHT_PX}px; max-width: ${UI_CONTROL_HEIGHT_PX}px; padding: 0;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
         }
-        Panel QScrollArea#hscroll QScrollBar:horizontal {
-            height: 4px; background: transparent; margin: 0; border-radius: 2px;
-        }
-        Panel QScrollArea#hscroll QScrollBar::handle:horizontal {
-            background: $UI_COLOR_BORDER; min-width: 24px; border-radius: 2px;
-        }
-        Panel QScrollArea#hscroll QScrollBar::handle:horizontal:hover { background: $UI_COLOR_TEXT_MUTED; }
-        Panel QScrollArea#hscroll QScrollBar::add-line, Panel QScrollArea#hscroll QScrollBar::sub-line {
-            width: 0; height: 0;
-        }
-        Panel QScrollArea#hscroll QScrollBar::add-page, Panel QScrollArea#hscroll QScrollBar::sub-page {
-            background: none;
-        }
+        Panel QPushButton#tool[half="true"] { min-height: 0; max-height: 1000px; }
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }
     """)
