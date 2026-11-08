@@ -9,44 +9,42 @@
   (рамка и толстая нижняя граница), как у остальных кнопок;
 * в заголовке плитки - имя канала и режим (CV / CC, OVP - сработала защита).
 
-Блокировка CH1 (правило лаборатории): CH1 включается, только если CH2 и CH3 потребляют ток не
-меньше порога; вкладка OUT, строка ILCK: ON - блокировка действует, OFF - обход. Выключить можно всегда.
-Ниже плиток - OFF ALL. Вкладки: PROT (OVP, предел уставки по каналам), OUT (объединение каналов).
+Правила (вкладка RULES): строки вида ``IF CH2.I < 5m OR CH2 OFF THEN CH1 OFF AND BLOCK ELSE UNBLOCK``
+(синтаксис и семантика - в rules.py). BLOCK запрещает включать выход (плитка показывает причину в
+подсказке), OFF выключает. Enter в строке - применить и сохранить, ошибка - красная рамка и подсказка.
+Правило по умолчанию - лабораторное: CH1 только когда CH2 и CH3 включены и потребляют ток.
+Ниже плиток - OFF ALL. Вкладки: PROT (OVP, предел уставки по каналам), OUT (объединение), RULES.
 
 ``SourceGrid`` принимает любой набор каналов [(прокси, номер, подпись)], в том числе с нескольких
 приборов: окно отдаёт ему каналы своего прибора.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from PyQt6.QtCore import QRectF, QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QPainter
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.params import ConnectionState
 from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
 from .params import PLabel, PLineEdit, PSButton, PanelLine, PanelTable, _repolish, paint_indicator
 from .power_meter import ActionButton, LToggle
+from .rules import Rule, RuleError, parse_rule, resolve
 from .theme import UI_COLUMN_WIDTH_PX, render_qss
 
-__all__ = ["PSUWindow", "SourceTile", "SourceGrid", "SourceField", "saved_connection"]
+__all__ = ["PSUWindow", "RulesTable", "SourceTile", "SourceGrid", "SourceField", "saved_connection"]
 
 CONNECTION_GROUP = "CONNECTION/PSU"
 PER_ROW = 3
-GATED, GATE_BY = 1, (2, 3)              # CH1 - только при потреблении CH2 и CH3
-GATE_MIN_A = 1e-3                       # порог «потребляет ток», А (ini: <prefix>/GATE_MIN_A)
+DEFAULT_RULES = [("IF CH2.I < 1m OR CH2 OFF OR CH3.I < 1m OR CH3 OFF THEN CH1 OFF AND BLOCK ELSE UNBLOCK", True)]
 
 
 def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
-
-
-def _fmt(value, unit: str) -> str:
-    return "---" if not isinstance(value, (int, float)) else si_format(value, unit, 5)
 
 
 class SourceField(PLineEdit):
@@ -281,6 +279,102 @@ class SourceGrid(QWidget):
             self.rows.append(row)
 
 
+class RuleRow(PanelLine):
+    """Строка правила: текст, вкл / выкл, удалить."""
+
+    def __init__(self, text: str, on: bool, channels, changed, remove, parent=None):
+        self.edit = QLineEdit(text)
+        self.edit.setObjectName("cfg")
+        self.edit.setMinimumWidth(80)
+        self.edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.edit.setCursorPosition(0)                          # длинное правило - показать начало
+        self.edit.setStyleSheet(render_qss('QLineEdit#cfg[wstate="error"] { border-color: $UI_COLOR_ERROR; }'))
+        self.edit.setPlaceholderText("IF CH2.I < 5m THEN CH1 OFF AND BLOCK ELSE UNBLOCK")
+        self.toggle = LToggle([("ON", True), ("OFF", False)], on)
+        self.toggle.setFixedWidth(48)
+        self.delete = QPushButton("×")
+        self.delete.setObjectName("choice")
+        self.delete.setFixedWidth(28)
+        self.delete.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete.setToolTip("Delete rule")
+        super().__init__("", self.edit, self.toggle, self.delete, parent=parent)
+        self._name.hide()
+        self.line_layout.setStretchFactor(self.edit, 1)
+        self.channels, self.rule, self.error = channels, None, ""
+        self._changed = changed
+        self.edit.editingFinished.connect(self.commit)
+        self.toggle.changed.connect(lambda _v: self._changed())
+        self.delete.clicked.connect(lambda: remove(self))
+        self.parse()
+
+    def parse(self) -> None:
+        text = self.edit.text().strip()
+        try:
+            self.rule, self.error = (parse_rule(text, self.channels) if text else None), ""
+        except RuleError as e:
+            self.rule, self.error = None, str(e)
+        self.edit.setProperty("wstate", "error" if self.error else "")
+        self.edit.setToolTip(self.error or "IF <cond> THEN <actions> [ELSE <actions>]; Enter applies")
+        _repolish(self.edit)
+
+    def commit(self) -> None:
+        if self.edit.isModified() or self.rule is None:
+            self.edit.setModified(False)
+            self.parse()
+            self._changed()
+
+    @property
+    def active(self) -> Rule | None:
+        return self.rule if self.toggle.value is True else None
+
+
+class RulesTable(PanelTable):
+    """Список правил с кнопкой «+»; ``changed`` вызывается после любой правки."""
+
+    def __init__(self, entries, channels, changed, parent=None):
+        super().__init__(parent=parent)
+        self.channels, self._changed = set(channels), changed
+        self.rows: list[RuleRow] = []
+        self.add_button = QPushButton("+")
+        self.add_button.setObjectName("choice")
+        self.add_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_button.setToolTip("Add rule")
+        self.add_button.clicked.connect(lambda: self.add_rule("", True, focus=True))
+        self.table_layout.addWidget(self.add_button)
+        for text, on in entries:
+            self.add_rule(text, on, notify=False)
+
+    def build(self, column_width: int | None = None) -> None:
+        """Столбцов нет: ширину задаёт сама строка (текст растягивается)."""
+
+    def add_rule(self, text: str = "", on: bool = True, focus: bool = False, notify: bool = True) -> RuleRow:
+        row = RuleRow(text, on, self.channels, self._changed, self.remove_rule)
+        self.rows.append(row)
+        self.lines.append(row)
+        self.table_layout.insertWidget(len(self.rows) - 1, row)
+        if focus:
+            row.edit.setFocus()
+        if notify:
+            self._changed()
+        return row
+
+    def remove_rule(self, row: RuleRow) -> None:
+        self.rows.remove(row)
+        self.lines.remove(row)
+        self.table_layout.removeWidget(row)
+        row.hide()
+        row.deleteLater()
+        self._changed()
+
+    def rules(self) -> list[Rule]:
+        return [r.active for r in self.rows if r.active is not None]
+
+    def entries(self) -> list[tuple[str, bool]]:
+        return [(r.edit.text().strip(), r.toggle.value is True) for r in self.rows if r.edit.text().strip()]
+
+
 class PSUWindow(InstrumentWindow):
     CONNECTION_GROUP = CONNECTION_GROUP
     DEFAULT_KIND = "it6300"
@@ -288,12 +382,12 @@ class PSUWindow(InstrumentWindow):
 
     def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Power supply", parent=None):
         super().__init__(proxy, settings, title, parent)
-        for n in (GATED, *GATE_BY):
-            for k in (f"ch{n}.meas_i", f"ch{n}.output"):
-                if proxy.supports(k):
-                    proxy.subscribe(k, lambda _v: self.update_gate())
-        proxy.state_changed.connect(lambda _s: self.update_gate())
-        self.update_gate()
+        for n in self.tiles:
+            for k in ("output", "meas_v", "meas_i", "meas_p"):
+                if proxy.supports(f"ch{n}.{k}"):
+                    proxy.subscribe(f"ch{n}.{k}", lambda _v: self.apply_rules())
+        proxy.state_changed.connect(lambda _s: self.apply_rules())
+        self.apply_rules()
 
     # ------------------------------------------------------------ сборка
     def build(self) -> None:
@@ -304,13 +398,6 @@ class PSUWindow(InstrumentWindow):
         self.tiles = {t.n: t for t in self.grid.tiles}
         for t in self.grid.tiles:
             self.saved_widgets += [t.fields["V"], t.fields["I"]]       # выходы после Init не включаем
-        # блокировка CH1: замок в плитке, закрыт - блокировка действует, открыт - обход
-        self.gate_lock = None
-        if GATED in self.tiles and all(n in self.tiles for n in GATE_BY):
-            self.gate_lock = LToggle([("ON", True), ("OFF", False)],
-                                     not s.value(f"{pre}/GATE_BYPASS", False, type=bool))
-            self.gate_lock.changed.connect(self._gate_toggled)
-        self.gate_min_a = s.value(f"{pre}/GATE_MIN_A", GATE_MIN_A, type=float)
         grid_line = PanelLine("", self.grid)
         grid_line._name.hide()
         self.top_lines = [grid_line]
@@ -346,37 +433,52 @@ class PSUWindow(InstrumentWindow):
             w = PSButton(proxy, "combine", [(c, c) for c in proxy.params["combine"].choices])
             self.saved_widgets.append(w)
             out.append(PanelLine("COMB", w))
-        if self.gate_lock is not None:
-            out.append(PanelLine("ILCK", self.gate_lock))
         if out:
             self.page_specs.append(("OUT", (), PanelTable(*out)))
+        raw = s.value(f"{pre}/RULES", None)
+        try:
+            saved = [(str(r["text"]), bool(r.get("on", True))) for r in json.loads(raw)] if raw else None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            saved = None
+        if saved is None:
+            saved = DEFAULT_RULES if all(n in self.tiles for n in (1, 2, 3)) else []
+        self.rules_table = RulesTable(saved, set(self.tiles), self._rules_changed)
+        self.page_specs.append(("RULES", (), self.rules_table))
 
     def restore_rank(self, key: str) -> int:
         return 0 if key == "combine" else 2
 
-    # ------------------------------------------------------------ блокировка CH1
-    def _gate_toggled(self, locked: bool) -> None:
-        self.settings.setValue(f"{self._prefix}/GATE_BYPASS", not locked)
-        self.update_gate()
+    # ------------------------------------------------------------ правила
+    def _rules_changed(self) -> None:
+        self.settings.setValue(f"{self._prefix}/RULES", json.dumps(
+            [{"text": t, "on": on} for t, on in self.rules_table.entries()], ensure_ascii=False))
+        self.apply_rules()
+        self._fit_height()
 
-    def gate_open(self) -> bool:
-        if self.gate_lock is None or self.gate_lock.value is not True:
-            return True
+    def _get(self, n: int, q: str):
         p = self.proxy
-        return all(p.value(f"ch{n}.output") is True and (p.value(f"ch{n}.meas_i") or 0.0) >= self.gate_min_a
-                   for n in GATE_BY)
+        if not p.is_connected:
+            return None
+        return p.value(f"ch{n}.output" if q == "OUT" else f"ch{n}.meas_{q.lower()}")
 
-    def update_gate(self) -> None:
-        if self.gate_lock is None:
+    def apply_rules(self) -> None:
+        """Применить правила: заблокировать плитки, выключить выходы. Без связи - всё заблокировано."""
+        if not hasattr(self, "rules_table"):
             return
-        tile = self.tiles[GATED]
-        self.gate_lock.setToolTip("Interlock ON: CH1 needs " + " and ".join(f"CH{n}" for n in GATE_BY)
-                                  + f" drawing ≥ {si_format(self.gate_min_a, 'A', 3)}. Click to bypass"
-                                  if self.gate_lock.value is True else "Interlock bypassed. Click to enable")
-        tile.set_locked(not self.gate_open(),
-                        " and ".join(f"CH{n}" for n in GATE_BY) + f" must draw ≥ {si_format(self.gate_min_a, 'A', 3)}")
+        off, on, blocked, why = resolve(self.rules_table.rules(), self._get)
+        for n, tile in self.tiles.items():
+            tile.set_locked(n in blocked or not self.proxy.is_connected, why.get(n, ""))
+        if not self.proxy.is_connected:
+            return
+        for n in sorted(off):
+            if n in self.tiles and self.proxy.value(f"ch{n}.output") is True:
+                self.proxy.set(f"ch{n}.output", False)
+        for n in sorted(on):
+            if n in self.tiles and self.proxy.value(f"ch{n}.output") is False:
+                self.proxy.set(f"ch{n}.output", True)
 
     def _on_state(self, state: ConnectionState) -> None:
         super()._on_state(state)
+        self.apply_rules()
         for t in (self.grid.tiles if hasattr(self, "grid") else ()):
             t._update_tip()
