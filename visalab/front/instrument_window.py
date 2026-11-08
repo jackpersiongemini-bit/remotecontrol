@@ -18,7 +18,7 @@ import re
 import time
 from typing import Any, Callable
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
                              QSizePolicy, QVBoxLayout, QWidget)
 
@@ -31,10 +31,47 @@ from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
                      Window, short_address)
 
-__all__ = ["InstrumentWindow", "PresetGroup", "HScrollArea", "saved_connection", "PRESET_HEIGHT", "PRESET_GAP"]
+__all__ = ["InstrumentWindow", "PresetGroup", "HScrollArea", "saved_connection", "PRESET_HEIGHT", "PRESET_GAP",
+           "LINKS", "ProxyLinks"]
 
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
+
+
+class ProxyLinks(QObject):
+    """Прокси открытых в этом процессе окон: окно может брать значения другого прибора
+    (ваттметр - скважность у ГСС) по имени профиля, не зная драйвера."""
+
+    changed = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._proxies: list[InstrumentProxy] = []
+
+    def add(self, proxy: InstrumentProxy) -> None:
+        if proxy not in self._proxies:
+            self._proxies.append(proxy)
+            self.changed.emit()
+
+    def remove(self, proxy: InstrumentProxy) -> None:
+        if proxy in self._proxies:
+            self._proxies.remove(proxy)
+            try:
+                self.changed.emit()
+            except RuntimeError:                 # выход из программы: реестр уже удалён
+                pass
+
+    def find(self, profile: str) -> InstrumentProxy | None:
+        """Последний открытый прибор с этим профилем (``function_generator``...)."""
+        for proxy in reversed(self._proxies):
+            prof = getattr(getattr(proxy, "driver_cls", None), "PROFILE", None)
+            if prof is not None and prof.name == profile:
+                return proxy
+        return None
+
+
+#: общий для процесса реестр приборов окон
+LINKS = ProxyLinks()
 
 
 def saved_connection(settings: QSettings, group: str) -> dict[str, str]:
@@ -296,6 +333,8 @@ class InstrumentWindow(Window):
         proxy.param_updated.connect(self._on_param)
         proxy.comm_error.connect(self._on_comm_error)
         self._on_state(proxy.state)
+        LINKS.add(proxy)
+        self.destroyed.connect(lambda *_a, p=proxy: LINKS.remove(p))
 
         self.address.setMinimumWidth(self.address.sizeHint().width())
         self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.minimumSize().width()))
