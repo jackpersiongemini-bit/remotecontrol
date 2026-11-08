@@ -206,3 +206,30 @@ def test_clickable_widgets_have_pointer_cursor(qtbot, opened):
            if c.isVisibleTo(win) and c.isEnabled() and c.property("static") is not True
            and c.cursor().shape() != Qt.CursorShape.PointingHandCursor]
     assert not bad, [(type(c).__name__, c.objectName()) for c in bad]
+
+
+def test_line_edit_placeholder_editing(qtbot, opened):
+    from PyQt6.QtCore import Qt
+    _sim, proxy, win = opened
+    win.show()
+    qtbot.waitExposed(win)
+    field = win.channels[0]["high"]
+    win.set_expanded(True)
+    shown = field.text()
+    assert shown
+    field.setFocus()
+    qtbot.waitUntil(field.hasFocus)
+    assert field.text() == "" and field.placeholderText() == shown     # значение - в подсказке
+    qtbot.keyClick(field, Qt.Key.Key_Escape)                           # отмена
+    assert not field.hasFocus() and field.text() == shown and field.placeholderText() == ""
+    field.setFocus()
+    qtbot.waitUntil(field.hasFocus)
+    qtbot.keyClicks(field, "1.25")
+    qtbot.keyClick(field, Qt.Key.Key_Return)                           # запись и выход из поля
+    _wait(qtbot, proxy, "ch1.high", lambda v: v == pytest.approx(1.25))
+    qtbot.waitUntil(lambda: field.text() == "1.25" and not field.hasFocus())
+    field.setFocus()
+    qtbot.waitUntil(field.hasFocus)
+    field.clearFocus()                                                 # пусто - значение не меняется
+    assert field.text() == "1.25"
+    assert proxy.value("ch1.high") == pytest.approx(1.25)

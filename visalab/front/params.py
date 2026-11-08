@@ -159,18 +159,48 @@ class PLineEdit(QLineEdit, _Bound):
         self.show_value(self._value, force=True)
 
     # -------------------------------------------------------- значение
+    def _editing(self) -> bool:
+        return self.hasFocus() and not self.isReadOnly()
+
     def show_value(self, value, force: bool = False):
-        if not force and self.hasFocus() and self.isModified():
-            return
+        editing = self._editing() and not force
         if value is None:
-            self.setText("")
+            text = ""
         elif isinstance(value, (int, float)) and not isinstance(value, bool) and self.unit:
-            self._auto_prefix(value)
-            self._update_unit()
-            self.setText(f"{value / self._factor():.{self.digits}g}")
+            if not editing:                       # пока пользователь печатает, единицу не трогаем
+                self._auto_prefix(value)
+                self._update_unit()
+            text = f"{value / self._factor():.{self.digits}g}"
         else:
-            self.setText(str(value))
+            text = str(value)
+        if editing:                               # в режиме ввода текущее значение - в подсказке
+            self.setPlaceholderText(text)
+            return
+        self.setText(text)
         self.setModified(False)
+
+    # -------------------------------------------------------- ввод
+    def focusInEvent(self, e):  # noqa: N802 - Qt
+        super().focusInEvent(e)
+        if not self.isReadOnly():                 # значение уходит в подсказку, печатать можно сразу
+            self.setPlaceholderText(self.text())
+            self.clear()
+            self.setModified(False)
+
+    def focusOutEvent(self, e):  # noqa: N802 - Qt
+        super().focusOutEvent(e)                  # editingFinished -> change_value
+        self.setPlaceholderText("")
+        self.show_value(self._value, force=True)
+
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        if e.key() == Qt.Key.Key_Escape:          # отмена правки
+            self.clear()
+            self.setModified(False)
+            self.clearFocus()
+            return
+        super().keyPressEvent(e)
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.clearFocus()
 
     def _parse(self, text: str):
         if self.spec.kind not in (Kind.FLOAT, Kind.INT):
