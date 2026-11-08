@@ -39,7 +39,7 @@ class WindowBar(TitleBar):
             max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
             background-color: $UI_COLOR_BORDER; border: none; border-radius: ${UI_BORDER_RADIUS_PX}px;
         }
-        WindowBar IconButtonBase:hover { background-color: $UI_COLOR_TEXT_MUTED; }
+        WindowBar IconButtonBase:hover { background-color: $UI_COLOR_INVERT_HOVER; }
         WindowBar IconButtonBase[status="process"] { background-color: $UI_COLOR_PROCESS; }
         WindowBar CustomOnButton[status="ON"] { background-color: $UI_COLOR_SUCCESS; }
         WindowBar CustomOnButton[status="ON"]:hover { background-color: $UI_COLOR_SUCCESS_HOVER; }
