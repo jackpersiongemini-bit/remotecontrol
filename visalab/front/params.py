@@ -800,6 +800,13 @@ class Panel(QFrame):
         }
         Panel PLineEdit:focus, Panel PSpinBox:focus { border-color: $UI_COLOR_TEXT_MUTED; }
         Panel PSpinBox { padding: 0 0 0 0; }
+        Panel CustomLockButton {
+            min-width: ${UI_CONTROL_HEIGHT_PX}px; max-width: ${UI_CONTROL_HEIGHT_PX}px;
+            min-height: ${UI_CONTROL_HEIGHT_PX}px; max-height: ${UI_CONTROL_HEIGHT_PX}px;
+            background-color: $UI_COLOR_BACKGROUND; border: none; border-radius: ${UI_BORDER_RADIUS_PX}px; padding: 0;
+        }
+        Panel CustomLockButton:hover { background-color: $UI_COLOR_INVERT_HOVER; }
+        Panel CustomLockButton:checked { background-color: $UI_COLOR_INVERT; }
         Panel QCheckBox { spacing: 0; padding: 0; color: $UI_COLOR_TEXT_MUTED; }
         Panel QCheckBox::indicator {
             width: 14px; height: 14px; border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER_LIGHT;
