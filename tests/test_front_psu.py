@@ -90,30 +90,51 @@ def test_tile_click_toggles_output(qtbot, psu):
     qtbot.waitUntil(lambda: t.mode.text() == "OFF", timeout=5000)
 
 
-def test_ch1_interlock_and_bypass(qtbot, psu):
+def test_default_rule_blocks_ch1(qtbot, psu):
     proxy, win, settings = psu
     t1 = win.tiles[1]
-    assert t1.locked and not t1.toggle()
+    assert len(win.rules_table.rows) == 1 and t1.locked and "CH2" in t1.lock_reason
+    assert not t1.toggle()
     for n in (2, 3):
         proxy.set(f"ch{n}.voltage", 2.0)                          # нагрузка 10 Ом -> 0.2 А
         proxy.set(f"ch{n}.output", True)
     qtbot.waitUntil(lambda: not t1.locked, timeout=5000)
     assert t1.toggle()
     _wait(qtbot, proxy, "ch1.output", lambda v: v is True)
-    proxy.set("ch3.output", False)
-    qtbot.waitUntil(lambda: t1.locked, timeout=5000)
-    assert t1.toggle()                                            # выключить можно всегда
+    proxy.set("ch3.output", False)                                # THEN CH1 OFF AND BLOCK
     _wait(qtbot, proxy, "ch1.output", lambda v: v is False)
+    qtbot.waitUntil(lambda: t1.locked, timeout=5000)
     assert not t1.toggle()
-    win.gate_lock.click()                                         # ILCK ON -> OFF: обход
-    assert not t1.locked and settings.value(f"{win._prefix}/GATE_BYPASS") in (True, "true")
-    assert t1.toggle()
-    _wait(qtbot, proxy, "ch1.output", lambda v: v is True)
+
+
+def test_rules_edit_save_and_errors(qtbot, psu):
+    proxy, win, settings = psu
+    table = win.rules_table
+    row = table.rows[0]
+    row.toggle.set_value(False)                                   # правило выключено - блокировки нет
+    qtbot.waitUntil(lambda: not win.tiles[1].locked, timeout=5000)
+    bad = table.add_rule("IF CH9 ON THEN CH1 OFF", True)
+    bad.commit()
+    assert bad.rule is None and "CH9" in bad.error and bad.edit.property("wstate") == "error"
+    bad.edit.setText("IF CH3 ON THEN CH2 BLOCK ELSE CH2 UNBLOCK")
+    bad.edit.setModified(True)
+    bad.commit()
+    assert bad.rule is not None and not bad.error
+    qtbot.waitUntil(lambda: win.tiles[2].locked is False, timeout=5000)
+    proxy.set("ch3.output", True)
+    qtbot.waitUntil(lambda: win.tiles[2].locked, timeout=5000)
+    assert "CH3 ON" in win.tiles[2].lock_reason
+    import json
+    saved = json.loads(settings.value(f"{win._prefix}/RULES"))
+    assert [r["on"] for r in saved] == [False, True] and saved[1]["text"].startswith("IF CH3 ON")
+    table.remove_rule(bad)                                        # удалили - блокировка снята
+    qtbot.waitUntil(lambda: not win.tiles[2].locked, timeout=5000)
+    assert len(json.loads(settings.value(f"{win._prefix}/RULES"))) == 1
 
 
 def test_off_all_and_tabs(qtbot, psu):
     proxy, win, _s = psu
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["PROT", "OUT"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["PROT", "OUT", "RULES"]
     for n in (2, 3):
         proxy.set(f"ch{n}.output", True)
     _wait(qtbot, proxy, "ch3.output", lambda v: v is True)

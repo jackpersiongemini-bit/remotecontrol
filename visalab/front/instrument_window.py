@@ -306,7 +306,7 @@ class InstrumentWindow(Window):
         label_w = 0
         for page in self.pages:
             page.build(UI_COLUMN_WIDTH_PX)
-            label_w = max(label_w, page.lines[0]._name.width(), *(ln.label_hint() for ln in page.lines))
+            label_w = max([label_w, *(ln.label_hint() for ln in page.lines)])
         for page in (*self.pages, self.connection_page):
             for ln in page.lines:
                 ln.set_label_width(label_w)
