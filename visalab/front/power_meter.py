@@ -603,7 +603,6 @@ class PowerMeterWindow(InstrumentWindow):
         # CAL: график поправки, выбор таблицы (CSV), автокалибровка, GAIN, DUTY, итог, датчик
         self.cal_dir = Path(s.fileName()).resolve().parent / "calibrations"
         self.cal_points: list[tuple[float, float]] = []
-        self.cal_on = LToggle([("OFF", False), ("ON", True)], s.value(f"{pre}/CAL_ON", True, type=bool))
         self.cal_value = QLabel("")
         self.cal_value.setObjectName("calValue")
         self.cal_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -634,13 +633,14 @@ class PowerMeterWindow(InstrumentWindow):
         self.duty_src.setToolTip("DUTY: OFF / manual / from the pulse generator (SDG CH1 / CH2) in this app")
         self.duty = LNumber(s.value(f"{pre}/DUTY", 100.0, type=float), "%", 0.001, 100.0)
         self.duty.setToolTip("Pulse duty cycle: adds 10·lg(100 / DUTY)")
-        for w, name in ((self.cal_on, "CAL_ON"), (self.gain_on, "GAIN_ON"), (self.duty_src, "DUTY_SRC")):
+        for w, name in ((self.gain_on, "GAIN_ON"), (self.duty_src, "DUTY_SRC")):
             w.changed.connect(lambda v, n=name: self._local_changed(n, v))
         for w, name in ((self.gain, "GAIN"), (self.duty, "DUTY")):
             w.changed.connect(lambda v, n=name: self._local_changed(n, v))
         plot_line = PanelLine("", self.cal_plot)
         plot_line._name.hide()
-        cal = [PanelLine("CAL", self.cal_on, self.cal_value), plot_line, PanelLine("TABL", self.cal_choice),
+        # выбранная таблица и есть «поправка включена»; NONE - без таблицы
+        cal = [plot_line, PanelLine("TABL", self.cal_choice, self.cal_value),
                PanelLine("ACAL", self.acal_start, self.acal_stop, self.acal_points, self.acal_run),
                PanelLine("GAIN", self.gain_on, self.gain), PanelLine("DUTY", self.duty_src, self.duty)]
         if sup("offset"):
@@ -776,7 +776,7 @@ class PowerMeterWindow(InstrumentWindow):
 
     def correction_parts(self) -> dict[str, float]:
         """Слагаемые поправки, dB: CAL(f), −GAIN, 10·lg(100 / DUTY)."""
-        cal = interpolate(self.cal_points, self.proxy.value("freq")) if self.cal_on.value else 0.0
+        cal = interpolate(self.cal_points, self.proxy.value("freq"))
         gain = -self.gain.value if self.gain_on.value else 0.0
         duty = self.duty_value()
         return {"cal": cal, "gain": gain, "duty": 10 * math.log10(100.0 / duty) if duty else 0.0}
@@ -789,7 +789,7 @@ class PowerMeterWindow(InstrumentWindow):
         """Записать итоговую поправку в прибор (offset), если она изменилась."""
         parts = self.correction_parts()
         freq = self.proxy.value("freq")
-        self.cal_value.setText(f"{parts['cal']:+.3g} dB" if self.cal_on.value else "")
+        self.cal_value.setText(f"{parts['cal']:+.3g} dB" if self.cal_points else "")
         self.cal_value.setToolTip(f"Table value at {si_format(freq, 'Hz', 6)}" if freq else "")
         if self.duty_src.value in ("CH1", "CH2"):
             self.duty.setReadOnly(True)
