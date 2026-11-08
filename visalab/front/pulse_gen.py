@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtWidgets import QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFrame, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.params import ConnectionState
 from ..core.proxy import InstrumentProxy
@@ -50,10 +50,14 @@ def _fmt(value: float) -> str:
 
 
 class PresetGroup(PBGroup):
-    """Пары (period, width) в QSettings (JSON). Чип в две строки: период / ширина."""
+    """Пары (period, width) в QSettings (JSON). Чип в две строки: период / ширина.
 
-    def __init__(self, settings: QSettings, key: str, defaults=PULSE_PRESETS, columns: int = 3, parent=None):
-        super().__init__(columns=columns, parent=parent)
+    Порядок - по последнему использованию: применённый или добавленный пресет становится первым.
+    """
+
+    def __init__(self, settings: QSettings, key: str, defaults=PULSE_PRESETS, parent=None):
+        super().__init__(parent=parent)
+        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.settings, self.key = settings, key
         self.data: list[tuple[float, float]] = []
         for preset in self._load(defaults):
@@ -72,9 +76,23 @@ class PresetGroup(PBGroup):
         self.settings.setValue(self.key, json.dumps(self.data, separators=(",", ":")))
 
     def _append(self, preset):
-        b = self.add_button(f"{_fmt(preset[0])}\n{_fmt(preset[1])}")
-        b.setToolTip(f"PERI {_fmt(preset[0])}\nWID {_fmt(preset[1])}")
+        self.add_button("")
         self.data.append(preset)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        for b, (period, width) in zip(self.buttons(), self.data):
+            b.setText(f"{_fmt(period)}\n{_fmt(width)}")
+            b.setToolTip(f"PERI {_fmt(period)}\nWID {_fmt(width)}")
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def touch(self, index: int) -> None:
+        """Переместить пресет в начало (последний использованный) и выделить."""
+        if 0 <= index < len(self.data):
+            self.data.insert(0, self.data.pop(index))
+            self._refresh()
+            self.set_checked(0)
+            self.save()
 
     def find(self, period: float, width: float) -> int:
         for i, (p, w) in enumerate(self.data):
@@ -87,8 +105,7 @@ class PresetGroup(PBGroup):
         if i < 0:
             self._append((float(period), float(width)))
             i = len(self.data) - 1
-            self.save()
-        self.set_checked(i)
+        self.touch(i)
         return True
 
     def remove_selected(self) -> bool:
@@ -99,6 +116,33 @@ class PresetGroup(PBGroup):
         del self.data[i]
         self.save()
         return True
+
+
+class HScrollArea(QScrollArea):
+    """Одна строка с горизонтальной прокруткой; колесо мыши листает вбок."""
+
+    def __init__(self, widget: QWidget, parent=None):
+        super().__init__(parent)
+        self.setObjectName("hscroll")
+        self.setWidget(widget)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(1)
+
+    def sizeHint(self):  # noqa: N802 - Qt
+        h = self.widget().sizeHint().height() + self.horizontalScrollBar().sizeHint().height() + 2
+        return QSize(1, h)
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt
+        return self.sizeHint()
+
+    def wheelEvent(self, e):  # noqa: N802 - Qt
+        bar = self.horizontalScrollBar()
+        bar.setValue(bar.value() - (e.angleDelta().y() or e.angleDelta().x()))
+        e.accept()
 
 
 class PulseGenWindow(Window):
@@ -145,6 +189,7 @@ class PulseGenWindow(Window):
         outputs = [ch["output"] for ch in self.channels if "output" in ch]
         self.presets = PresetGroup(settings, f"{self._prefix}/PULSE_PRESETS")
         self.presets.selected.connect(self._apply_preset)
+        self.preset_scroll = HScrollArea(self.presets)
         self.add_button = self._tool("+", "Add preset from CH1 PERI / WID", self._add_preset)
         self.remove_button = self._tool("−", "Remove selected preset", self.presets.remove_selected)
         tools = QWidget()
@@ -154,7 +199,7 @@ class PulseGenWindow(Window):
         tl.addWidget(self.add_button)
         tl.addWidget(self.remove_button)
         tl.addStretch()
-        top = PanelTable(PanelLine("OUT", *outputs), PanelLine("PRST", self.presets, tools))
+        top = PanelTable(PanelLine("OUT", *outputs), PanelLine("PRST", self.preset_scroll, tools))
         self.preset_panel = Panel(top)
         for w in outputs:
             w.setMinimumWidth(UI_COLUMN_WIDTH_PX)
@@ -273,6 +318,8 @@ class PulseGenWindow(Window):
 
     def _apply_preset(self, index: int) -> None:
         period, width = self.presets.data[index]
+        self.presets.touch(index)
+        self.preset_scroll.horizontalScrollBar().setValue(0)
         for ch in self.channels:
             cur = ch["period"].value
             pairs = [(ch["period"], period), (ch["width"], width)]
