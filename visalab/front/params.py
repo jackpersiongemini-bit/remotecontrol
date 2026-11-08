@@ -362,7 +362,7 @@ class PBGroup(QWidget):
             self.group_layout.addWidget(b, r, c)
 
     def add_button(self, name: str) -> QPushButton:
-        b = IndicatorButton(name)
+        b = QPushButton(name)                  # выбор (не включение) - инверсия, как у вкладки
         b.setObjectName("chip")
         b.setCheckable(True)
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -418,6 +418,7 @@ class PTabBar(QTabBar):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._on: set[int] = set()
         self._hover = -1
+        self.show_selection = True        # False - полоса только как индикаторы (свёрнутое окно)
 
     def set_on(self, index: int, on: bool) -> None:
         if on != (index in self._on):
@@ -452,14 +453,15 @@ class PTabBar(QTabBar):
         p.setPen(Qt.PenStyle.NoPen)
         for i in range(self.count()):
             rect = QRectF(self.tabRect(i)).adjusted(2.5, 0.5, -2.5, -0.5)
-            selected, on, hover = i == self.currentIndex(), i in self._on, i == self._hover
+            selected = self.show_selection and i == self.currentIndex()
+            on, hover = i in self._on, i == self._hover
             # фон: наведение и выбранная вкладка - инверсия
             bg = UI_COLOR_INVERT_HOVER if hover else UI_COLOR_INVERT if selected else None
             if bg:
                 p.setBrush(QColor(bg))
                 p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-            if on:                        # режим включён: тонкая рамка + толстая нижняя граница
-                paint_indicator(p, rect, UI_COLOR_TEXT_INVERSE if (selected or hover) else UI_COLOR_TEXT_MUTED)
+            if on and not selected:       # режим включён (у выбранной видно по STAT): рамка + толстая граница
+                paint_indicator(p, rect, UI_COLOR_TEXT_INVERSE if hover else UI_COLOR_TEXT_MUTED)
             fg = UI_COLOR_TEXT_INVERSE if (hover or selected) else \
                 UI_COLOR_TEXT_MUTED if on else UI_COLOR_BORDER_LIGHT
             font = QFont(self.font())
@@ -566,9 +568,9 @@ class Panel(QFrame):
         Panel PSButton:disabled, Panel PLineEdit:disabled { color: $UI_COLOR_BORDER; }
         Panel QPushButton#chip { padding: 2px 8px; min-height: 0; max-height: 1000px; }
         Panel QPushButton#chip:checked {
-            background-color: $UI_COLOR_BACKGROUND;
+            background-color: $UI_COLOR_INVERT;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-            color: $UI_COLOR_TEXT;
+            color: $UI_COLOR_TEXT_INVERSE;
         }
         Panel QPushButton#chip:checked:hover, Panel PSButton[state="true"]:hover, Panel PSButton[state="on"]:hover {
             background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE;
