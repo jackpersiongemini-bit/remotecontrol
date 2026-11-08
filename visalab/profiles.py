@@ -243,7 +243,13 @@ NETWORK_ANALYZER = Profile(
     doc="""Трасса ``trace`` - Trace(x в Hz, y в единицах формата: MLOG - dB, PHASE/UPHASE - deg,
     GDELAY - s, SWR/LIN_MAG/REAL/IMAG - без единиц), публикуется после каждой ЗАВЕРШЁННОЙ развёртки.
     Поэтому у ключа ``trace`` единица в профиле пустая, а настоящая - в ``Trace.y_unit``.
-    Драйвер работает с одним измерением (S-параметром) первого канала.""",
+
+    Все измерения канала 1: ``m{n}.*`` (n с 1, в порядке каталога прибора). Одна развёртка обновляет
+    все измерения канала, и после неё публикуются ВСЕ: ``m{n}.trace`` - в формате измерения,
+    ``m{n}.sdata`` - комплексная (Trace.im - мнимая часть, y - вещественная, единицы нет),
+    ``m{n}.name`` / ``sparam`` / ``format``; ``meas.count`` - сколько измерений есть. Нет измерения
+    с таким номером - значения None. ``trace`` / ``sparam`` / ``format`` и маркер относятся к
+    первому измерению (то же, что m1). ``meas.complex`` выключает чтение комплексных данных.""",
     slots=(
         Slot("trace", T, "", required=True, readonly=True),
         Slot("meas.continuous", B, required=True),
@@ -267,6 +273,13 @@ NETWORK_ANALYZER = Profile(
         Slot("marker.state", B),
         Slot("marker.freq", F, "Hz"),
         Slot("marker.value", F, "", readonly=True, doc="значение трассы в маркере, единицы - как у трассы"),
+        Slot("meas.count", I, readonly=True, doc="сколько измерений на канале 1"),
+        Slot("meas.complex", B, doc="читать комплексные данные m{n}.sdata"),
+        Slot("m{n}.name", S, readonly=True, doc="имя измерения"),
+        Slot("m{n}.sparam", E, choices=("S11", "S21", "S12", "S22")),
+        Slot("m{n}.format", E, choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")),
+        Slot("m{n}.trace", T, "", readonly=True, doc="трасса измерения в его формате"),
+        Slot("m{n}.sdata", T, "", readonly=True, doc="комплексная трасса измерения (Re в y, Im в im)"),
     ),
     actions=(
         ActionSlot("single", doc="одна развёртка"),

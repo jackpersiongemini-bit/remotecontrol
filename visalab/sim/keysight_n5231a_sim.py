@@ -54,6 +54,14 @@ class KeysightPNASim(SimInstrument):
         n, a, b = self.c["poin"], self.c["start"], self.c["stop"]
         return [a + (b - a) * i / (n - 1) if n > 1 else a for i in range(n)]
 
+    def sdata(self, name: str) -> list[float]:
+        """Комплексные данные измерения: re, im, re, im, ..."""
+        out: list[float] = []
+        for f in self.freqs():
+            v = self.s(self.meas[name]["s"], f)
+            out += [v.real, v.imag]
+        return out
+
     def fdata(self, name: str) -> list[float]:
         m = self.meas[name]
         fs = self.freqs()
@@ -230,9 +238,12 @@ class KeysightPNASim(SimInstrument):
         self._cur()["fmt"] = _FMT[t]
 
     def _data(self, a, g):
-        if a.strip().upper() != "FDATA":
+        kind = a.strip().upper()
+        if kind not in ("FDATA", "SDATA"):
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        return ",".join(f"{v:+.10E}" for v in self.fdata(self.selected if self.selected else "?"))
+        self._cur()
+        data = self.fdata(self.selected) if kind == "FDATA" else self.sdata(self.selected)
+        return ",".join(f"{v:+.10E}" for v in data)
 
     def _mode_set(self, a, g):
         t = a.strip().upper()
