@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from typing import Any
 
 from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
-from PyQt6.QtWidgets import QFrame, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+                             QVBoxLayout, QWidget)
 
-from ..core.params import ConnectionState, Kind
+from ..core.params import ConnectionState, Kind, PStatus
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
 from .params import PBGroup, PLabel, PTabBar, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
@@ -267,6 +269,7 @@ class PulseGenWindow(Window):
 
         # ---------------------------------------------------------- вкладки и таблицы (сворачиваются)
         self.tabs = PTabBar()
+        self._errors_shown = False
         self.pages: list[PanelTable] = []
         self._page_states: list[str | None] = []
         for title_, state, rows in PAGES:
@@ -292,6 +295,8 @@ class PulseGenWindow(Window):
         bl.addWidget(self.tabs)
         for page in self.pages:
             bl.addWidget(page)
+        self.error_page = self._build_error_page()
+        bl.addWidget(self.error_page)
         self.parameter_panel = Panel(body)
         label_w = 0
         for page in self.pages:
@@ -314,6 +319,8 @@ class PulseGenWindow(Window):
         names = {k: k.upper().replace(".", " ") for k in keys}
         self.tracker = WriteTracker(proxy, keys, names, self)
         self.tracker.changed.connect(self.error_indicator.set_items)
+        self.error_indicator.clicked.connect(self.show_errors)
+        proxy.param_status.connect(self._log_status)
         proxy.state_changed.connect(self._on_state)
         proxy.sync_done.connect(self._on_sync_done)
         proxy.action_done.connect(self._on_action_done)
@@ -334,8 +341,8 @@ class PulseGenWindow(Window):
         """Полный вид - вкладки с таблицами; обычный - выходы, пресеты и полоса вкладок-индикаторов."""
         self._expanded = bool(on)
         self.expand_button.set_expanded(on)
-        self.tabs.show_selection = self._expanded
-        self.tabs.update()
+        if not on:
+            self._errors_shown = False
         self._show_pages()
         self.settings.setValue(f"{self._prefix}/EXPANDED", bool(on))
         self._fit_height()
@@ -345,14 +352,72 @@ class PulseGenWindow(Window):
         self._fit_height()                # до показа раскладки считаются неточно
 
     def _show_pages(self) -> None:
+        errors = self._expanded and self._errors_shown
         for i, page in enumerate(self.pages):
-            page.setVisible(self._expanded and i == self.tabs.currentIndex())
+            page.setVisible(self._expanded and not errors and i == self.tabs.currentIndex())
+        self.error_page.setVisible(errors)
+        self.tabs.show_selection = self._expanded and not errors
+        self.tabs.update()
 
     def _on_tab_clicked(self, index: int) -> None:
-        """Клик по вкладке в свёрнутом окне разворачивает его сразу на ней."""
-        if index >= 0 and not self._expanded:
+        """Клик по вкладке: из журнала ошибок - обратно к таблице; в свёрнутом окне - развернуть на ней."""
+        if index < 0:
+            return
+        if self._errors_shown:
+            self._errors_shown = False
+            self.set_page(index, fit=not self._expanded)
+        if not self._expanded:
             self.set_page(index, fit=False)
             self.set_expanded(True)
+
+    # ------------------------------------------------------------ журнал ошибок
+    def _build_error_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        head = QHBoxLayout()
+        title = QLabel("ERRORS")
+        title.setObjectName("lineName")
+        head.addWidget(title)
+        head.addStretch()
+        self.clear_button = self._tool("CLEAR", "Clear the error log and return to parameters", self.clear_errors)
+        self.clear_button.setProperty("wide", True)
+        head.addWidget(self.clear_button)
+        lay.addLayout(head)
+        self.error_log = QPlainTextEdit()
+        self.error_log.setObjectName("errorLog")
+        self.error_log.setReadOnly(True)
+        self.error_log.setPlaceholderText("No errors")
+        self.error_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.error_log.setFixedHeight(10 * self.error_log.fontMetrics().lineSpacing() + 12)
+        lay.addWidget(self.error_log)
+        page.hide()
+        return page
+
+    def _log(self, name: str, detail: str) -> None:
+        detail = (detail or "error").strip().splitlines()[0] if detail else "error"
+        self.error_log.appendPlainText(f"{time.strftime('%H:%M:%S')}  {name}: {detail}")
+
+    def _log_status(self, key: str, status: PStatus, message: str) -> None:
+        if key in self.tracker.keys and status in (PStatus.ERROR, PStatus.INVALID):
+            self._log(self.tracker.names.get(key, key), message)
+
+    def show_errors(self) -> None:
+        """Клик по индикатору ошибок: вместо таблицы - журнал (выход - вкладка или CLEAR)."""
+        self._errors_shown = True
+        if self._expanded:
+            self._show_pages()
+            self._fit_height()
+        else:
+            self.set_expanded(True)
+
+    def clear_errors(self) -> None:
+        self.error_log.clear()
+        self.tracker.clear_errors()
+        self._errors_shown = False
+        self._show_pages()
+        self._fit_height()
 
     def _fit_height(self, again: bool = True) -> None:
         """Высота окна - по содержимому (вложенные раскладки пересчитываются не сразу)."""
@@ -502,7 +567,8 @@ class PulseGenWindow(Window):
             self.sync_button.set_status("ok")
             self.init_button.set_status("ok")
 
-    def _on_comm_error(self, _msg: str) -> None:
+    def _on_comm_error(self, msg: str) -> None:
+        self._log("CONNECTION", msg)
         self._resetting = False
         for b in (self.sync_button, self.init_button):
             if b.status() == "process":
