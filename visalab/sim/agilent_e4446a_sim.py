@@ -38,7 +38,11 @@ class AgilentPSASim(SimInstrument):
         self.c = {"center": 22e9, "span": 44e9, "rbw": 3e6, "rbw_auto": True, "vbw": 3e6, "vbw_auto": True,
                   "rlev": 0.0, "pdiv": 10.0, "att": 10.0, "att_auto": True, "swt": 0.1, "swt_auto": True,
                   "poin": 601, "det": "POS", "aver": False, "coun": 100, "rosc": "INT", "cont": True,
-                  "form": "ASC"}
+                  "form": "ASC", "roff": 0.0, "gain": False, "coup": "AC", "swtype": "AUTO", "tmode": "WRIT",
+                  "trig": "IMM", "tlev": -25.0, "tslope": "POS", "tdel": 1e-6, "tdel_on": False}
+        self.held: list[float] | None = None            # накопленная трасса MAXH / MINH
+        self.held_for: tuple | None = None
+        self.waiting_trigger = False
         self.marker = {"on": False, "x": 22e9}
         self.sweeping = False
         self.opc_pending = False
@@ -80,18 +84,40 @@ class AgilentPSASim(SimInstrument):
             mw = 10 ** (self.noise_dbm / 10) * rbw / 1e6
             for fs, p in self.signals:
                 mw += 10 ** (p / 10) * math.exp(-0.5 * ((f - fs) / (rbw / 2.355)) ** 2)
-            out.append(10 * math.log10(mw))
+            out.append(10 * math.log10(mw) + self.c["roff"])
         return out
 
     def finish_sweep(self) -> None:
         if not self.sweeping:
             return
-        self.last = self.spectrum()
+        self.last = self._apply_mode(self.spectrum())
         self.sweeping = False
+        self.waiting_trigger = False
         self.sweeps_done += 1
         if self.opc_pending:
             self.opc_pending = False
             self.esr |= ESR_OPC
+
+    def _apply_mode(self, data: list[float]) -> list[float]:
+        """Режим трассы 1: WRIT - как есть, MAXH / MINH - копим по развёрткам (рестарт при смене
+        частоты, полосы или точек), VIEW - трасса не обновляется, BLAN - тоже."""
+        mode, c = self.c["tmode"], self.c
+        if mode in ("VIEW", "BLAN") and self.last is not None:
+            return self.last
+        if mode not in ("MAXH", "MINH"):
+            return data
+        key = (c["center"], c["span"], c["poin"])
+        if self.held is None or self.held_for != key:
+            self.held, self.held_for = list(data), key
+        else:
+            pick = max if mode == "MAXH" else min
+            self.held = [pick(a, b) for a, b in zip(self.held, data)]
+        return list(self.held)
+
+    def fire_trigger(self) -> None:
+        """Тест: пришёл запуск (видео / внешний / сеть) - ждущая развёртка выполняется."""
+        if self.sweeping and self.waiting_trigger:
+            self.finish_sweep()
 
     # ------------------------------------------------------------ команды
     def _register_common(self) -> None:
@@ -139,10 +165,43 @@ class AgilentPSASim(SimInstrument):
         self.on("CALCulate:MARKer[1]:X", self._mk_x, self._mk_x_get)
         self.on("CALCulate:MARKer[1]:Y", get=self._mk_y)
         self.on("CALCulate:MARKer[1]:MAXimum", self._mk_max)
+        self.on("DISPlay:WINDow[1]:TRACe:Y[:SCALe]:RLEVel:OFFSet", self._n("roff", -327, 327),
+                self._g(lambda: self.c["roff"]))
+        self.on("[SENSe:]POWer[:RF]:GAIN[:STATe]", self._b("gain"), self._gb("gain"))
+        self.on("INPut:COUPling", self._enum("coup", {"AC": "AC", "DC": "DC"}), lambda a, g: self.c["coup"])
+        self.on("[SENSe:]SWEep:TYPE", self._enum("swtype", {"AUTO": "AUTO", "SWE": "SWE", "SWEEP": "SWE",
+                                                           "FFT": "FFT"}), lambda a, g: self.c["swtype"])
+        self.on("TRACe[1]:MODE", self._tmode_set, lambda a, g: self.c["tmode"])
+        self.on("TRIGger[:SEQuence]:SOURce", self._enum("trig", {"IMM": "IMM", "IMMEDIATE": "IMM", "VID": "VID",
+                "VIDEO": "VID", "LINE": "LINE", "EXT": "EXT1", "EXT1": "EXT1", "EXTERNAL": "EXT1",
+                "EXTERNAL1": "EXT1", "EXT2": "EXT2", "EXTERNAL2": "EXT2", "RFB": "RFB"}),
+                lambda a, g: self.c["trig"])
+        self.on("TRIGger[:SEQuence]:VIDeo:LEVel", self._n("tlev", -170, 30), self._g(lambda: self.c["tlev"]))
+        self.on("TRIGger[:SEQuence]:SLOPe", self._enum("tslope", {"POS": "POS", "POSITIVE": "POS", "NEG": "NEG",
+                "NEGATIVE": "NEG"}), lambda a, g: self.c["tslope"])
+        self.on("TRIGger[:SEQuence]:DELay:STATe", self._b("tdel_on"), self._gb("tdel_on"))
+        self.on("TRIGger[:SEQuence]:DELay", self._n("tdel", -0.15, 0.5), self._g(lambda: self.c["tdel"]))
         self.on("MMEMory:STORe:STATe", self._st_store)
         self.on("MMEMory:LOAD:STATe", self._st_load)
         self.on("MMEMory:CATalog", get=self._cat)
         self.on("MMEMory:DELete", self._file_del)
+
+    def _enum(self, key, table):
+        def fn(a, g):
+            t = a.strip().upper()
+            if t not in table:
+                raise SimError(-224, "Illegal parameter value", ESR_EXE)
+            self.c[key] = table[t]
+        return fn
+
+    def _tmode_set(self, a, g):
+        t = a.strip().upper()
+        modes = {"WRIT": "WRIT", "WRITE": "WRIT", "MAXH": "MAXH", "MAXHOLD": "MAXH", "MINH": "MINH",
+                 "MINHOLD": "MINH", "VIEW": "VIEW", "BLAN": "BLAN", "BLANK": "BLAN"}
+        if t not in modes:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        self.c["tmode"] = modes[t]
+        self.held = None
 
     # состояния (файлы .state)
     @staticmethod
@@ -257,7 +316,9 @@ class AgilentPSASim(SimInstrument):
         if self.c["cont"]:
             return                      # по мануалу при CONT ON команда игнорируется
         self.sweeping = True
-        if not self.hold_sweeps:
+        if self.c["trig"] != "IMM":
+            self.waiting_trigger = True            # ждём запуск: sim.fire_trigger()
+        elif not self.hold_sweeps:
             self.finish_sweep()
 
     def _trace(self, a, g):

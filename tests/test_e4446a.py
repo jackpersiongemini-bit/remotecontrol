@@ -123,3 +123,64 @@ def test_states_in_instrument_memory(sa):
     assert len(rec.errors) > n and not rec.comm
     drv.run_action("state_save", ("bad name",))                  # недопустимое имя в прибор не уходит
     assert "bad name" not in " ".join(sim.history)
+
+
+def test_input_trace_sweep_settings(sa):
+    drv, sim, rec = sa
+    for key, value, check in (("ref_offset", 10.0, lambda: sim.c["roff"] == 10.0),
+                              ("preamp", True, lambda: sim.c["gain"] is True),
+                              ("input.coupling", "DC", lambda: sim.c["coup"] == "DC"),
+                              ("sweep.type", "SWEPT", lambda: sim.c["swtype"] == "SWE"),
+                              ("trace.mode", "MAXHOLD", lambda: sim.c["tmode"] == "MAXH")):
+        assert setp(drv, rec, key, value) is PStatus.WRITTEN, key
+        assert check() and rec.values[key] == value, key
+    assert not rec.errors and not rec.comm
+    drv.poll()
+    assert rec.values["trace"].y[0] > -90 + 9               # смещение опорного уровня сдвигает трассу
+
+
+def test_trigger_settings_and_waiting_sweep(sa):
+    drv, sim, rec = sa
+    for key, value in (("trig.source", "VIDEO"), ("trig.level", -30.0), ("trig.slope", "NEG"),
+                       ("trig.delay", 0.01), ("trig.delay_state", True)):
+        assert setp(drv, rec, key, value) is PStatus.WRITTEN, key
+    assert (sim.c["trig"], sim.c["tlev"], sim.c["tslope"]) == ("VID", -30.0, "NEG")
+    assert sim.c["tdel"] == pytest.approx(0.01) and sim.c["tdel_on"] is True
+    sweeps = sim.sweeps_done
+    for _ in range(3):
+        drv.poll()
+    assert sim.sweeps_done == sweeps and rec.values["meas.armed"] is True and not rec.comm   # ждём запуск
+    sim.fire_trigger()
+    drv.poll()
+    assert sim.sweeps_done == sweeps + 1
+    assert setp(drv, rec, "trig.source", "EXT") is PStatus.WRITTEN and sim.c["trig"] == "EXT1"
+    assert setp(drv, rec, "trig.source", "FREE") is PStatus.WRITTEN and sim.c["trig"] == "IMM"
+
+
+def test_max_hold_accumulates(sa):
+    drv, sim, rec = sa
+    for k, v in (("freq.center", 1.0e9), ("freq.span", 10e6)):
+        setp(drv, rec, k, v)
+    sim.signals = [(1.0e9, -50.0)]
+    setp(drv, rec, "trace.mode", "MAXHOLD")
+    drv.poll()
+    low = rec.values["trace"].peak()[1]
+    sim.signals = [(1.0e9, -20.0)]
+    drv.poll(); drv.poll()                         # уже взведённая развёртка снята со старым сигналом
+    assert rec.values["trace"].peak()[1] > low + 20
+    sim.signals = [(1.0e9, -60.0)]
+    drv.poll(); drv.poll()
+    assert rec.values["trace"].peak()[1] == pytest.approx(-20, abs=0.5)    # максимум удержан
+
+
+def test_zero_span_trace_is_time(sa):
+    drv, sim, rec = sa
+    assert setp(drv, rec, "freq.center", 1.0e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "freq.span", 0.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "sweep.time", 2e-3) is PStatus.WRITTEN
+    drv.poll()
+    t = rec.values["trace"]
+    assert t.x_unit == "s" and t.x[0] == 0.0 and t.x[-1] == pytest.approx(2e-3) and t.y_unit == "dBm"
+    assert setp(drv, rec, "freq.span", 100e6) is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["trace"].x_unit == "Hz"

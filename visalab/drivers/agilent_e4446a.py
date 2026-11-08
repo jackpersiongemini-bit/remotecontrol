@@ -7,7 +7,12 @@
   аттенюатор ``POW:ATT`` и ``:AUTO``;
 * развёртка ``SWE:TIME`` и ``:AUTO``, точки ``SWE:POIN`` (101...8192, в нулевой полосе от 2);
 * детектор ``DET NORM|AVER|POS|SAMP|NEG|QPE|RMS``; усреднение ``AVER``, ``AVER:COUN``;
-* опора ``ROSC:SOUR INT|EXT``;
+* опора ``ROSC:SOUR INT|EXT``; вход ``INP:COUP AC|DC``, предусилитель ``POW:GAIN``, смещение
+  опорного уровня ``DISP:WIND:TRAC:Y:RLEV:OFFS``; тип развёртки ``SWE:TYPE AUTO|SWE|FFT``;
+* режим трассы 1 ``TRAC:MODE WRIT|MAXH|MINH|VIEW|BLAN``;
+* запуск ``TRIG:SOUR IMM|VID|EXT1|LINE``, ``TRIG:VID:LEV`` (dBm), ``TRIG:SLOP POS|NEG``,
+  ``TRIG:DEL`` (-150 мс...500 мс) и ``TRIG:DEL:STAT``;
+* нулевая полоса - ``FREQ:SPAN 0``: ось трассы - время (0...SWE:TIME);
 * трасса ``TRAC:DATA? TRACE1`` в формате ``FORM ASC`` (значения через запятую, dBm);
 * маркер ``CALC:MARK1:STAT``, ``:X``, ``:Y?``, ``:MAX``;
 * состояния в памяти прибора: ``MMEM:STOR:STAT 1,"имя"``, ``MMEM:LOAD:STAT 1,"имя"``,
@@ -121,6 +126,30 @@ class AgilentPSA(VISAInstrument):
                   minimum=1, maximum=8192),
             Param("ref.source", "Опора 10 МГц", E, section="Анализ/Опора", query="ROSC:SOUR?",
                   write="ROSC:SOUR {value}", choices=("INT", "EXT")),
+            Param("ref_offset", "Смещение опорного уровня", F, "dB", section=amp,
+                  query="DISP:WIND:TRAC:Y:RLEV:OFFS?", write="DISP:WIND:TRAC:Y:RLEV:OFFS {value}",
+                  minimum=-327.0, maximum=327.0, tolerance=1e-3),
+            Param("preamp", "Предусилитель", B, section=amp, query="POW:GAIN?", write="POW:GAIN {value}",
+                  also_read=("atten",)),
+            Param("input.coupling", "Связь входа", E, section=amp, query="INP:COUP?", write="INP:COUP {value}",
+                  choices=("AC", "DC")),
+            Param("sweep.type", "Тип развёртки", E, section=sw, query="SWE:TYPE?", write="SWE:TYPE {value}",
+                  choices=("AUTO", "SWEPT", "FFT"), enum_map=(("SWEPT", "SWE"),), also_read=("sweep.time",)),
+            Param("trace.mode", "Режим трассы", E, section="Спектр/Трасса", query="TRAC:MODE?",
+                  write="TRAC:MODE {value}", choices=("WRITE", "MAXHOLD", "MINHOLD", "VIEW", "BLANK"),
+                  enum_map=(("WRITE", "WRIT"), ("MAXHOLD", "MAXH"), ("MINHOLD", "MINH"), ("BLANK", "BLAN"))),
+            Param("trig.source", "Запуск", E, section="Анализ/Запуск", query="TRIG:SOUR?",
+                  write="TRIG:SOUR {value}", choices=("FREE", "VIDEO", "EXT", "LINE"),
+                  enum_map=(("FREE", "IMM"), ("VIDEO", "VID"), ("EXT", "EXT1"))),
+            Param("trig.level", "Уровень видеозапуска", F, "dBm", section="Анализ/Запуск",
+                  query="TRIG:VID:LEV?", write="TRIG:VID:LEV {value}", minimum=-170.0, maximum=30.0,
+                  tolerance=1e-3),
+            Param("trig.slope", "Фронт запуска", E, section="Анализ/Запуск", query="TRIG:SLOP?",
+                  write="TRIG:SLOP {value}", choices=("POS", "NEG")),
+            Param("trig.delay", "Задержка запуска", F, "s", section="Анализ/Запуск", query="TRIG:DEL?",
+                  write="TRIG:DEL {value}", minimum=-0.15, maximum=0.5, tolerance=1e-9),
+            Param("trig.delay_state", "Задержка запуска вкл", B, section="Анализ/Запуск",
+                  query="TRIG:DEL:STAT?", write="TRIG:DEL:STAT {value}"),
             Param("marker.state", "Маркер", B, section=mk, query="CALC:MARK1:STAT?",
                   write="CALC:MARK1:STAT {value}", also_read=("marker.freq", "marker.level")),
             Param("marker.freq", "Частота маркера", F, "Hz", section=mk, query="CALC:MARK1:X?",
@@ -203,9 +232,14 @@ class AgilentPSA(VISAInstrument):
         if start is None or stop is None:
             start, stop = self.query_float("FREQ:STAR?"), self.query_float("FREQ:STOP?")
         y = [parse_number(t) for t in self.query("TRAC:DATA? TRACE1").split(",") if t.strip()]
+        span, swt = self._values.get("freq.span"), self._values.get("sweep.time")
+        zero_span = span == 0 and swt is not None
         meta = {k: self._values.get(k) for k in ("bw.res", "bw.video", "detector", "ref_level", "atten",
                                                   "sweep.time", "avg.state", "avg.count")}
-        self._trace = Trace.linear(start, stop, y, x_unit="Hz", y_unit="dBm", name="trace", meta=meta)
+        if zero_span:                                  # нулевая полоса: ось - время развёртки
+            self._trace = Trace.linear(0.0, swt, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
+        else:
+            self._trace = Trace.linear(start, stop, y, x_unit="Hz", y_unit="dBm", name="trace", meta=meta)
         self._publish("trace", self._trace)
         if self._values.get("marker.state"):
             self._read_keys(["marker.freq", "marker.level"])
