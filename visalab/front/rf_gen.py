@@ -25,8 +25,8 @@ __all__ = ["RFGenWindow", "RF_PRESETS", "MOD_TYPES", "saved_connection"]
 #: тип модуляции пресета -> префикс ключей профиля (CW - без модуляции)
 MOD_TYPES = {"CW": None, "PULSE": "pulse", "AM": "am", "FM": "fm", "PM": "pm"}
 #: подпись строки «частота модуляции» в избранном и её ключ
-MOD_RATE = {"PULSE": ("PULS", "pulse.period"), "AM": ("AM", "am.freq"), "FM": ("FM", "fm.freq"),
-            "PM": ("PM", "pm.freq")}
+#: (AM в избранное не выводится - по просьбе Алексея; настраивается на вкладке AM)
+MOD_RATE = {"PULSE": ("PULS", "pulse.period"), "FM": ("FM", "fm.freq"), "PM": ("PM", "pm.freq")}
 RF_PRESETS = ((1e9, -10.0, "CW"),)                 # (FREQ, POW, MOD)
 
 CONNECTION_GROUP = "CONNECTION/RF_GEN"
@@ -103,7 +103,7 @@ class RFGenWindow(InstrumentWindow):
             if sup(key):
                 prefixes = ("n", "µ", "m", "") if key.endswith("period") else ("", "k", "M")
                 self.mod_spins[mod] = PSpinBox(proxy, key, prefixes)
-        self.mod_line = PanelLine("AM", *self.mod_spins.values())
+        self.mod_line = PanelLine("PULS", *self.mod_spins.values())
         self.top_lines.append(self.mod_line)
         saved_mod = str(self.settings.value(f"{self._prefix}/FAV_MOD", "PULSE"))
         self._fav_mod = saved_mod if saved_mod in self.mod_spins else next(iter(self.mod_spins), "")
