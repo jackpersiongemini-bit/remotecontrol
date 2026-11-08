@@ -20,6 +20,8 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import re
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, pyqtSignal
@@ -33,11 +35,11 @@ from ..core.scpi import si_format, si_parse
 from ..core.trace import Trace
 from . import instrument_window as _iw
 from .instrument_window import LINKS, InstrumentWindow
-from .params import IndicatorButton, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
+from .params import IndicatorButton, PChoice, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
                     UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
 
-__all__ = ["PowerMeterWindow", "PowerReadout", "TracePlot", "CalTable", "saved_connection", "interpolate"]
+__all__ = ["PowerMeterWindow", "PowerReadout", "TracePlot", "CalPlot", "load_csv", "save_csv", "saved_connection", "interpolate"]
 
 CONNECTION_GROUP = "CONNECTION/POWER_METER"
 OFFSET_LIMIT = 100.0                    # CORR:GAIN2: ±100 dB
@@ -137,9 +139,18 @@ class LNumber(QLineEdit):
         b.ensurePolished()
         w = max(b.sizeHint().width(), 26)
         b.setGeometry(2, 2, w, max(self.height() - 4, 0))
-        self.setTextMargins(w, 0, 0, 0)
+        self.setTextMargins(w if not b.isHidden() else 0, 0, 0, 0)
+
+    def _update_unit(self, value) -> None:
+        """Пустое поле с подсказкой - без единицы (подсказке нужно место); при вводе единица видна."""
+        show = not (self.hint and value is None and not self.hasFocus())
+        if self.unit_button.isVisibleTo(self) != show or self.unit_button.isHidden() == show:
+            self.unit_button.setVisible(show)
+            w = max(self.unit_button.sizeHint().width(), 26) if show else 0
+            self.setTextMargins(w, 0, 0, 0)
 
     def show_value(self, value: float | None) -> None:
+        self._update_unit(value)
         text = "" if value is None else f"{value / self.scale:.{self.digits}g}"
         if self.hasFocus() and not self.isReadOnly():
             self.setPlaceholderText(text or self.hint)
@@ -162,6 +173,7 @@ class LNumber(QLineEdit):
 
     def focusInEvent(self, e):  # noqa: N802 - Qt
         super().focusInEvent(e)
+        self._update_unit(self._value)
         if not self.isReadOnly():
             self.setPlaceholderText(self.text())
             self.clear()
@@ -247,129 +259,6 @@ class ActionButton(QPushButton):
     def _done(self, name: str, _result) -> None:
         if name == self.name:
             self._set_state("")
-
-
-class CalTable(QWidget):
-    """Таблица калибровки FREQ -> dB строками из обычных полей окна.
-
-    Каждая точка - строка «частота (GHz) | поправка (dB) | −»; поля правятся как любые поля окна,
-    точки сортируются по частоте. Внизу строка ввода: частота и dB, «+» - добавить (пустая частота -
-    частота датчика, пустые dB - значение по таблице на этой частоте). Больше ROWS_VISIBLE точек -
-    прокрутка колесом, без полосы."""
-
-    changed = pyqtSignal()
-    rows_changed = pyqtSignal()               # число строк изменилось - окну пересчитать высоту
-    ROWS_VISIBLE = 6
-
-    def __init__(self, points=(), default_freq=None, parent=None):
-        super().__init__(parent)
-        self.default_freq = default_freq or (lambda: None)
-        self._points: list[tuple[float, float]] = []
-        self.rows: list[tuple[LNumber, LNumber, QPushButton]] = []
-        self._list = QWidget()
-        self._list_layout = QVBoxLayout(self._list)
-        self._list_layout.setContentsMargins(0, 0, 0, 0)
-        self._list_layout.setSpacing(4)
-        self.scroll = QScrollArea()
-        self.scroll.setWidget(self._list)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.new_freq = LNumber(None, "GHz", 1e3, 1000e9, 6, scale=1e9, si_unit="Hz", hint="FREQ")
-        self.new_db = LNumber(None, "dB", -100.0, 100.0, 4, hint="dB")
-        self.new_db.ensurePolished()
-        self.add_button = InstrumentWindow._tool("+", "Add the point (empty FREQ - sensor frequency)",
-                                                 self.add_entry)
-        self.new_freq.returnPressed.connect(self.add_entry)
-        self.new_db.returnPressed.connect(self.add_entry)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        lay.addWidget(self.scroll)
-        lay.addWidget(self._row(self.new_freq, self.new_db, self.add_button))
-        self.set_points(points)
-
-    @staticmethod
-    def _row(*widgets) -> QWidget:
-        row = QWidget()
-        hl = QHBoxLayout(row)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(6)
-        for w in widgets:
-            hl.addWidget(w, 0 if isinstance(w, QPushButton) else 1)
-        return row
-
-    @property
-    def points(self) -> list[tuple[float, float]]:
-        return list(self._points)
-
-    def set_points(self, points) -> None:
-        self._points = sorted((float(f), float(d)) for f, d in points)
-        self._rebuild()
-
-    def _rebuild(self) -> None:
-        while self._list_layout.count():
-            item = self._list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.rows = []
-        for i, (f, d) in enumerate(self._points):
-            fw = LNumber(f, "GHz", 1e3, 1000e9, 6, scale=1e9, si_unit="Hz")
-            dw = LNumber(d, "dB", -100.0, 100.0, 4)
-            rm = InstrumentWindow._tool("−", "Remove this point", lambda _=False, i=i: self.remove(i))
-            fw.changed.connect(lambda v, i=i: self._edit(i, freq=v))
-            dw.changed.connect(lambda v, i=i: self._edit(i, db=v))
-            self.rows.append((fw, dw, rm))
-            self._list_layout.addWidget(self._row(fw, dw, rm))
-        for w in self._list.findChildren(QWidget):
-            w.ensurePolished()
-        n = min(len(self._points), self.ROWS_VISIBLE)
-        row_h = max(self.new_db.sizeHint().height(), UI_CONTROL_HEIGHT_PX)   # высота поля с рамкой
-        self.scroll.setFixedHeight(n * row_h + max(n - 1, 0) * 4)
-        self.scroll.setVisible(n > 0)
-        self._list_layout.invalidate()
-        self.layout().invalidate()
-        self.updateGeometry()
-        self.rows_changed.emit()
-
-    def _edit(self, i: int, freq: float | None = None, db: float | None = None) -> None:
-        if i >= len(self._points):
-            return
-        f, d = self._points[i]
-        pts = list(self._points)
-        pts[i] = (f if freq is None else freq, d if db is None else db)
-        if freq is not None:                          # частота другой точки - заменить её
-            pts = [p for j, p in enumerate(pts) if j == i or not math.isclose(p[0], freq, rel_tol=1e-9)]
-            self._points = sorted(pts)
-            QTimer.singleShot(0, self._rebuild)       # поле, которое сейчас правят, удалится
-        else:
-            self._points = pts
-        self.changed.emit()
-
-    def add_point(self, freq: float, db: float | None = None) -> None:
-        if db is None:
-            db = interpolate(self._points, freq)
-        pts = [p for p in self._points if not math.isclose(p[0], freq, rel_tol=1e-9)]
-        self.set_points(pts + [(freq, db)])
-        self.changed.emit()
-
-    def add_entry(self) -> None:
-        """«+»: точка из строки ввода."""
-        for w in (self.new_freq, self.new_db):
-            w._commit()
-        freq = self.new_freq.value if self.new_freq.value is not None else self.default_freq()
-        if not freq:
-            return
-        self.add_point(float(freq), self.new_db.value)
-        self.new_freq.clear_value()
-        self.new_db.clear_value()
-
-    def remove(self, index: int) -> None:
-        if 0 <= index < len(self._points):
-            del self._points[index]
-            QTimer.singleShot(0, self._rebuild)
-            self.changed.emit()
 
 
 # ---------------------------------------------------------------- индикатор избранного
@@ -492,6 +381,10 @@ class TracePlot(QWidget):
             isinstance(length, (int, float)) and length > 0 else None
         self.update()
 
+    def marker(self) -> float | None:
+        """X вертикальной метки (у графика калибровки - частота датчика)."""
+        return None
+
     def y_range(self) -> tuple[float, float]:
         """Сверху - максимум трассы, округлённый вверх до 10 dB; шкала 10 dB / дел."""
         top = math.ceil(max(self.trace.y) / 10.0) * 10.0 if self.trace else 0.0
@@ -556,14 +449,19 @@ class TracePlot(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
         p.drawPath(path)
-        # подписи: верх шкалы и дБ/дел слева сверху, время по краям снизу
+        # подписи: верх шкалы и дБ/дел слева сверху, X по краям снизу
+        xu, yu = t.x_unit, t.y_unit
         p.setPen(muted)
         p.drawText(QRectF(r.left() + 3, r.top() + 1, r.width(), 14), Qt.AlignmentFlag.AlignLeft,
-                   f"{hi:g} dBm  {self.DB_PER_DIV:g} dB/div")
+                   f"{hi:g} {yu}  {(hi - lo) / self.DIVS_Y:g} dB/div")
         bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 14)
-        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, "s", 4))
-        p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, 's', 3)}/div")
-        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, "s", 4))
+        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, xu, 4))
+        p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, xu, 3)}/div")
+        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, xu, 4))
+        mk = self.marker()
+        if mk is not None and x0 <= mk <= x1:            # метка: частота датчика
+            p.setPen(QPen(QColor(UI_COLOR_INVERT), 1))
+            p.drawLine(QPointF(px(mk), r.top()), QPointF(px(mk), r.bottom()))
         m = self._mouse
         if m is not None and r.contains(m):              # курсор: точка трассы под мышью
             i = min(range(len(t)), key=lambda k: abs(px(t.x[k]) - m.x()))
@@ -575,7 +473,61 @@ class TracePlot(QWidget):
             p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
             p.setPen(QColor(UI_COLOR_TEXT))
             p.drawText(QRectF(r.left(), r.top() + 1, r.width() - 3, 14), Qt.AlignmentFlag.AlignRight,
-                       f"{si_format(t.x[i], 's', 4)}  {t.y[i]:.2f} dBm")
+                       f"{si_format(t.x[i], xu, 4)}  {t.y[i]:.2f} {yu}")
+
+
+class CalPlot(TracePlot):
+    """Поправка от частоты (таблица калибровки): шкала по данным, метка - частота датчика."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(150)
+        self.freq: float | None = None
+
+    def set_points(self, points) -> None:
+        pts = sorted(points)
+        if len(pts) == 1:                              # одна точка - горизонтальная линия
+            pts = [(pts[0][0] * 0.999, pts[0][1]), (pts[0][0] * 1.001, pts[0][1])]
+        self.set_trace(Trace(tuple(f for f, _ in pts), tuple(d for _, d in pts), "Hz", "dB", "cal")
+                       if len(pts) > 1 else None)
+
+    def set_freq(self, freq) -> None:
+        self.freq = float(freq) if isinstance(freq, (int, float)) else None
+        self.update()
+
+    def marker(self) -> float | None:
+        return self.freq
+
+    def y_range(self) -> tuple[float, float]:
+        """Шкала по данным: шаг 0.1 / 0.2 / 0.5 / 1 / 2 / 5... dB на деление."""
+        lo, hi = min(self.trace.y), max(self.trace.y)
+        for step in (st * 10 ** e for e in range(-1, 4) for st in (1, 2, 5)):
+            full = step * self.DIVS_Y
+            if full < (hi - lo) * 1.1:
+                continue
+            bottom = math.floor((lo - (full - (hi - lo)) / 2) / step + 1e-9) * step
+            if bottom + full >= hi:
+                return bottom, bottom + full
+        return lo, hi + 1.0
+
+
+def load_csv(path) -> list[tuple[float, float]]:
+    """Таблица калибровки: строки «частота_Hz, dB» (разделитель , ; или таб; заголовок и
+    строки не из двух чисел пропускаются)."""
+    points = []
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = [x for x in re.split(r"[,;\t ]+", line.strip()) if x]
+        if len(parts) < 2:
+            continue
+        try:
+            points.append((float(parts[0]), float(parts[1])))
+        except ValueError:
+            continue
+    return sorted(points)
+
+
+def save_csv(path, points) -> None:
+    Path(path).write_text("freq_hz,db\n" + "".join(f"{f:.10g},{d:.6g}\n" for f, d in points), encoding="utf-8")
 
 
 # ---------------------------------------------------------------- окно
@@ -587,6 +539,9 @@ class PowerMeterWindow(InstrumentWindow):
     CONNECTION_GROUP = CONNECTION_GROUP
     DEFAULT_KIND = "u2021xa"
     PRESET_KEY = "PM_PRESETS"            # пресетов у ваттметра нет
+
+    #: ACAL ▶: (start Hz, stop Hz, точек) - выполнит слой сценариев, когда появится
+    acal_requested = pyqtSignal(float, float, int)
 
     def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Power meter", parent=None):
         self._sdg: InstrumentProxy | None = None
@@ -645,18 +600,33 @@ class PowerMeterWindow(InstrumentWindow):
                     ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
 
-        # CAL: таблица, GAIN, DUTY, итог в приборе, обнуление / калибровка датчика
-        try:
-            points = json.loads(s.value(f"{pre}/CAL_TABLE", "[]", type=str))
-        except (TypeError, ValueError):
-            points = []
+        # CAL: график поправки, выбор таблицы (CSV), автокалибровка, GAIN, DUTY, итог, датчик
+        self.cal_dir = Path(s.fileName()).resolve().parent / "calibrations"
+        self.cal_points: list[tuple[float, float]] = []
         self.cal_on = LToggle([("OFF", False), ("ON", True)], s.value(f"{pre}/CAL_ON", True, type=bool))
         self.cal_value = QLabel("")
         self.cal_value.setObjectName("calValue")
         self.cal_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.cal_value.setToolTip("Table value at the sensor frequency (dB)")
-        self.cal_table = CalTable(points, default_freq=lambda: self.proxy.value("freq"))
-        self.cal_table.rows_changed.connect(lambda: hasattr(self, "_layout") and QTimer.singleShot(0, self._fit_height))
+        self.cal_plot = CalPlot()
+        self.cal_plot.setToolTip("Calibration table: correction vs frequency; line - sensor frequency")
+        self.cal_choice = PChoice([("NONE", "")])
+        self.cal_choice.setToolTip(f"Calibration table (CSV: freq_hz, dB) from {self.cal_dir}")
+        self.cal_choice.pressed.connect(self.refresh_tables)
+        self.refresh_tables(s.value(f"{pre}/CAL_FILE", "", type=str))
+        self.cal_choice.changed.connect(self._table_chosen)
+        # автокалибровка: ГСС перебирает частоты, ваттметр меряет -> GAIN и таблица (пока только интерфейс)
+        self.acal_start = LNumber(None, "GHz", 1e3, 1000e9, 6, scale=1e9, si_unit="Hz", hint="START")
+        self.acal_stop = LNumber(None, "GHz", 1e3, 1000e9, 6, scale=1e9, si_unit="Hz", hint="STOP")
+        self.acal_points = LNumber(None, "", 2, 100000, 6, hint="PTS")
+        for w, name in ((self.acal_start, "ACAL_START"), (self.acal_stop, "ACAL_STOP"), (self.acal_points, "ACAL_PTS")):
+            v = s.value(f"{pre}/{name}")
+            if v not in (None, ""):
+                w.set_value(float(v), emit=False)
+            w.changed.connect(lambda v, n=name: s.setValue(f"{pre}/{n}", v))
+            w.setMinimumWidth(0)
+        self.acal_run = InstrumentWindow._tool("▶", "Run auto calibration: the generator steps the frequency, "
+                                               "the meter measures, GAIN and the table are fitted", self.run_acal)
         self.gain_on = LToggle([("OFF", False), ("ON", True)], s.value(f"{pre}/GAIN_ON", False, type=bool))
         self.gain = LNumber(s.value(f"{pre}/GAIN", 0.0, type=float), "dB", -100.0, 100.0)
         self.gain.setToolTip("Gain in the path (subtracted)")
@@ -668,11 +638,10 @@ class PowerMeterWindow(InstrumentWindow):
             w.changed.connect(lambda v, n=name: self._local_changed(n, v))
         for w, name in ((self.gain, "GAIN"), (self.duty, "DUTY")):
             w.changed.connect(lambda v, n=name: self._local_changed(n, v))
-        self.cal_table.changed.connect(lambda: self._local_changed("CAL_TABLE", json.dumps(self.cal_table.points)))
-        tabl = PanelLine("TABL", self.cal_table)
-        tabl.line_layout.setAlignment(tabl._name, Qt.AlignmentFlag.AlignTop)
-        tabl._name.setFixedHeight(UI_CONTROL_HEIGHT_PX + 2)
-        cal = [PanelLine("CAL", self.cal_on, self.cal_value), tabl,
+        plot_line = PanelLine("", self.cal_plot)
+        plot_line._name.hide()
+        cal = [PanelLine("CAL", self.cal_on, self.cal_value), plot_line, PanelLine("TABL", self.cal_choice),
+               PanelLine("ACAL", self.acal_start, self.acal_stop, self.acal_points, self.acal_run),
                PanelLine("GAIN", self.gain_on, self.gain), PanelLine("DUTY", self.duty_src, self.duty)]
         if sup("offset"):
             off = PNLabel(proxy, "offset")
@@ -710,7 +679,44 @@ class PowerMeterWindow(InstrumentWindow):
         elif key in ("gate.start", "gate.length"):
             self.plot.set_gate(self.proxy.value("gate.start"), self.proxy.value("gate.length"))
         elif key == "freq":
+            self.cal_plot.set_freq(value)
             self.apply_correction()
+
+    # ------------------------------------------------------------ таблицы калибровки (CSV)
+    def table_files(self) -> list[str]:
+        return sorted(p.name for p in self.cal_dir.glob("*.csv")) if self.cal_dir.is_dir() else []
+
+    def refresh_tables(self, select: str | None = None) -> None:
+        """Перечитать папку calibrations (перед открытием списка)."""
+        current = self.cal_choice.value if select is None else select
+        self.cal_choice.blockSignals(True)
+        self.cal_choice.set_choices([("NONE", "")] + [(Path(n).stem, n) for n in self.table_files()], current)
+        self.cal_choice.blockSignals(False)
+        if select is not None:
+            self._load_table(self.cal_choice.value)
+
+    def _load_table(self, name: str) -> None:
+        try:
+            self.cal_points = load_csv(self.cal_dir / name) if name else []
+        except OSError as exc:
+            if hasattr(self, "error_log"):
+                self._log("CAL TABLE", f"{name}: {exc}")
+            self.cal_points = []
+        self.cal_plot.set_points(self.cal_points)
+
+    def _table_chosen(self, name) -> None:
+        self._load_table(name or "")
+        self._local_changed("CAL_FILE", name or "")
+
+    def run_acal(self) -> None:
+        """Автокалибровка - пока только интерфейс: нужен слой сценариев (ГСС + ваттметр)."""
+        start, stop, pts = self.acal_start.value, self.acal_stop.value, self.acal_points.value
+        if None in (start, stop, pts) or stop <= start or pts < 2:
+            self._log("ACAL", "set START < STOP and PTS >= 2")
+            return
+        self.acal_requested.emit(float(start), float(stop), int(pts))
+        self._log("ACAL", f"{si_format(start, 'Hz', 6)} - {si_format(stop, 'Hz', 6)}, {int(pts)} pts: "
+                          "not available yet (needs the measurement scenario layer)")
 
     def show_plot(self, on: bool) -> None:
         """Избранное: график (временная область) или индикатор."""
@@ -770,7 +776,7 @@ class PowerMeterWindow(InstrumentWindow):
 
     def correction_parts(self) -> dict[str, float]:
         """Слагаемые поправки, dB: CAL(f), −GAIN, 10·lg(100 / DUTY)."""
-        cal = interpolate(self.cal_table.points, self.proxy.value("freq")) if self.cal_on.value else 0.0
+        cal = interpolate(self.cal_points, self.proxy.value("freq")) if self.cal_on.value else 0.0
         gain = -self.gain.value if self.gain_on.value else 0.0
         duty = self.duty_value()
         return {"cal": cal, "gain": gain, "duty": 10 * math.log10(100.0 / duty) if duty else 0.0}

@@ -9,7 +9,7 @@ from visalab.core import InstrumentProxy, SimTransport
 from visalab.drivers import DRIVERS
 from visalab.front import PowerMeterWindow, PulseGenWindow
 from visalab.front.instrument_window import LINKS
-from visalab.front.power_meter import interpolate
+from visalab.front.power_meter import interpolate, load_csv, save_csv
 
 
 def _proxy(kind):
@@ -79,8 +79,10 @@ def test_correction_written_as_offset(qtbot, pm):
     proxy, win, settings = pm
     proxy.set("freq", 2e9)
     _wait(qtbot, proxy, "freq", lambda v: v == pytest.approx(2e9))
-    win.cal_table.set_points([(1e9, 1.0), (3e9, 3.0)])
-    win.cal_table.changed.emit()
+    win.cal_dir.mkdir(exist_ok=True)
+    save_csv(win.cal_dir / "cable.csv", [(1e9, 1.0), (3e9, 3.0)])
+    win.cal_choice.click()                            # список перечитывает папку
+    win.cal_choice.set_value("cable.csv")
     _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(2.0, abs=1e-3))
     _wait(qtbot, proxy, "offset.state", lambda v: v is True)
     win.gain_on.set_value(True)
@@ -90,7 +92,8 @@ def test_correction_written_as_offset(qtbot, pm):
     win.duty.set_value(10.0)                          # 10 % -> +10 dB
     _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(2.0, abs=1e-3))
     assert win.readout.cal_button.text() == "CAL +2.00 dB"
-    assert json.loads(settings.value(f"{win._prefix}/CAL_TABLE")) == [[1e9, 1.0], [3e9, 3.0]]
+    assert settings.value(f"{win._prefix}/CAL_FILE") == "cable.csv"
+    assert win.cal_plot.trace is not None and win.cal_plot.marker() == pytest.approx(2e9)
     proxy.set("freq", 3e9)                            # частота датчика -> новая точка таблицы
     _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(3.0, abs=1e-3))
     win.cal_on.set_value(False)
@@ -99,34 +102,26 @@ def test_correction_written_as_offset(qtbot, pm):
     _wait(qtbot, proxy, "offset.state", lambda v: v is False)
 
 
-def test_cal_table_editing(qtbot, pm):
+def test_csv_and_acal_ui(qtbot, pm, tmp_path):
     proxy, win, _s = pm
-    t = win.cal_table
-    proxy.set("freq", 5e9)
-    _wait(qtbot, proxy, "freq", lambda v: v == pytest.approx(5e9))
-    t.add_button.click()                                   # пустая строка ввода - частота датчика
-    assert t.points == [(5e9, 0.0)]
-    t.new_freq.setText("2.4")                              # в GHz
-    t.new_freq.setModified(True)
-    t.new_db.setText("1.5")
-    t.new_db.setModified(True)
-    t.add_button.click()
-    assert t.points == [(pytest.approx(2.4e9), 1.5), (5e9, 0.0)]
-    assert t.new_freq.value is None and t.new_freq.text() == ""       # строка ввода очищена
-    qtbot.waitUntil(lambda: len(t.rows) == 2)
-    fw, dw, _rm = t.rows[1]
-    dw.setText("abc")                                       # не число - остаётся как было
-    dw.setModified(True)
-    dw._commit()
-    assert t.points[1][1] == 0.0
-    fw.setText("1G")                                        # с префиксом; точка уходит наверх
-    fw.setModified(True)
-    fw._commit()
-    assert t.points == [(pytest.approx(1e9), 0.0), (pytest.approx(2.4e9), 1.5)]
-    qtbot.waitUntil(lambda: t.rows[0][0].value == pytest.approx(1e9))
-    t.rows[0][2].click()
-    assert t.points == [(pytest.approx(2.4e9), 1.5)]
-    qtbot.waitUntil(lambda: len(t.rows) == 1)
+    path = tmp_path / "t.csv"
+    path.write_text("freq;dB\n2e9;1.5\n1e9;0.5\nbad line\n", encoding="utf-8")
+    assert load_csv(path) == [(1e9, 0.5), (2e9, 1.5)]
+    win.cal_plot.set_points(load_csv(path))
+    lo, hi = win.cal_plot.y_range()
+    assert lo <= 0.5 and hi >= 1.5 and hi - lo <= 3
+    win.cal_plot.resize(300, 150)
+    win.cal_plot.grab()
+    got = []
+    win.acal_requested.connect(lambda *a: got.append(a))
+    win.acal_run.click()                                 # поля пустые - только запись в журнал
+    assert got == [] and "ACAL" in win.error_log.toPlainText()
+    for w, text in ((win.acal_start, "1"), (win.acal_stop, "18"), (win.acal_points, "101")):
+        w.setText(text)
+        w.setModified(True)
+        w._commit()
+    win.acal_run.click()
+    assert got == [(pytest.approx(1e9), pytest.approx(18e9), 101)]
 
 def test_duty_from_pulse_generator(qtbot, pm, tmp_path):
     proxy, win, _s = pm
