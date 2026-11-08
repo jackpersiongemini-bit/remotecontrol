@@ -254,3 +254,44 @@ def test_error_log_opens_from_indicator(qtbot, opened):
     assert not win.error_page.isVisible() and win.pages[1].isVisible()
     from visalab.front.window import WriteState
     assert win.error_indicator.state is not WriteState.ERROR
+
+
+def test_connection_page_from_address(qtbot, opened, settings):
+    _sim, _proxy, win = opened
+    win.show()
+    qtbot.waitExposed(win)
+    win.address.clicked.emit()
+    assert win._expanded and win.connection_page.isVisible()
+    assert not win.error_page.isVisible() and not any(p.isVisible() for p in win.pages)
+    assert win.driver_choice.value == "sdg"
+    assert "SDG2042X" in win.model_choice._data
+    win._on_tab_clicked(0)                                   # вкладка - выход без изменений
+    assert not win.connection_page.isVisible() and win.pages[0].isVisible()
+    win.show_connection()
+    win.model_choice.set_value("SDG2042X")
+    win.address_edit.setText("192.168.0.5")
+    with qtbot.waitSignal(win.reconnect_requested) as sig:
+        win.apply_button.click()
+    assert sig.args == ["sdg", "192.168.0.5", "SDG2042X"]
+    assert not win.connection_page.isVisible()
+    from visalab.front.pulse_gen import saved_connection
+    assert saved_connection(settings) == {"driver": "sdg", "address": "192.168.0.5", "model": "SDG2042X"}
+
+
+def test_launcher_reconnect_builds_new_window(qtbot, tmp_path, monkeypatch):
+    import run_pulse_gen
+    from PyQt6.QtWidgets import QApplication
+    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    windows = []
+    orig = run_pulse_gen.PulseGenWindow.__init__
+
+    def track(self, *a, **k):
+        orig(self, *a, **k)
+        windows.append(self)
+    monkeypatch.setattr(run_pulse_gen.PulseGenWindow, "__init__", track)
+    ini = str(tmp_path / "l.ini")
+    assert run_pulse_gen.main(["--sim", "--ini", ini, "--no-connect", "--lab", str(tmp_path / "none.json")]) == 0
+    assert len(windows) == 1
+    windows[0].reconnect_requested.emit("sdg", "sim", "SDG2042X")
+    assert len(windows) == 2 and windows[1].isVisible() and not windows[0].isVisible()
+    windows[1].proxy.shutdown()
