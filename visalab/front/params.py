@@ -15,14 +15,14 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import QObject, QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter
+from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QTabBar, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import SI_PREFIXES, si_format, si_parse
-from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
+from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INDICATOR_FRAME, UI_COLOR_INVERT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_CONTROL_HEIGHT_PX, render_qss)
 from .window import WriteState
@@ -416,25 +416,33 @@ class PTabBar(QTabBar):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
         for i in range(self.count()):
-            rect = QRectF(self.tabRect(i)).adjusted(2, 0, -2, 0)
+            rect = QRectF(self.tabRect(i)).adjusted(2.5, 0.5, -2.5, -0.5)
             selected, on, hover = i == self.currentIndex(), i in self._on, i == self._hover
-            if on:
-                bg = UI_COLOR_TEXT_MUTED if selected else UI_COLOR_INVERT
-            elif hover:
-                bg = UI_COLOR_INVERT_HOVER
-            elif selected:
-                bg = UI_COLOR_BACKGROUND
-            else:
-                bg = None
-            fg = UI_COLOR_TEXT_INVERSE if (on or hover) else UI_COLOR_TEXT if selected else UI_COLOR_BORDER_LIGHT
+            # фон: наведение - инверсия, выбранная вкладка - фон поля
+            bg = UI_COLOR_INVERT_HOVER if hover else UI_COLOR_BACKGROUND if selected else None
             if bg:
                 p.setBrush(QColor(bg))
                 p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+            if on:                        # режим включён: тонкая рамка + толстая нижняя граница
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(UI_COLOR_INDICATOR_FRAME), UI_BORDER_WIDTH_PX))
+                p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(UI_COLOR_TEXT_MUTED))
+                bar = QRectF(rect.left(), rect.bottom() - UI_INDICATOR_WIDTH_PX, rect.width(), UI_INDICATOR_WIDTH_PX)
+                p.save()
+                clip = QPainterPath()
+                clip.addRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+                p.setClipPath(clip)
+                p.drawRect(bar)
+                p.restore()
+            fg = UI_COLOR_TEXT_INVERSE if hover else UI_COLOR_TEXT if selected else \
+                UI_COLOR_TEXT_MUTED if on else UI_COLOR_BORDER_LIGHT
             font = QFont(self.font())
-            font.setBold(selected or on)
+            font.setBold(selected)
             p.setFont(font)
             p.setPen(QColor(fg))
-            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.tabText(i))
+            p.drawText(rect.adjusted(0, 0, 0, -1 if on else 0), Qt.AlignmentFlag.AlignCenter, self.tabText(i))
             p.setPen(Qt.PenStyle.NoPen)
 
 
@@ -522,9 +530,11 @@ class Panel(QFrame):
             background-color: transparent; border-color: transparent;
         }
         Panel PSButton[state="true"], Panel PSButton[state="on"] {
-            background-color: $UI_COLOR_INVERT;
+            background-color: $UI_COLOR_BACKGROUND;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-            color: $UI_COLOR_TEXT_INVERSE;
+            color: $UI_COLOR_TEXT;
+            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_INDICATOR_FRAME;
+            border-bottom: ${UI_INDICATOR_WIDTH_PX}px solid $UI_COLOR_TEXT_MUTED;
         }
         Panel PSButton:hover, Panel QPushButton#chip:hover, Panel QPushButton#tool:hover {
             background-color: $UI_COLOR_INVERT_HOVER;
@@ -534,9 +544,14 @@ class Panel(QFrame):
         Panel PSButton:disabled, Panel PLineEdit:disabled { color: $UI_COLOR_BORDER; }
         Panel QPushButton#chip { padding: 2px 8px; min-height: 0; max-height: 1000px; }
         Panel QPushButton#chip:checked {
-            background-color: $UI_COLOR_INVERT;
+            background-color: $UI_COLOR_BACKGROUND;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-            color: $UI_COLOR_TEXT_INVERSE;
+            color: $UI_COLOR_TEXT;
+            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_INDICATOR_FRAME;
+            border-bottom: ${UI_INDICATOR_WIDTH_PX}px solid $UI_COLOR_TEXT_MUTED;
+        }
+        Panel QPushButton#chip:checked:hover, Panel PSButton[state="true"]:hover, Panel PSButton[state="on"]:hover {
+            background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE;
         }
         Panel QPushButton#tool {
             min-width: ${UI_CONTROL_HEIGHT_PX}px; max-width: ${UI_CONTROL_HEIGHT_PX}px; padding: 0;
