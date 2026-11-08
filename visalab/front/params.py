@@ -210,13 +210,48 @@ class PNLabel(PLineEdit):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
 
-class PSButton(QPushButton, _Bound):
+def paint_indicator(p: QPainter, rect: QRectF) -> None:
+    """Индикатор «включено/выбрано»: тонкая рамка и толстая нижняя граница по скруглению.
+
+    Рисуется вручную: QSS с разной толщиной границ даёт кривые углы на скруглениях.
+    """
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QColor(UI_COLOR_INDICATOR_FRAME), UI_BORDER_WIDTH_PX))
+    p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+    clip = QPainterPath()
+    clip.addRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+    p.setClipPath(clip)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(UI_COLOR_TEXT_MUTED))
+    p.drawRect(QRectF(rect.left(), rect.bottom() - UI_INDICATOR_WIDTH_PX, rect.width(), UI_INDICATOR_WIDTH_PX))
+    p.restore()
+
+
+class IndicatorButton(QPushButton):
+    """QPushButton с индикатором, когда он «включён» (``indicated()``; по умолчанию - isChecked)."""
+
+    def indicated(self) -> bool:
+        return self.isChecked()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        if self.indicated():
+            p = QPainter(self)
+            paint_indicator(p, QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5))
+
+
+class PSButton(IndicatorButton, _Bound):
     """Кнопка-переключатель: клик - следующий вариант. ``states`` - {подпись: значение}.
 
     Подпись показывает только значение прибора (``NKNW`` - пока не известно).
     """
 
     UNKNOWN = "NKNW"
+
+    def indicated(self) -> bool:
+        return self.property("state") in ("true", "on")
 
     def __init__(self, proxy: InstrumentProxy, key: str, states, parent=None):
         super().__init__(self.UNKNOWN, parent)
@@ -327,7 +362,7 @@ class PBGroup(QWidget):
             self.group_layout.addWidget(b, r, c)
 
     def add_button(self, name: str) -> QPushButton:
-        b = QPushButton(name)
+        b = IndicatorButton(name)
         b.setObjectName("chip")
         b.setCheckable(True)
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -424,18 +459,7 @@ class PTabBar(QTabBar):
                 p.setBrush(QColor(bg))
                 p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
             if on:                        # режим включён: тонкая рамка + толстая нижняя граница
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(QColor(UI_COLOR_INDICATOR_FRAME), UI_BORDER_WIDTH_PX))
-                p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(UI_COLOR_TEXT_MUTED))
-                bar = QRectF(rect.left(), rect.bottom() - UI_INDICATOR_WIDTH_PX, rect.width(), UI_INDICATOR_WIDTH_PX)
-                p.save()
-                clip = QPainterPath()
-                clip.addRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-                p.setClipPath(clip)
-                p.drawRect(bar)
-                p.restore()
+                paint_indicator(p, rect)
             fg = UI_COLOR_TEXT_INVERSE if hover else UI_COLOR_TEXT if selected else \
                 UI_COLOR_TEXT_MUTED if on else UI_COLOR_BORDER_LIGHT
             font = QFont(self.font())
@@ -533,8 +557,6 @@ class Panel(QFrame):
             background-color: $UI_COLOR_BACKGROUND;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             color: $UI_COLOR_TEXT;
-            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_INDICATOR_FRAME;
-            border-bottom: ${UI_INDICATOR_WIDTH_PX}px solid $UI_COLOR_TEXT_MUTED;
         }
         Panel PSButton:hover, Panel QPushButton#chip:hover, Panel QPushButton#tool:hover {
             background-color: $UI_COLOR_INVERT_HOVER;
@@ -547,8 +569,6 @@ class Panel(QFrame):
             background-color: $UI_COLOR_BACKGROUND;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             color: $UI_COLOR_TEXT;
-            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_INDICATOR_FRAME;
-            border-bottom: ${UI_INDICATOR_WIDTH_PX}px solid $UI_COLOR_TEXT_MUTED;
         }
         Panel QPushButton#chip:checked:hover, Panel PSButton[state="true"]:hover, Panel PSButton[state="on"]:hover {
             background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE;
