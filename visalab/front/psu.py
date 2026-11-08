@@ -10,7 +10,7 @@
 * в заголовке плитки - имя канала и режим (CV / CC, OVP - сработала защита).
 
 Блокировка CH1 (правило лаборатории): CH1 включается, только если CH2 и CH3 потребляют ток не
-меньше порога; замок в плитке CH1 - обход блокировки (открыт - обход). Выключить можно всегда.
+меньше порога; вкладка OUT, строка ILCK: ON - блокировка действует, OFF - обход. Выключить можно всегда.
 Ниже плиток - OFF ALL. Вкладки: PROT (OVP, предел уставки по каналам), OUT (объединение каналов).
 
 ``SourceGrid`` принимает любой набор каналов [(прокси, номер, подпись)], в том числе с нескольких
@@ -30,9 +30,8 @@ from ..core.scpi import si_format
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
 from .params import PLabel, PLineEdit, PSButton, PanelLine, PanelTable, _repolish, paint_indicator
-from .power_meter import ActionButton
+from .power_meter import ActionButton, LToggle
 from .theme import UI_COLUMN_WIDTH_PX, render_qss
-from .window import CustomLockButton
 
 __all__ = ["PSUWindow", "SourceTile", "SourceGrid", "SourceField", "saved_connection"]
 
@@ -308,10 +307,9 @@ class PSUWindow(InstrumentWindow):
         # блокировка CH1: замок в плитке, закрыт - блокировка действует, открыт - обход
         self.gate_lock = None
         if GATED in self.tiles and all(n in self.tiles for n in GATE_BY):
-            self.gate_lock = CustomLockButton()
-            self.gate_lock.setChecked(not s.value(f"{pre}/GATE_BYPASS", False, type=bool))
-            self.gate_lock.toggled.connect(self._gate_toggled)
-            self.tiles[GATED].head.addWidget(self.gate_lock)
+            self.gate_lock = LToggle([("ON", True), ("OFF", False)],
+                                     not s.value(f"{pre}/GATE_BYPASS", False, type=bool))
+            self.gate_lock.changed.connect(self._gate_toggled)
         self.gate_min_a = s.value(f"{pre}/GATE_MIN_A", GATE_MIN_A, type=float)
         grid_line = PanelLine("", self.grid)
         grid_line._name.hide()
@@ -348,6 +346,8 @@ class PSUWindow(InstrumentWindow):
             w = PSButton(proxy, "combine", [(c, c) for c in proxy.params["combine"].choices])
             self.saved_widgets.append(w)
             out.append(PanelLine("COMB", w))
+        if self.gate_lock is not None:
+            out.append(PanelLine("ILCK", self.gate_lock))
         if out:
             self.page_specs.append(("OUT", (), PanelTable(*out)))
 
@@ -360,7 +360,7 @@ class PSUWindow(InstrumentWindow):
         self.update_gate()
 
     def gate_open(self) -> bool:
-        if self.gate_lock is None or not self.gate_lock.isChecked():
+        if self.gate_lock is None or self.gate_lock.value is not True:
             return True
         p = self.proxy
         return all(p.value(f"ch{n}.output") is True and (p.value(f"ch{n}.meas_i") or 0.0) >= self.gate_min_a
@@ -372,7 +372,7 @@ class PSUWindow(InstrumentWindow):
         tile = self.tiles[GATED]
         self.gate_lock.setToolTip("Interlock ON: CH1 needs " + " and ".join(f"CH{n}" for n in GATE_BY)
                                   + f" drawing ≥ {si_format(self.gate_min_a, 'A', 3)}. Click to bypass"
-                                  if self.gate_lock.isChecked() else "Interlock bypassed. Click to enable")
+                                  if self.gate_lock.value is True else "Interlock bypassed. Click to enable")
         tile.set_locked(not self.gate_open(),
                         " and ".join(f"CH{n}" for n in GATE_BY) + f" must draw ≥ {si_format(self.gate_min_a, 'A', 3)}")
 
