@@ -15,7 +15,7 @@ from ..drivers import DRIVERS, make_transport
 from .instrument_window import saved_connection
 from .models import all_models
 
-__all__ = ["run_window"]
+__all__ = ["run_window", "run_windows"]
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -31,7 +31,15 @@ def _lab(path: str, key: str) -> dict:
 
 def run_window(window_cls, lab_key: str, doc: str = "", argv=None) -> int:
     """``window_cls`` - наследник InstrumentWindow; ``lab_key`` - запись прибора в lab.json."""
-    ap = argparse.ArgumentParser(description=doc, formatter_class=argparse.RawDescriptionHelpFormatter)
+    return run_windows([(window_cls, lab_key)], doc, argv)
+
+
+def run_windows(specs, doc: str = "", argv=None, parser=None) -> int:
+    """Несколько окон в одном процессе (окна видят приборы друг друга через LINKS).
+
+    ``specs`` - [(window_cls, lab_key)]; ``--address`` относится к первому окну. ``parser`` -
+    готовый ArgumentParser (если обёртке нужны свои флаги)."""
+    ap = parser or argparse.ArgumentParser(description=doc, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--address", metavar="ADDR")
     ap.add_argument("--sim", action="store_true")
     ap.add_argument("--lab", default=str(ROOT / "lab.json"))
@@ -39,18 +47,27 @@ def run_window(window_cls, lab_key: str, doc: str = "", argv=None) -> int:
     ap.add_argument("--backend", default="")
     ap.add_argument("--latency", type=float, default=0.005, help="задержка симулятора, с")
     ap.add_argument("--no-connect", action="store_true")
-    args = ap.parse_args(argv)
+    args, _rest = ap.parse_known_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
     settings = QSettings(args.ini, QSettings.Format.IniFormat)
+    opened: list[dict] = []
+    for n, (window_cls, lab_key) in enumerate(specs):
+        opened.append(_open(window_cls, lab_key, args, settings, args.address if n == 0 else None))
+    app.aboutToQuit.connect(lambda: [cur["proxy"].shutdown() for cur in opened])
+    return app.exec()
+
+
+def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None) -> dict:
+    """Создать прокси и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win} (обновляется)."""
     lab = _lab(args.lab, lab_key)
     saved = saved_connection(settings, window_cls.CONNECTION_GROUP)     # выбранное в окне (адрес -> APPLY)
     kind, model, delay = saved["driver"] or window_cls.DEFAULT_KIND, saved["model"] or None, None
     if args.sim:
         address = "sim"
-    elif args.address:
-        address = args.address
+    elif cli_address:
+        address = cli_address
     elif saved["address"]:
         address = saved["address"]
     else:
@@ -81,5 +98,4 @@ def run_window(window_cls, lab_key: str, doc: str = "", argv=None) -> int:
         build(kind, address, model or None, pos)
 
     build(kind, address, model, None)
-    app.aboutToQuit.connect(lambda: current["proxy"].shutdown())
-    return app.exec()
+    return current
