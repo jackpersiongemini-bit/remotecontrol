@@ -295,3 +295,29 @@ def test_launcher_reconnect_builds_new_window(qtbot, tmp_path, monkeypatch):
     windows[0].reconnect_requested.emit("sdg", "sim", "SDG2042X")
     assert len(windows) == 2 and windows[1].isVisible() and not windows[0].isVisible()
     windows[1].proxy.shutdown()
+
+
+def test_create_model_window(qtbot, opened, settings):
+    from visalab.drivers.siglent_sdg import SDGModel
+    from visalab.front.models import all_models, user_models
+    _sim, _proxy, win = opened
+    win.show_connection()
+    win.model_choice.set_value("SDG2042X")
+    win.new_model_button.click()
+    mw = win.model_window
+    qtbot.addWidget(mw)
+    labels = [f.label for f in mw.fields]
+    assert labels == ["NAME", "CH", "FMAX", "AMAX", "CMR"]
+    assert mw.fields[0].widget.text() == "SDG2042X-custom"
+    mw.fields[0].widget.setText("SDG-LAB")
+    mw.fields[2].widget.setText("25 MHz")                   # с приставкой
+    mw.fields[4].widget.click()                               # CMR -> YES
+    assert mw.save()
+    model = user_models(settings, "sdg")["SDG-LAB"]
+    assert model == SDGModel("SDG-LAB", 2, 25e6, 20.0, True)
+    assert "SDG-LAB" in all_models(settings, "sdg")
+    assert win.model_choice.value == "SDG-LAB"                # сразу выбрана в MDL
+    mw2 = __import__("visalab.front.models", fromlist=["ModelWindow"]).ModelWindow(settings, "sdg")
+    qtbot.addWidget(mw2)
+    mw2.fields[0].widget.setText("SDG2042X")                  # встроенное имя не перезаписать
+    assert not mw2.save() and "built-in" in mw2.status.text()

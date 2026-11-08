@@ -19,8 +19,9 @@ from PyQt6.QtWidgets import QApplication
 
 from run_gui import _load_lab
 from visalab.core import InstrumentProxy
-from visalab.drivers import DRIVERS, MODELS, make_transport
+from visalab.drivers import DRIVERS, make_transport
 from visalab.front import PulseGenWindow
+from visalab.front.models import all_models
 from visalab.front.pulse_gen import saved_connection
 
 HERE = Path(__file__).resolve().parent
@@ -57,7 +58,7 @@ def main(argv=None) -> int:
     def build(kind: str, address: str, model: str | None, pos=None) -> None:
         driver_cls, _ = DRIVERS[kind]
         proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency),
-                                model=MODELS[kind].get(model) if model else None,
+                                model=all_models(settings, kind).get(model) if model else None,
                                 command_delay_s=None if delay is None else float(delay))
         win = PulseGenWindow(proxy, settings)
         win.reconnect_requested.connect(reconnect)

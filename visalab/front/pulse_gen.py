@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextE
 from ..core.params import ConnectionState, Kind, PStatus
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
-from ..drivers import DRIVERS, MODELS
+from ..drivers import DRIVERS
+from .models import ModelWindow, all_models, model_class
 from .params import PBGroup, PChoice, PLabel, PTabBar, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, Switch,
@@ -439,15 +440,29 @@ class PulseGenWindow(Window):
         self.address_edit.returnPressed.connect(self.apply_connection)
         self.apply_button = self._tool("APPLY", "Save and reconnect with these settings", self.apply_connection)
         self.apply_button.setProperty("wide", True)
-        table = PanelTable(PanelLine("DRV", self.driver_choice), PanelLine("MDL", self.model_choice),
+        self.new_model_button = self._tool("+", "Create a model: limits and functions (based on the selected one)",
+                                           self.new_model)
+        table = PanelTable(PanelLine("DRV", self.driver_choice),
+                           PanelLine("MDL", self.model_choice, self.new_model_button),
                            PanelLine("ADDR", self.address_edit), PanelLine("", self.apply_button))
         table.lines[-1].line_layout.insertStretch(1)
         table.hide()
         return table
 
     def _fill_models(self, kind, value: str = "") -> None:
-        models = [("AUTO", "")] + [(m, m) for m in MODELS.get(kind, {})]
+        models = [("AUTO", "")] + [(m, m) for m in all_models(self.settings, kind)]
         self.model_choice.set_choices(models, value)
+        if hasattr(self, "new_model_button"):
+            self.new_model_button.setEnabled(model_class(kind) is not None)
+
+    def new_model(self) -> None:
+        """Окно создания модели; после SAVE модель появляется в списке MDL и выбирается."""
+        kind = self.driver_choice.value or self._driver_kind()
+        template = all_models(self.settings, kind).get(self.model_choice.value or "")
+        self.model_window = ModelWindow(self.settings, kind, template)
+        self.model_window.saved.connect(lambda name: self._fill_models(kind, name))
+        self.model_window.move(self.pos() + self.rect().center() - self.model_window.rect().center())
+        self.model_window.show()
 
     def show_connection(self) -> None:
         """Клик по адресу: вместо таблицы - драйвер / модель / адрес (выход - вкладка или APPLY)."""
