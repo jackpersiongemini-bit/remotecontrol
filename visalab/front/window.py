@@ -8,17 +8,18 @@ from __future__ import annotations
 import textwrap
 from enum import Enum
 
-from PyQt6.QtCore import QLineF, QRectF, QSettings, QSize, Qt
+from PyQt6.QtCore import QEasingCurve, QLineF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty
 from PyQt6.QtGui import QColor, QPainter, QPen
-from PyQt6.QtWidgets import QLabel, QPushButton, QWidget
+from PyQt6.QtWidgets import QAbstractButton, QLabel, QPushButton, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
 
-from .theme import (OFF, ON, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_ERROR, UI_COLOR_PANEL,
+from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_CONTROL, UI_COLOR_ERROR,
+                    UI_COLOR_PANEL, UI_SWITCH_MARGIN_PX, UI_TITLE_BAR_WIDE_ITEM_SIZE_PX,
                     UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss)
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
-           "CustomExpandButton",
+           "CustomExpandButton", "Switch",
            "CustomOnButton", "CustomSyncButton", "CustomInitButton"]
 
 
@@ -310,3 +311,94 @@ def short_address(address: str) -> str:
     if head.startswith("USB") and len(parts) >= 4:
         return parts[3]
     return address
+
+
+class Switch(QAbstractButton):
+    """Анимированный переключатель ON/OFF для заголовка окна (по WindowClass.py).
+
+    ``set_status``: ON / OFF / "process" (связь устанавливается) / "error".
+    """
+
+    COLORS = {OFF: UI_COLOR_ERROR, ON: UI_COLOR_SUCCESS, "process": UI_COLOR_PROCESS, "error": UI_COLOR_ERROR}
+    HANDLE_COLOR = QColor(UI_COLOR_CONTROL)
+    HANDLE_BORDER_COLOR = QColor(UI_COLOR_BORDER)
+
+    def __init__(self, state=OFF, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFixedSize(self.sizeHint())
+        self._status = ON if state in ON_EQV else OFF
+        self._handle_position = self._position_for_state(False)
+        self._animation = QPropertyAnimation(self, b"handle_position", self)
+        self._animation.setDuration(160)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        checked = state in ON_EQV
+        self.setChecked(checked)
+        self._handle_position = self._position_for_state(checked)
+        self.toggled.connect(self._animate_handle)
+
+    def sizeHint(self):  # noqa: N802 - Qt
+        return QSize(int(UI_TITLE_BAR_WIDE_ITEM_SIZE_PX * 0.9), int(UI_TITLE_BAR_ITEM_SIZE_PX * 0.9))
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt
+        return self.sizeHint()
+
+    def value(self) -> str:
+        return ON if self.isChecked() else OFF
+
+    def set_value(self, value) -> None:
+        self.setChecked(value in ON_EQV)
+
+    def status(self) -> str:
+        return self._status
+
+    def set_status(self, status: str) -> None:
+        """Состояние связи: ручка - включено/выключено, цвет дорожки - статус."""
+        self._status = status
+        self.blockSignals(True)
+        self.setChecked(status in (ON, "process"))
+        self.blockSignals(False)
+        self._animate_handle(self.isChecked())
+        self.setCursor(Qt.CursorShape.WaitCursor if status == "process" else Qt.CursorShape.PointingHandCursor)
+        self.update()
+
+    def _position_for_state(self, checked: bool) -> float:
+        margin = float(UI_SWITCH_MARGIN_PX)
+        diameter = max(0.0, self.height() - 2.0 * margin)
+        return self.width() - margin - diameter if checked else margin
+
+    def _animate_handle(self, checked: bool) -> None:
+        self._animation.stop()
+        self._animation.setStartValue(self._handle_position)
+        self._animation.setEndValue(self._position_for_state(checked))
+        self._animation.start()
+        self.update()
+
+    def get_handle_position(self) -> float:
+        return self._handle_position
+
+    def set_handle_position(self, position: float) -> None:
+        self._handle_position = float(position)
+        self.update()
+
+    handle_position = pyqtProperty(float, fget=get_handle_position, fset=set_handle_position)
+
+    def paintEvent(self, event):  # noqa: N802 - Qt
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(self.COLORS.get(self._status, UI_COLOR_ERROR))
+        if self.underMouse() and self.isEnabled():
+            color = color.lighter(112)
+        if not self.isEnabled():
+            color.setAlpha(110)
+        track = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawRoundedRect(track, track.height() / 2.0, track.height() / 2.0)
+        margin = float(UI_SWITCH_MARGIN_PX)
+        d = max(0.0, self.height() - 2.0 * margin)
+        p.setPen(QPen(self.HANDLE_BORDER_COLOR, 0.75))
+        p.setBrush(self.HANDLE_COLOR)
+        p.drawEllipse(QRectF(self._handle_position, margin, d, d))

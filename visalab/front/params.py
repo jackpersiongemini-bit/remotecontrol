@@ -18,9 +18,9 @@ from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QVBoxLayout,
                              QWidget)
 
-from ..core.params import ConnectionState, PStatus
+from ..core.params import ConnectionState, Kind, PStatus
 from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format, si_parse
+from ..core.scpi import SI_PREFIXES, si_format, si_parse
 from .theme import render_qss
 from .window import WriteState
 
@@ -68,33 +68,121 @@ class _Bound:
         raise NotImplementedError
 
 
+#: префиксы, которые предлагает список единиц (порядок - по возрастанию)
+UNIT_PREFIXES = {"s": ("n", "µ", "m", ""), "Hz": ("", "k", "M"), "V": ("m", ""), "Vpp": ("m", ""),
+                 "A": ("m", ""), "W": ("m", "")}
+
+
 class PLineEdit(QLineEdit, _Bound):
-    """Число с единицей: ввод «400m», «30 µs», «0.4» - значение в единицах СИ."""
+    """Число слева, единица справа - кнопка со списком префиксов (ns / µs / ms / s).
+
+    Введённое число берётся в выбранной единице; можно ввести и с префиксом («30u», «1.5 kHz»).
+    Пока единицу не выбрали вручную, префикс подбирается под значение.
+    """
 
     def __init__(self, proxy: InstrumentProxy, key: str, unit: str | None = None, digits: int = 6, parent=None):
         super().__init__(parent)
         self.unit = unit if unit is not None else proxy.params[key].unit
         self.digits = digits
-        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.prefixes = UNIT_PREFIXES.get(self.unit, ("",))
+        self.prefix = "" if "" in self.prefixes else self.prefixes[-1]
+        self.pinned = False                       # единица выбрана вручную
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.unit_button: QPushButton | None = None
+        if self.unit:
+            b = QPushButton(self.unit, self)
+            b.setObjectName("unit")
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            if len(self.prefixes) > 1:
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(self._unit_menu)
+            else:
+                b.setProperty("static", True)
+            self.unit_button = b
         self.bind(proxy, key)
         self.editingFinished.connect(self.change_value)
+        self._update_unit()
 
     @property
     def value(self):
         return self._value
 
-    def show_value(self, value):
-        if self.hasFocus() and self.isModified():
+    # -------------------------------------------------------- единица
+    def _factor(self) -> float:
+        return SI_PREFIXES[self.prefix] if self.prefix else 1.0
+
+    def _auto_prefix(self, value) -> None:
+        if self.pinned or not isinstance(value, (int, float)) or isinstance(value, bool) or not value:
             return
-        self.setText("" if value is None else si_format(value, self.unit, self.digits))
+        chosen = self.prefixes[0]
+        for p in self.prefixes:
+            if abs(value) >= (SI_PREFIXES[p] if p else 1.0) * 0.9999999:
+                chosen = p
+        self.prefix = chosen
+
+    def _update_unit(self) -> None:
+        if self.unit_button is None:
+            return
+        self.unit_button.setText(f"{self.prefix}{self.unit}")
+        self._place_unit()
+
+    def _place_unit(self) -> None:
+        b = self.unit_button
+        if b is None:
+            return
+        b.ensurePolished()
+        w = max(b.sizeHint().width(), 26)
+        b.setGeometry(self.width() - w - 2, 2, w, max(self.height() - 4, 0))
+        self.setTextMargins(0, 0, w, 0)
+
+    def resizeEvent(self, e):  # noqa: N802 - Qt
+        super().resizeEvent(e)
+        self._place_unit()
+
+    def _unit_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for p in self.prefixes:
+            act = menu.addAction(f"{p}{self.unit}")
+            act.setCheckable(True)
+            act.setChecked(p == self.prefix)
+            act.triggered.connect(lambda _=False, p=p: self.set_prefix(p))
+        menu.popup(self.unit_button.mapToGlobal(self.unit_button.rect().bottomLeft()))
+
+    def set_prefix(self, prefix: str) -> None:
+        """Выбрать единицу вручную: значение не меняется, меняется только показ."""
+        self.prefix, self.pinned = prefix, True
+        self._update_unit()
+        self.show_value(self._value, force=True)
+
+    # -------------------------------------------------------- значение
+    def show_value(self, value, force: bool = False):
+        if not force and self.hasFocus() and self.isModified():
+            return
+        if value is None:
+            self.setText("")
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and self.unit:
+            self._auto_prefix(value)
+            self._update_unit()
+            self.setText(f"{value / self._factor():.{self.digits}g}")
+        else:
+            self.setText(str(value))
         self.setModified(False)
+
+    def _parse(self, text: str):
+        if self.spec.kind not in (Kind.FLOAT, Kind.INT):
+            return text.strip()
+        try:
+            return float(text.strip().replace(",", ".")) * self._factor()
+        except ValueError:
+            return si_parse(text, self.unit)        # с префиксом: «30u», «1.5 kHz»
 
     def change_value(self) -> None:
         if self.isReadOnly() or not self.isModified():
             return
         self.setModified(False)
         try:
-            value = self.spec.validate(si_parse(self.text(), self.unit))
+            value = self.spec.validate(self._parse(self.text()))
         except ValueError as exc:
             self._on_status(PStatus.INVALID, str(exc))
             self.show_value(self._value)
@@ -127,12 +215,13 @@ class PSButton(QPushButton, _Bound):
 
     UNKNOWN = "NKNW"
 
-    def __init__(self, proxy: InstrumentProxy, key: str, states: dict[str, Any], parent=None):
+    def __init__(self, proxy: InstrumentProxy, key: str, states, parent=None):
         super().__init__(self.UNKNOWN, parent)
-        if not states:
+        pairs = list(states.items()) if isinstance(states, dict) else list(states)   # или [(подпись, значение)]
+        if not pairs:
             raise ValueError("PSButton requires at least one state")
-        self._names = tuple(states)
-        self._data = tuple(states.values())
+        self._names = tuple(n for n, _v in pairs)
+        self._data = tuple(v for _n, v in pairs)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.bind(proxy, key)
@@ -382,11 +471,33 @@ class Panel(QFrame):
         QMenu#psmenu::item:selected { background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE; }
         QMenu#psmenu::item:checked { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         QMenu#psmenu::indicator { width: 0; }
+        Panel QPushButton#tab {
+            background-color: $UI_COLOR_BACKGROUND; padding: 0 10px;
+            min-height: ${UI_CONTROL_HEIGHT_PX}px; max-height: ${UI_CONTROL_HEIGHT_PX}px;
+            border: 2px solid transparent;
+        }
+        Panel QPushButton#tab:hover {
+            background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE;
+        }
+        Panel QPushButton#tab[on="true"] {
+            background-color: $UI_COLOR_INVERT; color: $UI_COLOR_TEXT_INVERSE; font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+        }
+        Panel QPushButton#tab:checked {
+            border-color: $UI_COLOR_TEXT; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT;
+        }
+        Panel QPushButton#tab[on="true"]:checked { color: $UI_COLOR_TEXT_INVERSE; }
+        Panel QPushButton#unit {
+            background-color: transparent; border: none; padding: 0 4px; min-height: 0;
+            color: $UI_COLOR_BORDER_LIGHT; font-weight: normal;
+        }
+        Panel QPushButton#unit:hover { background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE; }
+        Panel QPushButton#unit[static="true"]:hover { background-color: transparent; color: $UI_COLOR_BORDER_LIGHT; }
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }
     """)
 
-    def __init__(self, table: PanelTable, column_width: int | None = None, parent=None):
+    def __init__(self, table: QWidget, column_width: int | None = None, parent=None):
+        """``table`` - PanelTable (будет выровнена) или любой виджет со своими таблицами."""
         super().__init__(parent)
         self.setStyleSheet(self.STYLE_SHEET)
         self.table = table
@@ -394,7 +505,8 @@ class Panel(QFrame):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(0)
         lay.addWidget(table)
-        table.build(column_width)
+        if isinstance(table, PanelTable):
+            table.build(column_width)
 
 
 class WriteTracker(QObject):
