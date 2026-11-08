@@ -24,8 +24,8 @@ from typing import Any
 
 from PyQt6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import (QAbstractItemView, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                             QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
+                             QVBoxLayout, QWidget)
 
 from ..core.params import ConnectionState, Kind
 from ..core.proxy import InstrumentProxy
@@ -110,12 +110,16 @@ class LNumber(QLineEdit):
 
     changed = pyqtSignal(float)
 
-    def __init__(self, value: float, unit: str, minimum: float, maximum: float, digits: int = 4, parent=None):
+    def __init__(self, value: float | None, unit: str, minimum: float, maximum: float, digits: int = 4,
+                 scale: float = 1.0, si_unit: str = "", hint: str = "", parent=None):
+        """``scale`` - показ в единицах unit (GHz: 1e9, значение в Hz); ``si_unit`` - можно ввести
+        с префиксом («2.4G»); ``hint`` - подсказка в пустом поле."""
         super().__init__(parent)
         self.setObjectName("cfg")
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.unit, self.minimum, self.maximum, self.digits = unit, minimum, maximum, digits
-        self._value = float(value)
+        self.scale, self.si_unit, self.hint = scale, si_unit, hint
+        self._value = None if value is None else float(value)
         self.unit_button = QPushButton(unit, self)
         self.unit_button.setObjectName("unit")
         self.unit_button.setProperty("static", True)
@@ -124,7 +128,7 @@ class LNumber(QLineEdit):
         self.show_value(self._value)
 
     @property
-    def value(self) -> float:
+    def value(self) -> float | None:
         return self._value
 
     def resizeEvent(self, e):  # noqa: N802 - Qt
@@ -136,12 +140,17 @@ class LNumber(QLineEdit):
         self.setTextMargins(w, 0, 0, 0)
 
     def show_value(self, value: float | None) -> None:
-        text = "" if value is None else f"{value:.{self.digits}g}"
+        text = "" if value is None else f"{value / self.scale:.{self.digits}g}"
         if self.hasFocus() and not self.isReadOnly():
-            self.setPlaceholderText(text)
+            self.setPlaceholderText(text or self.hint)
             return
         self.setText(text)
+        self.setPlaceholderText(self.hint if value is None else "")
         self.setModified(False)
+
+    def clear_value(self) -> None:
+        self._value = None
+        self.show_value(None)
 
     def set_value(self, value: float, emit: bool = True) -> None:
         value = min(max(float(value), self.minimum), self.maximum)
@@ -160,7 +169,6 @@ class LNumber(QLineEdit):
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
         super().focusOutEvent(e)
-        self.setPlaceholderText("")
         self.show_value(self._value)
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
@@ -177,12 +185,24 @@ class LNumber(QLineEdit):
         if self.isReadOnly() or not self.isModified() or not self.text().strip():
             return
         self.setModified(False)
-        try:
-            value = float(self.text().strip().replace(",", ".").removesuffix(self.unit).strip())
-        except ValueError:
+        value = self.parse(self.text())
+        if value is None:
             self.show_value(self._value)
             return
         self.set_value(value)
+
+    def parse(self, text: str) -> float | None:
+        text = text.strip().replace(",", ".").removesuffix(self.unit).strip()
+        try:
+            return float(text) * self.scale
+        except ValueError:
+            pass
+        if self.si_unit:
+            try:
+                return si_parse(text, self.si_unit)
+            except (TypeError, ValueError):
+                pass
+        return None
 
 
 class ActionButton(QPushButton):
@@ -230,57 +250,55 @@ class ActionButton(QPushButton):
 
 
 class CalTable(QWidget):
-    """Таблица калибровки FREQ -> dB (правка в ячейках, «+» - строка на частоте датчика, «−» - удалить)."""
+    """Таблица калибровки FREQ -> dB строками из обычных полей окна.
+
+    Каждая точка - строка «частота (GHz) | поправка (dB) | −»; поля правятся как любые поля окна,
+    точки сортируются по частоте. Внизу строка ввода: частота и dB, «+» - добавить (пустая частота -
+    частота датчика, пустые dB - значение по таблице на этой частоте). Больше ROWS_VISIBLE точек -
+    прокрутка колесом, без полосы."""
 
     changed = pyqtSignal()
-    ROWS_VISIBLE = 5
-    STYLE = render_qss("""
-        QTableWidget#calTable { background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_TEXT_MUTED; border: none;
-            border-radius: ${UI_BORDER_RADIUS_PX}px; gridline-color: $UI_COLOR_BORDER; outline: none; }
-        QTableWidget#calTable::item { padding: 0 4px; }
-        QTableWidget#calTable::item:selected { background-color: $UI_COLOR_INVERT; color: $UI_COLOR_TEXT_INVERSE; }
-        QTableWidget#calTable QHeaderView::section { background-color: $UI_COLOR_PANEL; color: $UI_COLOR_BORDER_LIGHT;
-            border: none; padding: 0 4px; }
-        QTableWidget#calTable QLineEdit { background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_TEXT;
-            border: 1px solid $UI_COLOR_TEXT_MUTED; padding: 0 2px; }
-        QTableWidget#calTable QScrollBar:vertical { width: 6px; background: transparent; }
-        QTableWidget#calTable QScrollBar::handle:vertical { background: $UI_COLOR_BORDER; border-radius: 3px; }
-        QTableWidget#calTable QScrollBar::add-line, QTableWidget#calTable QScrollBar::sub-line { height: 0; }
-    """)
+    rows_changed = pyqtSignal()               # число строк изменилось - окну пересчитать высоту
+    ROWS_VISIBLE = 6
 
-    def __init__(self, points=(), parent=None):
+    def __init__(self, points=(), default_freq=None, parent=None):
         super().__init__(parent)
-        self.table = QTableWidget(0, 2)
-        self.table.setObjectName("calTable")
-        self.table.setStyleSheet(self.STYLE)
-        self.table.setHorizontalHeaderLabels(["FREQ", "dB"])
-        self.table.verticalHeader().hide()
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.verticalHeader().setDefaultSectionSize(22)
-        self.table.horizontalHeader().setFixedHeight(22)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.table.setFixedHeight(22 * (self.ROWS_VISIBLE + 1) + 4)
-        self.table.itemChanged.connect(self._edited)
+        self.default_freq = default_freq or (lambda: None)
         self._points: list[tuple[float, float]] = []
-        self.add_button = InstrumentWindow._tool("+", "Add a point at the sensor frequency", lambda: None,
-                                                 (UI_CONTROL_HEIGHT_PX * 2 - 4) // 2)
-        self.remove_button = InstrumentWindow._tool("−", "Remove the selected point", self.remove_selected,
-                                                    (UI_CONTROL_HEIGHT_PX * 2 - 4) // 2)
-        tools = QWidget()
-        tl = QVBoxLayout(tools)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(4)
-        tl.addWidget(self.add_button)
-        tl.addWidget(self.remove_button)
-        tl.addStretch()
-        lay = QHBoxLayout(self)
+        self.rows: list[tuple[LNumber, LNumber, QPushButton]] = []
+        self._list = QWidget()
+        self._list_layout = QVBoxLayout(self._list)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(4)
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self._list)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.new_freq = LNumber(None, "GHz", 1e3, 1000e9, 6, scale=1e9, si_unit="Hz", hint="FREQ")
+        self.new_db = LNumber(None, "dB", -100.0, 100.0, 4, hint="dB")
+        self.new_db.ensurePolished()
+        self.add_button = InstrumentWindow._tool("+", "Add the point (empty FREQ - sensor frequency)",
+                                                 self.add_entry)
+        self.new_freq.returnPressed.connect(self.add_entry)
+        self.new_db.returnPressed.connect(self.add_entry)
+        lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-        lay.addWidget(self.table, 1)
-        lay.addWidget(tools)
+        lay.setSpacing(4)
+        lay.addWidget(self.scroll)
+        lay.addWidget(self._row(self.new_freq, self.new_db, self.add_button))
         self.set_points(points)
+
+    @staticmethod
+    def _row(*widgets) -> QWidget:
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+        for w in widgets:
+            hl.addWidget(w, 0 if isinstance(w, QPushButton) else 1)
+        return row
 
     @property
     def points(self) -> list[tuple[float, float]]:
@@ -288,55 +306,70 @@ class CalTable(QWidget):
 
     def set_points(self, points) -> None:
         self._points = sorted((float(f), float(d)) for f, d in points)
-        self._fill()
+        self._rebuild()
 
-    def _fill(self) -> None:
-        self.table.blockSignals(True)
-        self.table.setRowCount(len(self._points))
-        for r, (f, d) in enumerate(self._points):
-            for c, text in enumerate((si_format(f, "Hz", 6), f"{d:+.3g}")):
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(r, c, item)
-        self.table.blockSignals(False)
+    def _rebuild(self) -> None:
+        while self._list_layout.count():
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.rows = []
+        for i, (f, d) in enumerate(self._points):
+            fw = LNumber(f, "GHz", 1e3, 1000e9, 6, scale=1e9, si_unit="Hz")
+            dw = LNumber(d, "dB", -100.0, 100.0, 4)
+            rm = InstrumentWindow._tool("−", "Remove this point", lambda _=False, i=i: self.remove(i))
+            fw.changed.connect(lambda v, i=i: self._edit(i, freq=v))
+            dw.changed.connect(lambda v, i=i: self._edit(i, db=v))
+            self.rows.append((fw, dw, rm))
+            self._list_layout.addWidget(self._row(fw, dw, rm))
+        for w in self._list.findChildren(QWidget):
+            w.ensurePolished()
+        n = min(len(self._points), self.ROWS_VISIBLE)
+        row_h = max(self.new_db.sizeHint().height(), UI_CONTROL_HEIGHT_PX)   # высота поля с рамкой
+        self.scroll.setFixedHeight(n * row_h + max(n - 1, 0) * 4)
+        self.scroll.setVisible(n > 0)
+        self._list_layout.invalidate()
+        self.layout().invalidate()
+        self.updateGeometry()
+        self.rows_changed.emit()
+
+    def _edit(self, i: int, freq: float | None = None, db: float | None = None) -> None:
+        if i >= len(self._points):
+            return
+        f, d = self._points[i]
+        pts = list(self._points)
+        pts[i] = (f if freq is None else freq, d if db is None else db)
+        if freq is not None:                          # частота другой точки - заменить её
+            pts = [p for j, p in enumerate(pts) if j == i or not math.isclose(p[0], freq, rel_tol=1e-9)]
+            self._points = sorted(pts)
+            QTimer.singleShot(0, self._rebuild)       # поле, которое сейчас правят, удалится
+        else:
+            self._points = pts
+        self.changed.emit()
 
     def add_point(self, freq: float, db: float | None = None) -> None:
         if db is None:
             db = interpolate(self._points, freq)
         pts = [p for p in self._points if not math.isclose(p[0], freq, rel_tol=1e-9)]
         self.set_points(pts + [(freq, db)])
-        row = next(i for i, p in enumerate(self._points) if math.isclose(p[0], freq, rel_tol=1e-9))
-        self.table.selectRow(row)
         self.changed.emit()
 
-    def remove_selected(self) -> None:
-        rows = {i.row() for i in self.table.selectedIndexes()}
-        if not rows:
+    def add_entry(self) -> None:
+        """«+»: точка из строки ввода."""
+        for w in (self.new_freq, self.new_db):
+            w._commit()
+        freq = self.new_freq.value if self.new_freq.value is not None else self.default_freq()
+        if not freq:
             return
-        self.set_points([p for i, p in enumerate(self._points) if i not in rows])
-        self.changed.emit()
+        self.add_point(float(freq), self.new_db.value)
+        self.new_freq.clear_value()
+        self.new_db.clear_value()
 
-    def _edited(self, item: QTableWidgetItem) -> None:
-        r, c = item.row(), item.column()
-        f, d = self._points[r]
-        text = item.text().strip().replace(",", ".")
-        try:
-            if c == 0:
-                try:
-                    f = float(text)
-                except ValueError:
-                    f = si_parse(text, "Hz")
-                if f <= 0:
-                    raise ValueError
-            else:
-                d = float(text.removesuffix("dB").strip())
-        except (TypeError, ValueError):
-            self._fill()                              # не число - вернуть как было
-            return
-        pts = list(self._points)
-        pts[r] = (f, d)
-        self.set_points(pts)
-        self.changed.emit()
+    def remove(self, index: int) -> None:
+        if 0 <= index < len(self._points):
+            del self._points[index]
+            QTimer.singleShot(0, self._rebuild)
+            self.changed.emit()
 
 
 # ---------------------------------------------------------------- индикатор избранного
@@ -622,8 +655,8 @@ class PowerMeterWindow(InstrumentWindow):
         self.cal_value.setObjectName("calValue")
         self.cal_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.cal_value.setToolTip("Table value at the sensor frequency (dB)")
-        self.cal_table = CalTable(points)
-        self.cal_table.add_button.clicked.connect(self._add_cal_point)
+        self.cal_table = CalTable(points, default_freq=lambda: self.proxy.value("freq"))
+        self.cal_table.rows_changed.connect(lambda: hasattr(self, "_layout") and QTimer.singleShot(0, self._fit_height))
         self.gain_on = LToggle([("OFF", False), ("ON", True)], s.value(f"{pre}/GAIN_ON", False, type=bool))
         self.gain = LNumber(s.value(f"{pre}/GAIN", 0.0, type=float), "dB", -100.0, 100.0)
         self.gain.setToolTip("Gain in the path (subtracted)")
@@ -636,7 +669,10 @@ class PowerMeterWindow(InstrumentWindow):
         for w, name in ((self.gain, "GAIN"), (self.duty, "DUTY")):
             w.changed.connect(lambda v, n=name: self._local_changed(n, v))
         self.cal_table.changed.connect(lambda: self._local_changed("CAL_TABLE", json.dumps(self.cal_table.points)))
-        cal = [PanelLine("CAL", self.cal_on, self.cal_value), PanelLine("TABL", self.cal_table),
+        tabl = PanelLine("TABL", self.cal_table)
+        tabl.line_layout.setAlignment(tabl._name, Qt.AlignmentFlag.AlignTop)
+        tabl._name.setFixedHeight(UI_CONTROL_HEIGHT_PX + 2)
+        cal = [PanelLine("CAL", self.cal_on, self.cal_value), tabl,
                PanelLine("GAIN", self.gain_on, self.gain), PanelLine("DUTY", self.duty_src, self.duty)]
         if sup("offset"):
             off = PNLabel(proxy, "offset")
@@ -790,10 +826,6 @@ class PowerMeterWindow(InstrumentWindow):
     def _on_sdg_param(self, key: str, _value: Any) -> None:
         if key.endswith(".duty"):
             self.apply_correction()
-
-    def _add_cal_point(self) -> None:
-        freq = self.proxy.value("freq")
-        self.cal_table.add_point(float(freq) if freq else 1e9)
 
     def closeEvent(self, event):  # noqa: N802 - Qt
         try:
