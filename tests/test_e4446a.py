@@ -96,3 +96,30 @@ def test_marker_off_reads_none_without_error(sa):
     drv, sim, rec = sa
     drv.read_param("marker.level")
     assert rec.values["marker.level"] is None and not rec.errors
+
+
+def test_states_in_instrument_memory(sa):
+    drv, sim, rec = sa
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    drv.run_action("state_list")
+    assert actions[-1] == ("state_list", [])
+    for k, v in (("freq.center", 1.1e9), ("freq.span", 400e6)):
+        setp(drv, rec, k, v)
+    drv.run_action("state_save", ("fund",))
+    setp(drv, rec, "freq.center", 5e9)
+    setp(drv, rec, "freq.span", 1e6)
+    drv.run_action("state_save", ("other",))
+    drv.run_action("state_list")
+    assert actions[-1] == ("state_list", ["fund", "other"]) and set(sim.files) == {"fund.state", "other.state"}
+    drv.run_action("state_recall", ("fund",))
+    assert rec.values["freq.center"] == pytest.approx(1.1e9) and rec.values["freq.span"] == pytest.approx(400e6)
+    assert sim.c["form"] == "ASC" and not rec.comm
+    drv.run_action("state_delete", ("other",))
+    drv.run_action("state_list")
+    assert actions[-1] == ("state_list", ["fund"])
+    n = len(rec.errors)
+    drv.run_action("state_recall", ("missing",))                 # нет файла - ошибка прибора, а не обрыв
+    assert len(rec.errors) > n and not rec.comm
+    drv.run_action("state_save", ("bad name",))                  # недопустимое имя в прибор не уходит
+    assert "bad name" not in " ".join(sim.history)

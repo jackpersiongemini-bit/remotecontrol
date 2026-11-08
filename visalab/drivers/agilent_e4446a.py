@@ -10,6 +10,8 @@
 * опора ``ROSC:SOUR INT|EXT``;
 * трасса ``TRAC:DATA? TRACE1`` в формате ``FORM ASC`` (значения через запятую, dBm);
 * маркер ``CALC:MARK1:STAT``, ``:X``, ``:Y?``, ``:MAX``;
+* состояния в памяти прибора: ``MMEM:STOR:STAT 1,"имя"``, ``MMEM:LOAD:STAT 1,"имя"``,
+  ``MMEM:CAT?`` (файлы ``*.state``), ``MMEM:DEL "имя.state"``;
 * ``INIT:CONT OFF`` + ``INIT`` - одна развёртка, конец которой ловится через ``*OPC``.
 
 Драйвер всегда ведёт прибор однократными развёртками (INIT:CONT OFF): после окончания
@@ -18,6 +20,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,6 +51,8 @@ FREQ_KEYS = ("freq.center", "freq.span", "freq.start", "freq.stop")
 #: что прибор пересчитывает сам при смене полосы/RBW (связанные «авто»)
 COUPLED = ("bw.res", "bw.video", "sweep.time", "sweep.points")
 SWEEP_TIMEOUT_MS = 60000
+STATE_EXT = ".state"
+_STATE_NAME = re.compile(r"[A-Za-z0-9_\-]{1,32}")
 
 
 class AgilentPSA(VISAInstrument):
@@ -127,7 +132,10 @@ class AgilentPSA(VISAInstrument):
     def build_actions(self):
         return [Action("single", "Одна развёртка"), Action("abort", "Прервать"),
                 Action("marker_peak", "Маркер на пик"),
-                Action("reset", "Сброс *RST", confirm="Сбросить анализатор (Preset)?")]
+                Action("reset", "Сброс *RST", confirm="Сбросить анализатор (Preset)?"),
+                Action("state_list", "Состояния в памяти"), Action("state_save", "Сохранить состояние"),
+                Action("state_recall", "Вызвать состояние"),
+                Action("state_delete", "Удалить состояние", confirm="Удалить состояние из памяти анализатора?")]
 
     # --------------------------------------------------------------- хуки
     def on_connected(self) -> None:
@@ -239,4 +247,40 @@ class AgilentPSA(VISAInstrument):
             self.on_connected()
             self._sync_all()
             return None
+        if name == "state_list":
+            return self._state_list()
+        if name in ("state_save", "state_recall", "state_delete"):
+            return self._state_file_action(name, args)
         return super().run_custom_action(name, args)
+
+    # ------------------------------------------------- состояния в памяти прибора
+    def _state_list(self) -> list[str]:
+        reply = self.query("MMEM:CAT?")
+        names = []
+        for entry in re.findall(r'"([^"]*)"', reply):          # "имя.state,STAT,размер"
+            file = entry.split(",")[0].strip()
+            if file.lower().endswith(STATE_EXT):
+                names.append(file[:-len(STATE_EXT)])
+        return sorted(names)
+
+    def _state_file_action(self, name: str, args: tuple) -> None:
+        state = str(args[0]) if args else ""
+        if not _STATE_NAME.fullmatch(state):
+            raise ValueError(f"имя состояния: буквы, цифры, _ и -, до 32 знаков (получено {state!r})")
+        if name == "state_delete":
+            self.write(f'MMEM:DEL "{state}{STATE_EXT}"')
+            return
+        was_armed = self._armed
+        self._abort()
+        if name == "state_save":
+            self.write(f'MMEM:STOR:STAT 1,"{state}"')
+            self._check_errors(context=name)
+            if was_armed or self._continuous:
+                self._start_sweep()
+            return
+        self.write(f'MMEM:LOAD:STAT 1,"{state}"')                # state_recall
+        self._check_errors(context=name)
+        self.write("FORM ASC")
+        self._sync_all()                                        # значения прибора изменились; развёртка - как была
+        if was_armed and not self._armed:
+            self._start_sweep()
