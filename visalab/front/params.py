@@ -75,7 +75,7 @@ class PLineEdit(QLineEdit, _Bound):
         super().__init__(parent)
         self.unit = unit if unit is not None else proxy.params[key].unit
         self.digits = digits
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.bind(proxy, key)
         self.editingFinished.connect(self.change_value)
 
