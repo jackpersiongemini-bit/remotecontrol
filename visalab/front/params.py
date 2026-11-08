@@ -210,7 +210,7 @@ class PNLabel(PLineEdit):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
 
-def paint_indicator(p: QPainter, rect: QRectF) -> None:
+def paint_indicator(p: QPainter, rect: QRectF, bar: str = UI_COLOR_TEXT_MUTED) -> None:
     """Индикатор «включено/выбрано»: тонкая рамка и толстая нижняя граница по скруглению.
 
     Рисуется вручную: QSS с разной толщиной границ даёт кривые углы на скруглениях.
@@ -224,7 +224,7 @@ def paint_indicator(p: QPainter, rect: QRectF) -> None:
     clip.addRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
     p.setClipPath(clip)
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(UI_COLOR_TEXT_MUTED))
+    p.setBrush(QColor(bar))
     p.drawRect(QRectF(rect.left(), rect.bottom() - UI_INDICATOR_WIDTH_PX, rect.width(), UI_INDICATOR_WIDTH_PX))
     p.restore()
 
@@ -453,14 +453,14 @@ class PTabBar(QTabBar):
         for i in range(self.count()):
             rect = QRectF(self.tabRect(i)).adjusted(2.5, 0.5, -2.5, -0.5)
             selected, on, hover = i == self.currentIndex(), i in self._on, i == self._hover
-            # фон: наведение - инверсия, выбранная вкладка - фон поля
-            bg = UI_COLOR_INVERT_HOVER if hover else UI_COLOR_BACKGROUND if selected else None
+            # фон: наведение и выбранная вкладка - инверсия
+            bg = UI_COLOR_INVERT_HOVER if hover else UI_COLOR_INVERT if selected else None
             if bg:
                 p.setBrush(QColor(bg))
                 p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
             if on:                        # режим включён: тонкая рамка + толстая нижняя граница
-                paint_indicator(p, rect)
-            fg = UI_COLOR_TEXT_INVERSE if hover else UI_COLOR_TEXT if selected else \
+                paint_indicator(p, rect, UI_COLOR_TEXT_INVERSE if (selected or hover) else UI_COLOR_TEXT_MUTED)
+            fg = UI_COLOR_TEXT_INVERSE if (hover or selected) else \
                 UI_COLOR_TEXT_MUTED if on else UI_COLOR_BORDER_LIGHT
             font = QFont(self.font())
             font.setBold(selected)
