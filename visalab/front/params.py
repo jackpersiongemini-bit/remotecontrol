@@ -14,17 +14,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
-from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QVBoxLayout,
+from PyQt6.QtCore import QObject, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter
+from PyQt6.QtWidgets import (QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QTabBar, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import SI_PREFIXES, si_format, si_parse
-from .theme import render_qss
+from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
+                    UI_COLOR_INVERT_HOVER, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
+                    UI_CONTROL_HEIGHT_PX, render_qss)
 from .window import WriteState
 
-__all__ = ["PLineEdit", "PNLabel", "PSButton", "PLabel", "PBGroup", "PanelLine", "PanelTable", "Panel",
+__all__ = ["PLineEdit", "PNLabel", "PSButton", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
            "WriteTracker"]
 
 _WSTATE = {PStatus.WRITING: "process", PStatus.ERROR: "error", PStatus.INVALID: "error",
@@ -361,6 +364,80 @@ class PBGroup(QWidget):
         self._group.setExclusive(True)
 
 
+class PTabBar(QTabBar):
+    """Вкладки (QTabBar) в стиле панели: выбранная - фон поля, отмеченная ``set_on`` - инверсия.
+
+    QSS не умеет красить отдельные вкладки по своему признаку, поэтому вкладки рисуются здесь.
+    Колесо мыши и клавиши переключают вкладки (поведение QTabBar).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setExpanding(True)
+        self.setDrawBase(False)
+        self.setDocumentMode(True)
+        self.setUsesScrollButtons(True)
+        self.setElideMode(Qt.TextElideMode.ElideNone)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._on: set[int] = set()
+        self._hover = -1
+
+    def set_on(self, index: int, on: bool) -> None:
+        if on != (index in self._on):
+            (self._on.add if on else self._on.discard)(index)
+            self.update()
+
+    def is_on(self, index: int) -> bool:
+        return index in self._on
+
+    def tabSizeHint(self, index):  # noqa: N802 - Qt
+        hint = super().tabSizeHint(index)
+        return QSize(max(hint.width(), 56), UI_CONTROL_HEIGHT_PX)
+
+    def minimumTabSizeHint(self, index):  # noqa: N802 - Qt
+        return self.tabSizeHint(index)
+
+    def mouseMoveEvent(self, e):  # noqa: N802 - Qt
+        super().mouseMoveEvent(e)
+        hover = self.tabAt(e.position().toPoint())
+        if hover != self._hover:
+            self._hover = hover
+            self.update()
+
+    def leaveEvent(self, e):  # noqa: N802 - Qt
+        super().leaveEvent(e)
+        self._hover = -1
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(self.count()):
+            rect = QRectF(self.tabRect(i)).adjusted(2, 0, -2, 0)
+            selected, on, hover = i == self.currentIndex(), i in self._on, i == self._hover
+            if on:
+                bg = UI_COLOR_TEXT_MUTED if selected else UI_COLOR_INVERT
+            elif hover:
+                bg = UI_COLOR_INVERT_HOVER
+            elif selected:
+                bg = UI_COLOR_BACKGROUND
+            else:
+                bg = None
+            fg = UI_COLOR_TEXT_INVERSE if (on or hover) else UI_COLOR_TEXT if selected else UI_COLOR_BORDER_LIGHT
+            if bg:
+                p.setBrush(QColor(bg))
+                p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+            font = QFont(self.font())
+            font.setBold(selected or on)
+            p.setFont(font)
+            p.setPen(QColor(fg))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.tabText(i))
+            p.setPen(Qt.PenStyle.NoPen)
+
+
 class PanelLine(QWidget):
     """Строка панели: подпись слева, дальше виджеты (по одному на столбец)."""
 
@@ -471,21 +548,8 @@ class Panel(QFrame):
         QMenu#psmenu::item:selected { background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE; }
         QMenu#psmenu::item:checked { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         QMenu#psmenu::indicator { width: 0; }
-        Panel QPushButton#tab {
-            background-color: $UI_COLOR_BACKGROUND; padding: 0 10px;
-            min-height: ${UI_CONTROL_HEIGHT_PX}px; max-height: ${UI_CONTROL_HEIGHT_PX}px;
-            border: 2px solid transparent;
-        }
-        Panel QPushButton#tab:hover {
-            background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE;
-        }
-        Panel QPushButton#tab[on="true"] {
-            background-color: $UI_COLOR_INVERT; color: $UI_COLOR_TEXT_INVERSE; font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-        }
-        Panel QPushButton#tab:checked {
-            border-color: $UI_COLOR_TEXT; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT;
-        }
-        Panel QPushButton#tab[on="true"]:checked { color: $UI_COLOR_TEXT_INVERSE; }
+        Panel PTabBar { background: transparent; }
+        Panel PTabBar QToolButton { background-color: $UI_COLOR_BACKGROUND; border: none; }
         Panel QPushButton#unit {
             background-color: transparent; border: none; padding: 0 4px; min-height: 0;
             color: $UI_COLOR_BORDER_LIGHT; font-weight: normal;

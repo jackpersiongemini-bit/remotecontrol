@@ -174,12 +174,14 @@ def test_unit_dropdown_value_left(qtbot, opened):
 def test_mode_tabs_and_switch(qtbot, opened):
     from visalab.front.theme import ON
     sim, proxy, win = opened
-    assert [b.text() for b in win.tabs.buttons()] == ["MAIN", "MOD", "SWP", "BRST"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "MOD", "SWP", "BRST"]
     win.set_expanded(True)
     win.set_page(3)
     assert win.pages[3].isVisibleTo(win) and not win.pages[0].isVisibleTo(win)
-    assert not win.tabs.buttons()[3].property("on")
+    assert not win.tabs.is_on(3)
     win.channels[0]["burst_state"].click()
     _wait(qtbot, proxy, "ch1.burst_state", lambda v: v is True)
-    qtbot.waitUntil(lambda: win.tabs.buttons()[3].property("on") is True)
+    qtbot.waitUntil(lambda: win.tabs.is_on(3))
+    win.tabs.setCurrentIndex(1)                            # клик по вкладке
+    assert win.pages[1].isVisibleTo(win)
     assert win.on_button.status() == ON and win.on_button.isChecked()

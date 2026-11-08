@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import QFrame, QPushButton, QScrollArea, QSizePolicy, QVBox
 from ..core.params import ConnectionState, Kind
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
-from .params import PBGroup, PLabel, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
+from .params import PBGroup, PLabel, PTabBar, PLineEdit, PNLabel, PSButton, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, Switch,
                      ErrorIndicator, StatusIndicator, Window, short_address)
@@ -265,8 +265,7 @@ class PulseGenWindow(Window):
         top.lines[1].line_layout.setAlignment(top.lines[1]._name, Qt.AlignmentFlag.AlignTop)
 
         # ---------------------------------------------------------- вкладки и таблицы (сворачиваются)
-        self.tabs = PBGroup()
-        self.tabs.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.tabs = PTabBar()
         self.pages: list[PanelTable] = []
         self._page_states: list[str | None] = []
         for title_, state, rows in PAGES:
@@ -282,16 +281,13 @@ class PulseGenWindow(Window):
             lines += [PanelLine(t, *(ch[name] for ch in self.channels)) for t, name, _m, _s in present]
             self.pages.append(PanelTable(*lines))
             self._page_states.append(state)
-            tab = self.tabs.add_button(title_)
-            tab.setObjectName("tab")
-            tab.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.tabs.selected.connect(self.set_page)
-        self.tab_scroll = HScrollArea(self.tabs, UI_CONTROL_HEIGHT_PX)
+            self.tabs.addTab(title_)
+        self.tabs.currentChanged.connect(self.set_page)
         body = QWidget()
         bl = QVBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(8)
-        bl.addWidget(self.tab_scroll)
+        bl.addWidget(self.tabs)
         for page in self.pages:
             bl.addWidget(page)
         self.parameter_panel = Panel(body)
@@ -356,21 +352,20 @@ class PulseGenWindow(Window):
         index = index if 0 <= index < len(self.pages) else 0
         for i, page in enumerate(self.pages):
             page.setVisible(i == index)
-        self.tabs.set_checked(index)
-        self.tab_scroll.ensureWidgetVisible(self.tabs.buttons()[index], 0, 0)
+        if self.tabs.currentIndex() != index:
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(index)
+            self.tabs.blockSignals(False)
         self.settings.setValue(f"{self._prefix}/TAB", index)
         if fit:
             self._fit_height()
 
     def _update_tabs(self) -> None:
         """Вкладка режима инвертирована, если режим включён хотя бы на одном канале."""
-        for tab, state in zip(self.tabs.buttons(), self._page_states):
+        for i, state in enumerate(self._page_states):
             on = bool(state) and any(self.proxy.value(f"ch{n}.{state}") is True
                                      for n in range(1, len(self.channels) + 1))
-            if tab.property("on") != on:
-                tab.setProperty("on", on)
-                tab.style().unpolish(tab)
-                tab.style().polish(tab)
+            self.tabs.set_on(i, on)
 
     @staticmethod
     def _tool(text, tip, slot, height=None) -> QPushButton:
