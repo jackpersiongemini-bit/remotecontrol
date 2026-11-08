@@ -8,14 +8,14 @@ from __future__ import annotations
 import textwrap
 from enum import Enum
 
-from PyQt6.QtCore import QEasingCurve, QLineF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QLineF, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QAbstractButton, QLabel, QPushButton, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
 
 from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_CONTROL, UI_COLOR_ERROR,
                     UI_COLOR_PANEL, UI_SWITCH_MARGIN_PX, UI_TITLE_BAR_WIDE_ITEM_SIZE_PX,
-                    UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
+                    UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss)
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
@@ -46,6 +46,8 @@ class WindowBar(TitleBar):
         WindowBar CustomOnButton[status="ON"]:hover { background-color: $UI_COLOR_SUCCESS_HOVER; }
         WindowBar CustomOnButton[status="error"] { background-color: $UI_COLOR_ERROR; }
         WindowBar CustomCloseButton:hover { background-color: $UI_COLOR_ERROR; }
+        WindowBar ErrorIndicator[err="true"] { background-color: $UI_COLOR_ERROR; }
+        WindowBar ErrorIndicator[err="true"]:hover { background-color: $UI_COLOR_INVERT_HOVER; }
         WindowBar AddressLabel {
             min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
             padding: 0 8px; background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_TEXT_MUTED;
@@ -171,24 +173,6 @@ class StatusIndicator(WriteIndicator):
         return [i for i in items if i[1] is not WriteState.ERROR]
 
 
-class ErrorIndicator(WriteIndicator):
-    """Только ошибки и их подробности; клик открывает журнал ошибок."""
-    EMPTY = "No errors"
-    clicked = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def _filter(self, items):
-        return [i for i in items if i[1] is WriteState.ERROR]
-
-    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
-        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(e)
-
-
 class AddressLabel(QLabel):
     """Адрес прибора в заголовке; клик открывает настройки подключения."""
 
@@ -276,6 +260,53 @@ class CustomLockButton(IconButtonBase):
         path.lineTo(cx + r, base)
         p.drawPath(path)
         p.drawLine(QLineF(cx, body.top() + 2.5, cx, body.top() + 4.5))   # скважина
+
+
+class ErrorIndicator(IconButtonBase):
+    """Кнопка ошибок записи / связи: треугольник с «!». Есть ошибки - красный фон.
+
+    Подробности - в подсказке, клик открывает журнал ошибок.
+    """
+
+    EMPTY = "No errors"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.state = WriteState.OFF
+        self._items: tuple = ()
+        self.setToolTip(self.EMPTY)
+
+    def set_items(self, items, active: bool = True) -> None:
+        """items: [(name, WriteState, detail)] - учитываются только ошибки."""
+        self._items = tuple(i for i in items if i[1] is WriteState.ERROR)
+        self.state = WriteState.ERROR if self._items else (WriteState.VERIFIED if active else WriteState.OFF)
+        lines = []
+        for name, _state, detail in self._items:
+            text = f"{name}: {detail}" if detail else f"{name}: error"
+            lines.extend(textwrap.wrap(text, 72) or [text])
+        self.setToolTip("\n".join(lines) or self.EMPTY)
+        self.setProperty("err", self.state is WriteState.ERROR)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self._rest_color = QColor(UI_COLOR_TEXT if self.state is WriteState.ERROR else UI_COLOR_TEXT_MUTED)
+        self._icon_color = self.icon_color_hover if self.underMouse() else self._rest_color
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy = self.width() / 2, self.height() / 2
+        h, w = 9.5, 11.0                          # треугольник
+        top, base = cy - h / 2 - 0.5, cy + h / 2 - 0.5
+        path = QPainterPath()
+        path.moveTo(cx, top)
+        path.lineTo(cx + w / 2, base)
+        path.lineTo(cx - w / 2, base)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawLine(QLineF(cx, top + 3.2, cx, base - 3.0))       # «!»
+        p.drawPoint(QPointF(cx, base - 1.4))
 
 
 class CustomMinButton(IconButtonBase):
