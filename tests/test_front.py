@@ -70,9 +70,9 @@ def test_preset_add_apply_and_eqphase(qtbot, opened):
     screen = list(win.presets.data)
     win._apply_preset(0)
     assert win.presets.data == screen
-    assert win.presets.saved_order()[:2] == [screen[0], (2e-3, 50e-6)]
+    assert win.presets.saved_order()[:2] == [screen[0], (2e-3, 50e-6, "PULSE")]
     restarted = PresetGroup(win.presets.settings, win.presets.key)
-    assert restarted.data[:2] == [screen[0], (2e-3, 50e-6)]
+    assert restarted.data[:2] == [screen[0], (2e-3, 50e-6, "PULSE")]
     idx = win.presets.find(2e-3, 50e-6)
     # пресеты сохраняются в ini и удаляются
     win.presets.set_checked(idx)
@@ -136,3 +136,20 @@ def test_presets_switch_with_arrow_keys(qtbot, opened):
     assert win.presets.checked_index() == 0
     _wait(qtbot, proxy, "ch2.period", lambda v: v == pytest.approx(order[0][0]))
     assert win.add_button.height() + win.remove_button.height() + 4 == win.preset_scroll.height()
+
+
+def test_wave_type_menu_and_preset_wave(qtbot, opened):
+    from PyQt6.QtWidgets import QMenu
+    sim, proxy, win = opened
+    wave = win.channels[0]["wave"]
+    wave.click()
+    menu = wave.findChild(QMenu)
+    assert menu is not None and "SQUARE" in [a.text() for a in menu.actions()]
+    next(a for a in menu.actions() if a.text() == "SQUARE").trigger()
+    _wait(qtbot, proxy, "ch1.wave", lambda v: v == "SQUARE")
+    menu.close()
+    win.presets.add(1e-3, 10e-6, "PULSE")
+    win._apply_preset(win.presets.find(1e-3, 10e-6, "PULSE"))
+    _wait(qtbot, proxy, "ch1.wave", lambda v: v == "PULSE")
+    _wait(qtbot, proxy, "ch1.width", lambda v: v == pytest.approx(10e-6))
+    assert win.presets.buttons()[win.presets.find(1e-3, 10e-6)].text().startswith("PULSE\n")

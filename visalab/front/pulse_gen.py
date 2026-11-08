@@ -27,14 +27,14 @@ from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomO
 
 __all__ = ["PulseGenWindow", "PULSE_PRESETS", "ROWS"]
 
-PULSE_PRESETS = ((400e-3, 30e-6),)
+PULSE_PRESETS = ((400e-3, 30e-6, "PULSE"),)       # (PERI, WID, форма)
 
 #: параметры канала: (подпись, ключ без "chN.", фабрика виджета, сохранять в ini).
 #: OUT показывается наверху (всегда), остальное - в сворачиваемой таблице.
 ROWS = (
     ("OUT", "output", lambda p, k: PSButton(p, k, {f"{k[:3].upper()} OFF": False, f"{k[:3].upper()} ON": True}),
      True),
-    ("TYPE", "wave", lambda p, k: PSButton(p, k, {"PULSE": "PULSE"}), True),
+    ("TYPE", "wave", lambda p, k: PSButton(p, k, {c: c for c in (p.params[k].choices or ("PULSE",))}), True),
     ("DUTY", "duty", lambda p, k: PNLabel(p, k, "%"), False),
     ("PERI", "period", lambda p, k: PLineEdit(p, k, "s"), True),
     ("WID", "width", lambda p, k: PLineEdit(p, k, "s"), True),
@@ -49,8 +49,12 @@ def _fmt(value: float) -> str:
     return si_format(value, "s", 4)
 
 
+def _preset(period, width, wave="PULSE") -> tuple[float, float, str]:
+    return float(period), float(width), str(wave).upper()
+
+
 class PresetGroup(PBGroup):
-    """Пары (period, width) в QSettings (JSON). Чип в две строки: период / ширина.
+    """Пресеты (period, width, wave) в QSettings (JSON). Чип в три строки: форма / период / ширина.
 
     Порядок на экране за сеанс не меняется (иначе ← → переставляли бы соседей). Использование
     запоминается, и в ini пресеты пишутся по последнему использованию - новый порядок виден
@@ -61,21 +65,20 @@ class PresetGroup(PBGroup):
         super().__init__(parent=parent)
         self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.settings, self.key = settings, key
-        self.data: list[tuple[float, float]] = []
-        self._recent: list[tuple[float, float]] = []      # использованные за сеанс, последний - первый
+        self.data: list[tuple[float, float, str]] = []
+        self._recent: list[tuple[float, float, str]] = []      # использованные за сеанс, последний - первый
         for preset in self._load(defaults):
             self._append(preset)
 
     def _load(self, defaults):
         raw = self.settings.value(self.key)
-        if raw is None:
-            return [tuple(map(float, p)) for p in defaults]
         try:
-            return [(float(a), float(b)) for a, b in json.loads(str(raw))]
+            items = defaults if raw is None else json.loads(str(raw))
+            return [_preset(*p) for p in items]
         except (TypeError, ValueError):
-            return [tuple(map(float, p)) for p in defaults]
+            return [_preset(*p) for p in defaults]
 
-    def saved_order(self) -> list[tuple[float, float]]:
+    def saved_order(self) -> list[tuple[float, float, str]]:
         """Порядок для ini: использованные за сеанс (последний - первый), затем прочие как были."""
         recent = [p for p in self._recent if p in self.data]
         return recent + [p for p in self.data if p not in recent]
@@ -89,9 +92,9 @@ class PresetGroup(PBGroup):
         self._refresh()
 
     def _refresh(self) -> None:
-        for b, (period, width) in zip(self.buttons(), self.data):
-            b.setText(f"{_fmt(period)}\n{_fmt(width)}")
-            b.setToolTip(f"PERI {_fmt(period)}\nWID {_fmt(width)}")
+        for b, (period, width, wave) in zip(self.buttons(), self.data):
+            b.setText(f"{wave}\n{_fmt(period)}\n{_fmt(width)}")
+            b.setToolTip(f"TYPE {wave}\nPERI {_fmt(period)}\nWID {_fmt(width)}")
             b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             b.setFixedHeight(PRESET_HEIGHT)
 
@@ -105,16 +108,17 @@ class PresetGroup(PBGroup):
             self.set_checked(index)
             self.save()
 
-    def find(self, period: float, width: float) -> int:
-        for i, (p, w) in enumerate(self.data):
-            if math.isclose(p, period, rel_tol=1e-9) and math.isclose(w, width, rel_tol=1e-9):
+    def find(self, period: float, width: float, wave: str = "PULSE") -> int:
+        for i, (p, w, t) in enumerate(self.data):
+            if (math.isclose(p, period, rel_tol=1e-9) and math.isclose(w, width, rel_tol=1e-9)
+                    and t == str(wave).upper()):
                 return i
         return -1
 
-    def add(self, period: float, width: float) -> bool:
-        i = self.find(period, width)
+    def add(self, period: float, width: float, wave: str = "PULSE") -> bool:
+        i = self.find(period, width, wave)
         if i < 0:
-            self._append((float(period), float(width)))
+            self._append(_preset(period, width, wave))
             i = len(self.data) - 1
         self.touch(i)
         return True
@@ -129,7 +133,7 @@ class PresetGroup(PBGroup):
         return True
 
 
-PRESET_HEIGHT = 40          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
+PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
 
 
@@ -203,7 +207,7 @@ class PulseGenWindow(Window):
         self.presets.selected.connect(self._apply_preset)
         self.preset_scroll = HScrollArea(self.presets)
         half = (PRESET_HEIGHT - PRESET_GAP) // 2
-        self.add_button = self._tool("+", "Add preset from CH1 PERI / WID", self._add_preset, half)
+        self.add_button = self._tool("+", "Add preset from CH1 TYPE / PERI / WID", self._add_preset, half)
         self.remove_button = self._tool("−", "Remove selected preset", self.presets.remove_selected, half)
         tools = QWidget()
         tl = QVBoxLayout(tools)
@@ -342,20 +346,25 @@ class PulseGenWindow(Window):
     def _add_preset(self) -> None:
         ch1 = self.channels[0]
         period, width = ch1["period"].value, ch1["width"].value
+        wave = ch1["wave"].value if "wave" in ch1 else None
         if period is not None and width is not None:
-            self.presets.add(period, width)
+            self.presets.add(period, width, wave or "PULSE")
             i = self.presets.checked_index()
             if i >= 0:
                 self.preset_scroll.ensureWidgetVisible(self.presets.buttons()[i], 0, 0)
 
     def _apply_preset(self, index: int) -> None:
-        period, width = self.presets.data[index]
+        period, width, wave = self.presets.data[index]
         self.presets.touch(index)
         self.preset_scroll.ensureWidgetVisible(self.presets.buttons()[index], 0, 0)
         self.setFocus()                       # чтобы ← → сразу переключали пресеты
         for ch in self.channels:
+            if "wave" in ch:
+                ch["wave"].set_value(wave)    # форма - первой: от неё зависят PERI/WID
             cur = ch["period"].value
-            pairs = [(ch["period"], period), (ch["width"], width)]
+            pairs = [(ch["period"], period)]
+            if wave == "PULSE":               # ширина есть только у импульса
+                pairs.append((ch["width"], width))
             if cur is not None and period < cur:
                 pairs.reverse()              # уменьшаем: сначала WID, чтобы WID < PERI
             for w, v in pairs:
