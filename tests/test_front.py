@@ -170,7 +170,8 @@ def test_unit_dropdown_value_left(qtbot, opened):
     per.set_value(2e-3)
     _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(2e-3))
     qtbot.waitUntil(lambda: per.text() == "2")
-    assert per.unit_button.text() == "ms" and per.alignment() & Qt.AlignmentFlag.AlignLeft
+    assert per.unit_button.text() == "ms" and per.alignment() & Qt.AlignmentFlag.AlignRight
+    assert per.unit_button.x() < per.width() // 2
     per.set_prefix("µ")                                   # показ в µs, значение то же
     assert per.text() == "2000" and per.unit_button.text() == "µs"
     per.setText("1500")                                   # ввод - в выбранной единице

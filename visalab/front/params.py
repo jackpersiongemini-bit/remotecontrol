@@ -90,7 +90,7 @@ class PLineEdit(QLineEdit, _Bound):
         self.prefixes = UNIT_PREFIXES.get(self.unit, ("",))
         self.prefix = "" if "" in self.prefixes else self.prefixes[-1]
         self.pinned = False                       # единица выбрана вручную
-        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.unit_button: QPushButton | None = None
         if self.unit:
             b = QPushButton(self.unit, self)
@@ -135,8 +135,8 @@ class PLineEdit(QLineEdit, _Bound):
             return
         b.ensurePolished()
         w = max(b.sizeHint().width(), 26)
-        b.setGeometry(self.width() - w - 2, 2, w, max(self.height() - 4, 0))
-        self.setTextMargins(0, 0, w, 0)
+        b.setGeometry(2, 2, w, max(self.height() - 4, 0))   # единица слева, число справа
+        self.setTextMargins(w, 0, 0, 0)
 
     def resizeEvent(self, e):  # noqa: N802 - Qt
         super().resizeEvent(e)
