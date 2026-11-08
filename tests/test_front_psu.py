@@ -105,7 +105,7 @@ def test_ch1_interlock_and_bypass(qtbot, psu):
     assert t1.toggle()                                            # выключить можно всегда
     _wait(qtbot, proxy, "ch1.output", lambda v: v is False)
     assert not t1.toggle()
-    win.gate_lock.click()                                         # обход блокировки
+    win.gate_lock.click()                                         # ILCK ON -> OFF: обход
     assert not t1.locked and settings.value(f"{win._prefix}/GATE_BYPASS") in (True, "true")
     assert t1.toggle()
     _wait(qtbot, proxy, "ch1.output", lambda v: v is True)
