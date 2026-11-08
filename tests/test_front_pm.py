@@ -96,7 +96,7 @@ def test_correction_written_as_offset(qtbot, pm):
     assert win.cal_plot.trace is not None and win.cal_plot.marker() == pytest.approx(2e9)
     proxy.set("freq", 3e9)                            # частота датчика -> новая точка таблицы
     _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(3.0, abs=1e-3))
-    win.cal_on.set_value(False)
+    win.cal_choice.set_value("")                      # NONE - таблица выключена
     win.gain_on.set_value(False)
     win.duty_src.set_value("OFF")
     _wait(qtbot, proxy, "offset.state", lambda v: v is False)
