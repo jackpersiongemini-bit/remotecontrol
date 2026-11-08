@@ -53,6 +53,16 @@ def test_layout_and_readout(qtbot, pm):
     win.readout.sec_button.click()
     assert win.readout.sec_button.text().startswith("PEAK")
     assert win.readout.trig_button.text().startswith("FREE")
+    # клик по основной мощности: dBm <-> W (малое поле показывает другую единицу)
+    from PyQt6.QtCore import Qt
+    r = win.readout
+    r.sec_button.click()
+    r.sec_button.click()                                     # снова W
+    qtbot.mouseClick(r.main, Qt.MouseButton.LeftButton)
+    assert r.main_unit == "W" and r.unit.text().endswith("W") and r.sec_button.text().endswith("dBm")
+    assert _s.value(f"{win._prefix}/MAIN_UNIT") == "W"
+    qtbot.mouseClick(r.unit, Qt.MouseButton.LeftButton)
+    assert r.main_unit == "dBm" and r.unit.text() == "dBm"
 
 
 def test_trigger_toggle_from_readout(qtbot, pm):

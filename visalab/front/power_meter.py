@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit
 
 from ..core.params import ConnectionState, Kind
 from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format, si_parse
+from ..core.scpi import SI_PREFIXES, si_format, si_parse
 from ..core.trace import Trace
 from . import instrument_window as _iw
 from .instrument_window import LINKS, InstrumentWindow
@@ -271,6 +271,7 @@ class PowerReadout(QFrame):
     trigger_clicked = pyqtSignal()
     cal_clicked = pyqtSignal()
     secondary_changed = pyqtSignal(str)
+    main_unit_changed = pyqtSignal(str)          # основная величина: "dBm" / "W"
 
     STYLE = render_qss("""
         PowerReadout { background-color: $UI_COLOR_BACKGROUND; border: none; border-radius: ${UI_BORDER_RADIUS_PX}px; }
@@ -284,10 +285,11 @@ class PowerReadout(QFrame):
         PowerReadout QPushButton#trig[armed="true"] { color: $UI_COLOR_PROCESS; }
     """)
 
-    def __init__(self, secondary: str = "W", parent=None):
+    def __init__(self, secondary: str = "W", main_unit: str = "dBm", parent=None):
         super().__init__(parent)
         self.setStyleSheet(self.STYLE)
         self.secondary = secondary if secondary in SECONDARY else "W"
+        self.main_unit = main_unit if main_unit in ("dBm", "W") else "dBm"
         self.sec_button = self._button("sec", "W / PEAK / PTAV - click to switch", self.next_secondary)
         self.trig_button = self._button("trig", "Trigger: click to switch FREE RUN / LEVEL / EXT", self.trigger_clicked)
         self.cal_button = self._button("cal", "Correction added to every reading: CAL − GAIN + DUTY",
@@ -298,6 +300,9 @@ class PowerReadout(QFrame):
         self.unit = QLabel("dBm")
         self.unit.setObjectName("mainUnit")
         self.unit.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
+        for w in (self.main, self.unit):                 # клик по мощности - dBm <-> W
+            w.setCursor(Qt.CursorShape.PointingHandCursor)
+            w.setToolTip("Click to switch dBm / W")
         lay = QGridLayout(self)
         lay.setContentsMargins(4, 4, 8, 4)
         lay.setHorizontalSpacing(0)
@@ -320,6 +325,18 @@ class PowerReadout(QFrame):
         b.clicked.connect(slot)
         return b
 
+    def mousePressEvent(self, e):  # noqa: N802 - Qt
+        if any(w.geometry().contains(e.position().toPoint()) for w in (self.main, self.unit)):
+            self.toggle_main_unit()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def toggle_main_unit(self) -> None:
+        self.main_unit = "W" if self.main_unit == "dBm" else "dBm"
+        self.main_unit_changed.emit(self.main_unit)
+        self.refresh()
+
     def next_secondary(self) -> None:
         self.secondary = SECONDARY[(SECONDARY.index(self.secondary) + 1) % len(SECONDARY)]
         self.secondary_changed.emit(self.secondary)
@@ -332,9 +349,22 @@ class PowerReadout(QFrame):
     def refresh(self) -> None:
         v = self.values
         power = v.get("power")
-        self.main.setText("---" if power is None else f"{power:.2f}")
-        if self.secondary == "W":
-            sec = "--- W" if power is None else si_format(_dbm_to_w(power), "W", 4)
+        if self.main_unit == "W":                      # «13.74 µW»: число крупно, единица с префиксом
+            num, unit = "---", "W"
+            if power is not None:
+                w = _dbm_to_w(power)
+                unit = si_format(w, "W", 4).partition(" ")[2] or "W"        # префикс: µW, mW...
+                num = f"{w / SI_PREFIXES.get(unit[:-1], 1.0) if unit[:-1] else w:#.4g}".rstrip(".")
+            self.main.setText(num)
+            self.unit.setText(unit or "W")
+        else:
+            self.main.setText("---" if power is None else f"{power:.2f}")
+            self.unit.setText("dBm")
+        if self.secondary == "W":                      # малое поле - другая единица основной величины
+            if self.main_unit == "W":
+                sec = "--- dBm" if power is None else f"{power:.2f} dBm"
+            else:
+                sec = "--- W" if power is None else si_format(_dbm_to_w(power), "W", 4)
         elif self.secondary == "PEAK":
             peak = v.get("peak")
             sec = "PEAK " + ("---" if peak is None else f"{peak:.2f} dBm")
@@ -563,7 +593,9 @@ class PowerMeterWindow(InstrumentWindow):
         self.widgets: dict[str, Any] = {}
 
         # избранное: один индикатор
-        self.readout = PowerReadout(s.value(f"{pre}/SECONDARY", "W", type=str))
+        self.readout = PowerReadout(s.value(f"{pre}/SECONDARY", "W", type=str),
+                                    s.value(f"{pre}/MAIN_UNIT", "dBm", type=str))
+        self.readout.main_unit_changed.connect(lambda v: s.setValue(f"{pre}/MAIN_UNIT", v))
         self.readout.setMinimumWidth(2 * UI_COLUMN_WIDTH_PX + 40)
         self.readout.secondary_changed.connect(lambda v: s.setValue(f"{pre}/SECONDARY", v))
         self.readout.trigger_clicked.connect(self.toggle_trigger)
