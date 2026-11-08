@@ -43,6 +43,9 @@ def test_interpolate():
 def test_layout_and_readout(qtbot, pm):
     proxy, win, _s = pm
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "CAL", "TIME"]
+    avg = next(ln for ln in win.pages[0].lines if ln.name == "AVG")       # усреднение - одной строкой
+    assert [w.key for w in avg.widgets] == ["avg.state", "avg.count", "avg.auto"]
+    assert not any(ln.name in ("ACNT", "AAUT") for ln in win.pages[0].lines)
     assert len(win.preset_panel.table.lines) == 1 and win.preset_panel.table.lines[0].widgets == [win.readout, win.plot]
     qtbot.waitUntil(lambda: proxy.value("meas.power") is not None, timeout=5000)
     qtbot.waitUntil(lambda: win.readout.main.text() == f"{proxy.value('meas.power'):.2f}", timeout=5000)
@@ -58,6 +61,16 @@ def test_trigger_toggle_from_readout(qtbot, pm):
     win.readout.trig_button.click()
     _wait(qtbot, proxy, "trig.source", lambda v: v == "INT")
     qtbot.waitUntil(lambda: win.readout.trig_button.text().startswith("LEVEL"), timeout=5000)
+    win.readout.trig_button.click()
+    _wait(qtbot, proxy, "trig.source", lambda v: v == "EXT")       # внешний запуск: ждём импульс на TRIG IN
+    qtbot.waitUntil(lambda: win.readout.trig_button.text() == "EXT · WAIT", timeout=5000)
+    sim = proxy._worker.transport.sim
+    before = proxy.value("meas.power")
+    sim.set_signal(on_dbm=-3.0, width=None)
+    sim.fire_external()
+    qtbot.waitUntil(lambda: proxy.value("meas.power") is not None
+                    and proxy.value("meas.power") == pytest.approx(-3.0, abs=0.05), timeout=5000)
+    assert before is None or before != pytest.approx(-3.0, abs=0.05)
     win.readout.trig_button.click()
     _wait(qtbot, proxy, "trig.source", lambda v: v == "IMM")
 

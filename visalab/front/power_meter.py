@@ -1,7 +1,7 @@
 """Окно ваттметра (U2021XA - профиль power_meter), по образцу окон SDG и СВЧ генератора.
 
 Избранное - один виджет-индикатор: основная мощность крупно справа, дополнительная (W / PEAK /
-PTAV, клик - следующая) слева сверху, под ней запуск (FREE RUN / LEVEL, клик - переключить), ниже -
+PTAV, клик - следующая) слева сверху, под ней запуск (FREE RUN / LEVEL / EXT, клик - следующий), ниже -
 сколько добавляет поправка (CAL, клик - вкладка CAL).
 
 Вкладки: MAIN (частота, усреднение, запуск), CAL (таблица калибровки по частоте, GAIN, DUTY,
@@ -364,7 +364,7 @@ class PowerReadout(QFrame):
         self.setStyleSheet(self.STYLE)
         self.secondary = secondary if secondary in SECONDARY else "W"
         self.sec_button = self._button("sec", "W / PEAK / PTAV - click to switch", self.next_secondary)
-        self.trig_button = self._button("trig", "Trigger: click to switch FREE RUN / LEVEL", self.trigger_clicked)
+        self.trig_button = self._button("trig", "Trigger: click to switch FREE RUN / LEVEL / EXT", self.trigger_clicked)
         self.cal_button = self._button("cal", "Correction added to every reading: CAL − GAIN + DUTY",
                                        self.cal_clicked)
         self.main = QLabel("---")
@@ -586,23 +586,30 @@ class PowerMeterWindow(InstrumentWindow):
         self.top_lines = [line]
 
         def add(rows):
+            """Строка: (подпись, ключ, фабрика[, (ключ, фабрика)...]) - несколько виджетов в одной строке."""
             lines = []
-            for t, k, make in rows:
-                if not sup(k):
-                    continue
-                w = make(proxy, k) if make else _auto(proxy, k)
-                self.widgets.setdefault(k, w)
-                if not isinstance(w, PNLabel):
-                    self.saved_widgets.append(w)
-                lines.append(PanelLine(t, w))
+            for t, k, make, *more in rows:
+                ws = []
+                for key, mk in ((k, make), *more):
+                    if not sup(key):
+                        continue
+                    w = mk(proxy, key) if mk else _auto(proxy, key)
+                    self.widgets.setdefault(key, w)
+                    if not isinstance(w, PNLabel):
+                        self.saved_widgets.append(w)
+                    ws.append(w)
+                if ws:
+                    lines.append(PanelLine(t, *ws))
             return lines
 
         # MAIN
-        trig = lambda p, k: PSButton(p, k, [("FREE", "IMM"), ("LEVEL", "INT")])   # noqa: E731
+        trig = lambda p, k: PSButton(p, k, [("FREE", "IMM"), ("LEVEL", "INT"), ("EXT", "EXT")])   # noqa: E731
         main = add((("FREQ", "freq", lambda p, k: PSpinBox(p, k, ("k", "M", "G"))),
                     ("TRIG", "trig.source", trig), ("TLVL", "trig.level", None), ("TAUT", "trig.level_auto", None),
-                    ("SLOP", "trig.slope", None), ("AVG", "avg.state", None), ("ACNT", "avg.count", None),
-                    ("AAUT", "avg.auto", None), ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
+                    ("SLOP", "trig.slope", None),
+                    ("AVG", "avg.state", None, ("avg.count", None),         # усреднение: вкл, число, авто
+                     ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)]))),
+                    ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
 
         # CAL: таблица, GAIN, DUTY, итог в приборе, обнуление / калибровка датчика
@@ -700,9 +707,11 @@ class PowerMeterWindow(InstrumentWindow):
             self._refresh_readout()
 
     def toggle_trigger(self) -> None:
-        """Клик по запуску в индикаторе: FREE RUN <-> LEVEL."""
+        """Клик по запуску в индикаторе: FREE RUN -> LEVEL -> EXT -> FREE RUN."""
         if self.proxy.is_connected and self.proxy.supports("trig.source"):
-            self.proxy.set("trig.source", "INT" if self.proxy.value("trig.source") == "IMM" else "IMM")
+            order = ("IMM", "INT", "EXT")
+            cur = self.proxy.value("trig.source")
+            self.proxy.set("trig.source", order[(order.index(cur) + 1) % 3] if cur in order else "IMM")
 
     # ------------------------------------------------------------ поправка
     def _local_changed(self, name: str, value) -> None:
