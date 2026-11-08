@@ -1,7 +1,7 @@
 """Окно СВЧ генератора (E8267D, SMF100A - профиль signal_generator), по образцу окна SDG.
 
-Избранное: выходы RF / MOD, пресеты (частота, мощность, тип модуляции), частота RF и частота
-модулирующего сигнала (у импульсной - период) спинбоксами: шаг - разряд под курсором.
+Избранное: выходы RF / MOD, пресеты (частота, мощность, тип модуляции) и частота RF спинбоксом
+(шаг - разряд под курсором) с HOLD: пресет не меняет частоту. Модуляция - на вкладках.
 Развёрнутый вид - вкладки RF / AM / FM / PM / PULS (индикатор - режим включён).
 
 Окно знает только InstrumentProxy и ключи профиля signal_generator.
@@ -10,8 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtWidgets import QCheckBox
+from PyQt6.QtCore import QSettings
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
@@ -20,14 +19,12 @@ from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow, PresetGroup
 from .params import PLineEdit, PSButton, PSpinBox, PanelLine, PanelTable
 from .theme import UI_COLUMN_WIDTH_PX
+from .window import CustomLockButton
 
 __all__ = ["RFGenWindow", "RF_PRESETS", "MOD_TYPES", "saved_connection"]
 
 #: тип модуляции пресета -> префикс ключей профиля (CW - без модуляции)
 MOD_TYPES = {"CW": None, "PULSE": "pulse", "AM": "am", "FM": "fm", "PM": "pm"}
-#: подпись строки «частота модуляции» в избранном и её ключ
-#: (AM в избранное не выводится - по просьбе Алексея; настраивается на вкладке AM)
-MOD_RATE = {"PULSE": ("PULS", "pulse.period"), "FM": ("FM", "fm.freq"), "PM": ("PM", "pm.freq")}
 RF_PRESETS = ((1e9, -10.0, "CW"),)                 # (FREQ, POW, MOD)
 
 CONNECTION_GROUP = "CONNECTION/RF_GEN"
@@ -88,7 +85,7 @@ class RFGenWindow(InstrumentWindow):
         self.widgets: dict[str, Any] = {}
         sup = proxy.supports
 
-        # избранное: выходы, пресеты, частота RF и частота модуляции
+        # избранное: выходы, пресеты, частота RF
         outs = []
         for key, name in (("rf.output", "RF"), ("mod.output", "MOD")):
             if sup(key):
@@ -98,24 +95,11 @@ class RFGenWindow(InstrumentWindow):
                 outs.append(w)
         self.top_lines = [PanelLine("OUT", *outs), self.preset_line()]
         self.freq_spin = PSpinBox(proxy, "rf.frequency", ("k", "M", "G"))
-        self.freq_hold = QCheckBox("HOLD")
-        self.freq_hold.setObjectName("hold")
-        self.freq_hold.setToolTip("Presets keep the current frequency (only POW and MOD are applied)")
-        self.freq_hold.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.freq_hold.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.freq_hold = CustomLockButton()           # замок: закрыт - пресет не меняет частоту
+        self.freq_hold.setToolTip("HOLD: presets keep the current frequency (only POW and MOD are applied)")
         self.freq_hold.setChecked(self.settings.value(f"{self._prefix}/FREQ_HOLD", False, type=bool))
         self.freq_hold.toggled.connect(lambda on: self.settings.setValue(f"{self._prefix}/FREQ_HOLD", bool(on)))
         self.top_lines.append(PanelLine("FREQ", self.freq_spin, self.freq_hold))
-        self.mod_spins: dict[str, PSpinBox] = {}
-        for mod, (_label, key) in MOD_RATE.items():
-            if sup(key):
-                prefixes = ("n", "µ", "m", "") if key.endswith("period") else ("", "k", "M")
-                self.mod_spins[mod] = PSpinBox(proxy, key, prefixes)
-        self.mod_line = PanelLine("PULS", *self.mod_spins.values())
-        self.top_lines.append(self.mod_line)
-        saved_mod = str(self.settings.value(f"{self._prefix}/FAV_MOD", "PULSE"))
-        self._fav_mod = saved_mod if saved_mod in self.mod_spins else next(iter(self.mod_spins), "")
-        self._show_mod_rate(self._fav_mod)
 
         # вкладки: один столбец
         for title_, state, rows in PAGES:
@@ -134,25 +118,6 @@ class RFGenWindow(InstrumentWindow):
 
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
-
-    # ------------------------------------------------------------ частота модуляции в избранном
-    def _show_mod_rate(self, mod: str) -> None:
-        """Показать в избранном частоту (у импульса - период) модуляции ``mod``."""
-        if mod not in self.mod_spins:
-            return
-        self._fav_mod = mod
-        for m, w in self.mod_spins.items():
-            w.setVisible(m == mod)
-        label, key = MOD_RATE[mod]
-        self.mod_line._name.setText(label)
-        self.mod_line._name.setToolTip(key)
-        self.settings.setValue(f"{self._prefix}/FAV_MOD", mod)
-
-    def on_param(self, key: str, value: Any) -> None:
-        if value is True and key.endswith(".state"):
-            mod = next((m for m, p in MOD_TYPES.items() if p and key == f"{p}.state"), None)
-            if mod:
-                self._show_mod_rate(mod)
 
     def current_mod(self) -> str:
         if self.proxy.supports("mod.output") and self.proxy.value("mod.output") is False:
@@ -186,6 +151,5 @@ class RFGenWindow(InstrumentWindow):
                 w[key].set_value(False, force=True)
         if target and f"{target}.state" in w:
             w[f"{target}.state"].set_value(True)
-            self._show_mod_rate(mod)
         if "mod.output" in w:
             w["mod.output"].set_value(target is not None)

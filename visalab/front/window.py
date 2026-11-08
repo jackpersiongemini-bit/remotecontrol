@@ -9,7 +9,7 @@ import textwrap
 from enum import Enum
 
 from PyQt6.QtCore import QEasingCurve, QLineF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QAbstractButton, QLabel, QPushButton, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
 
@@ -19,7 +19,7 @@ from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDE
                     UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss)
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
-           "CustomExpandButton", "Switch",
+           "CustomExpandButton", "CustomLockButton", "Switch",
            "CustomOnButton", "CustomSyncButton", "CustomInitButton"]
 
 
@@ -244,6 +244,38 @@ class IconButtonBase(QPushButton):
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
+
+
+class CustomLockButton(IconButtonBase):
+    """Замок (кнопка с фиксацией): закрыт - checked. Рисуется вектором, как кнопки заголовка."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.toggled.connect(lambda _on: self.update())
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        if self.isChecked():                      # инверсия: тёмный значок на светлом фоне
+            self._icon_color = QColor(UI_COLOR_TEXT_INVERSE)
+        elif not self.underMouse():
+            self._icon_color = self._rest_color
+        self._pen(p)
+        cx, cy = self.width() / 2, self.height() / 2
+        bw, bh = 10.0, 7.0                        # корпус
+        body = QRectF(cx - bw / 2, cy - 0.5, bw, bh)
+        p.drawRoundedRect(body, 1.5, 1.5)
+        r = 3.0                                   # дужка: открыт - поднята над корпусом
+        base = cy - 0.5 - (0.0 if self.isChecked() else 2.5)
+        top = base - 4.5
+        path = QPainterPath()
+        path.moveTo(cx - r, base)
+        path.lineTo(cx - r, top + r)
+        path.arcTo(QRectF(cx - r, top, 2 * r, 2 * r), 180, -180)
+        path.lineTo(cx + r, base)
+        p.drawPath(path)
+        p.drawLine(QLineF(cx, body.top() + 2.5, cx, body.top() + 4.5))   # скважина
 
 
 class CustomMinButton(IconButtonBase):

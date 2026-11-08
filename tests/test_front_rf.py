@@ -29,7 +29,7 @@ def test_layout_tabs_and_favourites(qtbot, rf):
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["RF", "AM", "FM", "PM", "PULS"]
     assert [ln.name for ln in win.preset_panel.table.lines][:3] == ["OUT", "PRST", "FREQ"]
     assert win.freq_spin.key == "rf.frequency"
-    assert set(win.mod_spins) == {"PULSE", "FM", "PM"}          # AM - только на вкладке
+    assert len(win.preset_panel.table.lines) == 3                # модуляция - только на вкладках
 
 
 def test_preset_add_and_apply(qtbot, rf):
@@ -44,14 +44,12 @@ def test_preset_add_and_apply(qtbot, rf):
     _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(10e9))
     _wait(qtbot, proxy, "am.state", lambda v: v is True)
     _wait(qtbot, proxy, "mod.output", lambda v: v is True)
-    assert win.mod_line.name == "PULS"                           # AM в избранном нет - строка не меняется
     assert win.current_mod() == "AM"
     qtbot.waitUntil(lambda: win.tabs.is_on(1))                  # вкладка AM - индикатор
     win.presets.add(5e9, -20.0, "PULSE")
     win._apply_preset(win.presets.find(5e9, -20.0, "PULSE"))
     _wait(qtbot, proxy, "pulse.state", lambda v: v is True)
     _wait(qtbot, proxy, "am.state", lambda v: v is False)
-    assert win.mod_line.name == "PULS"
     win.presets.add(1e9, -10.0, "CW")
     win._apply_preset(win.presets.find(1e9, -10.0, "CW"))
     _wait(qtbot, proxy, "pulse.state", lambda v: v is False)
