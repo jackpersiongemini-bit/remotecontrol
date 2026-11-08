@@ -43,7 +43,7 @@ def test_interpolate():
 def test_layout_and_readout(qtbot, pm):
     proxy, win, _s = pm
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "CAL", "TIME"]
-    assert len(win.preset_panel.table.lines) == 1 and win.preset_panel.table.lines[0].widgets == [win.readout]
+    assert len(win.preset_panel.table.lines) == 1 and win.preset_panel.table.lines[0].widgets == [win.readout, win.plot]
     qtbot.waitUntil(lambda: proxy.value("meas.power") is not None, timeout=5000)
     qtbot.waitUntil(lambda: win.readout.main.text() == f"{proxy.value('meas.power'):.2f}", timeout=5000)
     assert win.readout.sec_button.text().endswith("W")
@@ -150,11 +150,13 @@ def test_time_domain_trace(qtbot, pm):
     assert len(t) == 1000 and t.x_unit == "s"
     assert max(t.y) == pytest.approx(-10.0, abs=0.01)    # импульс симулятора -10 dBm
     qtbot.waitUntil(lambda: win.tabs.is_on(2), timeout=5000)
+    assert not win.plot.isHidden() and win.readout.isHidden()          # график вместо индикатора
     win.plot.resize(400, 200)
     win.plot.grab()                                     # отрисовка без ошибок
     proxy.set("detector", "AVERAGE")                    # трасса только в NORMAL - выключается
     _wait(qtbot, proxy, "trace.state", lambda v: v is False)
     qtbot.waitUntil(lambda: win.plot.trace is None and not win.tabs.is_on(2), timeout=5000)
+    assert win.plot.isHidden() and not win.readout.isHidden()
 
 def test_pm_launcher_with_sdg(qtbot, tmp_path, monkeypatch):
     import run_power_meter

@@ -5,8 +5,8 @@ PTAV, клик - следующая) слева сверху, под ней за
 сколько добавляет поправка (CAL, клик - вкладка CAL).
 
 Вкладки: MAIN (частота, усреднение, запуск), CAL (таблица калибровки по частоте, GAIN, DUTY,
-обнуление и калибровка датчика), TIME - режим временной области: график мощности от времени
-(трасса датчика после каждого измерения, строб на графике) и его настройки.
+обнуление и калибровка датчика), TIME - режим временной области: TRAC ON - в избранном вместо
+индикатора график мощности от времени (трасса датчика после каждого измерения, строб на графике).
 
 Поправка считается в окне и пишется в прибор как offset (CORR:GAIN2), поэтому все показания
 прибора уже исправлены:  P = Pизм + CAL(f) − GAIN + 10·lg(100 / DUTY).
@@ -577,7 +577,11 @@ class PowerMeterWindow(InstrumentWindow):
         self.readout.secondary_changed.connect(lambda v: s.setValue(f"{pre}/SECONDARY", v))
         self.readout.trigger_clicked.connect(self.toggle_trigger)
         self.readout.cal_clicked.connect(self.show_cal)
-        line = PanelLine("", self.readout)
+        # режим временной области (TRAC ON) - вместо индикатора график
+        self.plot = TracePlot()
+        self.plot.setToolTip("Power vs time after each measurement; shaded band - gate")
+        self.plot.hide()
+        line = PanelLine("", self.readout, self.plot)
         line._name.hide()                     # один виджет на всю ширину, без подписи
         self.top_lines = [line]
 
@@ -643,17 +647,13 @@ class PowerMeterWindow(InstrumentWindow):
             cal.append(PanelLine("SENS", *acts))
         self.page_specs.append(("CAL", ("offset.state",) if sup("offset.state") else (), PanelTable(*cal)))
 
-        # TIME: режим временной области - график мощности от времени и его настройки
-        self.plot = TracePlot()
-        self.plot.setToolTip("Power vs time after each measurement; shaded band - gate")
-        plot_line = PanelLine("", self.plot)
-        plot_line._name.hide()
+        # TIME: режим временной области (график - в избранном, пока TRAC ON) и его настройки
         time_ = add((("TRAC", "trace.state", None), ("TLEN", "trace.time", None), ("TOFS", "trace.offset", None),
                      ("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
                      ("DLY", "trig.delay", None), ("GSTR", "gate.start", None), ("GLEN", "gate.length", None),
                      ("HOLD", "trig.holdoff", None), ("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
         self.page_specs.append(("TIME", ("trace.state",) if sup("trace.state") else (),
-                                PanelTable(plot_line, *time_)))
+                                PanelTable(*time_)))
 
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
@@ -662,10 +662,20 @@ class PowerMeterWindow(InstrumentWindow):
     def on_param(self, key: str, value: Any) -> None:
         if key == "trace":
             self.plot.set_trace(value)
+        elif key == "trace.state":
+            self.show_plot(value is True)
         elif key in ("gate.start", "gate.length"):
             self.plot.set_gate(self.proxy.value("gate.start"), self.proxy.value("gate.length"))
         elif key == "freq":
             self.apply_correction()
+
+    def show_plot(self, on: bool) -> None:
+        """Избранное: график (временная область) или индикатор."""
+        if self.plot.isHidden() != on:
+            return
+        self.readout.setVisible(not on)
+        self.plot.setVisible(on)
+        self._fit_height()
 
     def show_cal(self) -> None:
         self.set_page(1, fit=False)
