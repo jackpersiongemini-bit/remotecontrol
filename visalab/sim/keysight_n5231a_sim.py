@@ -26,8 +26,10 @@ class KeysightPNASim(SimInstrument):
         self.c = {"start": 10e6, "stop": 13.5e9, "poin": 201, "bwid": 35e3, "pow": -5.0, "outp": True,
                   "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "corr": False, "mode": "CONT",
                   "form": "ASC"}
-        self.meas = {"CH1_S11_1": {"s": "S11", "fmt": "MLOG"}}
-        self.selected = ""
+        self.meas = {"CH1_S11_1": {"s": "S11", "fmt": "MLOG", "ch": 1}}
+        self.selected = ""                               # выбранное измерение канала 1
+        self.sel_other: dict[int, str] = {}              # то же у остальных каналов
+        self.other: dict[int, dict] = {}                 # стимул каналов 2...
         self.marker = {"on": False, "x": 1e9}
         self.sweeping = False
         self.opc_pending = False
@@ -50,21 +52,28 @@ class KeysightPNASim(SimInstrument):
             return s21
         return 1 - s21 / k * 0.98
 
-    def freqs(self) -> list[float]:
-        n, a, b = self.c["poin"], self.c["start"], self.c["stop"]
+    def stim(self, ch: int) -> dict:
+        """Стимул канала: канал 1 - ``self.c``, остальные создаются при первом обращении."""
+        if ch == 1:
+            return self.c
+        return self.other.setdefault(ch, {"start": 1e9, "stop": 2e9, "poin": 101})
+
+    def freqs(self, ch: int = 1) -> list[float]:
+        st = self.stim(ch)
+        n, a, b = st["poin"], st["start"], st["stop"]
         return [a + (b - a) * i / (n - 1) if n > 1 else a for i in range(n)]
 
     def sdata(self, name: str) -> list[float]:
         """Комплексные данные измерения: re, im, re, im, ..."""
         out: list[float] = []
-        for f in self.freqs():
+        for f in self.freqs(self.meas[name]["ch"]):
             v = self.s(self.meas[name]["s"], f)
             out += [v.real, v.imag]
         return out
 
     def fdata(self, name: str) -> list[float]:
         m = self.meas[name]
-        fs = self.freqs()
+        fs = self.freqs(m["ch"])
         vals = [self.s(m["s"], f) for f in fs]
         fmt = m["fmt"]
         if fmt == "MLOG":
@@ -120,25 +129,28 @@ class KeysightPNASim(SimInstrument):
 
     def register(self) -> None:
         self.on("SYSTem:ERRor[:NEXT]", get=self._err)
+        self.on("SYSTem:CHANnels:CATalog", get=lambda a, g: '"' + ",".join(
+            str(c) for c in sorted({1} | {m["ch"] for m in self.meas.values()} | set(self.other))) + '"')
         self.on("FORMat[:DATA]", self._form_set, lambda a, g: "ASC,0")
         self.on("CALCulate#:PARameter:CATalog:EXTended", get=self._cat)
         self.on("CALCulate#:PARameter:CATalog", get=self._cat)
-        self.on("CALCulate#:PARameter:SELect", self._sel, lambda a, g: f'"{self.selected}"')
+        self.on("CALCulate#:PARameter:SELect", self._sel, lambda a, g: f'"{self._selected(self._ch(g))}"')
         self.on("CALCulate#:PARameter:DEFine:EXTended", self._define)
         self.on("CALCulate#:PARameter:MODify:EXTended", self._modify)
         self.on("DISPlay:WINDow#:STATe", lambda a, g: None)
         self.on("DISPlay:WINDow#:TRACe#:FEED", lambda a, g: None)
-        self.on("CALCulate#:FORMat", self._fmt_set, lambda a, g: self._cur()["fmt"])
+        self.on("CALCulate#:FORMat", self._fmt_set, lambda a, g: self._cur(g)["fmt"])
         self.on("CALCulate#:DATA", get=self._data)
         self.on("CALCulate#:MARKer#:FUNCtion:EXECute", self._mk_exec)
         self.on("CALCulate#:MARKer#:X", self._mk_x, lambda a, g: f"{self.marker['x']:+.11E}")
         self.on("CALCulate#:MARKer#:Y", get=self._mk_y)
         self.on("CALCulate#:MARKer#[:STATe]", self._mk_state, lambda a, g: "1" if self.marker["on"] else "0")
-        self.on("SENSe#:FREQuency:STARt", self._f("start"), self._g(lambda: self.c["start"]))
-        self.on("SENSe#:FREQuency:STOP", self._f("stop"), self._g(lambda: self.c["stop"]))
-        self.on("SENSe#:FREQuency:CENTer", self._f("center"), self._g(lambda: (self.c["start"] + self.c["stop"]) / 2))
-        self.on("SENSe#:FREQuency:SPAN", self._f("span"), self._g(lambda: self.c["stop"] - self.c["start"]))
-        self.on("SENSe#:SWEep:POINts", self._n("poin", 1, 32001, integer=True), lambda a, g: str(self.c["poin"]))
+        self.on("SENSe#:FREQuency:STARt", self._f("start"), self._gs("start"))
+        self.on("SENSe#:FREQuency:STOP", self._f("stop"), self._gs("stop"))
+        self.on("SENSe#:FREQuency:CENTer", self._f("center"), self._gs("center"))
+        self.on("SENSe#:FREQuency:SPAN", self._f("span"), self._gs("span"))
+        self.on("SENSe#:SWEep:POINts", self._n("poin", 1, 32001, integer=True),
+                lambda a, g: str(self.stim(self._ch(g))["poin"]))
         self.on("SENSe#:SWEep:TIME:AUTO", self._b("swt_auto"), self._gb("swt_auto"))
         self.on("SENSe#:SWEep:TIME", self._n("swt", 0, 86400, auto="swt_auto"), self._g(lambda: self.c["swt"]))
         self.on("SENSe#:SWEep:MODE", self._mode_set, lambda a, g: self.c["mode"])
@@ -156,6 +168,17 @@ class KeysightPNASim(SimInstrument):
         return f'{code:+d},"{msg}"'
 
     # помощники
+    @staticmethod
+    def _ch(g) -> int:
+        return int(g[0]) if g and g[0] else 1
+
+    def _gs(self, which):
+        def fn(a, g):
+            st = self.stim(self._ch(g))
+            v = {"center": (st["start"] + st["stop"]) / 2, "span": st["stop"] - st["start"]}.get(which)
+            return f"{(st[which] if v is None else v):+.11E}"
+        return fn
+
     def _g(self, fn):
         return lambda a, g: f"{fn():+.11E}"
 
@@ -171,7 +194,8 @@ class KeysightPNASim(SimInstrument):
     def _n(self, k, lo, hi, integer=False, auto=None):
         def fn(a, g):
             v = self.num(a, lo, hi)
-            self.c[k] = int(round(v)) if integer else v
+            target = self.stim(self._ch(g)) if k == "poin" else self.c
+            target[k] = int(round(v)) if integer else v
             if auto:
                 self.c[auto] = False
             self._auto_time()
@@ -185,7 +209,7 @@ class KeysightPNASim(SimInstrument):
 
     def _f(self, which):
         def fn(a, g):
-            c = self.c
+            c = self.stim(self._ch(g))
             if which == "span":
                 v = self.num(a, 0, self.F_MAX - self.F_MIN)
                 mid = (c["start"] + c["stop"]) / 2
@@ -206,43 +230,52 @@ class KeysightPNASim(SimInstrument):
             raise SimError(-221, "Settings conflict", ESR_EXE)
 
     def _cat(self, a, g):
-        if not self.meas:
+        mine = {n: m for n, m in self.meas.items() if m["ch"] == self._ch(g)}
+        if not mine:
             return '"NO CATALOG"'
-        return '"' + ",".join(f"{n},{m['s']}" for n, m in self.meas.items()) + '"'
+        return '"' + ",".join(f"{n},{m['s']}" for n, m in mine.items()) + '"'
 
-    def _cur(self) -> dict:
-        if self.selected not in self.meas:
+    def _selected(self, ch: int) -> str:
+        return self.selected if ch == 1 else self.sel_other.get(ch, "")
+
+    def _cur(self, g=()) -> dict:
+        name = self._selected(self._ch(g))
+        if name not in self.meas:
             raise SimError(-221, "Settings conflict; no measurement selected", ESR_EXE)
-        return self.meas[self.selected]
+        return self.meas[name]
 
     def _sel(self, a, g):
-        name = a.strip().strip("'\"")
-        if name not in self.meas:
+        name, ch = a.strip().strip("'\""), self._ch(g)
+        if name not in self.meas or self.meas[name]["ch"] != ch:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        self.selected = name
+        if ch == 1:
+            self.selected = name
+        else:
+            self.sel_other[ch] = name
 
     def _define(self, a, g):
         name, s = (t.strip().strip("'\"") for t in a.split(","))
-        self.meas[name] = {"s": s.upper(), "fmt": "MLOG"}
+        self.meas[name] = {"s": s.upper(), "fmt": "MLOG", "ch": self._ch(g)}
 
     def _modify(self, a, g):
         s = a.strip().strip("'\"").upper()
         if s not in ("S11", "S21", "S12", "S22"):
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        self._cur()["s"] = s
+        self._cur(g)["s"] = s
 
     def _fmt_set(self, a, g):
         t = a.strip().upper()
         if t not in _FMT:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        self._cur()["fmt"] = _FMT[t]
+        self._cur(g)["fmt"] = _FMT[t]
 
     def _data(self, a, g):
         kind = a.strip().upper()
         if kind not in ("FDATA", "SDATA"):
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        self._cur()
-        data = self.fdata(self.selected) if kind == "FDATA" else self.sdata(self.selected)
+        self._cur(g)
+        name = self._selected(self._ch(g))
+        data = self.fdata(name) if kind == "FDATA" else self.sdata(name)
         return ",".join(f"{v:+.10E}" for v in data)
 
     def _mode_set(self, a, g):

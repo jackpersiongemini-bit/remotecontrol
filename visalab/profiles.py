@@ -244,12 +244,17 @@ NETWORK_ANALYZER = Profile(
     GDELAY - s, SWR/LIN_MAG/REAL/IMAG - без единиц), публикуется после каждой ЗАВЕРШЁННОЙ развёртки.
     Поэтому у ключа ``trace`` единица в профиле пустая, а настоящая - в ``Trace.y_unit``.
 
-    Все измерения канала 1: ``m{n}.*`` (n с 1, в порядке каталога прибора). Одна развёртка обновляет
-    все измерения канала, и после неё публикуются ВСЕ: ``m{n}.trace`` - в формате измерения,
-    ``m{n}.sdata`` - комплексная (Trace.im - мнимая часть, y - вещественная, единицы нет),
-    ``m{n}.name`` / ``sparam`` / ``format``; ``meas.count`` - сколько измерений есть. Нет измерения
-    с таким номером - значения None. ``trace`` / ``sparam`` / ``format`` и маркер относятся к
-    первому измерению (то же, что m1). ``meas.complex`` выключает чтение комплексных данных.""",
+    Измерения - слоты ``m1..m16``: пользователь сам выбирает, что читать. У слота: ``m{n}.channel``
+    (канал прибора), ``m{n}.name`` (имя измерения на приборе; пустое - слот не назначен) и
+    ``m{n}.enabled``. Читаются только включённые слоты и только нужные им каналы. После каждой
+    развёртки для каждого включённого слота публикуются ``m{n}.trace`` - в формате измерения - и
+    ``m{n}.sdata`` - комплексная (Trace.im - мнимая часть, y - вещественная, единицы нет); у остальных
+    None. ``m{n}.sparam`` / ``m{n}.format`` - S-параметр и формат назначенного измерения.
+    ``meas.count`` - сколько слотов прочитано. Действия: ``meas_catalog`` -> action_done с
+    [(канал, имя, S-параметр), ...] по всем каналам, ``meas_all`` - занять слоты первыми измерениями
+    всех каналов и включить, ``meas_none`` - выключить все. По умолчанию слоты занимают измерения
+    канала 1 по порядку, включён m1. ``trace`` / ``sparam`` / ``format`` и маркер - первое измерение
+    канала 1 (``trace`` = m1.trace). ``meas.complex`` выключает чтение комплексных данных.""",
     slots=(
         Slot("trace", T, "", required=True, readonly=True),
         Slot("meas.continuous", B, required=True),
@@ -275,7 +280,9 @@ NETWORK_ANALYZER = Profile(
         Slot("marker.value", F, "", readonly=True, doc="значение трассы в маркере, единицы - как у трассы"),
         Slot("meas.count", I, readonly=True, doc="сколько измерений на канале 1"),
         Slot("meas.complex", B, doc="читать комплексные данные m{n}.sdata"),
-        Slot("m{n}.name", S, readonly=True, doc="имя измерения"),
+        Slot("m{n}.channel", I, doc="канал прибора"),
+        Slot("m{n}.name", S, doc="имя измерения на приборе (пусто - слот не назначен)"),
+        Slot("m{n}.enabled", B, doc="читать это измерение после каждой развёртки"),
         Slot("m{n}.sparam", E, choices=("S11", "S21", "S12", "S22")),
         Slot("m{n}.format", E, choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")),
         Slot("m{n}.trace", T, "", readonly=True, doc="трасса измерения в его формате"),
@@ -286,6 +293,9 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("abort"),
         ActionSlot("marker_peak", doc="маркер на максимум"),
         ActionSlot("marker_min", doc="маркер на минимум"),
+        ActionSlot("meas_catalog", doc="каталог измерений -> action_done('meas_catalog', [(канал, имя, S-параметр)])"),
+        ActionSlot("meas_all", doc="занять слоты первыми измерениями всех каналов и включить"),
+        ActionSlot("meas_none", doc="выключить чтение всех слотов"),
         ActionSlot("reset"),
     ),
 )
