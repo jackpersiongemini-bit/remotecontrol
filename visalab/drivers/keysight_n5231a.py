@@ -12,18 +12,22 @@
 * маркер ``CALC1:MARK1``, ``CALC1:MARK1:X``, ``CALC1:MARK1:Y?`` (два числа), ``CALC1:MARK1:FUNC:EXEC MAX|MIN``;
 * развёртка ``SENS1:SWE:MODE SING`` + ``*OPC`` - бит OPC по окончании, ``SENS1:SWE:MODE HOLD`` - стоп.
 
-Подключение не создаёт и не удаляет измерения пользователя. Читаются ВСЕ измерения канала 1
-(до ``MEAS_SLOTS``, в порядке каталога): после каждой завершённой развёртки для каждого
-публикуются ``m{n}.trace`` (в формате измерения) и ``m{n}.sdata`` (комплексная), плюс имя,
-S-параметр и формат. Если измерений нет - создаётся ``VL_MEAS``. Легаси-ключи ``trace`` /
-``sparam`` / ``format`` и маркер относятся к первому измерению (m1) и его не меняют.
+Подключение не создаёт и не удаляет измерения пользователя (если измерений нет - создаётся
+``VL_MEAS``). Что читать, выбирает пользователь: ``MEAS_SLOTS`` слотов ``m1..m16``, у слота -
+канал (``m{n}.channel``), имя измерения (``m{n}.name``) и ``m{n}.enabled``. Читаются только
+включённые слоты, и только каналы, которые им нужны. После каждой завершённой развёртки для
+каждого включённого слота публикуются ``m{n}.trace`` (в формате измерения) и ``m{n}.sdata``
+(комплексная). По умолчанию слоты занимают измерения канала 1 по порядку каталога, включён
+только m1. Действия: ``meas_catalog`` (каталог всех каналов), ``meas_all`` (занять слоты первыми
+измерениями всех каналов и включить), ``meas_none``. Легаси-ключи ``trace`` / ``sparam`` /
+``format`` и маркер - первое измерение канала 1 (``trace`` = m1.trace).
 Как и анализатор спектра, ВАЦ ведётся однократными развёртками: наружу уходят только
-целые трассы. Ось X считается линейной (SENS:SWE:TYPE LIN).
+целые трассы. Ось X считается линейной от ``SENS<c>:FREQ:STAR`` до ``STOP`` канала измерения.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..core.instrument import VISAInstrument
@@ -55,10 +59,18 @@ PNA_MODELS = {
 Y_UNITS = {"MLOG": "dB", "PHASE": "deg", "UPHASE": "deg", "GDELAY": "s"}
 FREQ_KEYS = ("freq.start", "freq.stop", "freq.center", "freq.span")
 MEAS_NAME = "VL_MEAS"
-MEAS_SLOTS = 8                   # сколько измерений канала 1 выставляется наружу (m1..m8)
+MEAS_SLOTS = 16                  # слотов выбора измерений (m1..m16)
 FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")
 FORMAT_MAP = (("PHASE", "PHAS"), ("UPHASE", "UPH"), ("GDELAY", "GDEL"), ("LIN_MAG", "MLIN"))
 _MEAS_KEY = re.compile(r"m(\d+)\.(\w+)")
+
+
+@dataclass
+class _Slot:
+    """Слот выбора измерения: что именно читать и читать ли."""
+    channel: int = 1
+    name: str = ""
+    enabled: bool = False
 
 
 class KeysightPNA(VISAInstrument):
@@ -74,7 +86,8 @@ class KeysightPNA(VISAInstrument):
         self._armed = False
         self._complex = True
         self._sweep: dict[str, Any] = {}       # последняя завершённая развёртка: ключи m{n}.*, trace, meas.count
-        self.meas_names: list[str] = []
+        self._slots = [_Slot() for _ in range(MEAS_SLOTS)]
+        self._armed_channels: list[int] = [1]
         self.meas_name = ""
         super().__init__(transport, parent, command_delay_s)
 
@@ -92,13 +105,17 @@ class KeysightPNA(VISAInstrument):
         ch = dict(channel=1)          # перед CALC-командой выбрать наше измерение
         per_meas = []
         for n in range(1, MEAS_SLOTS + 1):
-            sec, mch = f"Измерения/m{n}", dict(channel=n)
+            sec, rd = f"Измерения/m{n}", (f"m{n}.sparam", f"m{n}.format")
             per_meas += [
-                Param(f"m{n}.name", f"Имя m{n}", Kind.STR, section=sec, group="SWEEP"),
-                Param(f"m{n}.sparam", f"S-параметр m{n}", E, section=sec, query="<catalog>",
-                      write="CALC1:PAR:MOD:EXT '{value}'", choices=("S11", "S21", "S12", "S22"), **mch),
-                Param(f"m{n}.format", f"Формат m{n}", E, section=sec, query="CALC1:FORM?",
-                      write="CALC1:FORM {value}", choices=FORMATS, enum_map=FORMAT_MAP, **mch),
+                Param(f"m{n}.channel", f"Канал m{n}", I, section=sec, query="<virtual>", write="<virtual>",
+                      minimum=1, maximum=200, also_read=rd),
+                Param(f"m{n}.name", f"Имя m{n}", Kind.STR, section=sec, query="<virtual>", write="<virtual>",
+                      also_read=rd),
+                Param(f"m{n}.enabled", f"Читать m{n}", B, section=sec, query="<virtual>", write="<virtual>"),
+                Param(f"m{n}.sparam", f"S-параметр m{n}", E, section=sec, query="<catalog>", write="<custom>",
+                      choices=("S11", "S21", "S12", "S22")),
+                Param(f"m{n}.format", f"Формат m{n}", E, section=sec, query="<format>", write="<custom>",
+                      choices=FORMATS, enum_map=FORMAT_MAP),
                 Param(f"m{n}.trace", f"Трасса m{n}", Kind.TRACE, "", section=sec, group="SWEEP"),
                 Param(f"m{n}.sdata", f"Комплексная трасса m{n}", Kind.TRACE, "", section=sec, group="SWEEP"),
             ]
@@ -151,6 +168,8 @@ class KeysightPNA(VISAInstrument):
     def build_actions(self):
         return [Action("single", "Одна развёртка"), Action("abort", "Стоп"),
                 Action("marker_peak", "Маркер на максимум"), Action("marker_min", "Маркер на минимум"),
+                Action("meas_catalog", "Каталог измерений"), Action("meas_all", "Читать все измерения"),
+                Action("meas_none", "Не читать измерения"),
                 Action("reset", "Preset *RST",
                        confirm="Preset удалит измерения и выключит калибровку. Продолжить?")]
 
@@ -165,35 +184,44 @@ class KeysightPNA(VISAInstrument):
             self.write("DISP:WIND1:STAT ON")
             self.write(f"DISP:WIND1:TRAC1:FEED '{MEAS_NAME}'")
             cat = self._catalog() or {MEAS_NAME: "S11"}
-        self._remember(cat)
+        self.meas_name = next(iter(cat))
+        self._slots = [_Slot() for _ in range(MEAS_SLOTS)]
+        for slot, name in zip(self._slots, cat):               # по умолчанию - канал 1 по порядку, читаем только m1
+            slot.name = name
+        self._slots[0].enabled = True
 
     def on_disconnecting(self) -> None:
         if self._armed:
-            self.write("SENS1:SWE:MODE HOLD")
-            self._armed = False
+            self._abort()
 
-    def _catalog(self) -> dict[str, str]:
-        """{имя измерения: S-параметр} канала 1."""
-        raw = self.query("CALC1:PAR:CAT:EXT?").strip().strip('"').strip()
+    def _catalog(self, channel: int = 1) -> dict[str, str]:
+        """{имя измерения: S-параметр} канала."""
+        raw = self.query(f"CALC{channel}:PAR:CAT:EXT?").strip().strip('"').strip()
         if not raw or raw.upper().startswith("NO CATALOG"):
             return {}
         items = [t.strip() for t in raw.split(",")]
         return dict(zip(items[0::2], (s.upper() for s in items[1::2])))
 
-    def _remember(self, cat: dict[str, str]) -> None:
-        self.meas_names = list(cat)[:MEAS_SLOTS]
-        if self.meas_names:
-            self.meas_name = self.meas_names[0]
+    def _channels(self) -> list[int]:
+        raw = self.query("SYST:CHAN:CAT?")
+        return sorted({int(t) for t in re.findall(r"\d+", raw)}) or [1]
 
     def select_channel(self, channel: int) -> None:
-        """Канал = номер измерения (1 - первое, оно же легаси-ключи); нет такого - ошибка."""
-        if channel == 1 or not self.meas_names:
-            name = self.meas_name
-        elif channel <= len(self.meas_names):
-            name = self.meas_names[channel - 1]
-        else:
-            raise ValueError(f"нет измерения m{channel} (на канале 1 их {len(self.meas_names)})")
-        self.write(f"CALC1:PAR:SEL '{name}'")
+        """Выбор измерения легаси-ключей (первое измерение канала 1)."""
+        self.write(f"CALC1:PAR:SEL '{self.meas_name}'")
+
+    def _select(self, slot: _Slot) -> None:
+        self.write(f"CALC{slot.channel}:PAR:SEL '{slot.name}'")
+
+    def _slot_of(self, key: str) -> tuple[int, _Slot, str] | None:
+        m = _MEAS_KEY.fullmatch(key)
+        if m and 1 <= int(m.group(1)) <= MEAS_SLOTS:
+            return int(m.group(1)), self._slots[int(m.group(1)) - 1], m.group(2)
+        return None
+
+    def _active_channels(self) -> list[int]:
+        """Каналы, которые нужно развернуть: включённые слоты (иначе - канал 1)."""
+        return sorted({s.channel for s in self._slots if s.enabled and s.name}) or [1]
 
     def write_param(self, spec: Param, value: Any) -> None:
         if spec.key == "meas.continuous":
@@ -207,10 +235,35 @@ class KeysightPNA(VISAInstrument):
         was_armed = self._armed
         self._abort()
         try:
-            super().write_param(spec, value)
+            if not self._write_slot(spec, value):
+                super().write_param(spec, value)
         finally:                                  # отказ записи не должен останавливать развёртки
             if was_armed or self._continuous:
                 self._start_sweep()
+
+    def _write_slot(self, spec: Param, value: Any) -> bool:
+        found = self._slot_of(spec.key)
+        if found is None:
+            return False
+        n, slot, what = found
+        if what == "enabled":
+            slot.enabled = bool(value)
+        elif what == "channel":
+            slot.channel = int(value)
+        elif what == "name":
+            name = str(value).strip()
+            if name and name not in self._catalog(slot.channel):
+                raise ValueError(f"нет измерения {name!r} на канале {slot.channel}")
+            slot.name = name
+        else:                                      # sparam / format - у выбранного измерения
+            if not slot.name:
+                raise ValueError(f"слот m{n} не назначен (задайте m{n}.name)")
+            self._select(slot)
+            if what == "sparam":
+                self.write(f"CALC{slot.channel}:PAR:MOD:EXT '{spec.to_scpi(value)}'")
+            else:
+                self.write(f"CALC{slot.channel}:FORM {spec.to_scpi(value)}")
+        return True
 
     def read_param_raw(self, spec: Param) -> Any:
         key = spec.key
@@ -222,13 +275,24 @@ class KeysightPNA(VISAInstrument):
             return self._complex
         if key == "sparam":
             return self._catalog().get(self.meas_name)
-        m = _MEAS_KEY.fullmatch(key)
-        if m and m.group(2) in ("sparam", "format"):
-            n = int(m.group(1))
-            if n > len(self.meas_names):
-                return None                       # такого измерения нет
-            if m.group(2) == "sparam":
-                return self._catalog().get(self.meas_names[n - 1])
+        found = self._slot_of(key)
+        if found is not None:
+            n, slot, what = found
+            if what == "enabled":
+                return slot.enabled
+            if what == "channel":
+                return slot.channel
+            if what == "name":
+                return slot.name or None
+            if not slot.name:
+                return None
+            cat = self._catalog(slot.channel)
+            if slot.name not in cat:
+                return None                       # измерение удалено на приборе
+            if what == "sparam":
+                return cat[slot.name]
+            self._select(slot)
+            return spec.from_scpi(self.query(f"CALC{slot.channel}:FORM?"))
         if key in ("marker.value", "marker.freq") and not self._values.get("marker.state"):
             return None
         if key == "marker.value":
@@ -251,53 +315,57 @@ class KeysightPNA(VISAInstrument):
             self._publish("meas.armed", armed)
 
     def _start_sweep(self) -> None:
-        self.arm_opc("SENS1:SWE:MODE SING")
+        self._armed_channels = self._active_channels()
+        self.arm_opc(*[f"SENS{c}:SWE:MODE SING" for c in self._armed_channels])
         self._set_armed(True)
 
     def _abort(self) -> None:
         if self._armed:
-            self.write("SENS1:SWE:MODE HOLD")
+            for c in self._armed_channels:
+                self.write(f"SENS{c}:SWE:MODE HOLD")
             self._set_armed(False)
 
+    def _stimulus(self, channel: int) -> tuple[float, float]:
+        if channel == 1 and self._values.get("freq.start") is not None and self._values.get("freq.stop") is not None:
+            return self._values["freq.start"], self._values["freq.stop"]
+        return self.query_float(f"SENS{channel}:FREQ:STAR?"), self.query_float(f"SENS{channel}:FREQ:STOP?")
+
     def _read_trace(self) -> None:
-        """Все измерения канала 1 после завершённой развёртки: форматированные и комплексные данные."""
-        start, stop = self._values.get("freq.start"), self._values.get("freq.stop")
-        if start is None or stop is None:
-            start, stop = self.query_float("SENS1:FREQ:STAR?"), self.query_float("SENS1:FREQ:STOP?")
-        cat = self._catalog()
-        if cat:
-            self._remember(cat)
+        """Включённые слоты после завершённой развёртки: форматированные и комплексные данные."""
         stim = {k: self._values.get(k) for k in ("bw.if", "source.power", "avg.state", "avg.count", "cal.state")}
-        out: dict[str, Any] = {"meas.count": len(self.meas_names)}
-        for n in range(1, MEAS_SLOTS + 1):
-            if n > len(self.meas_names):                       # измерения нет (или удалено на приборе)
-                out.update({f"m{n}.name": None, f"m{n}.trace": None, f"m{n}.sdata": None})
+        cats: dict[int, dict[str, str]] = {}
+        axes: dict[int, tuple[float, float]] = {}
+        out: dict[str, Any] = {}
+        count = 0
+        for n, slot in enumerate(self._slots, 1):
+            out[f"m{n}.trace"] = out[f"m{n}.sdata"] = None
+            if not (slot.enabled and slot.name):
                 continue
-            name = self.meas_names[n - 1]
-            sparam = cat.get(name)
-            self.write(f"CALC1:PAR:SEL '{name}'")
-            fmt = self._params[f"m{n}.format"].from_scpi(self.query("CALC1:FORM?"))
-            y = [parse_number(t) for t in self.query("CALC1:DATA? FDATA").split(",") if t.strip()]
-            meta = {**stim, "name": name, "sparam": sparam, "format": fmt}
-            out[f"m{n}.name"] = name
+            c = slot.channel
+            cat = cats.setdefault(c, self._catalog(c))
+            sparam = cat.get(slot.name)
+            if sparam is None:                                 # удалено на приборе
+                continue
+            start, stop = axes.setdefault(c, self._stimulus(c))
+            self._select(slot)
+            fmt = self._params[f"m{n}.format"].from_scpi(self.query(f"CALC{c}:FORM?"))
+            y = [parse_number(t) for t in self.query(f"CALC{c}:DATA? FDATA").split(",") if t.strip()]
+            meta = {**stim, "channel": c, "name": slot.name, "sparam": sparam, "format": fmt}
             out[f"m{n}.trace"] = Trace.linear(start, stop, y, x_unit="Hz", y_unit=Y_UNITS.get(fmt, ""),
-                                              name=sparam or name, meta=meta)
-            out[f"m{n}.sdata"] = None
+                                              name=sparam, meta=meta)
             if self._complex:
-                raw = [parse_number(t) for t in self.query("CALC1:DATA? SDATA").split(",") if t.strip()]
+                raw = [parse_number(t) for t in self.query(f"CALC{c}:DATA? SDATA").split(",") if t.strip()]
                 out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit="Hz", y_unit="",
-                                                  name=sparam or name, meta={**meta, "format": "SDATA"})
+                                                  name=sparam, meta={**meta, "format": "SDATA"})
+            count += 1
             for k, v in ((f"m{n}.sparam", sparam), (f"m{n}.format", fmt)):
-                if v is not None and self._values.get(k) != v:
+                if self._values.get(k) != v:
                     self._publish(k, v)
-        out["trace"] = out["m1.trace"] if self.meas_names else None
+        out["trace"] = out["m1.trace"]
+        out["meas.count"] = count
         self._sweep = out
         for k, v in out.items():
             self._publish(k, v)
-        if self.meas_names:                                    # легаси-ключи = первое измерение
-            for legacy, k in (("sparam", "m1.sparam"), ("format", "m1.format")):
-                if self._values.get(k) is not None and self._values.get(legacy) != self._values[k]:
-                    self._publish(legacy, self._values[k])
         if self._values.get("marker.state"):
             self._read_keys(["marker.freq", "marker.value"])
 
@@ -318,6 +386,25 @@ class KeysightPNA(VISAInstrument):
         if name == "abort":
             self._abort()
             self.write("SENS1:SWE:MODE HOLD")
+            return None
+        if name == "meas_catalog":
+            return [(c, n, sp) for c in self._channels() for n, sp in self._catalog(c).items()]
+        if name in ("meas_all", "meas_none"):
+            was_armed = self._armed
+            self._abort()
+            try:
+                if name == "meas_all":
+                    entries = [(c, n) for c in self._channels() for n in self._catalog(c)][:MEAS_SLOTS]
+                    self._slots = [_Slot(c, n, True) for c, n in entries] + \
+                                  [_Slot() for _ in range(MEAS_SLOTS - len(entries))]
+                else:
+                    for slot in self._slots:
+                        slot.enabled = False
+                self._read_keys([f"m{n}.{w}" for n in range(1, MEAS_SLOTS + 1)
+                                 for w in ("channel", "name", "enabled", "sparam", "format")])
+            finally:
+                if was_armed or self._continuous:
+                    self._start_sweep()
             return None
         if name in ("marker_peak", "marker_min"):
             self.select_channel(1)
