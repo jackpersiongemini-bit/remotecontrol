@@ -45,6 +45,7 @@ ONOFF = [("OFF", False), ("ON", True)]
 AUTO = [("MAN", False), ("AUTO", True)]
 SLOTS = 16
 MATH = (("DATA", "NORM"), ("D/M", "DIV"), ("D−M", "SUBT"), ("D+M", "ADD"), ("D·M", "MULT"))
+CHANNEL_CHIP_HEIGHT = 30          # чипы каналов - высотой с обычную кнопку строки
 DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
 
 #: вкладка STIM: (подпись, ключ, второй ключ или None)
@@ -233,8 +234,8 @@ class _ChannelChip(QPushButton):
         self.setToolTip(f"STIM settings of channel {channel}")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def sizeHint(self):  # noqa: N802 - Qt; высота - как у пресета (QSS чипа иначе перебивает)
-        return QSize(super().sizeHint().width(), PRESET_HEIGHT)
+    def sizeHint(self):  # noqa: N802 - Qt; высота - как у обычной строки (QSS чипа иначе перебивает)
+        return QSize(super().sizeHint().width(), CHANNEL_CHIP_HEIGHT)
 
     def minimumSizeHint(self):  # noqa: N802 - Qt
         return self.sizeHint()
@@ -249,7 +250,7 @@ class StimChannels(PBGroup):
         super().__init__(parent=parent)
         self.group_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.channels: list[int] = []
-        self.scroll = HScrollArea(self)
+        self.scroll = HScrollArea(self, CHANNEL_CHIP_HEIGHT)
         self.selected.connect(lambda i: proxy.set("stim.channel", self.channels[i]))
         proxy.subscribe("stim.channel", lambda _v: self._show())
         proxy.action_done.connect(self._on_action)

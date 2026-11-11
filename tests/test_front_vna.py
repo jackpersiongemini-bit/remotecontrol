@@ -187,7 +187,7 @@ def test_stim_channel_chips(qtbot, vna):
     sc = win.stim_channels
     _wait(qtbot, lambda: sc.channels == [1, 2])
     assert [b.text() for b in sc.buttons()] == ["C1", "C2"] and sc.checked_index() == 0
-    assert all(b.sizeHint().height() == 56 for b in sc.buttons())
+    assert all(b.sizeHint().height() == 30 for b in sc.buttons())
     sc.buttons()[1].click()                                    # STIM -> канал 2
     _wait(qtbot, lambda: proxy.value("stim.channel") == 2 and proxy.value("sweep.points") == 101)
     win.widgets["sweep.points"].set_value(21)
