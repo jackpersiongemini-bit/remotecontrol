@@ -95,7 +95,7 @@ def test_trace_chips_read_and_mem_math(qtbot, vna):
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
     assert _chips(te) == ["C1 S11\nMLOG", "C1 S21\nMLOG", "C2 S12\nMLOG"]
     assert te.current == (1, "CH1_S11_1") and te.chips.checked_index() == 0       # выбран первый
-    assert te.chips.buttons()[0].indicated() and not te.chips.buttons()[2].indicated()   # индикатор - читается
+    assert not te.chips.buttons()[0].indicated() and not te.chips.buttons()[2].indicated()   # выбран / не читается
     te.chips.buttons()[2].click()                              # выбрать трейс канала 2
     assert te.current == (2, "CH2_S12") and te.channel.text() == "C2" and not te.read.indicated()
     te.read.click()                                            # READ: свободный слот
@@ -152,3 +152,18 @@ def test_states_tab(qtbot, vna):
     win.presets.set_checked(0)
     win.presets.remove_selected()
     _wait(qtbot, lambda: win.presets.names() == [] and not sim.files)
+
+
+def test_trace_chips_fill_width_and_selected_has_no_indicator(qtbot, vna):
+    proxy, win, _s, _sim = vna
+    win.show()
+    win.set_expanded(True)
+    win.set_page(0)
+    te = win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    _wait(qtbot, lambda: sum(b.width() for b in te.chips.buttons()) + 8 >= te.scroll.viewport().width())
+    assert all(b.height() == win.add_button.height() * 2 + 4 or b.height() == 56 for b in te.chips.buttons())
+    first = te.chips.buttons()[0]
+    assert first.isChecked() and te.is_read(1, "CH1_S11_1") and not first.indicated()   # выбран - без индикатора
+    te.chips.buttons()[1].click()
+    assert first.indicated()                                   # не выбран и читается - индикатор

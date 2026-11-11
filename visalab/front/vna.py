@@ -22,8 +22,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtWidgets import QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtCore import QSettings, QSize, Qt
+from PyQt6.QtWidgets import QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
@@ -221,7 +221,8 @@ class MenuButton(IndicatorButton):
 
 
 class _TraceChip(IndicatorButton):
-    """Чип трейса: выбор - инверсия (как у пресета), индикатор снизу - трейс читается."""
+    """Чип трейса: выбор - инверсия (как у пресета), индикатор снизу - трейс читается (у выбранного
+    не рисуется: выбор и включение не смешиваются). Высота - как у «+»/«−», ширина - вся строка."""
 
     def __init__(self, owner: "TraceEditor", key: tuple[int, str]):
         super().__init__()
@@ -230,9 +231,16 @@ class _TraceChip(IndicatorButton):
         self.setCheckable(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def sizeHint(self):  # noqa: N802 - Qt; QSS чипа (min/max-height) иначе перебивает setFixedHeight
+        return QSize(super().sizeHint().width(), PRESET_HEIGHT)
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt
+        return self.sizeHint()
 
     def indicated(self) -> bool:
-        return self.owner.is_read(*self.trace_key)
+        return not self.isChecked() and self.owner.is_read(*self.trace_key)
 
 
 class TraceChips(PBGroup):
@@ -241,7 +249,7 @@ class TraceChips(PBGroup):
     def __init__(self, owner: "TraceEditor", parent=None):
         self.owner = owner
         super().__init__(parent=parent)
-        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignTop)          # чипы делят всю ширину
 
     def add_button(self, name: str) -> QPushButton:  # чипы создаёт set_keys
         raise NotImplementedError
@@ -251,7 +259,6 @@ class TraceChips(PBGroup):
             self.remove_button(0)
         for key in keys:
             b = _TraceChip(self.owner, key)
-            b.setFixedHeight(PRESET_HEIGHT)
             self._group.addButton(b, len(self._buttons))
             self._buttons.append(b)
         self._relayout()
