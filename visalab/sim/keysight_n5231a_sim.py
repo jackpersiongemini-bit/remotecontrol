@@ -21,6 +21,9 @@ _FMT = {"MLOG": "MLOG", "PHAS": "PHAS", "PHASE": "PHAS", "UPH": "UPH", "UPHASE":
 
 
 DEFAULT_DIR = "C:\\Users\\Public\\Documents\\Network Analyzer"
+CONNECTORS = ("APC 3.5 female", "APC 3.5 male", "Type N (50) female", "Type N (50) male", "Not used")
+#: семейство разъёма -> наборы (идеальный - как пользовательское определение набора на приборе)
+KITS = {"APC 3.5": ("85052D", "Ideal 3.5mm", "N4691-60004 ECal"), "Type N": ("85054D", "Ideal Type N")}
 
 class KeysightPNASim(SimInstrument):
     IDN = "Agilent Technologies,N5231A,MY00000001,A.09.90.02"
@@ -51,6 +54,8 @@ class KeysightPNASim(SimInstrument):
                              "pow": -10.0},
                 "CAL_FULL": {"start": 10e6, "stop": 13.5e9, "poin": 401, "type": "LIN", "cw": 1e9, "bwid": 10e3,
                              "pow": -5.0}}
+        self.guid = {"conn": {1: "Not used", 2: "Not used"}, "kit": {1: "", 2: ""}, "steps": [], "done": set(),
+                     "ch": 1}
         if not hasattr(self, "dut"):
             self.dut = {"f0": 2e9, "q": 20.0, "il_db": 1.0}
             self.hold_sweeps = False
@@ -236,6 +241,16 @@ class KeysightPNASim(SimInstrument):
         self.on("CSET:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.csets)) + '"')
         self.on("SENSe#:CORRection:CSET:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.csets)) + '"')
         self.on("CSET:DELete", self._cset_del)
+        g = "SENSe#:CORRection:COLLect:GUIDed:"
+        self.on(g + "CONNector:CATalog", get=lambda a, g_: '"' + ",".join(CONNECTORS) + '"')
+        self.on(g + "CONNector:PORT#", self._guid_conn, lambda a, g_: f'"{self.guid["conn"][int(g_[1])]}"')
+        self.on(g + "CKIT:CATalog", get=self._guid_kits)
+        self.on(g + "CKIT:PORT#", self._guid_kit, lambda a, g_: f'"{self.guid["kit"][int(g_[1])]}"')
+        self.on(g + "INITiate[:IMMediate]", self._guid_init)
+        self.on(g + "STEPs", get=lambda a, g_: str(len(self.guid["steps"])))
+        self.on(g + "DESCription", get=self._guid_desc)
+        self.on(g + "ACQuire", self._guid_acq)
+        self.on(g + "SAVE:CSET", self._guid_save)
         self.on("SOURce#:POWer#[:LEVel][:IMMediate][:AMPLitude]", self._n("pow", -90, 20),
                 self._gs("pow"))
         self.on("OUTPut[:STATe]", self._b("outp"), self._gb("outp"))
@@ -530,6 +545,68 @@ class KeysightPNASim(SimInstrument):
         for st in (self.c, *self.other.values()):
             if st.get("cset") == name:
                 st["cset"], st["corr"] = "", False
+
+    # ----------------------------------------------------------- калибровка (guided)
+    @staticmethod
+    def _family(conn: str) -> str:
+        return next((f for f in KITS if conn.startswith(f)), "")
+
+    def _guid_conn(self, a, g):
+        conn = a.strip().strip("'\"")
+        if conn not in CONNECTORS:
+            raise SimError(-224, "Illegal parameter value; unknown connector", ESR_EXE)
+        self.guid["conn"][int(g[1])] = conn
+
+    def _guid_kits(self, a, g):
+        return '"' + ",".join(KITS.get(self._family(a.strip().strip("'\"")), ())) + '"'
+
+    def _guid_kit(self, a, g):
+        port, kit = int(g[1]), a.strip().strip("'\"")
+        if kit not in KITS.get(self._family(self.guid["conn"][port]), ()):
+            raise SimError(-224, "Illegal parameter value; kit does not fit the connector", ESR_EXE)
+        self.guid["kit"][port] = kit
+
+    def _guid_init(self, a, g):
+        gd = self.guid
+        ports = [p for p in (1, 2) if gd["conn"][p] != "Not used"]
+        if not ports or any(not gd["kit"][p] for p in ports):
+            raise SimError(-221, "Settings conflict; cal ports not defined", ESR_EXE)
+        steps = []
+        if all("ECal" in gd["kit"][p] for p in ports):
+            steps.append(f"Connect ECal module to port{'s' if len(ports) > 1 else ''} "
+                         + " and ".join(str(p) for p in ports))
+        else:
+            for p in ports:
+                steps += [f"Connect {gd['conn'][p]} {std} to port {p}" for std in ("OPEN", "SHORT", "LOAD")]
+            if len(ports) == 2:
+                steps.append("Connect THRU between port 1 and port 2")
+        gd.update(steps=steps, done=set(), ch=self._ch(g))
+
+    def _guid_desc(self, a, g):
+        k = int(self.num(a, 1, max(1, len(self.guid["steps"]))))
+        return f'"{self.guid["steps"][k - 1]}"'
+
+    def _guid_acq(self, a, g):
+        t = a.strip().upper()
+        if not t.startswith("STAN") or not self.guid["steps"]:
+            raise SimError(-221, "Settings conflict; guided cal not initiated", ESR_EXE)
+        k = int(t[4:] or 0)
+        if not 1 <= k <= len(self.guid["steps"]):
+            raise SimError(-222, "Data out of range", ESR_EXE)
+        self.guid["done"].add(k)
+        self.sweeping = True                             # стандарт меряется развёрткой
+        if not self.hold_sweeps:
+            self.finish_sweep()
+
+    def _guid_save(self, a, g):
+        gd = self.guid
+        if not gd["steps"] or len(gd["done"]) < len(gd["steps"]):
+            raise SimError(-221, "Settings conflict; cal not complete", ESR_EXE)
+        name = a.split(",")[0].strip().strip("'\"")
+        st = self.stim(gd["ch"])
+        self.csets[name] = {k: st[k] for k in ("start", "stop", "poin", "type", "cw", "bwid", "pow")}
+        st["cset"], st["corr"] = name, True
+        gd.update(steps=[], done=set())
 
     # ----------------------------------------------------------- файлы состояний
     @staticmethod

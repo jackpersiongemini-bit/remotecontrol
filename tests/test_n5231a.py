@@ -526,3 +526,37 @@ def test_cal_set_per_channel(make):
     assert actions[-1] == ("cal_delete", ["CAL_FULL"])
     assert v["cal.set"] == "" and v["cal.state"] is False
     assert not rec.comm
+
+
+def test_guided_calibration(make):
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
+    v = rec.values
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    drv.run_action("cal_conns")
+    assert actions[-1][1] == ["APC 3.5 female", "APC 3.5 male", "Type N (50) female", "Type N (50) male"]
+    drv.run_action("cal_kits", "APC 3.5 female")
+    assert actions[-1][1][0] == "Ideal 3.5mm"                  # идеальный набор - первым
+    with pytest.raises(ValueError):
+        drv.run_custom_action("cal_measure", (1,))             # калибровка не начата
+    drv.run_action("cal_start", ("APC 3.5 female", "Ideal 3.5mm", "Type N (50) male", "Ideal Type N"))
+    steps, done = actions[-1][1]
+    assert len(steps) == 7 and steps[0] == "Connect APC 3.5 female OPEN to port 1" and done == []
+    assert "THRU" in steps[-1] and not drv._armed               # развёртки стоят
+    with pytest.raises(ValueError):
+        drv.run_custom_action("cal_save", ("MYCAL",))           # не все стандарты
+    for k in range(1, 8):
+        drv.run_action("cal_measure", k)
+        assert v["cal.busy"] is True
+        drv.poll()
+        assert v["cal.busy"] is False
+    drv.run_action("cal_status")
+    assert actions[-1][1] == (steps, list(range(1, 8)))
+    drv.run_action("cal_save", "MYCAL")
+    assert "MYCAL" in actions[-1][1] and sim.c["cset"] == "MYCAL" and sim.c["corr"]
+    assert v["cal.set"] == "MYCAL" and v["cal.state"] is True and drv._armed      # развёртки снова идут
+    # ECal на одном порту: один шаг; прервать
+    drv.run_action("cal_start", ("APC 3.5 male", "N4691-60004 ECal", "", ""))
+    assert actions[-1][1][0] == ["Connect ECal module to port 1"]
+    drv.run_action("cal_abort")
+    assert drv._cal is None and drv._armed and not rec.comm

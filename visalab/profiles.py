@@ -307,6 +307,7 @@ NETWORK_ANALYZER = Profile(
         Slot("cal.set", S, doc="cal set канала stim.channel (пусто - нет); запись применяет cal set к каналу"),
         Slot("cal.stim", B, doc="применять cal set вместе с его стимулом (частоты, точки, полоса, мощность)"),
         Slot("cal.interp", B, doc="интерполяция калибровки при стимуле, отличном от cal set"),
+        Slot("cal.busy", B, readonly=True, doc="калибровка: идёт измерение стандарта (cal_measure)"),
         Slot("marker.state", B),
         Slot("marker.freq", F, "Hz"),
         Slot("marker.value", F, "", readonly=True, doc="значение трассы в маркере, единицы - как у трассы"),
@@ -346,6 +347,14 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("state_delete", doc="удалить состояние из памяти прибора: аргумент - имя"),
         ActionSlot("cal_list", doc="имена cal set'ов в памяти прибора -> action_done('cal_list', [имя, ...])"),
         ActionSlot("cal_delete", doc="удалить cal set из памяти прибора: аргумент - имя -> новый список"),
+        ActionSlot("cal_conns", doc="разъёмы для калибровки -> action_done('cal_conns', [имя, ...])"),
+        ActionSlot("cal_kits", doc="аргумент - разъём -> action_done('cal_kits', [набор, ...]), идеальные первыми"),
+        ActionSlot("cal_start", doc="аргументы (разъём 1, набор 1, разъём 2, набор 2; пусто - порт не нужен): "
+                                    "калибровка канала stim.channel -> (шаги, измеренные)"),
+        ActionSlot("cal_measure", doc="аргумент - номер шага: измерить стандарт (cal.busy до конца)"),
+        ActionSlot("cal_status", doc="-> action_done('cal_status', ([описание шага, ...], [измеренные шаги]))"),
+        ActionSlot("cal_save", doc="аргумент - имя: сохранить калибровку в cal set и применить -> список cal set"),
+        ActionSlot("cal_abort", doc="прервать калибровку (развёртки продолжаются)"),
         ActionSlot("reset"),
     ),
 )
