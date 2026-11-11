@@ -26,7 +26,9 @@
 (комплексная). По умолчанию слоты занимают измерения канала 1 по порядку каталога, включён
 только m1. Таблица измерений для окна: ``meas_table`` -> [(канал, имя, S-параметр, формат, математика)];
 ``meas_config`` (канал, имя, что, значение) - S-параметр / формат / математика любого измерения;
-``meas_create`` (канал, S-параметр) - новое измерение в окне канала, ``meas_delete`` (канал, имя);
+``meas_create`` (канал, S-параметр) - новое измерение в окне канала, ``meas_delete`` (канал, имя),
+``meas_move`` (канал, имя, новый канал) - пересоздать измерение в другом канале (S-параметр и формат
+сохраняются, память и математика - нет; слот, который его читал, переходит на новое);
 все три возвращают новую таблицу. Действия: ``meas_catalog`` (каталог всех каналов), ``meas_all`` (занять слоты первыми
 измерениями всех каналов и включить), ``meas_none``. Легаси-ключи ``trace`` / ``sparam`` /
 ``format`` и маркер - первое измерение канала 1 (``trace`` = m1.trace).
@@ -199,7 +201,7 @@ class KeysightPNA(VISAInstrument):
                 Action("meas_catalog", "Каталог измерений"), Action("meas_all", "Читать все измерения"),
                 Action("meas_none", "Не читать измерения"),
                 Action("meas_table", "Таблица измерений"), Action("meas_config", "Настроить измерение"),
-                Action("meas_create", "Создать измерение"),
+                Action("meas_create", "Создать измерение"), Action("meas_move", "Перенести измерение в канал"),
                 Action("meas_delete", "Удалить измерение", confirm="Удалить измерение с прибора?"),
                 Action("mem_store", "Данные в память"),
                 Action("state_list", "Состояния в памяти"), Action("state_save", "Сохранить состояние"),
@@ -461,7 +463,7 @@ class KeysightPNA(VISAInstrument):
             return None
         if name == "meas_table":
             return self._meas_table()
-        if name in ("meas_config", "meas_create", "meas_delete"):
+        if name in ("meas_config", "meas_create", "meas_delete", "meas_move"):
             was_armed = self._armed
             self._abort()
             try:
@@ -590,5 +592,24 @@ class KeysightPNA(VISAInstrument):
         for slot in self._slots:
             if slot.channel == c and slot.name == name:
                 slot.name, slot.enabled = "", False
+        if c == 1 and name == self.meas_name:
+            self.meas_name = next(iter(self._catalog(1)), "")
+
+    def _meas_move(self, channel, name, new_channel) -> None:
+        c, name, nc = int(channel), str(name), int(new_channel)
+        cat = self._catalog(c)
+        if name not in cat:
+            raise ValueError(f"нет измерения {name!r} на канале {c}")
+        if nc == c:
+            return
+        self.write(f"CALC{c}:PAR:SEL '{name}'")
+        fmt = self.query(f"CALC{c}:FORM?").strip()
+        new = self._meas_create(nc, cat[name])
+        self.write(f"CALC{nc}:PAR:SEL '{new}'")
+        self.write(f"CALC{nc}:FORM {fmt}")
+        self.write(f"CALC{c}:PAR:DEL '{name}'")
+        for slot in self._slots:
+            if slot.channel == c and slot.name == name:
+                slot.channel, slot.name = nc, new
         if c == 1 and name == self.meas_name:
             self.meas_name = next(iter(self._catalog(1)), "")
