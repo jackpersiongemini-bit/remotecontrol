@@ -167,3 +167,16 @@ def test_trace_chips_fill_width_and_selected_has_no_indicator(qtbot, vna):
     assert first.isChecked() and te.is_read(1, "CH1_S11_1") and not first.indicated()   # выбран - без индикатора
     te.chips.buttons()[1].click()
     assert first.indicated()                                   # не выбран и читается - индикатор
+
+
+def test_plus_minus_at_right_edge(qtbot, vna):
+    proxy, win, _s, _sim = vna
+    win.show()
+    win.set_expanded(True)
+    for page in (0, 3):                                        # TRAC и SAVE
+        win.set_page(page)
+        qtbot.wait(50)
+        tools = win._trc_tools if page == 0 else win.add_button.parentWidget()
+        line = tools.parentWidget()
+        assert line.width() - tools.geometry().right() <= 2
+        assert tools.width() <= 40
