@@ -3,9 +3,10 @@
     python run_main.py                 # все приборы из lab.json (адреса из ini окон, иначе lab.json)
     python run_main.py --sim           # все на симуляторах; генератор подаёт сигнал на SA и ваттметр
     python run_main.py --only pna,e4446a,u2021xa,e8267d
-    python run_main.py --show-windows  # сразу показать и окна приборов (иначе - по клику на плитку)
+    python run_main.py --hide-windows  # окна приборов скрыты, открываются кликом по плитке
 
-Плитка прибора: класс и состояние, индикатор - прибор измеряет или выход включён; клик - окно прибора.
+Открываются главное окно и окна всех приборов. Плитка прибора: класс и состояние, индикатор - прибор
+измеряет или выход включён; клик - поднять окно прибора.
 Панели ниже - приёмники, которые сейчас измеряют (ВАЦ - трейсы, ваттметр - точки, анализатор - спектр).
 """
 from __future__ import annotations
@@ -57,14 +58,14 @@ def setup(opened, args, settings):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", default="", help="записи lab.json через запятую")
-    ap.add_argument("--show-windows", action="store_true", help="показать и окна приборов")
+    ap.add_argument("--hide-windows", action="store_true", help="окна приборов скрыты (открываются по плитке)")
     known = ap.parse_known_args(argv)[0]
     keys = [k.strip() for k in known.only.split(",") if k.strip()] or list(WINDOWS)
     unknown = [k for k in keys if k not in WINDOWS]
     if unknown:
         ap.error(f"неизвестные приборы: {', '.join(unknown)} (есть: {', '.join(WINDOWS)})")
     specs = [(WINDOWS[k], k) for k in keys]
-    return run_windows(specs, __doc__, argv, parser=ap, show=known.show_windows, setup=setup)
+    return run_windows(specs, __doc__, argv, parser=ap, show=not known.hide_windows, setup=setup)
 
 
 if __name__ == "__main__":
