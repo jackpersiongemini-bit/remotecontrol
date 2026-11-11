@@ -47,15 +47,19 @@ def test_layout(qtbot, vna):
 
 def test_power_preset_mode(qtbot, vna):
     proxy, win, settings, sim = vna
-    spin = win.power_spin
+    spin, pl = win.power_spin, win.power_levels
+    assert [ln.name for ln in win.pages[5].lines] == ["POW", "RF", "PRST"]
+    assert [b.text() for b in pl.chips.buttons()] == ["-20", "-10", "-5", "0"]
+    pl.chips.buttons()[2].click()                              # чип -5 -> мощность
+    _wait(qtbot, lambda: sim.c["pow"] == pytest.approx(-5.0) and pl.chips.checked_index() == 2)
+    assert pl.remove_selected() and spin.levels == [-20.0, -10.0, 0.0]      # «−» - выбранный
+    spin.set_value(5.0)
+    _wait(qtbot, lambda: proxy.value("source.power") == pytest.approx(5.0))
+    assert pl.add_current() and not pl.add_current()           # «+» - текущая, без повторов
+    assert spin.levels == [-20.0, -10.0, 0.0, 5.0] and pl.chips.checked_index() == 3
+    assert settings.value(f"{win._prefix}/POWER_LIST") == "-20, -10, 0, 5"
     spin.set_value(-7.0)
-    _wait(qtbot, lambda: proxy.value("source.power") == pytest.approx(-7.0))
-    win.levels_edit.setText("0; -10, 5 -20 x")
-    win._levels_edited()                                       # мусор - список не меняется
-    assert spin.levels == [-20.0, -10.0, -5.0, 0.0]
-    win.levels_edit.setText("0; -10, 5 -20")
-    win._levels_edited()
-    assert spin.levels == [-20.0, -10.0, 0.0, 5.0] and win.levels_edit.text() == "-20, -10, 0, 5"
+    _wait(qtbot, lambda: proxy.value("source.power") == pytest.approx(-7.0) and pl.chips.checked_index() == -1)
     win.prst_button.setChecked(True)
     assert settings.value(f"{win._prefix}/POWER_PRESET_MODE", type=bool) is True
     spin.stepBy(1)                                             # -7 -> ближайший уровень выше: 0
@@ -180,7 +184,7 @@ def test_plus_minus_at_right_edge(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    for page, tools, width in ((0, win._trc_tools, 40), (6, win._cal_tools, 40),
+    for page, tools, width in ((0, win._trc_tools, 40), (5, win._pwr_tools, 40), (6, win._cal_tools, 40),
                                 (7, win.add_button.parentWidget(), 40)):   # TRC, CAL и SAVE
         win.set_page(page)
         qtbot.wait(50)

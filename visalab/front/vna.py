@@ -15,8 +15,8 @@
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
 SCAL (масштаб выбранного трейса), MARK (маркеры выбранного трейса: чипы 1..10, STAT, X, Y, MAX / MIN,
-OFF всех), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, список
-пресетов мощности), CAL (cal set'ы прибора чипами: клик применяет к каналу выбранного трейса, NONE снимает;
+OFF всех), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, пресеты
+мощности чипами: клик ставит, «+» текущая, «−» выбранная), CAL (cal set'ы прибора чипами: клик применяет к каналу выбранного трейса, NONE снимает;
 стимул из cal set или свой, CORR, интерполяция; CALIBRATE открывает отдельное окно калибровки), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
 Окно знает только InstrumentProxy и ключи профиля network_analyzer.
@@ -117,6 +117,65 @@ class PowerSpin(PSpinBox):
             target = below[-min(-steps, len(below))] if below else self.levels[0]
         self.show_value(target, force=True)
         self.set_value(target)
+
+
+class PowerLevels(QWidget):
+    """Пресеты мощности (вкладка PWR): чипы уровней по возрастанию, клик ставит мощность; выбран чип,
+    равный текущей мощности. «+» добавляет текущую мощность, «−» удаляет выбранный. Список - для PRST."""
+
+    COLUMNS = 4
+
+    def __init__(self, proxy: InstrumentProxy, spin: PowerSpin, on_change, parent=None):
+        super().__init__(parent)
+        self.proxy, self.spin, self.on_change = proxy, spin, on_change
+        self.chips = PBGroup(columns=self.COLUMNS)
+        self.chips.selected.connect(self._clicked)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.chips)
+        proxy.subscribe("source.power", lambda _v: self._show())
+        self.set_levels(spin.levels)
+
+    @property
+    def levels(self) -> list[float]:
+        return list(self.spin.levels)
+
+    def set_levels(self, levels) -> None:
+        levels = sorted({round(float(v), 3) for v in levels})
+        self.spin.levels = levels
+        while self.chips.buttons():
+            self.chips.remove_button(0)
+        for v in levels:
+            b = self.chips.add_button(f"{v:g}")
+            b.setToolTip(f"Set the source power to {v:g} dBm")
+        self._show()
+
+    def _show(self) -> None:
+        cur = self.proxy.value("source.power")
+        i = next((k for k, v in enumerate(self.spin.levels)
+                  if isinstance(cur, (int, float)) and abs(v - cur) < 1e-6), -1)
+        self.chips.set_checked(i)
+
+    def _clicked(self, index: int) -> None:
+        if 0 <= index < len(self.spin.levels):
+            self.proxy.set("source.power", self.spin.levels[index])
+        self._show()
+
+    def add_current(self) -> bool:
+        cur = self.proxy.value("source.power")
+        if not isinstance(cur, (int, float)) or any(abs(v - cur) < 1e-6 for v in self.spin.levels):
+            return False
+        self.set_levels([*self.spin.levels, cur])
+        self.on_change()
+        return True
+
+    def remove_selected(self) -> bool:
+        i = self.chips.checked_index()
+        if i < 0 or len(self.spin.levels) <= 1:              # хотя бы один уровень остаётся
+            return False
+        self.set_levels([v for k, v in enumerate(self.spin.levels) if k != i])
+        self.on_change()
+        return True
 
 
 class MathButton(IndicatorButton):
@@ -946,6 +1005,7 @@ class VNAWindow(InstrumentWindow):
         super().__init__(proxy, settings, title, parent)
         # столбики «+»/«−» (TRC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
         for tools in (getattr(self, "_trc_tools", None), getattr(self, "_cal_tools", None),
+                      getattr(self, "_pwr_tools", None),
                       getattr(self, "add_button", None) and self.add_button.parentWidget()):
             if tools is not None:
                 tools.setMinimumWidth(0)
@@ -1048,13 +1108,19 @@ class VNAWindow(InstrumentWindow):
             self.page_specs.append(("TRIG", (), PanelTable(*trig)))
 
         # PWR
-        self.levels_edit = QLineEdit(", ".join(f"{v:g}" for v in self.power_spin.levels))
-        self.levels_edit.setToolTip("Power presets, dBm, separated by commas: the PRST mode steps through them")
-        self.levels_edit.editingFinished.connect(self._levels_edited)
+        pl = self.power_levels = PowerLevels(proxy, self.power_spin, self._save_levels)
+        tools = self._pwr_tools = QWidget()
+        tl = QVBoxLayout(tools)                       # «+» над «−», как у пресетов
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(PRESET_GAP)
+        half = (_iw.PRESET_HEIGHT - PRESET_GAP) // 2
+        tl.addWidget(self._tool("+", "Add the current power to the presets", pl.add_current, half))
+        tl.addWidget(self._tool("−", "Remove the selected power preset", pl.remove_selected, half))
+        tl.addStretch(1)
         pwr = [PanelLine("POW", _auto(proxy, "source.power"))]
         if sup("rf.output"):
             pwr.append(PanelLine("RF", PSButton(proxy, "rf.output", ONOFF)))
-        pwr.append(PanelLine("LIST", self.levels_edit))
+        pwr.append(PanelLine("PRST", pl, tools))
         self.page_specs.append(("PWR", ("rf.output",) if sup("rf.output") else (), PanelTable(*pwr)))
 
         # CAL: калибровка канала выбранного трейса - cal set из памяти прибора
@@ -1359,15 +1425,8 @@ class VNAWindow(InstrumentWindow):
         except ValueError:
             return list(DEFAULT_POWER_LIST)
 
-    def _levels_edited(self) -> None:
-        try:
-            levels = parse_power_list(self.levels_edit.text())
-        except ValueError:
-            levels = []
-        if levels:
-            self.power_spin.levels = levels
-            self.settings.setValue(f"{self._prefix}/POWER_LIST", ", ".join(f"{v:g}" for v in levels))
-        self.levels_edit.setText(", ".join(f"{v:g}" for v in self.power_spin.levels))
+    def _save_levels(self) -> None:
+        self.settings.setValue(f"{self._prefix}/POWER_LIST", ", ".join(f"{v:g}" for v in self.power_spin.levels))
 
     def _set_preset_mode(self, on: bool) -> None:
         self.power_spin.preset_mode = bool(on)
