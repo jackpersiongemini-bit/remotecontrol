@@ -17,7 +17,7 @@
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
 SCAL (масштаб выбранного трейса), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, список
 пресетов мощности), CAL (cal set'ы прибора чипами: клик применяет к каналу выбранного трейса, NONE снимает;
-стимул из cal set или свой, CORR, интерполяция), SAVE (состояния в памяти прибора: чип -
+стимул из cal set или свой, CORR, интерполяция; CALIBRATE открывает отдельное окно калибровки), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
 Окно знает только InstrumentProxy и ключи профиля network_analyzer.
 """
@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QPoint, QSettings, QSize, Qt, QTimer
+from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QFileDialog, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.export import write_traces_csv
@@ -37,10 +37,11 @@ from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
 from . import instrument_window as _iw
 from .instrument_window import PRESET_GAP, HScrollArea, InstrumentWindow, PresetGroup
-from .params import IndicatorButton, PBGroup, PLineEdit, PSButton, PSpinBox, PanelLine, PanelTable
+from .params import IndicatorButton, PBGroup, PLineEdit, PSButton, PSpinBox, Panel, PanelLine, PanelTable
 from .power_meter import CONFIRM_MS, ActionButton
 from .spectrum import StatePresets
-from .theme import UI_COLUMN_WIDTH_PX
+from .theme import UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
+from .window import Window
 
 __all__ = ["VNAWindow", "PowerSpin", "MathButton", "CWButton", "TraceEditor", "MenuButton", "parse_power_list",
            "saved_connection"]
@@ -52,6 +53,7 @@ SLOTS = 16
 MATH = (("DATA", "NORM"), ("D/M", "DIV"), ("D−M", "SUBT"), ("D+M", "ADD"), ("D·M", "MULT"))
 TRACE_CHIP_HEIGHT = 44            # чипы трейсов в избранном: две строки (формат / канал·S-параметр)
 DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
+CAL_WINDOW_WIDTH = 440            # окно калибровки: полные названия наборов и шагов
 
 #: вкладка STIM: (подпись, ключ, второй ключ или None)
 STIM_ROWS = (("STAR", "freq.start", None), ("STOP", "freq.stop", None), ("CENT", "freq.center", None),
@@ -744,6 +746,79 @@ class CalWizard(QWidget):
             line.setVisible(running)
 
 
+class _CalOpenButton(IndicatorButton):
+    """CALIBRATE: открыть окно калибровки; индикатор - калибровка идёт."""
+
+    def __init__(self, wizard: "CalWizard"):
+        super().__init__("CALIBRATE")
+        self.wizard = wizard
+        self.setObjectName("choice")
+        self.setToolTip("Open the calibration window for the channel of the selected trace")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        wizard.proxy.action_done.connect(lambda *_a: self.update())
+
+    def indicated(self) -> bool:
+        return bool(self.wizard.steps)
+
+
+class CalWindow(Window):
+    """Отдельное окно калибровки (guided) канала выбранного трейса: P1 / P2, START / ABORT, шаги, NAME + SAVE.
+    Закрытие окна посреди калибровки её прерывает (развёртки продолжаются)."""
+
+    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+        super().__init__(settings, parent)
+        self.proxy = proxy
+        wz = self.wizard = CalWizard(proxy, settings, prefix)
+        wz.run_lines = [PanelLine("STEP", wz.steps_box), PanelLine("NAME", wz.name_edit, wz.save_button)]
+        self.table = PanelTable(PanelLine("P1", wz.conn_buttons[1], wz.kit_buttons[1]),
+                                PanelLine("P2", wz.conn_buttons[2], wz.kit_buttons[2]),
+                                PanelLine("RUN", wz.start_button, wz.abort_button), *wz.run_lines)
+        panel = Panel(self.table)
+        self.table.build(UI_COLUMN_WIDTH_PX)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
+        self._outer.addWidget(panel)
+        self.setMinimumWidth(max(self.titleBar.sizeHint().width(), self._outer.minimumSize().width()))
+        self.recall_size(QSize(max(self.minimumWidth(), CAL_WINDOW_WIDTH), 0))
+        wz.relayout = self.fit_height
+        proxy.subscribe("stim.channel", lambda _v: self._title())
+        self._title()
+        wz._show()
+        self.fit_height()
+
+    def _title(self) -> None:
+        self.setWindowTitle(f"CAL CH{self.proxy.value('stim.channel') or 1}")
+
+    def fit_height(self, again: bool = True) -> None:
+        """Высота - по содержимому (шаги появились / исчезли); раскладки пересчитываются не сразу."""
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
+        for w in self.findChildren(QWidget):
+            if w.layout() is not None:
+                w.layout().invalidate()
+        self._outer.invalidate()
+        self._outer.activate()
+        self.setFixedHeight(self._outer.sizeHint().height())
+        if again:
+            QTimer.singleShot(0, self._fit_again)
+
+    def _fit_again(self) -> None:
+        self.fit_height(False)
+
+    def open(self) -> None:
+        self.wizard.refresh()
+        self._title()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.fit_height()
+
+    def closeEvent(self, event):  # noqa: N802 - Qt
+        if self.wizard.steps and self.proxy.is_connected:
+            self.proxy.action("cal_abort")
+        super().closeEvent(event)
+
+
 class VNAWindow(InstrumentWindow):
     CONNECTION_GROUP = CONNECTION_GROUP
     DEFAULT_KIND = "pna"
@@ -895,14 +970,12 @@ class VNAWindow(InstrumentWindow):
                     w.setToolTip(tip)
                     self.widgets.setdefault(key, w)
                     cal.append(PanelLine(name, w))
-            if "cal_start" in proxy.actions:          # сама калибровка канала (guided)
-                wz = self.cal_wizard = CalWizard(proxy, self.settings, pre)
-                wz.run_lines = [PanelLine("STEP", wz.steps_box), PanelLine("NAME", wz.name_edit, wz.save_button)]
-                cal += [PanelLine("P1", wz.conn_buttons[1], wz.kit_buttons[1]),
-                        PanelLine("P2", wz.conn_buttons[2], wz.kit_buttons[2]),
-                        PanelLine("RUN", wz.start_button, wz.abort_button), *wz.run_lines]
-                wz._show()
-                wz.relayout = self._fit_height
+            if "cal_start" in proxy.actions:          # сама калибровка - в отдельном окне
+                self.cal_window = CalWindow(proxy, self.settings, pre)
+                self.cal_wizard = self.cal_window.wizard
+                b = self.cal_button = _CalOpenButton(self.cal_wizard)
+                b.clicked.connect(self.open_cal_window)
+                cal.append(PanelLine("NEW", b))
             cs.relayout = self._fit_height
             self.page_specs.append(("CAL", ("cal.state",), PanelTable(*cal)))
 
@@ -971,6 +1044,17 @@ class VNAWindow(InstrumentWindow):
                      PanelLine("DATA", self.data_button)]
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
+
+    def open_cal_window(self) -> None:
+        w = self.cal_window
+        if not w.isVisible():
+            w.move(self.pos() + QPoint(self.width() + 8, 0))
+        w.open()
+
+    def closeEvent(self, event):  # noqa: N802 - Qt
+        if getattr(self, "cal_window", None) is not None:
+            self.cal_window.close()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------ папка состояний на анализаторе
     _dirs_asked = False

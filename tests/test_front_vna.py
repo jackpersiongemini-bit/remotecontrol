@@ -322,7 +322,7 @@ def test_cal_tab_cal_sets(qtbot, vna):
     proxy, win, _s, sim = vna
     cs, te = win.cal_sets, win.trace_editor
     _wait(qtbot, lambda: [b.text() for b in cs.chips.buttons()] == ["NONE", "CAL_1-3G", "CAL_FULL"])
-    assert [ln.name for ln in win.pages[5].lines] == ["CSET", "STIM", "CORR", "INT", "P1", "P2", "RUN", "STEP", "NAME"]
+    assert [ln.name for ln in win.pages[5].lines] == ["CSET", "STIM", "CORR", "INT", "NEW"]
     assert cs.chips.checked_index() == 0                       # у канала 1 калибровки нет
     cs.chips.buttons()[1].click()                              # cal set со стимулом
     _wait(qtbot, lambda: sim.c["cset"] == "CAL_1-3G" and proxy.value("cal.set") == "CAL_1-3G")
@@ -348,10 +348,14 @@ def test_cal_tab_cal_sets(qtbot, vna):
 
 def test_cal_tab_guided_calibration(qtbot, vna):
     proxy, win, settings, sim = vna
-    wz = win.cal_wizard
+    wz, cw = win.cal_wizard, win.cal_window
     win.show()
     win.set_expanded(True)
     win.set_page(5)
+    assert not cw.isVisible()
+    win.cal_button.click()                                     # отдельное окно калибровки
+    assert cw.isVisible() and cw.windowTitle() == "CAL CH1"
+    assert [ln.name for ln in cw.table.lines] == ["P1", "P2", "RUN", "STEP", "NAME"]
     _wait(qtbot, lambda: wz.kit(1) == "Ideal 3.5mm" and wz.kit(2) == "Ideal 3.5mm")   # идеальный - по умолчанию
     assert wz.conn_buttons[1].text() == "3.5 F" and not wz.run_lines[0].isVisible()
     wz.set_conn(2, "Type N (50) male")
@@ -359,7 +363,9 @@ def test_cal_tab_guided_calibration(qtbot, vna):
     assert settings.value(f"{win._prefix}/CAL_P2_CONN") == "Type N (50) male"
     wz.start_button.click()
     _wait(qtbot, lambda: len(wz.step_buttons()) == 7)
-    assert wz.run_lines[0].isVisible() and not wz.save_button.isEnabled() and not wz.start_button.isEnabled()
+    qtbot.wait(50)
+    h = cw.height()
+    assert win.cal_button.indicated() and wz.run_lines[0].isVisible() and not wz.save_button.isEnabled() and not wz.start_button.isEnabled()
     assert wz.step_buttons()[0].text() == "1. 3.5 F OPEN to P1"
     for k in range(7):
         _wait(qtbot, lambda: wz.step_buttons()[k].isEnabled())
@@ -375,6 +381,7 @@ def test_cal_tab_guided_calibration(qtbot, vna):
     wz.set_conn(2, wz.OFF)                                     # однопортовая, прервать
     assert not wz.kit_buttons[2].isVisible()
     wz.start_button.click()
-    _wait(qtbot, lambda: len(wz.step_buttons()) == 3)
-    wz.abort_button.click()
+    _wait(qtbot, lambda: len(wz.step_buttons()) == 3 and cw.height() < h)   # окно - по шагам
+    cw.close()                                                 # закрыть посреди калибровки - прервать
     _wait(qtbot, lambda: not wz.steps and proxy.value("meas.armed") is True)
+    assert not win.cal_button.indicated()
