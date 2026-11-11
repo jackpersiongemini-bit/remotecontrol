@@ -16,7 +16,7 @@
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
 SCAL (масштаб выбранного трейса), MARK (маркеры выбранного трейса: чипы 1..10, STAT, X, Y, MAX / MIN,
-OFF всех, список), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, список
+OFF всех), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, список
 пресетов мощности), CAL (cal set'ы прибора чипами: клик применяет к каналу выбранного трейса, NONE снимает;
 стимул из cal set или свой, CORR, интерполяция; CALIBRATE открывает отдельное окно калибровки), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
@@ -490,8 +490,8 @@ class _MarkChip(IndicatorButton):
 
 
 class MarkerPanel(QWidget):
-    """Маркеры выбранного трейса (``trace.sel``): чипы 1..10 (выбор ``mark.n``, индикатор - включён),
-    значение выбранного и список всех включённых (перечитывается после каждой развёртки)."""
+    """Маркеры выбранного трейса (``trace.sel``): чипы 1..10 (выбор ``mark.n``, индикатор - включён) и
+    значение выбранного (``mark.y`` перечитывается после каждой развёртки)."""
 
     MARKS = 10
 
@@ -512,15 +512,10 @@ class MarkerPanel(QWidget):
         self.value = QLabel("")
         self.value.setObjectName("lineName")
         self.value.setToolTip("Value of the selected marker on the selected trace")
-        self.list = QLabel("")
-        self.list.setObjectName("lineName")
-        self.list.setToolTip("All markers of the selected trace")
-        self.relayout = None                               # окно: подогнать высоту, когда строк в списке стало больше
         proxy.subscribe("mark.n", lambda _v: self._show())
         proxy.subscribe("mark.y", lambda _v: self._show())
         for key in ("trace.sel", "mark.state", "mark.x"):
             proxy.subscribe(key, lambda _v: self.refresh())
-        proxy.subscribe("meas.armed", lambda v: v is False and self.table and self.refresh())
         proxy.action_done.connect(self._on_action)
         self._show()
 
@@ -549,11 +544,7 @@ class MarkerPanel(QWidget):
             b.update()
         on = self.proxy.value("mark.state") is True
         self.value.setText(self.text(self.proxy.value("mark.x"), self.proxy.value("mark.y")) if on else "OFF")
-        lines = self.list.text().count("\n")
-        self.list.setText("\n".join(f"M{k}  {self.text(x, y)}" for k, (x, y) in sorted(self.table.items()))
-                          or "no markers")
-        if self.list.text().count("\n") != lines and self.relayout is not None:
-            self.relayout()
+
 
 
 class CalSets(QWidget):
@@ -1161,8 +1152,6 @@ class VNAWindow(InstrumentWindow):
                 mark.append(PanelLine("SRCH", *search))
             if "mark_aoff" in proxy.actions:
                 mark.append(PanelLine("ALL", ActionButton(proxy, "mark_aoff", "OFF", "All markers of the trace off")))
-            mark.append(PanelLine("LIST", mp.list))
-            mp.relayout = self._fit_height
             pos = next((i + 1 for i, (n, *_r) in enumerate(self.page_specs) if n == "SCAL"), len(self.page_specs))
             self.page_specs.insert(pos, ("MARK", ("mark.state",), PanelTable(*mark)))
 
