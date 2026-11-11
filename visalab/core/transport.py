@@ -18,7 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-__all__ = ["TransportError", "TransportTimeout", "Transport", "PyVisaTransport", "SimTransport",
+__all__ = ["TransportError", "TransportTimeout", "TransportNotSupported", "Transport", "PyVisaTransport", "SimTransport",
            "parse_float_block", "float_block"]
 
 
@@ -28,6 +28,10 @@ class TransportError(Exception):
 
 class TransportTimeout(TransportError):
     """Прибор не ответил за отведённое время."""
+
+
+class TransportNotSupported(TransportError):
+    """Интерфейс не умеет эту операцию VISA (VI_ERROR_NSUP_OPER: serial poll, device clear...)."""
 
 
 def float_block(values) -> str:
@@ -140,12 +144,14 @@ class PyVisaTransport(Transport):
         )
 
     def close(self) -> None:
-        for obj in (self._res, self._rm):
-            if obj is not None:
-                try:
-                    obj.close()
-                except Exception as exc:  # закрытие не должно ронять поток
-                    log.debug("close %s: %s", self.address, exc)
+        """Закрыть только свой ресурс. ResourceManager у pyvisa ОДИН на процесс (на библиотеку VISA):
+        закрыть его - оборвать сессии всех остальных приборов («session ... does not support this
+        operation» / «invalid session»)."""
+        if self._res is not None:
+            try:
+                self._res.close()
+            except Exception as exc:  # закрытие не должно ронять поток
+                log.debug("close %s: %s", self.address, exc)
         self._res = None
         self._rm = None
 
@@ -162,6 +168,8 @@ class PyVisaTransport(Transport):
         except pyvisa.errors.VisaIOError as exc:
             if exc.error_code == pyvisa.constants.StatusCode.error_timeout:
                 raise TransportTimeout(f"{self.address}: таймаут") from exc
+            if exc.error_code == pyvisa.constants.StatusCode.error_nonsupported_operation:
+                raise TransportNotSupported(f"{self.address}: {exc}") from exc
             raise TransportError(f"{self.address}: {exc}") from exc
         except (pyvisa.Error, OSError) as exc:
             raise TransportError(f"{self.address}: {exc}") from exc

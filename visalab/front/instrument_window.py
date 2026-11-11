@@ -18,12 +18,14 @@ import re
 import time
 from typing import Any, Callable
 
-from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
                              QSizePolicy, QVBoxLayout, QWidget)
 
 from ..core.params import ConnectionState, PStatus
+from ..coord.registry import LINKS, ProxyLinks
 from ..core.proxy import InstrumentProxy
+from ..core.scpi import si_format, si_parse
 from ..drivers import DRIVERS
 from .models import ModelWindow, all_models, model_class
 from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
@@ -31,7 +33,7 @@ from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
                      Window, short_address)
 
-__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "parse_power_list",
+__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay", "parse_power_list",
            "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "LINKS", "ProxyLinks"]
 
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
@@ -48,45 +50,20 @@ def parse_power_list(text: str) -> list[float]:
     return sorted(out)
 
 
-class ProxyLinks(QObject):
-    """Прокси открытых в этом процессе окон: окно может брать значения другого прибора
-    (ваттметр - скважность у ГСС) по имени профиля, не зная драйвера."""
-
-    changed = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self._proxies: list[InstrumentProxy] = []
-
-    def add(self, proxy: InstrumentProxy) -> None:
-        if proxy not in self._proxies:
-            self._proxies.append(proxy)
-            self.changed.emit()
-
-    def remove(self, proxy: InstrumentProxy) -> None:
-        if proxy in self._proxies:
-            self._proxies.remove(proxy)
-            try:
-                self.changed.emit()
-            except RuntimeError:                 # выход из программы: реестр уже удалён
-                pass
-
-    def find(self, profile: str) -> InstrumentProxy | None:
-        """Последний открытый прибор с этим профилем (``function_generator``...)."""
-        for proxy in reversed(self._proxies):
-            prof = getattr(getattr(proxy, "driver_cls", None), "PROFILE", None)
-            if prof is not None and prof.name == profile:
-                return proxy
-        return None
-
-
-#: общий для процесса реестр приборов окон
-LINKS = ProxyLinks()
 
 
 def saved_connection(settings: QSettings, group: str) -> dict[str, str]:
     """Сохранённые в окне драйвер / адрес / модель (пустые строки - не задано)."""
     return {k: str(settings.value(f"{group}/{k.upper()}", "") or "") for k in ("driver", "address", "model")}
+
+
+def saved_delay(settings: QSettings, group: str) -> float | None:
+    """Сохранённая на странице адреса пауза между командами, с (None - не задана: как у драйвера)."""
+    v = settings.value(f"{group}/DELAY", "")
+    try:
+        return None if v in (None, "") else max(0.0, float(v))
+    except (TypeError, ValueError):
+        return None
 
 
 def _same(a, b) -> bool:
@@ -703,11 +680,20 @@ class InstrumentWindow(Window):
         self.address_edit.setPlaceholderText("192.168.0.5 / USB0::... / sim")
         self.address_edit.setToolTip("VISA address: IP, IP:port, full VISA string, or sim")
         self.address_edit.returnPressed.connect(self.apply_connection)
+        self.delay_edit = QLineEdit()
+        self.delay_edit.setObjectName("cfg")
+        self.delay_edit.setPlaceholderText("driver default")
+        self.delay_edit.setToolTip("Pause between commands to the instrument (e.g. 50m = 50 ms); "
+                                   "Enter applies at once, empty = driver default")
+        self.delay_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._show_delay()
+        self.delay_edit.returnPressed.connect(self.apply_delay)
         self.apply_button = self._tool("APPLY", "Save and reconnect with these settings", self.apply_connection)
         self.apply_button.setProperty("wide", True)
         table = PanelTable(PanelLine("DRV", self.driver_choice),
                            PanelLine("MDL", self.model_choice, self.new_model_button),
-                           PanelLine("ADDR", self.address_edit), PanelLine("", self.apply_button))
+                           PanelLine("ADDR", self.address_edit), PanelLine("DLY", self.delay_edit),
+                           PanelLine("", self.apply_button))
         table.lines[-1].line_layout.insertStretch(1)
         table.hide()
         return table
@@ -730,7 +716,29 @@ class InstrumentWindow(Window):
         """Клик по адресу: вместо таблицы - драйвер / модель / адрес (выход - вкладка или APPLY)."""
         self._show_overlay("connection")
 
+    def _show_delay(self) -> None:
+        saved = saved_delay(self.settings, self.CONNECTION_GROUP)
+        self.delay_edit.setText("" if saved is None else si_format(saved, "s", 4))
+
+    def apply_delay(self) -> bool:
+        """DLY: сохранить в ini и сразу применить к прибору. False - не число (поле возвращается)."""
+        text = self.delay_edit.text().strip()
+        if not text:
+            self.settings.remove(f"{self.CONNECTION_GROUP}/DELAY")
+            self.proxy.set_command_delay(getattr(self.proxy.driver_cls, "COMMAND_DELAY_S", 0.0))
+            return True
+        try:
+            value = max(0.0, si_parse(text, "s"))
+        except ValueError:
+            self._show_delay()
+            return False
+        self.settings.setValue(f"{self.CONNECTION_GROUP}/DELAY", value)
+        self.proxy.set_command_delay(value)
+        self._show_delay()
+        return True
+
     def apply_connection(self) -> None:
+        self.apply_delay()
         driver = self.driver_choice.value or self._driver_kind()
         address = self.address_edit.text().strip() or "sim"
         model = self.model_choice.value or ""

@@ -72,3 +72,36 @@ def test_lan_address_shortcut():
     assert normalize_address("192.168.0.3:5025") == "TCPIP0::192.168.0.3::5025::SOCKET"
     assert normalize_address("USB0::0xF4EC::0x1102::X::INSTR") == "USB0::0xF4EC::0x1102::X::INSTR"
     assert make_transport("sdg", "192.168.0.3").address == "TCPIP0::192.168.0.3::INSTR"
+
+
+def test_pyvisa_transport_close_keeps_shared_resource_manager(monkeypatch):
+    """ResourceManager pyvisa общий на процесс: закрытие одного прибора не должно рвать остальные."""
+    import pyvisa
+    from visalab.core import PyVisaTransport
+
+    class Res:
+        interface_type = None
+        resource_class = "INSTR"
+        closed = False
+        timeout = 0
+
+        def close(self):
+            self.closed = True
+
+    class RM:
+        closed = False
+
+        def open_resource(self, address, **kw):
+            return Res()
+
+        def close(self):
+            RM.closed = True
+
+    shared = RM()
+    monkeypatch.setattr(pyvisa, "ResourceManager", lambda backend="": shared)
+    a, b = PyVisaTransport("TCPIP0::1.1.1.1::INSTR"), PyVisaTransport("TCPIP0::1.1.1.2::INSTR")
+    a.open()
+    b.open()
+    res_b = b._res
+    a.close()
+    assert not RM.closed and not res_b.closed and b.is_open

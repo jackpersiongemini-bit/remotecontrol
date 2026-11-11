@@ -40,7 +40,7 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 from .params import Action, ConnectionState, Param, PStatus
 from .profile import Profile
 from .scpi import parse_number, strip_response_header
-from .transport import Transport, TransportError, TransportTimeout
+from .transport import Transport, TransportError, TransportNotSupported, TransportTimeout
 
 log = logging.getLogger(__name__)
 
@@ -532,7 +532,11 @@ class VISAInstrument(QObject):
 
     def _read_status_byte(self) -> int:
         if self.transport.supports_serial_poll:
-            return self.transport.read_stb()
+            try:
+                return self.transport.read_stb()
+            except TransportNotSupported:          # VI_ERROR_NSUP_OPER: дальше статус через *STB?
+                log.warning("%s: serial poll не поддерживается, статус через *STB?", self.transport.address)
+                self.transport.supports_serial_poll = False
         return self.query_int("*STB?")
 
     @pyqtSlot()
