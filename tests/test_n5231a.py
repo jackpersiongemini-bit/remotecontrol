@@ -200,3 +200,61 @@ def test_slot_errors_and_deleted_measurement(make):
     assert setp(drv, rec, "meas.complex", False) is PStatus.WRITTEN
     drv.poll()
     assert rec.values["m1.sdata"] is None and rec.values["m1.trace"] is not None
+
+
+def test_memory_and_math(make):
+    sim = KeysightPNASim()
+    sim.meas["USER_S21"] = _meas("S21")
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    drv.run_action("meas_all")
+    assert setp(drv, rec, "m2.math", "DIV") is not PStatus.WRITTEN      # памяти ещё нет - прибор отказал
+    assert rec.values["m2.math"] == "NORM" and "math" not in sim.meas["USER_S21"]
+    drv.run_action("mem_store")                                         # все включённые слоты
+    assert actions[-1] == ("mem_store", [1, 2]) and sim.meas["USER_S21"]["mem"] is not None
+    assert setp(drv, rec, "m2.math", "DIV") is PStatus.WRITTEN and sim.meas["USER_S21"]["math"] == "DIV"
+    drv.poll()
+    t = rec.values["m2.trace"]
+    assert max(abs(v) for v in t.y) < 1e-6 and t.meta["math"] == "DIV"   # данные / та же память = 0 dB
+    assert rec.values["m1.trace"].meta["math"] == "NORM"
+    assert rec.values["m2.sdata"].meta["math"] == "NORM" and abs(rec.values["m2.sdata"].complex_y()[100]) < 1
+    sim.dut["il_db"] = 3.0                                              # DUT изменился: видно отличие от памяти
+    drv.poll()
+    assert rec.values["m2.trace"].y[100] == pytest.approx(-2.0, abs=0.01)
+    assert setp(drv, rec, "m2.math", "NORM") is PStatus.WRITTEN
+    drv.run_action("mem_store", 1)
+    assert actions[-1] == ("mem_store", [1])
+    drv.run_action("mem_store", 5)                                      # не назначен - отказ, в прибор не ушло
+    assert len(rec.comm) == 1 and "m5" in rec.comm[0] and actions[-1] == ("mem_store", [1])
+
+
+def test_state_save_recall(make):
+    sim = KeysightPNASim()
+    sim.meas["USER_S21"] = _meas("S21")
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    drv.run_action("state_list")
+    assert actions[-1] == ("state_list", [])
+    assert setp(drv, rec, "freq.start", 1.5e9) is PStatus.WRITTEN
+    drv.run_action("state_save", "filt_a")
+    assert 'MMEM:STOR "filt_a.csa"' in sim.history and rec.values["meas.armed"] is True
+    sim.files["notes.txt"] = ()
+    drv.run_action("state_list")
+    assert actions[-1] == ("state_list", ["filt_a"])                    # только имена состояний
+    # на приборе всё поменяли: другое измерение, другая частота
+    assert setp(drv, rec, "freq.start", 1e9) is PStatus.WRITTEN
+    del sim.meas["USER_S21"]
+    sim.meas["OTHER"] = _meas("S12")
+    drv.run_action("state_recall", "filt_a")
+    assert rec.values["freq.start"] == pytest.approx(1.5e9)
+    assert rec.values["m2.name"] == "USER_S21" and rec.values["m1.enabled"] and not rec.values["m2.enabled"]
+    drv.poll()
+    assert rec.values["m1.trace"].x[0] == pytest.approx(1.5e9) and not rec.errors and not rec.comm
+    drv.run_action("state_recall", "bad name")                          # недопустимое имя в прибор не уходит
+    assert "bad name" not in " ".join(sim.history)
+    drv.run_action("state_recall", "nope")
+    assert any("state_recall" in m for _, m in rec.errors)              # нет файла - ошибка прибора
+    drv.run_action("state_delete", "filt_a")
+    assert "filt_a.csa" not in sim.files

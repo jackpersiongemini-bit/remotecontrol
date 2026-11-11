@@ -8,6 +8,7 @@ DUT: резонатор с центральной частотой ``f0``, на�
 from __future__ import annotations
 
 import cmath
+import copy
 import math
 
 from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
@@ -34,6 +35,8 @@ class KeysightPNASim(SimInstrument):
         self.sweeping = False
         self.opc_pending = False
         self.sweeps_done = 0
+        if not hasattr(self, "files"):
+            self.files: dict[str, tuple] = {}            # "имя.csa" -> состояние (переживает *RST)
         if not hasattr(self, "dut"):
             self.dut = {"f0": 2e9, "q": 20.0, "il_db": 1.0}
             self.hold_sweeps = False
@@ -75,6 +78,11 @@ class KeysightPNASim(SimInstrument):
         m = self.meas[name]
         fs = self.freqs(m["ch"])
         vals = [self.s(m["s"], f) for f in fs]
+        mem, fn = m.get("mem"), m.get("math", "NORM")
+        if fn != "NORM" and mem is not None and len(mem) == len(vals):
+            op = {"DIV": lambda d, p: d / p if p else 0j, "SUBT": lambda d, p: d - p,
+                  "ADD": lambda d, p: d + p, "MULT": lambda d, p: d * p}[fn]
+            vals = [op(d, p) for d, p in zip(vals, mem)]
         fmt = m["fmt"]
         if fmt == "MLOG":
             return [20 * math.log10(max(abs(v), 1e-15)) for v in vals]
@@ -141,6 +149,12 @@ class KeysightPNASim(SimInstrument):
         self.on("DISPlay:WINDow#:TRACe#:FEED", lambda a, g: None)
         self.on("CALCulate#:FORMat", self._fmt_set, lambda a, g: self._cur(g)["fmt"])
         self.on("CALCulate#:DATA", get=self._data)
+        self.on("CALCulate#:MATH:MEMorize", self._memorize)
+        self.on("CALCulate#:MATH:FUNCtion", self._math_set, lambda a, g: self._cur(g).get("math", "NORM"))
+        self.on("MMEMory:STORe[:FILE]", self._st_store)
+        self.on("MMEMory:LOAD[:FILE]", self._st_load)
+        self.on("MMEMory:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.files)) + '"')
+        self.on("MMEMory:DELete", self._file_del)
         self.on("CALCulate#:MARKer#:FUNCtion:EXECute", self._mk_exec)
         self.on("CALCulate#:MARKer#:X", self._mk_x, lambda a, g: f"{self.marker['x']:+.11E}")
         self.on("CALCulate#:MARKer#:Y", get=self._mk_y)
@@ -310,3 +324,46 @@ class KeysightPNASim(SimInstrument):
         pick = max if a.strip().upper().startswith("MAX") else min
         i = pick(range(len(data)), key=data.__getitem__)
         self.marker.update(on=True, x=fs[i])
+
+    # ------------------------------------------------------- память, математика
+    def _memorize(self, a, g):
+        m = self._cur(g)
+        m["mem"] = [self.s(m["s"], f) for f in self.freqs(m["ch"])]
+
+    def _math_set(self, a, g):
+        t = a.strip().upper()
+        fn = {"NORM": "NORM", "NORMAL": "NORM", "DIV": "DIV", "DIVIDE": "DIV", "SUBT": "SUBT",
+              "SUBTRACT": "SUBT", "ADD": "ADD", "MULT": "MULT", "MULTIPLY": "MULT"}.get(t)
+        if fn is None:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        m = self._cur(g)
+        if fn != "NORM" and m.get("mem") is None:
+            raise SimError(-221, "Settings conflict; no memory trace", ESR_EXE)
+        m["math"] = fn
+
+    # ----------------------------------------------------------- файлы состояний
+    @staticmethod
+    def _file(a) -> str:
+        name = a.strip().strip("'\"")
+        if not name.lower().endswith((".csa", ".cst", ".sta", ".cal")):
+            raise SimError(-256, "File name not found", ESR_EXE)
+        return name
+
+    def _st_store(self, a, g):
+        self.files[self._file(a)] = copy.deepcopy((self.c, self.meas, self.other, self.marker))
+
+    def _st_load(self, a, g):
+        name = self._file(a)
+        if name not in self.files:
+            raise SimError(-256, "File name not found", ESR_EXE)
+        c, self.meas, self.other, self.marker = copy.deepcopy(self.files[name])
+        c["form"] = self.c["form"]
+        self.c = c
+        self.selected, self.sel_other = "", {}
+        self.sweeping = False
+
+    def _file_del(self, a, g):
+        name = self._file(a)
+        if name not in self.files:
+            raise SimError(-256, "File name not found", ESR_EXE)
+        del self.files[name]
