@@ -18,7 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-__all__ = ["TransportError", "TransportTimeout", "Transport", "PyVisaTransport", "SimTransport",
+__all__ = ["TransportError", "TransportTimeout", "TransportNotSupported", "Transport", "PyVisaTransport", "SimTransport",
            "parse_float_block", "float_block"]
 
 
@@ -28,6 +28,10 @@ class TransportError(Exception):
 
 class TransportTimeout(TransportError):
     """Прибор не ответил за отведённое время."""
+
+
+class TransportNotSupported(TransportError):
+    """Интерфейс не умеет эту операцию VISA (VI_ERROR_NSUP_OPER: serial poll, device clear...)."""
 
 
 def float_block(values) -> str:
@@ -162,6 +166,8 @@ class PyVisaTransport(Transport):
         except pyvisa.errors.VisaIOError as exc:
             if exc.error_code == pyvisa.constants.StatusCode.error_timeout:
                 raise TransportTimeout(f"{self.address}: таймаут") from exc
+            if exc.error_code == pyvisa.constants.StatusCode.error_nonsupported_operation:
+                raise TransportNotSupported(f"{self.address}: {exc}") from exc
             raise TransportError(f"{self.address}: {exc}") from exc
         except (pyvisa.Error, OSError) as exc:
             raise TransportError(f"{self.address}: {exc}") from exc
