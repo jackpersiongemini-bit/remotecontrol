@@ -225,17 +225,17 @@ class MenuButton(IndicatorButton):
 
 class _ChannelChip(QPushButton):
     def __init__(self, channel: int):
-        super().__init__(f"C{channel}")
+        super().__init__(str(channel))
         self.channel = channel
         self.setObjectName("chip")
         self.setCheckable(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"STIM settings of channel {channel}")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setToolTip(f"Channel {channel}: POW / CW / CORR and the STIM tab")
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-    def sizeHint(self):  # noqa: N802 - Qt; высота - как у обычной строки (QSS чипа иначе перебивает)
-        return QSize(super().sizeHint().width(), CHANNEL_CHIP_HEIGHT)
+    def sizeHint(self):  # noqa: N802 - Qt; квадрат высотой с обычную строку (QSS чипа иначе перебивает)
+        return QSize(CHANNEL_CHIP_HEIGHT, CHANNEL_CHIP_HEIGHT)
 
     def minimumSizeHint(self):  # noqa: N802 - Qt
         return self.sizeHint()
@@ -248,7 +248,7 @@ class StimChannels(PBGroup):
     def __init__(self, proxy: InstrumentProxy, parent=None):
         self.proxy = proxy
         super().__init__(parent=parent)
-        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.channels: list[int] = []
         self.scroll = HScrollArea(self, CHANNEL_CHIP_HEIGHT)
         self.selected.connect(lambda i: proxy.set("stim.channel", self.channels[i]))
