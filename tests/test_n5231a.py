@@ -124,6 +124,7 @@ def test_all_measurements_formatted_and_complex(make):
     sim.meas["USER_S21"] = _meas("S21", "PHAS")
     sim.meas["USER_S12"] = _meas("S12", "MLIN")
     drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert setp(drv, rec, "meas.complex", True) is PStatus.WRITTEN               # SDATA - по запросу
     for k, v in (("freq.start", 1e9), ("freq.stop", 3e9), ("sweep.points", 201)):
         assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
     drv.run_action("meas_all")
@@ -152,6 +153,7 @@ def test_other_channels(make):
     sim.stim(2).update(start=2e9, stop=4e9, poin=51)                # у канала 2 свой стимул
     sim.meas["CH2_S11"] = _meas("S11", "PHAS", 2)
     drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert setp(drv, rec, "meas.complex", True) is PStatus.WRITTEN               # SDATA - по запросу
     actions = []
     drv.action_done.connect(lambda n, r: actions.append((n, r)))
     drv.run_action("meas_catalog")
@@ -206,6 +208,7 @@ def test_memory_and_math(make):
     sim = KeysightPNASim()
     sim.meas["USER_S21"] = _meas("S21")
     drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert setp(drv, rec, "meas.complex", True) is PStatus.WRITTEN               # SDATA - по запросу
     actions = []
     drv.action_done.connect(lambda n, r: actions.append((n, r)))
     drv.run_action("meas_all")
@@ -319,3 +322,19 @@ def test_measurement_move_to_other_channel(make):
     assert rec.values["m2.channel"] == 3 and rec.values["m2.name"] == "CH3_S21_1" and rec.values["m2.enabled"]
     drv.poll()
     assert rec.values["m2.trace"].meta["channel"] == 3 and not rec.errors and not rec.comm
+
+
+def test_complex_formats_and_sdata_off_by_default(vna):
+    drv, sim, rec = vna
+    drv.poll()
+    assert rec.values["meas.complex"] is False and rec.values["m1.sdata"] is None
+    assert not any("SDATA" in c for c in sim.history)                       # лишнего не читаем
+    for fmt in ("POLAR", "SMITH"):
+        assert setp(drv, rec, "m1.format", fmt) is PStatus.WRITTEN
+        drv.poll()
+        t = rec.values["m1.trace"]
+        assert t.is_complex and len(t.im) == len(t) == 201 and t.meta["format"] == fmt and t.y_unit == ""
+    z = t.complex_y()
+    assert abs(z[0]) == pytest.approx(1.0, abs=0.05)                         # S11 вне полосы ~ 1
+    drv.run_action("marker_peak")
+    assert not rec.errors and not rec.comm

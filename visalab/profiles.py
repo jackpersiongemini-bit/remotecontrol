@@ -241,7 +241,7 @@ SPECTRUM_ANALYZER = Profile(
 NETWORK_ANALYZER = Profile(
     "network_analyzer", "Векторный анализатор цепей",
     doc="""Трасса ``trace`` - Trace(x в Hz, y в единицах формата: MLOG - dB, PHASE/UPHASE - deg,
-    GDELAY - s, SWR/LIN_MAG/REAL/IMAG - без единиц), публикуется после каждой ЗАВЕРШЁННОЙ развёртки.
+    GDELAY - s, SWR/LIN_MAG/REAL/IMAG - без единиц; POLAR/SMITH - комплексная: Re в y, Im в Trace.im), публикуется после каждой ЗАВЕРШЁННОЙ развёртки.
     Поэтому у ключа ``trace`` единица в профиле пустая, а настоящая - в ``Trace.y_unit``.
 
     Измерения - слоты ``m1..m16``: пользователь сам выбирает, что читать. У слота: ``m{n}.channel``
@@ -267,7 +267,7 @@ NETWORK_ANALYZER = Profile(
         Slot("meas.armed", B, readonly=True),
         Slot("sparam", E, required=True, choices=("S11", "S21", "S12", "S22")),
         Slot("format", E, required=True,
-             choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")),
+             choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG", "POLAR", "SMITH")),
         Slot("freq.start", F, "Hz", required=True),
         Slot("freq.stop", F, "Hz", required=True),
         Slot("freq.center", F, "Hz"),
@@ -293,7 +293,8 @@ NETWORK_ANALYZER = Profile(
         Slot("m{n}.name", S, doc="имя измерения на приборе (пусто - слот не назначен)"),
         Slot("m{n}.enabled", B, doc="читать это измерение после каждой развёртки"),
         Slot("m{n}.sparam", E, choices=("S11", "S21", "S12", "S22")),
-        Slot("m{n}.format", E, choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")),
+        Slot("m{n}.format", E, choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG",
+                                        "POLAR", "SMITH")),
         Slot("m{n}.math", E, choices=("NORM", "DIV", "SUBT", "ADD", "MULT"),
              doc="математика с памятью: данные, Д/П, Д-П, Д+П, Д*П"),
         Slot("m{n}.trace", T, "", readonly=True, doc="трасса измерения в его формате"),

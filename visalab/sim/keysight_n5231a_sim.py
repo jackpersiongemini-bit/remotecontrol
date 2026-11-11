@@ -16,7 +16,8 @@ from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
 __all__ = ["KeysightPNASim"]
 
 _FMT = {"MLOG": "MLOG", "PHAS": "PHAS", "PHASE": "PHAS", "UPH": "UPH", "UPHASE": "UPH", "GDEL": "GDEL",
-        "GDELAY": "GDEL", "SWR": "SWR", "MLIN": "MLIN", "REAL": "REAL", "IMAG": "IMAG"}
+        "GDELAY": "GDEL", "SWR": "SWR", "MLIN": "MLIN", "REAL": "REAL", "IMAG": "IMAG", "POL": "POL", "POLAR": "POL",
+        "SMIT": "SMIT", "SMITH": "SMIT"}
 
 
 class KeysightPNASim(SimInstrument):
@@ -111,6 +112,8 @@ class KeysightPNASim(SimInstrument):
             return out
         if fmt == "SWR":
             return [(1 + min(abs(v), 0.999999)) / (1 - min(abs(v), 0.999999)) for v in vals]
+        if fmt in ("POL", "SMIT"):                       # комплексные форматы: пары re,im
+            return [x for v in vals for x in (v.real, v.imag)]
         if fmt == "REAL":
             return [v.real for v in vals]
         return [v.imag for v in vals]
@@ -325,10 +328,14 @@ class KeysightPNASim(SimInstrument):
             raise SimError(-221, "Settings conflict", ESR_EXE)
         data, fs = self.fdata(self.selected), self.freqs()
         i = min(range(len(fs)), key=lambda k: abs(fs[k] - self.marker["x"]))
+        if len(data) == 2 * len(fs):                      # комплексный формат
+            return f"{data[2 * i]:+.10E},{data[2 * i + 1]:+.10E}"
         return f"{data[i]:+.10E},+0.00000000000E+000"
 
     def _mk_exec(self, a, g):
         data, fs = self.fdata(self.selected), self.freqs()
+        if len(data) == 2 * len(fs):                      # комплексный формат - по модулю
+            data = [math.hypot(a, b) for a, b in zip(data[0::2], data[1::2])]
         pick = max if a.strip().upper().startswith("MAX") else min
         i = pick(range(len(data)), key=data.__getitem__)
         self.marker.update(on=True, x=fs[i])

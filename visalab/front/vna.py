@@ -185,7 +185,7 @@ class CWButton(IndicatorButton):
 SPARAMS = ("S11", "S21", "S12", "S22")
 #: формат профиля -> короткая подпись
 FORMATS = (("MLOG", "MLOG"), ("PHAS", "PHASE"), ("UPH", "UPHASE"), ("GDEL", "GDELAY"), ("SWR", "SWR"),
-           ("MLIN", "LIN_MAG"), ("REAL", "REAL"), ("IMAG", "IMAG"))
+           ("MLIN", "LIN_MAG"), ("REAL", "REAL"), ("IMAG", "IMAG"), ("POL", "POLAR"), ("SMIT", "SMITH"))
 
 
 class MenuButton(IndicatorButton):
@@ -526,8 +526,6 @@ class VNAWindow(InstrumentWindow):
                      if a in proxy.actions]
             if quick:
                 trac.append(PanelLine("SET", *quick))
-            if sup("meas.complex"):
-                trac.append(PanelLine("CPLX", PSButton(proxy, "meas.complex", ONOFF)))
             self.page_specs.insert(0, ("TRAC", (), PanelTable(*trac)))
 
         # SAVE: чипы состояний в памяти прибора
