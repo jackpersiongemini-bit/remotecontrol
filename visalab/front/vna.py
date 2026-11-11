@@ -418,17 +418,15 @@ class TraceEditor(QWidget):
     def _show_current(self) -> None:
         gen = self.proxy.value("gen.state") is True
         cur_ch = self.proxy.value("stim.channel")
-        pairs = [(c, sp) for c, _n, sp, *_ in self.table]
         for b, (c, n, sp, fmt, math) in zip(self.chips.buttons(), self.table):
-            label = f"{c}·{sp}"
-            if pairs.count((c, sp)) > 1:                   # одинаковые S-параметры канала - различить форматом
-                label += " " + next((n for n, d in FORMATS if d == fmt), fmt)
-            b.setText(label)
+            b.setText(f"{c}·{sp} {next((n for n, d in FORMATS if d == fmt), fmt)}")
             b.setToolTip(f"Channel {c}, measurement {n!r}\n{sp} {fmt} {math}")
             b.setEnabled(not gen or c == cur_ch)
             b.update()
         keys = [(c, n) for c, n, *_ in self.table]
         self.chips.set_checked(keys.index(self.current) if self.current in keys else -1)
+        if self.current in keys:                           # выбранный трейс - в видимой части строки
+            self.scroll.ensureWidgetVisible(self.chips.buttons()[keys.index(self.current)], 0, 0)
         row = self.row()
         for w in self.editors:
             w.setEnabled(row is not None)
