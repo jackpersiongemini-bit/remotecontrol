@@ -10,7 +10,8 @@
   возвращает прежний тип; рядом частота CW;
 * CORR - коррекция (калибровка) ON / OFF.
 
-Вкладка STIM - настройки одного канала: сверху чипы каналов (как пресеты, без «+»/«−»).
+Первая строка избранного CH - чипы каналов (как пресеты, без «+»/«−»): текущий канал окна, к нему
+относятся POW, CW, CORR и вкладка STIM.
 Вкладки: TRAC (сверху чипы всех трейсов прибора, как пресеты: клик выбирает, + создаёт трейс S21 на
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
@@ -504,6 +505,9 @@ class VNAWindow(InstrumentWindow):
         proxy, sup, pre = self.proxy, self.proxy.supports, self._prefix
         self.widgets: dict[str, Any] = {}
         top = []
+        if sup("stim.channel"):                       # текущий канал окна: POW / CW / CORR и вкладка STIM
+            self.stim_channels = StimChannels(proxy)
+            top.append(PanelLine("CH", self.stim_channels.scroll))
         if "mem_store" in proxy.actions:
             top.append(PanelLine("MEM", ActionButton(proxy, "mem_store", "DATA→MEM",
                                                      "Copy data to memory for every measurement being read")))
@@ -539,11 +543,8 @@ class VNAWindow(InstrumentWindow):
         self.top_lines = top
         self.saved_widgets += [self.power_spin, *(w for k, w in self.widgets.items() if k not in NOT_SAVED)]
 
-        # STIM: настройки канала, выбранного в CH
+        # STIM: настройки канала, выбранного в избранном (CH)
         lines = []
-        if sup("stim.channel"):
-            self.stim_channels = StimChannels(proxy)
-            lines.append(PanelLine("CH", self.stim_channels.scroll))
         for name, key, extra in STIM_ROWS:
             if not sup(key):
                 continue

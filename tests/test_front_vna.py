@@ -37,7 +37,7 @@ def _wait(qtbot, cond):
 
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
-    assert [ln.name for ln in win.preset_panel.table.lines] == ["MEM", "MATH", "POW", "CW", "CORR"]
+    assert [ln.name for ln in win.preset_panel.table.lines] == ["CH", "MEM", "MATH", "POW", "CW", "CORR"]
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "PWR", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
