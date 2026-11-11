@@ -506,14 +506,13 @@ class VNAWindow(InstrumentWindow):
         if sup("m1.math"):
             self.math_button = MathButton(proxy)
             top.append(PanelLine("MATH", self.math_button))
-        if sup("m1.trace"):                           # читаемые трейсы последней развёртки -> CSV на ПК
+        if sup("m1.trace"):                           # читаемые трейсы последней развёртки -> CSV на ПК (вкладка SAVE)
             b = self.data_button = QPushButton("SAVE")
             b.setObjectName("choice")
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setToolTip("Save every trace being read (last sweep) to a CSV file; folder and name - SAVE tab")
             b.clicked.connect(self.save_data)
-            top.append(PanelLine("DATA", b))
         self.power_spin = PowerSpin(proxy, "source.power")
         self.power_spin.levels = self._load_levels()
         pow_ws: list[QWidget] = [self.power_spin]
@@ -649,7 +648,8 @@ class VNAWindow(InstrumentWindow):
             self.name_edit.setToolTip("Prefix of the file name; date and time are added: <prefix>_YYYYMMDD_HHMMSS.csv")
             self.name_edit.editingFinished.connect(
                 lambda: self.settings.setValue(f"{pre}/DATA_NAME", self.name_edit.text().strip()))
-            save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit)]
+            save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit),
+                     PanelLine("DATA", self.data_button)]
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
 
