@@ -43,7 +43,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..core.instrument import VISAInstrument
@@ -74,6 +74,9 @@ PNA_MODELS = {
 
 Y_UNITS = {"MLOG": "dB", "PHASE": "deg", "UPHASE": "deg", "GDELAY": "s"}
 FREQ_KEYS = ("freq.start", "freq.stop", "freq.center", "freq.span")
+#: ключи стимула: относятся к каналу ``stim.channel`` (в SCPI ``SENS1:`` / ``SOUR1:`` -> номер канала)
+STIM_KEYS = (*FREQ_KEYS, "freq.cw", "sweep.type", "sweep.points", "sweep.time", "sweep.time_auto", "bw.if",
+             "avg.state", "avg.count", "cal.state", "source.power")
 MEAS_NAME = "VL_MEAS"
 MEAS_SLOTS = 16                  # слотов выбора измерений (m1..m16)
 FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG", "POLAR", "SMITH")
@@ -113,6 +116,7 @@ class KeysightPNA(VISAInstrument):
         self._slots = [_Slot() for _ in range(MEAS_SLOTS)]
         self._armed_channels: list[int] = [1]
         self.meas_name = ""
+        self._stim_ch = 1
         super().__init__(transport, parent, command_delay_s)
 
     @property
@@ -148,6 +152,8 @@ class KeysightPNA(VISAInstrument):
         return per_meas + [
             Param("trace", "Трасса", Kind.TRACE, "", section="Трасса/Трасса", group="SWEEP"),
             Param("meas.count", "Измерений", I, section=rs, group="SWEEP"),
+            Param("stim.channel", "Канал стимула", I, section=st, query="<virtual>", write="<virtual>",
+                  minimum=1, maximum=200, also_read=STIM_KEYS),
             Param("meas.complex", "Комплексные данные", B, section=rs, query="<virtual>", write="<virtual>"),
             Param("meas.armed", "Идёт развёртка", B, section=sw, query="<virtual>"),
             Param("meas.continuous", "Непрерывно", B, section=sw, query="<virtual>", write="<virtual>"),
@@ -216,6 +222,7 @@ class KeysightPNA(VISAInstrument):
     # --------------------------------------------------------------- хуки
     def on_connected(self) -> None:
         self._armed = False
+        self._stim_ch = 1
         self._sweep = {}
         self.write("FORM:DATA ASCII,0")
         cat = self._catalog()
@@ -272,6 +279,13 @@ class KeysightPNA(VISAInstrument):
         if spec.key == "meas.complex":
             self._complex = bool(value)
             return
+        if spec.key == "stim.channel":
+            c = int(value)
+            if c not in self._channels():
+                raise ValueError(f"нет канала {c} (каналы: {self._channels()})")
+            self._stim_ch = c
+            return
+        spec = self._stim_spec(spec)
         was_armed = self._armed
         self._abort()
         try:
@@ -315,6 +329,10 @@ class KeysightPNA(VISAInstrument):
             return self._armed
         if key == "meas.complex":
             return self._complex
+        if key == "stim.channel":
+            return self._stim_ch
+        if key in STIM_KEYS:
+            return super().read_param_raw(self._stim_spec(spec))
         if key == "sparam":
             return self._catalog().get(self.meas_name)
         found = self._slot_of(key)
@@ -368,14 +386,23 @@ class KeysightPNA(VISAInstrument):
                 self.write(f"SENS{c}:SWE:MODE HOLD")
             self._set_armed(False)
 
+    def _stim_spec(self, spec: Param) -> Param:
+        """Ключ стимула -> команды для канала ``stim.channel``."""
+        if spec.key not in STIM_KEYS or self._stim_ch == 1:
+            return spec
+        c = self._stim_ch
+        sub = lambda t: t and t.replace("SENS1:", f"SENS{c}:").replace("SOUR1:", f"SOUR{c}:")
+        return replace(spec, query=sub(spec.query), write=sub(spec.write))
+
     def _stimulus(self, channel: int) -> tuple[float, float, str]:
         """Ось X трасс канала: (начало, конец, единица). CW - время развёртки."""
-        typ = self._values.get("sweep.type") if channel == 1 else None
+        cached = channel == self._stim_ch                       # ключи стимула показывают этот канал
+        typ = self._values.get("sweep.type") if cached else None
         if typ is None:
             typ = self.query(f"SENS{channel}:SWE:TYPE?").strip().upper()
         if typ == "CW":
             return 0.0, self.query_float(f"SENS{channel}:SWE:TIME?"), "s"
-        if channel == 1 and self._values.get("freq.start") is not None and self._values.get("freq.stop") is not None:
+        if cached and self._values.get("freq.start") is not None and self._values.get("freq.stop") is not None:
             return self._values["freq.start"], self._values["freq.stop"], "Hz"
         return self.query_float(f"SENS{channel}:FREQ:STAR?"), self.query_float(f"SENS{channel}:FREQ:STOP?"), "Hz"
 
@@ -400,7 +427,7 @@ class KeysightPNA(VISAInstrument):
             fmt = self._params[f"m{n}.format"].from_scpi(self.query(f"CALC{c}:FORM?"))
             math = self._params[f"m{n}.math"].from_scpi(self.query(f"CALC{c}:MATH:FUNC?"))
             y = [parse_number(t) for t in self.query(f"CALC{c}:DATA? FDATA").split(",") if t.strip()]
-            meta = {**stim, "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
+            meta = {**(stim if c == self._stim_ch else {}), "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
             if fmt in COMPLEX_FORMATS:                         # пары re,im
                 out[f"m{n}.trace"] = Trace.linear(start, stop, y[0::2], im=y[1::2], x_unit=x_unit, y_unit="",
                                                   name=sparam, meta=meta)

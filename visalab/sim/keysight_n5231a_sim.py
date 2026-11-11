@@ -45,9 +45,10 @@ class KeysightPNASim(SimInstrument):
         self._auto_time()
 
     # ------------------------------------------------------------ физика
-    def _auto_time(self) -> None:
-        if self.c["swt_auto"]:
-            self.c["swt"] = self.c["poin"] / self.c["bwid"] * 1.2
+    def _auto_time(self, st: dict | None = None) -> None:
+        st = self.c if st is None else st
+        if st["swt_auto"]:
+            st["swt"] = st["poin"] / st["bwid"] * 1.2
 
     def s(self, name: str, f: float) -> complex:
         d = self.dut
@@ -61,7 +62,12 @@ class KeysightPNASim(SimInstrument):
         """Стимул канала: канал 1 - ``self.c``, остальные создаются при первом обращении."""
         if ch == 1:
             return self.c
-        return self.other.setdefault(ch, {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9})
+        if ch not in self.other:
+            st = {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9, "bwid": 35e3, "pow": -5.0,
+                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False}
+            self._auto_time(st)
+            self.other[ch] = st
+        return self.other[ch]
 
     def freqs(self, ch: int = 1) -> list[float]:
         st = self.stim(ch)
@@ -177,14 +183,14 @@ class KeysightPNASim(SimInstrument):
         self.on("SENSe#:FREQuency:CW", self._cw_set, self._gs("cw"))
         self.on("SENSe#:FREQuency:FIXed", self._cw_set, self._gs("cw"))
         self.on("SENSe#:SWEep:TIME:AUTO", self._b("swt_auto"), self._gb("swt_auto"))
-        self.on("SENSe#:SWEep:TIME", self._n("swt", 0, 86400, auto="swt_auto"), self._g(lambda: self.c["swt"]))
+        self.on("SENSe#:SWEep:TIME", self._n("swt", 0, 86400, auto="swt_auto"), self._gs("swt"))
         self.on("SENSe#:SWEep:MODE", self._mode_set, lambda a, g: self.c["mode"])
-        self.on("SENSe#:BWIDth[:RESolution]", self._bwid_set, self._g(lambda: self.c["bwid"]))
-        self.on("SENSe#:AVERage:COUNt", self._n("coun", 1, 65536, integer=True), lambda a, g: str(self.c["coun"]))
+        self.on("SENSe#:BWIDth[:RESolution]", self._bwid_set, self._gs("bwid"))
+        self.on("SENSe#:AVERage:COUNt", self._n("coun", 1, 65536, integer=True), lambda a, g: str(self.stim(self._ch(g))["coun"]))
         self.on("SENSe#:AVERage[:STATe]", self._b("aver"), self._gb("aver"))
         self.on("SENSe#:CORRection[:STATe]", self._b("corr"), self._gb("corr"))
         self.on("SOURce#:POWer#[:LEVel][:IMMediate][:AMPLitude]", self._n("pow", -90, 20),
-                self._g(lambda: self.c["pow"]))
+                self._gs("pow"))
         self.on("OUTPut[:STATe]", self._b("outp"), self._gb("outp"))
         self.on("ABORt", lambda a, g: setattr(self, "sweeping", False))
 
@@ -208,29 +214,31 @@ class KeysightPNASim(SimInstrument):
         return lambda a, g: f"{fn():+.11E}"
 
     def _gb(self, k):
-        return lambda a, g: "1" if self.c[k] else "0"
+        return lambda a, g: "1" if self.stim(self._ch(g))[k] else "0"
 
     def _b(self, k):
         def fn(a, g):
-            self.c[k] = self.boolean(a)
-            self._auto_time()
+            st = self.stim(self._ch(g))
+            st[k] = self.boolean(a)
+            self._auto_time(st)
         return fn
 
     def _n(self, k, lo, hi, integer=False, auto=None):
         def fn(a, g):
             v = self.num(a, lo, hi)
-            target = self.stim(self._ch(g)) if k == "poin" else self.c
+            target = self.stim(self._ch(g))
             target[k] = int(round(v)) if integer else v
             if auto:
-                self.c[auto] = False
-            self._auto_time()
+                target[auto] = False
+            self._auto_time(target)
         return fn
 
     def _bwid_set(self, a, g):
         v = self.num(a, 1, 15e6)
         steps = [10 ** e * m for e in range(0, 8) for m in (1, 1.5, 2, 3, 5, 7)]
-        self.c["bwid"] = min(steps, key=lambda s: abs(s - v))    # прибор округляет к ряду
-        self._auto_time()
+        st = self.stim(self._ch(g))
+        st["bwid"] = min(steps, key=lambda s: abs(s - v))        # прибор округляет к ряду
+        self._auto_time(st)
 
     def _f(self, which):
         def fn(a, g):
