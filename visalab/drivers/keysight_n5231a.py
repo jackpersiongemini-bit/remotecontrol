@@ -24,7 +24,10 @@
 включённые слоты, и только каналы, которые им нужны. После каждой завершённой развёртки для
 каждого включённого слота публикуются ``m{n}.trace`` (в формате измерения) и ``m{n}.sdata``
 (комплексная). По умолчанию слоты занимают измерения канала 1 по порядку каталога, включён
-только m1. Действия: ``meas_catalog`` (каталог всех каналов), ``meas_all`` (занять слоты первыми
+только m1. Таблица измерений для окна: ``meas_table`` -> [(канал, имя, S-параметр, формат, математика)];
+``meas_config`` (канал, имя, что, значение) - S-параметр / формат / математика любого измерения;
+``meas_create`` (канал, S-параметр) - новое измерение в окне канала, ``meas_delete`` (канал, имя);
+все три возвращают новую таблицу. Действия: ``meas_catalog`` (каталог всех каналов), ``meas_all`` (занять слоты первыми
 измерениями всех каналов и включить), ``meas_none``. Легаси-ключи ``trace`` / ``sparam`` /
 ``format`` и маркер - первое измерение канала 1 (``trace`` = m1.trace).
 Память и математика - у каждого слота: ``m{n}.math``, действие ``mem_store`` (аргументы - номера
@@ -195,6 +198,9 @@ class KeysightPNA(VISAInstrument):
                 Action("marker_peak", "Маркер на максимум"), Action("marker_min", "Маркер на минимум"),
                 Action("meas_catalog", "Каталог измерений"), Action("meas_all", "Читать все измерения"),
                 Action("meas_none", "Не читать измерения"),
+                Action("meas_table", "Таблица измерений"), Action("meas_config", "Настроить измерение"),
+                Action("meas_create", "Создать измерение"),
+                Action("meas_delete", "Удалить измерение", confirm="Удалить измерение с прибора?"),
                 Action("mem_store", "Данные в память"),
                 Action("state_list", "Состояния в памяти"), Action("state_save", "Сохранить состояние"),
                 Action("state_recall", "Вызвать состояние"),
@@ -453,6 +459,19 @@ class KeysightPNA(VISAInstrument):
             self.write(f"CALC1:MARK1:FUNC:EXEC {'MAX' if name == 'marker_peak' else 'MIN'}")
             self._read_keys(["marker.state", "marker.freq", "marker.value"])
             return None
+        if name == "meas_table":
+            return self._meas_table()
+        if name in ("meas_config", "meas_create", "meas_delete"):
+            was_armed = self._armed
+            self._abort()
+            try:
+                getattr(self, f"_{name}")(*args)
+                self._check_errors(context=name)
+                self._read_keys([f"m{n}.{w}" for n in range(1, MEAS_SLOTS + 1) for w in SLOT_KEYS])
+            finally:
+                if was_armed or self._continuous:
+                    self._start_sweep()
+            return self._meas_table()
         if name == "mem_store":
             return self._mem_store(args)
         if name == "state_list":
@@ -519,3 +538,57 @@ class KeysightPNA(VISAInstrument):
         self._sync_all()                                         # перечитать всё; непрерывная - запустится
         if was_armed and not self._armed:
             self._start_sweep()
+
+    # ------------------------------------------------- таблица измерений (окно)
+    def _meas_table(self) -> list[tuple[int, str, str, str, str]]:
+        fmt, math = self._params["m1.format"], self._params["m1.math"]
+        out = []
+        for c in self._channels():
+            for name, sparam in self._catalog(c).items():
+                self.write(f"CALC{c}:PAR:SEL '{name}'")
+                out.append((c, name, sparam, fmt.from_scpi(self.query(f"CALC{c}:FORM?")),
+                            math.from_scpi(self.query(f"CALC{c}:MATH:FUNC?"))))
+        return out
+
+    def _meas_config(self, channel, name, what, value) -> None:
+        c, name, what = int(channel), str(name), str(what)
+        if name not in self._catalog(c):
+            raise ValueError(f"нет измерения {name!r} на канале {c}")
+        if what not in ("sparam", "format", "math"):
+            raise ValueError(f"meas_config: sparam / format / math, получено {what!r}")
+        spec = self._params[f"m1.{what}"]
+        value = spec.validate(value)
+        self.write(f"CALC{c}:PAR:SEL '{name}'")
+        if what == "sparam":
+            self.write(f"CALC{c}:PAR:MOD:EXT '{spec.to_scpi(value)}'")
+        else:
+            self.write(f"CALC{c}:{'FORM' if what == 'format' else 'MATH:FUNC'} {spec.to_scpi(value)}")
+
+    def _meas_create(self, channel, sparam) -> str:
+        c = int(channel)
+        if not 1 <= c <= 200:
+            raise ValueError(f"канал 1..200, получено {c}")
+        sparam = self._params["m1.sparam"].validate(str(sparam).upper())
+        names = set(self._catalog(c))
+        k = 1
+        while f"CH{c}_{sparam}_{k}" in names:
+            k += 1
+        name = f"CH{c}_{sparam}_{k}"
+        self.write(f"CALC{c}:PAR:DEF:EXT '{name}','{sparam}'")
+        # окно с номером канала; трейс - следующий свободный номер в нём
+        if self.query(f"DISP:WIND{c}:STAT?").strip() not in ("1", "ON"):
+            self.write(f"DISP:WIND{c}:STAT ON")
+        used = [int(t) for t in re.findall(r"\d+", self.query(f"DISP:WIND{c}:CAT?"))]
+        self.write(f"DISP:WIND{c}:TRAC{max(used, default=0) + 1}:FEED '{name}'")
+        return name
+
+    def _meas_delete(self, channel, name) -> None:
+        c, name = int(channel), str(name)
+        if name not in self._catalog(c):
+            raise ValueError(f"нет измерения {name!r} на канале {c}")
+        self.write(f"CALC{c}:PAR:DEL '{name}'")
+        for slot in self._slots:
+            if slot.channel == c and slot.name == name:
+                slot.name, slot.enabled = "", False
+        if c == 1 and name == self.meas_name:
+            self.meas_name = next(iter(self._catalog(1)), "")

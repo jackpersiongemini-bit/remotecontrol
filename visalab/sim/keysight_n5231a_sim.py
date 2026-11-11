@@ -32,6 +32,7 @@ class KeysightPNASim(SimInstrument):
         self.sel_other: dict[int, str] = {}              # то же у остальных каналов
         self.other: dict[int, dict] = {}                 # стимул каналов 2...
         self.marker = {"on": False, "x": 1e9}
+        self.windows: dict[int, dict[int, str]] = {1: {1: "CH1_S11_1"}}     # окно -> {номер трейса: измерение}
         self.sweeping = False
         self.opc_pending = False
         self.sweeps_done = 0
@@ -147,8 +148,10 @@ class KeysightPNASim(SimInstrument):
         self.on("CALCulate#:PARameter:SELect", self._sel, lambda a, g: f'"{self._selected(self._ch(g))}"')
         self.on("CALCulate#:PARameter:DEFine:EXTended", self._define)
         self.on("CALCulate#:PARameter:MODify:EXTended", self._modify)
-        self.on("DISPlay:WINDow#:STATe", lambda a, g: None)
-        self.on("DISPlay:WINDow#:TRACe#:FEED", lambda a, g: None)
+        self.on("CALCulate#:PARameter:DELete", self._delete)
+        self.on("DISPlay:WINDow#:STATe", self._win_state, lambda a, g: "1" if int(g[0]) in self.windows else "0")
+        self.on("DISPlay:WINDow#:CATalog", get=self._win_cat)
+        self.on("DISPlay:WINDow#:TRACe#:FEED", self._feed)
         self.on("CALCulate#:FORMat", self._fmt_set, lambda a, g: self._cur(g)["fmt"])
         self.on("CALCulate#:DATA", get=self._data)
         self.on("CALCulate#:MATH:MEMorize", self._memorize)
@@ -383,3 +386,34 @@ class KeysightPNASim(SimInstrument):
 
     def _cw_set(self, a, g):
         self.stim(self._ch(g))["cw"] = self.num(a, self.F_MIN, self.F_MAX)
+
+    # ----------------------------------------------------- создание / удаление
+    def _delete(self, a, g):
+        name = a.strip().strip("'\"")
+        if name not in self.meas or self.meas[name]["ch"] != self._ch(g):
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        del self.meas[name]
+        for traces in self.windows.values():
+            for t in [t for t, n in traces.items() if n == name]:
+                del traces[t]
+        if self.selected == name:
+            self.selected = ""
+        self.sel_other = {c: n for c, n in self.sel_other.items() if n != name}
+
+    def _win_state(self, a, g):
+        w = int(g[0])
+        if self.boolean(a):
+            self.windows.setdefault(w, {})
+        else:
+            self.windows.pop(w, None)
+
+    def _win_cat(self, a, g):
+        traces = self.windows.get(int(g[0]))
+        return '"' + (",".join(str(t) for t in sorted(traces)) if traces else "EMPTY") + '"'
+
+    def _feed(self, a, g):
+        w, t = int(g[0]), int(g[1])
+        name = a.strip().strip("'\"")
+        if w not in self.windows or name not in self.meas or self.windows[w].get(t) in self.meas:
+            raise SimError(-221, "Settings conflict", ESR_EXE)
+        self.windows[w][t] = name
