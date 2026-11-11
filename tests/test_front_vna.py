@@ -437,15 +437,15 @@ def test_cal_window_thru_response(qtbot, vna):
 def test_mark_tab_markers_of_selected_trace(qtbot, vna):
     proxy, win, _s, sim = vna
     te, mp = win.trace_editor, win.marker_panel
-    assert [ln.name for ln in win.pages[2].lines] == ["MKR", "STAT", "X", "Y", "SRCH", "ALL", "LIST"]
+    assert [ln.name for ln in win.pages[2].lines] == ["MKR", "STAT", "X", "Y", "SRCH", "ALL"]
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
     te.chips.buttons()[1].click()                              # 1·S21
     _wait(qtbot, lambda: proxy.value("trace.sel") == "1:USER_S21")
-    assert mp.chips.checked_index() == 0 and mp.value.text() == "OFF" and mp.list.text() == "no markers"
+    assert mp.chips.checked_index() == 0 and mp.value.text() == "OFF"
     next(b for b in win.findChildren(ActionButton) if b.name == "mark_peak").click()
     _wait(qtbot, lambda: 1 in mp.table and proxy.value("mark.state") is True)
     assert proxy.value("mark.x") == pytest.approx(2e9, rel=5e-2) and "dB" in mp.value.text()   # шаг 67 МГц
-    assert "GHz" in mp.value.text() and mp.list.text().startswith("M1 ")
+    assert "GHz" in mp.value.text()
     mp.chips.buttons()[2].click()                              # M3: поставить на 1.5 ГГц
     _wait(qtbot, lambda: proxy.value("mark.n") == 3 and proxy.value("mark.state") is False)
     assert mp.chips.buttons()[0].indicated() and not mp.chips.buttons()[2].indicated()
@@ -456,15 +456,14 @@ def test_mark_tab_markers_of_selected_trace(qtbot, vna):
     win.set_expanded(True)
     win.set_page(2)
     qtbot.wait(50)
-    h, area = win.height(), mp.list_area.height()
-    for n in (2, *range(4, 11)):                               # 10 маркеров: окно не растёт, список - прокрутка
+    h = win.height()
+    for n in (2, *range(4, 11)):                               # 10 маркеров: окно не растёт
         proxy.set("mark.n", n)
         _wait(qtbot, lambda: proxy.value("mark.n") == n)
         proxy.set("mark.x", 1e9 + n * 1e8)
         _wait(qtbot, lambda: n in mp.table)
     _wait(qtbot, lambda: len(mp.table) == 10)
     qtbot.wait(50)
-    assert win.height() == h and mp.list_area.height() == area and mp.list.text().count("\n") == 9
-    assert mp.list_area.verticalScrollBar().maximum() > 0
+    assert win.height() == h and all(b.indicated() for b in mp.chips.buttons()[:9])
     next(b for b in win.findChildren(ActionButton) if b.name == "mark_aoff").click()
-    _wait(qtbot, lambda: not mp.table and mp.list.text() == "no markers")
+    _wait(qtbot, lambda: not mp.table and not any(b.indicated() for b in mp.chips.buttons()))
