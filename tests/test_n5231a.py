@@ -493,3 +493,36 @@ def test_scale_and_processing_of_selected_trace(make):
     assert setp(drv, rec, "smooth.aper", 50.0) is not PStatus.WRITTEN      # больше 25 % нельзя
     assert setp(drv, rec, "trace.sel", "2:NOPE") is PStatus.ERROR
     assert not rec.comm
+
+
+def test_cal_set_per_channel(make):
+    sim = KeysightPNASim()
+    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    v = rec.values
+    assert v["cal.set"] == "" and v["cal.state"] is False and v["cal.stim"] is True and v["cal.interp"] is True
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    drv.run_action("cal_list")
+    assert actions[-1] == ("cal_list", ["CAL_1-3G", "CAL_FULL"])
+    assert setp(drv, rec, "cal.state", True) is not PStatus.WRITTEN and v["cal.state"] is False   # без cal set
+    # cal set со стимулом: канал 1 берёт частоты / точки / полосу / мощность калибровки
+    assert setp(drv, rec, "cal.set", "CAL_1-3G") is PStatus.WRITTEN
+    assert v["cal.set"] == "CAL_1-3G" and v["cal.state"] is True
+    assert (v["freq.start"], v["freq.stop"], v["sweep.points"], v["bw.if"]) == (1e9, 3e9, 201, 1e3)
+    # канал 2: без стимула, обзор внутри калибровки - интерполяция
+    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN and v["cal.set"] == ""
+    assert setp(drv, rec, "cal.stim", False) is PStatus.WRITTEN
+    assert setp(drv, rec, "cal.set", "CAL_FULL") is PStatus.WRITTEN
+    assert v["cal.set"] == "CAL_FULL" and v["cal.state"] is True and v["freq.start"] == pytest.approx(1e9)
+    assert 'SENS2:CORR:CSET:ACT "CAL_FULL",0' in sim.history
+    assert setp(drv, rec, "cal.set", "NOPE") is PStatus.ERROR
+    assert setp(drv, rec, "cal.set", "") is PStatus.WRITTEN               # снять
+    assert v["cal.set"] == "" and v["cal.state"] is False and sim.stim(2)["cset"] == ""
+    assert sim.c["cset"] == "CAL_1-3G"                                     # канал 1 не тронут
+    # удаление cal set снимает его с канала
+    assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN and v["cal.set"] == "CAL_1-3G"
+    drv.run_action("cal_delete", "CAL_1-3G")
+    assert actions[-1] == ("cal_delete", ["CAL_FULL"])
+    assert v["cal.set"] == "" and v["cal.state"] is False
+    assert not rec.comm
