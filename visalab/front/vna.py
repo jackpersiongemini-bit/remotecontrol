@@ -10,7 +10,8 @@
   возвращает прежний тип; рядом частота CW;
 * CORR - коррекция (калибровка) ON / OFF.
 
-Вкладка STIM - настройки одного канала: сверху чипы каналов (как пресеты, без «+»/«−»).
+Первая строка избранного CH - чипы каналов (как пресеты, без «+»/«−»): текущий канал окна, к нему
+относятся POW, CW, CORR и вкладка STIM.
 Вкладки: TRAC (сверху чипы всех трейсов прибора, как пресеты: клик выбирает, + создаёт трейс S21 на
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
@@ -44,6 +45,7 @@ ONOFF = [("OFF", False), ("ON", True)]
 AUTO = [("MAN", False), ("AUTO", True)]
 SLOTS = 16
 MATH = (("DATA", "NORM"), ("D/M", "DIV"), ("D−M", "SUBT"), ("D+M", "ADD"), ("D·M", "MULT"))
+CHANNEL_CHIP_HEIGHT = 30          # чипы каналов - высотой с обычную кнопку строки
 DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
 
 #: вкладка STIM: (подпись, ключ, второй ключ или None)
@@ -223,17 +225,17 @@ class MenuButton(IndicatorButton):
 
 class _ChannelChip(QPushButton):
     def __init__(self, channel: int):
-        super().__init__(f"C{channel}")
+        super().__init__(str(channel))
         self.channel = channel
         self.setObjectName("chip")
         self.setCheckable(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"STIM settings of channel {channel}")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setToolTip(f"Channel {channel}: POW / CW / CORR and the STIM tab")
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-    def sizeHint(self):  # noqa: N802 - Qt; высота - как у пресета (QSS чипа иначе перебивает)
-        return QSize(super().sizeHint().width(), PRESET_HEIGHT)
+    def sizeHint(self):  # noqa: N802 - Qt; квадрат высотой с обычную строку (QSS чипа иначе перебивает)
+        return QSize(CHANNEL_CHIP_HEIGHT, CHANNEL_CHIP_HEIGHT)
 
     def minimumSizeHint(self):  # noqa: N802 - Qt
         return self.sizeHint()
@@ -246,9 +248,9 @@ class StimChannels(PBGroup):
     def __init__(self, proxy: InstrumentProxy, parent=None):
         self.proxy = proxy
         super().__init__(parent=parent)
-        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.channels: list[int] = []
-        self.scroll = HScrollArea(self)
+        self.scroll = HScrollArea(self, CHANNEL_CHIP_HEIGHT)
         self.selected.connect(lambda i: proxy.set("stim.channel", self.channels[i]))
         proxy.subscribe("stim.channel", lambda _v: self._show())
         proxy.action_done.connect(self._on_action)
@@ -504,6 +506,9 @@ class VNAWindow(InstrumentWindow):
         proxy, sup, pre = self.proxy, self.proxy.supports, self._prefix
         self.widgets: dict[str, Any] = {}
         top = []
+        if sup("stim.channel"):                       # текущий канал окна: POW / CW / CORR и вкладка STIM
+            self.stim_channels = StimChannels(proxy)
+            top.append(PanelLine("CH", self.stim_channels.scroll))
         if "mem_store" in proxy.actions:
             top.append(PanelLine("MEM", ActionButton(proxy, "mem_store", "DATA→MEM",
                                                      "Copy data to memory for every measurement being read")))
@@ -539,11 +544,8 @@ class VNAWindow(InstrumentWindow):
         self.top_lines = top
         self.saved_widgets += [self.power_spin, *(w for k, w in self.widgets.items() if k not in NOT_SAVED)]
 
-        # STIM: настройки канала, выбранного в CH
+        # STIM: настройки канала, выбранного в избранном (CH)
         lines = []
-        if sup("stim.channel"):
-            self.stim_channels = StimChannels(proxy)
-            lines.append(PanelLine("CH", self.stim_channels.scroll))
         for name, key, extra in STIM_ROWS:
             if not sup(key):
                 continue

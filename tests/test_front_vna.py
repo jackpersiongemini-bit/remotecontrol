@@ -1,6 +1,6 @@
 """Окно ВАЦ на симуляторе N5231A: избранное, режим пресетов мощности, CW, выбор измерений, состояния."""
 import pytest
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, QSize
 
 from visalab.core import InstrumentProxy, SimTransport
 from visalab.drivers import DRIVERS
@@ -37,7 +37,7 @@ def _wait(qtbot, cond):
 
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
-    assert [ln.name for ln in win.preset_panel.table.lines] == ["MEM", "MATH", "POW", "CW", "CORR"]
+    assert [ln.name for ln in win.preset_panel.table.lines] == ["CH", "MEM", "MATH", "POW", "CW", "CORR"]
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "PWR", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
@@ -186,8 +186,8 @@ def test_stim_channel_chips(qtbot, vna):
     proxy, win, _s, sim = vna
     sc = win.stim_channels
     _wait(qtbot, lambda: sc.channels == [1, 2])
-    assert [b.text() for b in sc.buttons()] == ["C1", "C2"] and sc.checked_index() == 0
-    assert all(b.sizeHint().height() == 56 for b in sc.buttons())
+    assert [b.text() for b in sc.buttons()] == ["1", "2"] and sc.checked_index() == 0
+    assert all(b.sizeHint() == QSize(30, 30) for b in sc.buttons())
     sc.buttons()[1].click()                                    # STIM -> канал 2
     _wait(qtbot, lambda: proxy.value("stim.channel") == 2 and proxy.value("sweep.points") == 101)
     win.widgets["sweep.points"].set_value(21)
