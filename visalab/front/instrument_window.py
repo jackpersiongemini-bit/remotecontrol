@@ -18,11 +18,12 @@ import re
 import time
 from typing import Any, Callable
 
-from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
                              QSizePolicy, QVBoxLayout, QWidget)
 
 from ..core.params import ConnectionState, PStatus
+from ..coord.registry import LINKS, ProxyLinks
 from ..core.proxy import InstrumentProxy
 from ..drivers import DRIVERS
 from .models import ModelWindow, all_models, model_class
@@ -48,40 +49,6 @@ def parse_power_list(text: str) -> list[float]:
     return sorted(out)
 
 
-class ProxyLinks(QObject):
-    """Прокси открытых в этом процессе окон: окно может брать значения другого прибора
-    (ваттметр - скважность у ГСС) по имени профиля, не зная драйвера."""
-
-    changed = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self._proxies: list[InstrumentProxy] = []
-
-    def add(self, proxy: InstrumentProxy) -> None:
-        if proxy not in self._proxies:
-            self._proxies.append(proxy)
-            self.changed.emit()
-
-    def remove(self, proxy: InstrumentProxy) -> None:
-        if proxy in self._proxies:
-            self._proxies.remove(proxy)
-            try:
-                self.changed.emit()
-            except RuntimeError:                 # выход из программы: реестр уже удалён
-                pass
-
-    def find(self, profile: str) -> InstrumentProxy | None:
-        """Последний открытый прибор с этим профилем (``function_generator``...)."""
-        for proxy in reversed(self._proxies):
-            prof = getattr(getattr(proxy, "driver_cls", None), "PROFILE", None)
-            if prof is not None and prof.name == profile:
-                return proxy
-        return None
-
-
-#: общий для процесса реестр приборов окон
-LINKS = ProxyLinks()
 
 
 def saved_connection(settings: QSettings, group: str) -> dict[str, str]:

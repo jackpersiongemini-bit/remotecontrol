@@ -34,11 +34,13 @@ def run_window(window_cls, lab_key: str, doc: str = "", argv=None) -> int:
     return run_windows([(window_cls, lab_key)], doc, argv)
 
 
-def run_windows(specs, doc: str = "", argv=None, parser=None) -> int:
+def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool = True, setup=None) -> int:
     """Несколько окон в одном процессе (окна видят приборы друг друга через LINKS).
 
     ``specs`` - [(window_cls, lab_key)]; ``--address`` относится к первому окну. ``parser`` -
-    готовый ArgumentParser (если обёртке нужны свои флаги)."""
+    готовый ArgumentParser (если обёртке нужны свои флаги). ``show=False`` - окна приборов создаются
+    скрытыми (их показывает главное окно). ``setup(opened, args, settings)`` - вызывается после
+    создания окон (главное окно, стенд симуляторов); что вернёт - живёт до выхода."""
     ap = parser or argparse.ArgumentParser(description=doc, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--address", metavar="ADDR")
     ap.add_argument("--sim", action="store_true")
@@ -54,12 +56,14 @@ def run_windows(specs, doc: str = "", argv=None, parser=None) -> int:
     settings = QSettings(args.ini, QSettings.Format.IniFormat)
     opened: list[dict] = []
     for n, (window_cls, lab_key) in enumerate(specs):
-        opened.append(_open(window_cls, lab_key, args, settings, args.address if n == 0 else None))
+        opened.append(_open(window_cls, lab_key, args, settings, args.address if n == 0 else None, show))
+    keep = setup(opened, args, settings) if setup else None  # noqa: F841 - держим ссылку до выхода
     app.aboutToQuit.connect(lambda: [cur["proxy"].shutdown() for cur in opened])
     return app.exec()
 
 
-def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None) -> dict:
+def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None,
+          show: bool = True) -> dict:
     """Создать прокси и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win} (обновляется)."""
     lab = _lab(args.lab, lab_key)
     saved = saved_connection(settings, window_cls.CONNECTION_GROUP)     # выбранное в окне (адрес -> APPLY)
@@ -75,7 +79,7 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
         model, delay = model or lab.get("model"), lab.get("delay")
     current: dict = {}
 
-    def build(kind: str, address: str, model: str | None, pos=None) -> None:
+    def build(kind: str, address: str, model: str | None, pos=None, visible: bool = True) -> None:
         driver_cls, _ = DRIVERS[kind]
         proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency),
                                 model=all_models(settings, kind).get(model) if model else None,
@@ -84,18 +88,19 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
         win.reconnect_requested.connect(reconnect)
         if pos is not None:
             win.move(pos)
-        win.show()
+        if visible:
+            win.show()
         current.update(proxy=proxy, win=win)
         if not args.no_connect:
             proxy.open()
 
     def reconnect(kind: str, address: str, model: str) -> None:
         old_proxy, old_win = current["proxy"], current["win"]
-        pos = old_win.pos()
+        pos, visible = old_win.pos(), old_win.isVisible()
         old_win.hide()
         old_proxy.shutdown()
         old_win.deleteLater()
-        build(kind, address, model or None, pos)
+        build(kind, address, model or None, pos, visible)
 
-    build(kind, address, model, None)
+    build(kind, address, model, None, show)
     return current
