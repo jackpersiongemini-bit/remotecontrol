@@ -423,6 +423,7 @@ class InstrumentWindow(Window):
         proxy.action_done.connect(self._on_action_done)
         proxy.param_updated.connect(self._on_param)
         proxy.comm_error.connect(self._on_comm_error)
+        proxy.reconnect_pending.connect(self._on_reconnect)
         self._on_state(proxy.state)
         LINKS.add(proxy)
         self.destroyed.connect(lambda *_a, p=proxy: LINKS.remove(p))
@@ -795,8 +796,8 @@ class InstrumentWindow(Window):
 
     # ------------------------------------------------------------ кнопки
     def _toggle_connection(self) -> None:
-        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
-            self.proxy.close()
+        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or self.proxy.reconnecting:
+            self.proxy.close()          # в том числе - перестать переподключаться
         else:
             self.proxy.open()
 
@@ -814,8 +815,10 @@ class InstrumentWindow(Window):
     # ------------------------------------------------------------ события
     def _on_state(self, state: ConnectionState) -> None:
         status = {ConnectionState.CONNECTED: ON, ConnectionState.CONNECTING: "process",
-                  ConnectionState.ERROR: "error"}.get(state, OFF)
+                  ConnectionState.ERROR: "retry" if self.proxy.reconnecting else "error"}.get(state, OFF)
         self.on_button.set_status(status)
+        self.on_button.setToolTip("No connection: reconnecting by itself when the instrument answers. "
+                                  "Click - stop" if status == "retry" else "Connect / disconnect")
         on = state is ConnectionState.CONNECTED
         self.sync_button.setEnabled(on)
         self.init_button.setEnabled(on)
@@ -823,6 +826,9 @@ class InstrumentWindow(Window):
             self._resetting = False
             self.sync_button.set_status("ok")
             self.init_button.set_status("ok")
+
+    def _on_reconnect(self, _seconds: float) -> None:
+        self._on_state(self.proxy.state)
 
     def _on_comm_error(self, msg: str) -> None:
         self._log("CONNECTION", msg)

@@ -1,4 +1,6 @@
-"""Запуск окна прибора: адрес из аргументов / ini окна / lab.json, пересоздание по APPLY."""
+"""Запуск окна прибора: адрес из аргументов / ini окна / lab.json, пересоздание по APPLY.
+
+Журнал программы - в ``logs/visalab.log`` рядом с ini (``--log``), см. :mod:`visalab.applog`."""
 from __future__ import annotations
 
 import argparse
@@ -10,20 +12,22 @@ from pathlib import Path
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
+from ..applog import close_logging, default_log_path, setup_logging
 from ..coord import COORD
 from ..core import InstrumentProxy
 from ..drivers import DRIVERS, make_transport
 from .instrument_window import saved_connection, saved_delay
 from .models import all_models
 
-__all__ = ["run_window", "run_windows", "remember_windows"]
+__all__ = ["run_window", "run_windows", "remember_windows", "connection_for", "lab_entry"]
 
 ROOT = Path(__file__).resolve().parents[2]
 #: при выходе - сколько ждать, пока идущий сценарий вернёт приборы
 QUIT_SCENARIO_WAIT_MS = 5000
 
 
-def _lab(path: str, key: str) -> dict:
+def lab_entry(path: str, key: str) -> dict:
+    """Запись прибора в lab.json ({address, model, delay}) или {}."""
     p = Path(path)
     if not p.is_file():
         return {}
@@ -58,8 +62,9 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None 
     ap.add_argument("--backend", default="")
     ap.add_argument("--latency", type=float, default=0.005, help="задержка симулятора, с")
     ap.add_argument("--no-connect", action="store_true")
+    ap.add_argument("--log", metavar="FILE", help="журнал программы (по умолчанию logs/visalab.log рядом с ini)")
     args, _rest = ap.parse_known_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log_file = setup_logging(args.log or default_log_path(args.ini))
 
     sys.excepthook = _log_exception
     app = QApplication.instance() or QApplication(sys.argv[:1])
@@ -72,7 +77,11 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None 
     keep = setup(opened, args, settings) if setup else None  # noqa: F841 - держим ссылку до выхода
 
     app.aboutToQuit.connect(lambda: _quit(opened))
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        logging.getLogger("visalab").info("выход")
+        close_logging(log_file)
 
 
 def _quit(opened: list[dict]) -> None:
@@ -89,16 +98,17 @@ def remember_windows(opened: list[dict], settings: QSettings) -> None:
     settings.sync()
 
 
-def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None,
-          show: bool = True) -> dict:
-    """Создать прокси и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win} (обновляется)."""
-    lab = _lab(args.lab, lab_key)
+def connection_for(window_cls, lab_key: str, lab_path: str, settings: QSettings, sim: bool = False,
+                   cli_address: str | None = None) -> dict:
+    """Как подключать прибор окна: {kind, address, model, delay}. Адрес - из аргумента, иначе выбранный в окне
+    (ini, APPLY), иначе lab.json; ``sim`` - симулятор."""
+    lab = lab_entry(lab_path, lab_key)
     saved = saved_connection(settings, window_cls.CONNECTION_GROUP)     # выбранное в окне (адрес -> APPLY)
     kind, model = saved["driver"] or window_cls.DEFAULT_KIND, saved["model"] or None
     delay = saved_delay(settings, window_cls.CONNECTION_GROUP)          # DLY на странице адреса
     if delay is None:
         delay = lab.get("delay")
-    if args.sim:
+    if sim:
         address = "sim"
     elif cli_address:
         address = cli_address
@@ -107,6 +117,14 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
     else:
         address = lab.get("address", "sim")
         model = model or lab.get("model")
+    return {"kind": kind, "address": address, "model": model, "delay": delay}
+
+
+def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None,
+          show: bool = True) -> dict:
+    """Создать прокси и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win} (обновляется)."""
+    conn = connection_for(window_cls, lab_key, args.lab, settings, args.sim, cli_address)
+    kind, address, model, delay = conn["kind"], conn["address"], conn["model"], conn["delay"]
     current: dict = {}
 
     def build(kind: str, address: str, model: str | None, pos=None, visible: bool = True) -> None:

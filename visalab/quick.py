@@ -332,6 +332,7 @@ class QuickWindow(QFrame):
         self.idn_label = self.title_label            # IDN - в подсказке заголовка
 
         proxy.state_changed.connect(self._on_state)
+        proxy.reconnect_pending.connect(lambda _s: self._on_state(self.proxy.state))
         proxy.identified.connect(lambda idn: self.title_label.setToolTip(f"{idn}\n{proxy.address}"))
         proxy.instrument_error.connect(lambda c, m: self.show_message(f"Instrument error {c}: {m}", True))
         proxy.comm_error.connect(lambda m: self.show_message(m, True))
@@ -349,15 +350,16 @@ class QuickWindow(QFrame):
             self.show_message(f"{key}: {message}", status is not PStatus.COERCED)
 
     def _toggle_connection(self) -> None:
-        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or self.proxy.reconnecting:
             self.proxy.close()
         else:
             self.proxy.open()
 
     def _on_state(self, state: ConnectionState) -> None:
-        self.state_label.setText(_STATE_TEXT[state])
+        retry = state is ConnectionState.ERROR and self.proxy.reconnecting
+        self.state_label.setText("No connection, reconnecting…" if retry else _STATE_TEXT[state])
         self.led.setStyleSheet(f"background: {_LED[state]};")
-        busy = state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
+        busy = state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or retry
         self.connect_btn.setText("Disconnect" if busy else "Connect")
 
     def shutdown(self) -> None:

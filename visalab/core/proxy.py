@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 
+from ..applog import Throttle
 from .instrument import VISAInstrument
 from .params import Action, ConnectionState, Param, PStatus
 from .transport import Transport
@@ -36,6 +37,7 @@ class InstrumentProxy(QObject):
     _req_poll = pyqtSignal(int)
     _req_log_poll = pyqtSignal(bool)
     _req_delay = pyqtSignal(float)
+    _req_auto = pyqtSignal(bool)
     _req_shutdown = pyqtSignal()
 
     # ------------------------------------------- события прибор -> GUI
@@ -49,6 +51,8 @@ class InstrumentProxy(QObject):
     action_done = pyqtSignal(str, object)
     sync_done = pyqtSignal()
     raw_response = pyqtSignal(str, str)
+    #: связи нет, прибор переподключится сам через столько секунд; 0 - не ждём (см. ``reconnecting``)
+    reconnect_pending = pyqtSignal(float)
 
     def __init__(self, driver_cls: type[VISAInstrument], transport: Transport,
                  parent: QObject | None = None, **driver_kwargs):
@@ -67,11 +71,14 @@ class InstrumentProxy(QObject):
         self.channels = self._worker.channels
         self.capabilities: frozenset[str] = self._worker.capabilities
         self.state = ConnectionState.DISCONNECTED
+        #: связь потеряна, прибор переподключается сам (выключатель окна - отменить: ``close()``)
+        self.reconnecting = False
         self.idn = ""
         self._values: dict[str, Any] = {}
         self._statuses: dict[str, PStatus] = {}
         self._subs: dict[str, list[Callable]] = defaultdict(list)
         self._status_subs: dict[str, list[Callable]] = defaultdict(list)
+        self._throttle = Throttle()          # журнал в файл: одинаковое сообщение - не чаще раза в минуту
 
         self._worker.moveToThread(self._thread)
         w = self._worker
@@ -81,7 +88,7 @@ class InstrumentProxy(QObject):
             (self._req_read, w.read_param), (self._req_action, w.run_action),
             (self._req_raw_write, w.raw_write), (self._req_raw_query, w.raw_query),
             (self._req_poll, w.set_poll_interval), (self._req_log_poll, w.set_log_polling),
-            (self._req_delay, w.set_command_delay),
+            (self._req_delay, w.set_command_delay), (self._req_auto, w.set_auto_reconnect),
         )
         for sig, slot in self._requests:
             sig.connect(slot, _Q)
@@ -92,8 +99,10 @@ class InstrumentProxy(QObject):
         w.identified.connect(self._on_idn, _Q)
         w.param_updated.connect(self._on_value, _Q)
         w.param_status.connect(self._on_status, _Q)
-        for name in ("instrument_error", "comm_error", "scpi_log", "action_done",
-                     "sync_done", "raw_response"):
+        w.reconnect_pending.connect(self._on_reconnect, _Q)
+        w.instrument_error.connect(self._on_instrument_error, _Q)
+        w.comm_error.connect(self._on_comm_error, _Q)
+        for name in ("scpi_log", "action_done", "sync_done", "raw_response"):
             getattr(w, name).connect(getattr(self, name), _Q)
         # Воркер НЕ удаляется через finished -> deleteLater: тогда его (и QTimer) удалял бы поток прибора,
         # которому для этого нужен GIL, а GUI-поток в ~QThread ждёт этот поток, держа GIL, - взаимная
@@ -136,6 +145,10 @@ class InstrumentProxy(QObject):
     def set_log_polling(self, on: bool) -> None:
         """Показывать ли в журнале трафик периодического опроса."""
         self._req_log_poll.emit(bool(on))
+
+    def set_auto_reconnect(self, on: bool) -> None:
+        """Переподключаться ли самому после обрыва связи (по умолчанию да)."""
+        self._req_auto.emit(bool(on))
 
     def supports(self, key: str) -> bool:
         """Есть ли у прибора этот параметр/действие (стандартный ключ профиля или x.*)."""
@@ -207,14 +220,33 @@ class InstrumentProxy(QObject):
 
     # ------------------------------------------------------ внутреннее
     def _on_state(self, state: ConnectionState) -> None:
+        if state is not self.state:
+            log.info("%s %s: %s", self.name, self.address, state.value)
         self.state = state
         if state is not ConnectionState.CONNECTED:
             self._values.clear()
+        if state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTED):
+            self.reconnecting = False
         self.state_changed.emit(state)
+
+    def _on_reconnect(self, seconds: float) -> None:
+        self.reconnecting = seconds > 0 and self.state is not ConnectionState.CONNECTED
+        self.reconnect_pending.emit(float(seconds))
 
     def _on_idn(self, idn: str) -> None:
         self.idn = idn
+        log.info("%s %s: *IDN? %s", self.name, self.address, idn)
         self.identified.emit(idn)
+
+    def _on_comm_error(self, message: str) -> None:
+        if self._throttle("comm", message):
+            log.warning("%s %s: %s", self.name, self.address, message)
+        self.comm_error.emit(message)
+
+    def _on_instrument_error(self, code: int, message: str) -> None:
+        if self._throttle(f"error {code}", message):
+            log.warning("%s %s: ошибка прибора %d: %s", self.name, self.address, code, message)
+        self.instrument_error.emit(code, message)
 
     def _on_value(self, key: str, value: Any) -> None:
         self._values[key] = value
@@ -223,6 +255,8 @@ class InstrumentProxy(QObject):
         self.param_updated.emit(key, value)
 
     def _on_status(self, key: str, status: PStatus, message: str) -> None:
+        if status in (PStatus.ERROR, PStatus.INVALID) and self._throttle(f"key {key}", message):
+            log.warning("%s %s: %s %s: %s", self.name, self.address, key, status.value, message)
         self._statuses[key] = status
         for cb in self._status_subs.get(key, ()):
             cb(status, message)

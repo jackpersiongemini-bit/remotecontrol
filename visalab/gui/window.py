@@ -45,6 +45,7 @@ class InstrumentWindow(QMainWindow):
         self._build_console()
 
         proxy.state_changed.connect(self._on_state)
+        proxy.reconnect_pending.connect(lambda _s: self._on_state(self.proxy.state))
         proxy.identified.connect(lambda idn: self.idn_label.setText(idn))
         proxy.instrument_error.connect(lambda c, m: self._log(f"ОШИБКА ПРИБОРА {c}: {m}", error=True))
         proxy.comm_error.connect(lambda m: self._log(f"ОШИБКА: {m}", error=True))
@@ -143,7 +144,7 @@ class InstrumentWindow(QMainWindow):
 
     # ------------------------------------------------------------ обработчики
     def _toggle_connection(self) -> None:
-        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or self.proxy.reconnecting:
             self.proxy.close()
         else:
             self.proxy.open()
@@ -163,11 +164,13 @@ class InstrumentWindow(QMainWindow):
 
     def _on_state(self, state: ConnectionState) -> None:
         color, text = _LED[state]
+        if state is ConnectionState.ERROR and self.proxy.reconnecting:
+            text = "Нет связи, переподключение…"
         self.led.setStyleSheet(f"background: {color};")
         self.state_label.setText(text)
         connected = state is ConnectionState.CONNECTED
-        self.connect_btn.setText("Отключить" if state in (ConnectionState.CONNECTED,
-                                                           ConnectionState.CONNECTING) else "Подключить")
+        self.connect_btn.setText("Отключить" if state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
+                                 or self.proxy.reconnecting else "Подключить")
         self.tabs.setEnabled(connected)
         self.sync_btn.setEnabled(connected)
         for b in self.action_buttons:

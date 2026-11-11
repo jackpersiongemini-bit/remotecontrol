@@ -371,10 +371,11 @@ class MainWindow(Window):
         prof = profile_name(proxy)
         name = self.monitor.name(proxy)
         connected = proxy.state is ConnectionState.CONNECTED
+        off = "RETRY" if getattr(proxy, "reconnecting", False) else "OFF"     # связь потеряна, переподключается
         if prof in ("network_analyzer", "spectrum_analyzer", "power_meter"):
             a = self.monitor.activity(proxy)
             if not connected:
-                line = "OFF"
+                line = off
             elif not a.measuring:
                 line = "IDLE"
             elif prof == "network_analyzer":
@@ -388,11 +389,11 @@ class MainWindow(Window):
                 self._update_visibility()
         elif prof == "signal_generator":
             on = connected and proxy.value("rf.output") is True
-            line = si_format(proxy.value("rf.frequency"), "Hz", 4) if on else ("RF OFF" if connected else "OFF")
+            line = si_format(proxy.value("rf.frequency"), "Hz", 4) if on else ("RF OFF" if connected else off)
             tile.show_state(name, line, on)
         else:
             on = connected and _output_on(proxy)
-            tile.show_state(name, ("OUT ON" if on else "ON") if connected else "OFF", on)
+            tile.show_state(name, ("OUT ON" if on else "ON") if connected else off, on)
 
     def _on_runs(self, *_args) -> None:
         self.scenario_chip.show_runs(self.coord.runs())

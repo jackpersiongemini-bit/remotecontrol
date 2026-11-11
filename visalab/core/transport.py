@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import socket
 import struct
 import time
 from abc import ABC, abstractmethod
@@ -19,7 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 __all__ = ["TransportError", "TransportTimeout", "TransportNotSupported", "Transport", "PyVisaTransport", "SimTransport",
-           "parse_float_block", "float_block"]
+           "parse_float_block", "float_block", "lan_endpoint"]
 
 
 class TransportError(Exception):
@@ -54,6 +56,45 @@ def parse_float_block(raw: bytes) -> list[float]:
     return list(struct.unpack(f">{size // 4}f", data))
 
 
+_VISA_LOGGED = False
+
+
+def _log_visa_library(rm) -> None:
+    """Один раз за процесс: какая библиотека VISA работает (NI, Keysight IO, pyvisa-py) - в журнал."""
+    global _VISA_LOGGED
+    if _VISA_LOGGED:
+        return
+    _VISA_LOGGED = True
+    try:
+        log.info("VISA: %s", rm.visalib)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_HISLIP_RE = re.compile(r"^hislip\d*(?:,(\d+))?$", re.IGNORECASE)
+
+
+def lan_endpoint(address: str) -> tuple[str, int] | None:
+    """(узел, TCP-порт) VISA-ресурса LAN или None (USB, GPIB, ASRL...).
+
+    ``TCPIP0::192.168.0.3::INSTR`` / ``...::inst0::INSTR`` -> 111 (VXI-11: portmapper),
+    ``TCPIP0::host::hislip0::INSTR`` -> 4880, ``TCPIP0::host::5025::SOCKET`` -> 5025."""
+    parts = [s.strip() for s in str(address).split("::")]
+    if len(parts) < 2 or not parts[0].upper().startswith("TCPIP") or not parts[1]:
+        return None
+    host = parts[1]
+    if parts[-1].upper() == "SOCKET" and len(parts) >= 4:
+        try:
+            return host, int(parts[2])
+        except ValueError:
+            return None
+    if len(parts) >= 3:
+        m = _HISLIP_RE.match(parts[2])
+        if m:
+            return host, int(m.group(1) or 4880)
+    return host, 111
+
+
 class Transport(ABC):
     """Минимальный набор операций, нужный базовому классу прибора."""
 
@@ -80,6 +121,11 @@ class Transport(ABC):
     def query(self, message: str) -> str:
         self.write(message)
         return self.read()
+
+    def reachable(self) -> bool:
+        """Быстрая проверка перед автоматической попыткой подключения: стоит ли пробовать сейчас.
+        False - точно нет (узел LAN не отвечает); по умолчанию - пробовать."""
+        return True
 
     def query_float_block(self, message: str) -> list[float]:
         """Запрос с ответом - двоичным блоком float32 big-endian (TRAC:DATA? у U2020X)."""
@@ -140,6 +186,7 @@ class PyVisaTransport(Transport):
         from pyvisa import constants
         try:
             self._rm = pyvisa.ResourceManager(self._backend)
+            _log_visa_library(self._rm)
             self._res = self._rm.open_resource(
                 self.address,
                 read_termination=self._read_term,
@@ -178,6 +225,25 @@ class PyVisaTransport(Transport):
     @property
     def is_open(self) -> bool:
         return self._res is not None
+
+    #: сколько ждать ответа узла LAN при проверке перед автоматическим подключением, с
+    REACH_TIMEOUT_S = 1.0
+
+    def reachable(self) -> bool:
+        """LAN: TCP-соединение с портом прибора (VXI-11 - portmapper 111, HiSLIP - 4880, SOCKET - свой)
+        за ``REACH_TIMEOUT_S``. Выключенный прибор не отвечает, и библиотека VISA ждала бы его в open
+        десятки секунд - поток прибора (и выход из программы) стоял бы всё это время. USB, GPIB - True:
+        там open без прибора сразу ошибка."""
+        endpoint = lan_endpoint(self.address)
+        if endpoint is None:
+            return True
+        try:
+            with socket.create_connection(endpoint, timeout=self.REACH_TIMEOUT_S):
+                return True
+        except ConnectionRefusedError:
+            return True        # узел отвечает (служба ещё не поднялась) - VISA ответит быстро, пусть пробует
+        except OSError:
+            return False
 
     def _call(self, fn, *args):
         import pyvisa
@@ -276,6 +342,9 @@ class SimTransport(Transport):
     @property
     def is_open(self) -> bool:
         return self._open
+
+    def reachable(self) -> bool:
+        return bool(self.sim.powered)
 
     def write(self, message: str) -> None:
         self._tick()

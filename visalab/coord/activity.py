@@ -214,6 +214,11 @@ class ActivityMonitor(QObject):
             p.param_updated.connect(on_value)
             p.state_changed.connect(on_state)
             self._conns[p] = [(p.param_updated, on_value), (p.state_changed, on_state)]
+            pending = getattr(p, "reconnect_pending", None)      # плитка: «переподключается»
+            if pending is not None:
+                on_retry = (lambda _s, p=p: self._emit(p))
+                pending.connect(on_retry)
+                self._conns[p].append((pending, on_retry))
             self.history[p] = deque(maxlen=HISTORY)
         self.roster_changed.emit()
 
