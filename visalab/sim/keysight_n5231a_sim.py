@@ -55,6 +55,7 @@ class KeysightPNASim(SimInstrument):
                 "CAL_FULL": {"start": 10e6, "stop": 13.5e9, "poin": 401, "type": "LIN", "cw": 1e9, "bwid": 10e3,
                              "pow": -5.0}}
         self.snp_form = "MA"
+        self.coll: dict = {}                             # калибровка без мастера: метод, канал, что измерено
         self.guid = {"conn": {1: "Not used", 2: "Not used"}, "kit": {1: "", 2: ""}, "steps": [], "done": set(),
                      "ch": 1}
         if not hasattr(self, "dut"):
@@ -245,6 +246,10 @@ class KeysightPNASim(SimInstrument):
         self.on("MMEMory:STORe:TRACe:FORMat:SNP", lambda a, g: setattr(self, "snp_form", a.strip().upper()),
                 lambda a, g: self.snp_form)
         self.on("CALCulate#:DATA:SNP:PORTs", get=self._snp)
+        self.on("SENSe#:CORRection:COLLect:METHod", self._coll_meth, lambda a, g: self.coll.get("meth", "NONE"))
+        self.on("SENSe#:CORRection:COLLect[:ACQuire]", self._coll_acq)
+        self.on("SENSe#:CORRection:COLLect:SAVE", self._coll_save)
+        self.on("SENSe#:CORRection:CSET:COPY", self._cset_copy)
         g = "SENSe#:CORRection:COLLect:GUIDed:"
         self.on(g + "CONNector:CATalog", get=lambda a, g_: '"' + ",".join(CONNECTORS) + '"')
         self.on(g + "CONNector:PORT#", self._guid_conn, lambda a, g_: f'"{self.guid["conn"][int(g_[1])]}"')
@@ -511,6 +516,38 @@ class KeysightPNASim(SimInstrument):
         if fn != "NORM" and m.get("mem") is None:
             raise SimError(-221, "Settings conflict; no memory trace", ESR_EXE)
         m["math"] = fn
+
+    # ----------------------------------------------------------- калибровка без мастера (response THRU)
+    def _coll_meth(self, a, g):
+        meth = a.strip().upper()
+        if meth not in ("TRAN1", "TRAN2", "REFL1", "REFL3", "SPARSOLT"):
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        self.coll = {"meth": meth, "ch": self._ch(g), "done": set()}
+
+    def _coll_acq(self, a, g):
+        std = a.strip().upper()
+        if self.coll.get("meth") != "TRAN1" or std != "THRU":
+            raise SimError(-221, "Settings conflict; calibration method", ESR_EXE)
+        self.coll["done"].add(std)
+        self.sweeping = True
+        if not self.hold_sweeps:
+            self.finish_sweep()
+
+    def _coll_save(self, a, g):
+        if "THRU" not in self.coll.get("done", ()):
+            raise SimError(-221, "Settings conflict; cal not complete", ESR_EXE)
+        ch = self.coll["ch"]
+        st = self.stim(ch)
+        name = f"CH{ch}_CALREG"
+        self.csets[name] = {k: st[k] for k in ("start", "stop", "poin", "type", "cw", "bwid", "pow")}
+        st["cset"], st["corr"] = name, True
+        self.coll = {}
+
+    def _cset_copy(self, a, g):
+        st = self.stim(self._ch(g))
+        if not st["cset"]:
+            raise SimError(-221, "Settings conflict; no cal set", ESR_EXE)
+        self.csets[a.strip().strip("'\"")] = dict(self.csets[st["cset"]])
 
     # ----------------------------------------------------------- Touchstone
     def _snp(self, a, g):

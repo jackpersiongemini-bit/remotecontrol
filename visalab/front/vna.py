@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QSize, Qt, QTimer
-from PyQt6.QtWidgets import QFileDialog, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFileDialog, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.export import write_touchstone, write_traces_csv
 from ..core.params import Kind
@@ -576,7 +576,10 @@ class _StepButton(IndicatorButton):
 class CalWizard(QWidget):
     """Калибровка канала выбранного трейса (guided): разъём и набор порта 1 и 2 (P2 OFF - однопортовая),
     START - прибор выдаёт шаги; клик по шагу меряет стандарт (индикатор - измерен); SAVE - в cal set с
-    именем NAME и сразу на канал. Набор по умолчанию - первый в списке прибора (идеальные первыми)."""
+    именем NAME и сразу на канал. Набор по умолчанию - первый в списке прибора (идеальные первыми).
+    TYPE THRU - калибровка только по перемычке (response) выбранного трейса S21 / S12: один шаг, без наборов."""
+
+    TYPES = ("FULL", "THRU")
 
     OFF = "OFF"
 
@@ -590,6 +593,15 @@ class CalWizard(QWidget):
         self.port_kit = {p: str(settings.value(f"{prefix}/CAL_P{p}_KIT", "") or "") for p in (1, 2)}
         self.steps: list[str] = []
         self.done: set[int] = set()
+        kind = str(settings.value(f"{prefix}/CAL_TYPE", "FULL") or "FULL")
+        self.kind = kind if kind in self.TYPES else "FULL"
+        self.type_button = self._button(self.kind, "Calibration type: FULL - guided with the cal kits (P1 / P2),\n"
+                                                   "THRU - transmission response of the selected S21 / S12 trace",
+                                        self.next_type)
+        self.trace_label = QLabel("")
+        self.trace_label.setObjectName("lineName")
+        self.trace_row = None                              # окно: () -> строка выбранного трейса (канал, имя, S, ...)
+        self.port_lines: list[QWidget] = []                # P1 / P2 - только для FULL
         self.conn_buttons = {p: MenuButton([], lambda v, p=p: self.set_conn(p, v), f"Port {p} connector")
                              for p in (1, 2)}
         self.kit_buttons = {p: MenuButton([], lambda v, p=p: self.set_kit(p, v), f"Port {p} cal kit")
@@ -607,6 +619,7 @@ class CalWizard(QWidget):
         proxy.action_done.connect(self._on_action)
         proxy.subscribe("cal.busy", self._on_busy)
         proxy.subscribe("gen.state", lambda _v: self._show())
+        proxy.subscribe("trace.sel", lambda _v: self._show())
         self.run_lines: list[QWidget] = []                 # строки шагов и имени - только во время калибровки
         self.relayout = None                               # окно: подогнать высоту (шаги появились / исчезли)
         proxy.state_changed.connect(lambda _s: self._show())
@@ -655,7 +668,22 @@ class CalWizard(QWidget):
         return self.port_kit[port] if self.port_kit[port] in kits else (kits[0] if kits else "")
 
     # -------------------------------------------------------- калибровка
+    def next_type(self) -> None:
+        self.kind = self.TYPES[(self.TYPES.index(self.kind) + 1) % len(self.TYPES)]
+        self.settings.setValue(f"{self.prefix}/CAL_TYPE", self.kind)
+        self._show()
+        if self.relayout is not None:
+            self.relayout()
+
+    def thru_trace(self) -> tuple | None:
+        """Выбранный трейс, если он годится для калибровки по перемычке (S21 / S12)."""
+        row = self.trace_row() if self.trace_row is not None else None
+        return row if row is not None and row[2] in ("S21", "S12") else None
+
     def start(self) -> None:
+        if self.kind == "THRU":
+            self.proxy.action("cal_start_thru")
+            return
         args = []
         for p in (1, 2):
             c = self.conn(p)
@@ -688,9 +716,10 @@ class CalWizard(QWidget):
                 self._ask_kits(self.conn(p))
         elif name == "cal_kits" and isinstance(result, (list, tuple)) and self._kits_pending:
             self.kits[self._kits_pending.pop(0)] = [str(k) for k in result]
-        elif name in ("cal_start", "cal_status") and isinstance(result, (list, tuple)) and len(result) == 2:
+        elif name in ("cal_start", "cal_start_thru", "cal_status") and isinstance(result, (list, tuple)) \
+                and len(result) == 2:
             steps, done = result
-            if name == "cal_start" or list(steps) != self.steps:
+            if name != "cal_status" or list(steps) != self.steps:
                 self.steps = [str(t) for t in steps]
                 self._make_steps()
                 self.name_edit.setText(self.default_name())
@@ -734,7 +763,17 @@ class CalWizard(QWidget):
             self.kit_buttons[p].setVisible(self.conn(p) != self.OFF)
             for b in (self.conn_buttons[p], self.kit_buttons[p]):
                 b.setEnabled(on and not running)
-        self.start_button.setEnabled(on and not running and not gen and bool(self.conn(1)) and bool(self.kit(1)))
+        thru = self.kind == "THRU"
+        self.type_button.setText(self.kind)
+        self.type_button.setEnabled(on and not running)
+        for line in self.port_lines:
+            line.setVisible(not thru)
+        row = self.trace_row() if self.trace_row is not None else None
+        self.trace_label.setVisible(thru)
+        self.trace_label.setText("" if row is None else f"{row[0]}·{row[2]}" + ("" if self.thru_trace() else " ✕"))
+        self.trace_label.setToolTip("Selected trace; THRU needs S21 or S12")
+        ready = bool(self.thru_trace()) if thru else bool(self.conn(1)) and bool(self.kit(1))
+        self.start_button.setEnabled(on and not running and not gen and ready)
         self.abort_button.setEnabled(on and running and not busy)
         for b in self.step_buttons():
             b.done = b.step in self.done
@@ -771,8 +810,9 @@ class CalWindow(Window):
         self.proxy = proxy
         wz = self.wizard = CalWizard(proxy, settings, prefix)
         wz.run_lines = [PanelLine("STEP", wz.steps_box), PanelLine("NAME", wz.name_edit, wz.save_button)]
-        self.table = PanelTable(PanelLine("P1", wz.conn_buttons[1], wz.kit_buttons[1]),
-                                PanelLine("P2", wz.conn_buttons[2], wz.kit_buttons[2]),
+        wz.port_lines = [PanelLine("P1", wz.conn_buttons[1], wz.kit_buttons[1]),
+                         PanelLine("P2", wz.conn_buttons[2], wz.kit_buttons[2])]
+        self.table = PanelTable(PanelLine("TYPE", wz.type_button, wz.trace_label), *wz.port_lines,
                                 PanelLine("RUN", wz.start_button, wz.abort_button), *wz.run_lines)
         panel = Panel(self.table)
         self.table.build(UI_COLUMN_WIDTH_PX)
@@ -807,6 +847,7 @@ class CalWindow(Window):
 
     def open(self) -> None:
         self.wizard.refresh()
+        self.wizard._show()
         self._title()
         self.show()
         self.raise_()
@@ -973,6 +1014,9 @@ class VNAWindow(InstrumentWindow):
             if "cal_start" in proxy.actions:          # сама калибровка - в отдельном окне
                 self.cal_window = CalWindow(proxy, self.settings, pre)
                 self.cal_wizard = self.cal_window.wizard
+                if hasattr(self, "trace_editor"):
+                    self.cal_wizard.trace_row = self.trace_editor.row
+                    self.trace_editor.chips.selected.connect(lambda _i: self.cal_wizard._show())
                 b = self.cal_button = _CalOpenButton(self.cal_wizard)
                 b.clicked.connect(self.open_cal_window)
                 cal.append(PanelLine("NEW", b))

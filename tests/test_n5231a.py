@@ -582,3 +582,23 @@ def test_snp_read_for_touchstone(make, tmp_path):
     drv.run_action("snp_read", "2")
     assert list(actions[-1][1]) == ["S22"]
     assert drv._armed and not rec.comm
+
+
+def test_thru_response_calibration(make):
+    sim = KeysightPNASim()
+    sim.meas["CH1_S21"] = _meas("S21", "MLOG", 1)
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    with pytest.raises(ValueError):
+        drv.run_custom_action("cal_start_thru", ())          # выбран S11 - не перемычка
+    assert setp(drv, rec, "trace.sel", "1:CH1_S21") is PStatus.WRITTEN
+    drv.run_action("cal_start_thru")
+    steps, done = actions[-1][1]
+    assert steps == ["Connect THRU between port 1 and port 2 (S21 CH1_S21)"] and done == [] and not drv._armed
+    drv.run_action("cal_measure", 1)
+    drv.poll()
+    assert rec.values["cal.busy"] is False
+    drv.run_action("cal_save", "THRU_CAL")
+    assert "THRU_CAL" in actions[-1][1] and sim.c["cset"] == "THRU_CAL" and sim.c["corr"]
+    assert "SENS1:CORR:COLL:METH TRAN1" in sim.history and drv._armed and not rec.comm

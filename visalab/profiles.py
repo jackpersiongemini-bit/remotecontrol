@@ -355,6 +355,8 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("cal_status", doc="-> action_done('cal_status', ([описание шага, ...], [измеренные шаги]))"),
         ActionSlot("cal_save", doc="аргумент - имя: сохранить калибровку в cal set и применить -> список cal set"),
         ActionSlot("cal_abort", doc="прервать калибровку (развёртки продолжаются)"),
+        ActionSlot("cal_start_thru", doc="калибровка по перемычке (response THRU) трейса trace.sel (S21 / S12) "
+                                         "-> (шаги, измеренные); дальше cal_measure 1 и cal_save"),
         ActionSlot("snp_read", doc="аргумент - порты \"1,2\" | \"1\" | \"2\": S-параметры канала stim.channel -> "
                                    "{\"S11\": Trace(комплексная), ...} для Touchstone"),
         ActionSlot("reset"),

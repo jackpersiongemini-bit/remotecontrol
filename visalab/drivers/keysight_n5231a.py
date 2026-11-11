@@ -21,7 +21,10 @@
   ``CONN:PORT<n>``, ``CKIT:PORT<n>``, ``INIT``, ``STEPS?``, ``DESC? <шаг>`` -> список шагов; ``cal_measure``
   (номер шага) - ``ACQ STAN<шаг>`` + ``*OPC`` без блокировки (ключ ``cal.busy``); ``cal_status`` -> (шаги,
   измеренные); ``cal_save`` (имя) - ``SAVE:CSET "имя"``, cal set сразу применяется к каналу; ``cal_abort``.
-  Пока идёт калибровка, развёртки не запускаются;
+  Пока идёт калибровка, развёртки не запускаются. Калибровка только по перемычке (response THRU) трейса
+  ``trace.sel`` (S21 / S12): ``cal_start_thru`` - ``CALC<c>:PAR:SEL``, ``SENS<c>:CORR:COLL:METH TRAN1``, шаг
+  один (``SENS<c>:CORR:COLL:ACQ THRU``); ``cal_save`` - ``SENS<c>:CORR:COLL:SAVE``, затем
+  ``SENS<c>:CORR:CSET:COPY "имя"`` и ``ACT "имя",0``;
 * S-параметры канала для Touchstone: действие ``snp_read`` (порты, по умолчанию "1,2") - одна развёртка
   канала ``stim.channel`` (при внутреннем запуске), ``MMEM:STOR:TRAC:FORM:SNP RI``,
   ``CALC<c>:DATA:SNP:PORT? "1,2"`` (частоты, затем Re и Im каждого S-параметра в порядке S11 S21 S12 S22)
@@ -310,6 +313,7 @@ class KeysightPNA(VISAInstrument):
                 Action("cal_start", "Начать калибровку"), Action("cal_measure", "Измерить стандарт"),
                 Action("cal_status", "Шаги калибровки"), Action("cal_save", "Сохранить калибровку в cal set"),
                 Action("cal_abort", "Прервать калибровку"),
+                Action("cal_start_thru", "Калибровка по перемычке (response THRU) трейса trace.sel"),
                 Action("snp_read", "S-параметры канала (Touchstone)"),
                 Action("reset", "Preset *RST",
                        confirm="Preset удалит измерения и выключит калибровку. Продолжить?")]
@@ -750,7 +754,7 @@ class KeysightPNA(VISAInstrument):
             return self._mem_store(args)
         if name == "cal_list":
             return self._cal_list()
-        if name.startswith("cal_") and name not in ("cal_delete",):
+        if name.startswith("cal_") and name != "cal_delete":
             return self._cal_action(name, args)
         if name == "cal_delete":
             cset = str(args[0]) if args else ""
@@ -880,8 +884,23 @@ class KeysightPNA(VISAInstrument):
             self.write(f"{guid}:INIT")
             self._check_errors(context=name)
             steps = int(parse_number(self.query(f"{guid}:STEP?")))
-            self._cal = {"channel": c, "done": set(), "busy": None,
+            self._cal = {"channel": c, "done": set(), "busy": None, "kind": "guided",
                          "steps": [self.query(f"{guid}:DESC? {k}").strip().strip('"') for k in range(1, steps + 1)]}
+            return self._cal_status()
+        if name == "cal_start_thru":
+            if self._gen is not None:
+                raise ValueError("режим генератора: сначала выключите CW")
+            c, meas = self._sel
+            sparam = self._catalog(c).get(meas)
+            if sparam not in ("S21", "S12"):
+                raise ValueError(f"калибровка по перемычке - для трейса S21 / S12 (выбран {meas!r}: {sparam})")
+            self._abort()
+            self.write(f"CALC{c}:PAR:SEL '{meas}'")
+            self.write(f"SENS{c}:CORR:COLL:METH TRAN1")
+            self._check_errors(context=name)
+            a, b = sparam[1], sparam[2]
+            self._cal = {"channel": c, "done": set(), "busy": None, "kind": "thru", "meas": meas,
+                         "steps": [f"Connect THRU between port {b} and port {a} ({sparam} {meas})"]}
             return self._cal_status()
         if self._cal is None:
             raise ValueError("калибровка не начата (cal_start)")
@@ -891,7 +910,11 @@ class KeysightPNA(VISAInstrument):
                 raise ValueError(f"шаг 1..{len(self._cal['steps'])}, получено {k}")
             if self._cal["busy"] is not None:
                 raise ValueError(f"идёт измерение шага {self._cal['busy']}")
-            self.arm_opc(f"{guid}:ACQ STAN{k}")
+            if self._cal["kind"] == "thru":
+                self.write(f"CALC{c}:PAR:SEL '{self._cal['meas']}'")
+                self.arm_opc(f"SENS{c}:CORR:COLL:ACQ THRU")
+            else:
+                self.arm_opc(f"{guid}:ACQ STAN{k}")
             self._cal["busy"] = k
             self._publish("cal.busy", True)
             return k
@@ -901,7 +924,14 @@ class KeysightPNA(VISAInstrument):
                 raise ValueError(f"имя cal set: буквы, цифры, _ и -, до 32 знаков (получено {cset!r})")
             if self._cal["busy"] is not None or len(self._cal["done"]) < len(self._cal["steps"]):
                 raise ValueError("калибровка: измерены не все стандарты")
-            self.write(f'{guid}:SAVE:CSET "{cset}"')
+            if self._cal["kind"] == "thru":
+                self.write(f"CALC{c}:PAR:SEL '{self._cal['meas']}'")
+                self.write(f"SENS{c}:CORR:COLL:SAVE")
+                self.query("*OPC?")
+                self.write(f'SENS{c}:CORR:CSET:COPY "{cset}"')
+                self.write(f'SENS{c}:CORR:CSET:ACT "{cset}",0')
+            else:
+                self.write(f'{guid}:SAVE:CSET "{cset}"')
             self.query("*OPC?")
             self._check_errors(context=name)
             self._cal_end()
