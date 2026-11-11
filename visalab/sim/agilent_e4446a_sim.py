@@ -12,7 +12,7 @@ import copy
 import math
 import re
 
-from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
+from .base import ESR_CME, ESR_EXE, ESR_OPC, SimError, SimInstrument
 
 __all__ = ["AgilentPSASim"]
 

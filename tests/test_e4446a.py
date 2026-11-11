@@ -131,6 +131,8 @@ def test_states_in_instrument_memory(sa):
     assert "'C:\\.STA'" not in " ".join(sim.history)
     drv.run_action("state_save", ("1GHz_100MHz",))               # длиннее 8 знаков - обрезается
     assert actions[-1] == ("state_save", "1GHZ100M")
+    sim.write(":MMEM:CAT?")                                      # без каталога: как PSA, -109 в очереди
+    assert sim.read() is None and sim.errors[-2][0] == -109
 
 
 def test_e4446a_has_no_input_coupling_query(make):

@@ -407,6 +407,8 @@ class Run(QObject):
         self._seq = 0
         self._stopping = False
         self._first_error: ScenarioError | None = None
+        #: что вернуть, когда прибор снова подключится (связь пропала до возврата): [(proxy, ключ, значение)]
+        self.deferred: list[tuple[Any, str, Any]] = []
 
     # ----------------------------------------------------------- для сценария
     @property
@@ -448,6 +450,11 @@ class Run(QObject):
     def log(self, text: str) -> None:
         log.info("%s: %s", self.name, text)
         self.message.emit(text)
+
+    def defer_restore(self, dev: Device, key: str, value: Any) -> None:
+        """С прибором нет связи: записать ``key = value``, когда он снова подключится (это сделает координатор
+        после конца сценария - например, выключить выход, который сценарий включил)."""
+        self.deferred.append((dev.proxy, key, value))
 
     # ----------------------------------------------------------- управление
     def start(self) -> None:
@@ -560,7 +567,5 @@ class Run(QObject):
                 gen.close()
             except Exception:  # noqa: BLE001
                 pass
-        self.state, self.error = state, error
-        if state != self.DONE and error:
-            log.info("%s: %s (%s)", self.name, state, error)
+        self.state, self.error = state, error      # в журнал итог пишет координатор (с числом точек)
         self.ended.emit(self)

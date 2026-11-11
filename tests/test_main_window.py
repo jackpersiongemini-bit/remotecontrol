@@ -46,6 +46,7 @@ def test_nice_range_contains_data():
     lo, hi, step = nice_range(-23.4, -11.2, 6)
     assert lo <= -23.4 and hi >= -11.2 and step in (2.0, 5.0)
     assert nice_range(5.0, 5.0, 6)[0] < 5.0 < nice_range(5.0, 5.0, 6)[1]
+    assert nice_range(-120.0, -5.0, 6) == (-120.0, 0.0, 20.0)       # ваттметр: ВЧ выкл и вкл - не 50 dB/дел
 
 
 def test_sim_bench_feeds_analyzer_and_meter():

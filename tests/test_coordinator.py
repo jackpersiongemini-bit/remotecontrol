@@ -2,6 +2,8 @@
 
 Стенд SimBench: выход генератора E8267D попадает на ваттметр U2021XA с потерями 10 dB + 0.5 dB/ГГц.
 """
+import time
+
 import pytest
 from PyQt6.QtCore import QSettings, QTimer
 
@@ -54,6 +56,7 @@ def lab(qtbot):
     links.add(gen)
     links.add(pm)
     coord = Coordinator(links)
+    coord.bench = bench                     # тестам: менять тракт
     yield gen, pm, coord
     coord.stop_all(wait_ms=3000)
     timer.stop()
@@ -145,10 +148,12 @@ def test_acal_fits_gain_and_table_and_restores(qtbot, lab, tmp_path):
     pm_freq = pm.value("freq")
     path = tmp_path / "cal" / "acal.csv"
     run = coord.start(AutoCalibration(1e9, 3e9, 5, path=path, settle_s=0.02))
-    points = []
+    points, messages = [], []
     run.point.connect(points.append)
+    run.message.connect(messages.append)
     _finish(qtbot, run)
     assert run.state == "done", run.error
+    assert any("GAIN -11.00 dB, flatness 1.00 dB p-p" in m for m in messages), messages
     res = run.result
     # R(f) = −(10 + 0.5·f[ГГц]): среднее на 1..3 ГГц = −11, таблица = 0.5·f − 1
     assert res.gain == pytest.approx(-(LOSS + 2 * SLOPE), abs=0.01)
@@ -344,3 +349,90 @@ def test_main_window_shows_running_scenario(qtbot, pm_window, tmp_path):
     win.acal_run.click()
     qtbot.waitUntil(lambda: main.scenario_chip.isHidden(), timeout=10000)
     main.monitor.stop()
+
+
+# ------------------------------------------------------------------ ACAL на стенде: что бывает на железе
+def _lagging(sim, window_s=0.15):
+    """Датчик усредняет за window_s: после смены уровня показание ещё window_s «тянет» старое значение."""
+    real, hist = sim._compute, []
+
+    def compute(triggered):
+        r = real(triggered)
+        now = time.monotonic()
+        if not hist or hist[-1][1] != r["AVER"]:
+            hist.append((now, r["AVER"]))
+        start = now - window_s
+        cur_t, cur_v, acc = start, hist[0][1], 0.0
+        for t_i, v_i in hist:
+            if t_i <= start:
+                cur_v = v_i
+                continue
+            acc += cur_v * (t_i - cur_t)
+            cur_t, cur_v = t_i, v_i
+        acc += cur_v * (now - cur_t)
+        return {**r, "AVER": acc / window_s}
+    sim._compute = compute
+
+
+def _response_error(run, loss, slope):
+    """Наибольшее отличие измеренного R(f) от тракта стенда, dB."""
+    return max(abs(r + loss + slope * f / 1e9) for f, r in run.result.response)
+
+
+def test_acal_waits_for_settled_reading(qtbot, lab):
+    """Ваттметр усредняет: сразу после смены частоты показание ещё «тянет» старое значение. ACAL берёт
+    показание, когда два подряд совпали; с одним показанием на точку таблица была бы с ошибкой."""
+    gen, pm, coord = lab
+    coord.bench.slope_db_per_ghz = 4.0                             # 2 dB между точками
+    _lagging(_sim(pm))
+    hasty = _finish(qtbot, coord.start(AutoCalibration(1e9, 3e9, 5, settle_s=0.02, max_readings=1)))
+    assert hasty.state == "done", hasty.error
+    careful = _finish(qtbot, coord.start(AutoCalibration(1e9, 3e9, 5, settle_s=0.02)))
+    assert careful.state == "done", careful.error
+    assert _response_error(hasty, LOSS, 4.0) > 0.3
+    assert _response_error(careful, LOSS, 4.0) < AutoCalibration.STABLE_DB      # в пределах «совпали»
+
+
+def test_acal_without_signal_fails_with_reason(qtbot, lab):
+    gen, pm, coord = lab
+    coord.bench.loss_db = 80.0                                     # кабель не подключён
+    run = _finish(qtbot, coord.start(AutoCalibration(1e9, 3e9, 5, settle_s=0.02)))
+    assert run.state == "failed" and "no signal at PM" in run.error and "check the cable" in run.error
+    _wait_value(qtbot, gen, "rf.output", lambda v: v is False)        # генератор вернули
+
+
+def test_acal_stops_when_generator_is_changed_by_hand(qtbot, lab):
+    gen, pm, coord = lab
+    run = coord.start(AutoCalibration(1e9, 3e9, 5, settle_s=0.5))
+    fiddled = []
+
+    def by_hand(done, _total, _text):
+        if done == 1 and not fiddled:                               # точка 2: частота поставлена, идёт пауза
+            fiddled.append(1)
+            QTimer.singleShot(250, lambda: gen.set("rf.frequency", 7e9))
+    run.progress.connect(by_hand)
+    _finish(qtbot, run)
+    assert run.state == "failed" and "GEN rf.frequency changed during ACAL" in run.error, run.error
+    _wait_value(qtbot, gen, "rf.output", lambda v: v is False)
+
+
+def test_generator_lost_during_acal_rf_off_when_it_reconnects(qtbot, lab):
+    """Связь с генератором пропала посреди ACAL (сбой LAN): ВЧ у него остался включённым. Сценарий не
+    может его выключить - это сделает координатор, когда генератор переподключится сам."""
+    gen, pm, coord = lab
+    gen._worker.RECONNECT_DELAYS_S = (0.05,)
+    tr, sim = gen._worker.transport, _sim(gen)
+    run = coord.start(AutoCalibration(1e9, 3e9, 50, settle_s=0.05))
+    messages = []
+    run.message.connect(messages.append)
+    qtbot.waitUntil(lambda: run.done >= 1, timeout=10000)
+    sim.powered, tr.fail_after = False, tr._ops                       # обмен с генератором оборвался
+    _finish(qtbot, run)
+    assert run.state == "failed" and "GEN" in run.error
+    assert any("GEN: no connection" in m and "rf.output OFF when it reconnects" in m for m in messages), messages
+    assert ("rf.output", False) in coord.pending_restore(gen)
+    assert sim.s["rf.output"] is True                                 # на самом приборе ВЧ ещё включён
+    sim.powered, tr.fail_after = True, None                           # связь вернулась
+    qtbot.waitUntil(lambda: gen.is_connected, timeout=5000)
+    qtbot.waitUntil(lambda: sim.s["rf.output"] is False, timeout=5000)
+    assert coord.pending_restore(gen) == []

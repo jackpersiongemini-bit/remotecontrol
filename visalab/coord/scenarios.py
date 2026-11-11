@@ -8,7 +8,12 @@
   равно уровню генератора, то есть тракт генератор -> датчик учтён.
 
 В конце (и при остановке / ошибке) всё, что сценарий менял, возвращается как было: сначала выход
-ВЧ генератора, потом настройки ваттметра, потом частоты.
+ВЧ генератора, потом настройки ваттметра, потом частоты. Прибор, с которым пропала связь, вернуть
+нельзя - выход, который включил сценарий, координатор выключит, когда прибор снова подключится.
+
+На каждой точке: показание берётся, когда устоялось (датчик ещё усредняет значения до смены частоты);
+нет сигнала (ниже ``MIN_SIGNAL_DBM``) - отказ с понятной причиной; частоту или выход генератора
+поменяли руками во время сценария - отказ (точки были бы не на тех частотах).
 """
 from __future__ import annotations
 
@@ -47,14 +52,24 @@ class FrequencySweep(Scenario):
     needs = ("signal_generator", "power_meter")
     #: пауза после смены частоты до замера, с (генератор и датчик установились)
     SETTLE_S = 0.3
+    #: показание устоялось: два подряд различаются не больше, dB
+    STABLE_DB = 0.05
+    #: показаний на точку самое большее (не устоялось - среднее двух последних и строка в журнале)
+    MAX_READINGS = 6
+    #: ниже - сигнала на датчике нет (кабель, выход генератора), dBm
+    MIN_SIGNAL_DBM = -60.0
 
     def __init__(self, freqs, settle_s: float | None = None, skip: int = 1, count: int = 1,
-                 timeout_s: float = MEASURE_TIMEOUT_S):
+                 timeout_s: float = MEASURE_TIMEOUT_S, stable_db: float | None = None,
+                 max_readings: int | None = None, min_signal_dbm: float | None = None):
         self.freqs = [float(f) for f in freqs]
         if not self.freqs:
             raise ValueError("no frequencies")
         self.settle_s = self.SETTLE_S if settle_s is None else float(settle_s)
         self.skip, self.count, self.timeout_s = int(skip), int(count), timeout_s
+        self.stable_db = self.STABLE_DB if stable_db is None else float(stable_db)
+        self.max_readings = self.MAX_READINGS if max_readings is None else max(1, int(max_readings))
+        self.min_signal_dbm = self.MIN_SIGNAL_DBM if min_signal_dbm is None else float(min_signal_dbm)
         self.points: list[tuple[float, float, float]] = []
 
     # ------------------------------------------------------------ шаги
@@ -82,11 +97,13 @@ class FrequencySweep(Scenario):
                 sets = [gen.set("rf.frequency", f)]
                 if pm.supports("freq"):
                     sets.append(pm.set("freq", f))           # поправка датчика на этой частоте
-                yield sets
+                # что приборы подтвердили (могли округлить) - с этим и сверять, не поменял ли кто
+                confirmed = list(zip(((gen, "rf.frequency"), (pm, "freq")), (yield sets)))
                 if self.settle_s > 0:
                     yield run.sleep(self.settle_s)
-                power = float((yield pm.measure("meas.power", self.skip, self.count, self.timeout_s)))
+                power = yield from self.reading(run, pm, f)
                 level = float(gen.value("rf.power"))
+                self.check_point(gen, pm, f, power, level, confirmed)
                 self.points.append((f, power, level))
                 run.add_point({"freq": f, "power": power, "level": level, "index": i, "total": n})
             run.report(n, n, "done")
@@ -94,6 +111,39 @@ class FrequencySweep(Scenario):
         finally:
             yield from self.restore(run, saved)
         return result
+
+    def reading(self, run: Run, pm: Device, f: float):
+        """Показание на точке, когда устоялось: после смены частоты датчик ещё усредняет значения
+        до неё - ждать, пока два подряд совпадут (``STABLE_DB``), но не больше ``MAX_READINGS``."""
+        prev = float((yield pm.measure("meas.power", self.skip, self.count, self.timeout_s)))
+        if self.max_readings <= 1:
+            return prev
+        cur = prev
+        for _ in range(self.max_readings - 1):
+            cur = float((yield pm.measure("meas.power", 0, self.count, self.timeout_s)))
+            if abs(cur - prev) <= self.stable_db:
+                return (cur + prev) / 2
+            prev_, prev = prev, cur
+        run.log(f"{si_format(f, 'Hz', 6)}: reading not settled in {self.max_readings} "
+                f"({prev_:+.2f} / {cur:+.2f} dBm), mean taken")
+        return (cur + prev_) / 2
+
+    def check_point(self, gen: Device, pm: Device, f: float, power: float, level: float,
+                    confirmed=()) -> None:
+        """Сигнал на датчике есть; выход генератора включён и частоты те, что приборы подтвердили на этой
+        точке (``confirmed`` - [((прибор, ключ), значение)]): никто не поменял их руками во время сценария."""
+        if power < self.min_signal_dbm:
+            raise ScenarioError(f"no signal at {pm.name}: {power:.1f} dBm at {si_format(f, 'Hz', 6)} "
+                                f"({gen.name} {level:+.1f} dBm) - check the cable and the generator output")
+        if gen.value("rf.output") is False:
+            raise ScenarioError(f"{gen.name} RF output was switched off during {self.NAME}")
+        for (dev, key), expected in confirmed:
+            actual = dev.value(key)
+            if actual is None or expected is None:
+                continue
+            if not dev.proxy.params[key].same(expected, actual):
+                raise ScenarioError(f"{dev.name} {key} changed during {self.NAME}: "
+                                    f"{si_format(actual, 'Hz', 6)} instead of {si_format(expected, 'Hz', 6)}")
 
     # ------------------------------------------------------------ хуки
     def check(self, run: Run, gen: Device, pm: Device) -> None:
@@ -125,15 +175,34 @@ class FrequencySweep(Scenario):
 
     @staticmethod
     def restore(run: Run, saved: list):
-        """Вернуть всё в обратном порядке; ошибка одного ключа не мешает остальным."""
+        """Вернуть всё в обратном порядке; ошибка одного ключа не мешает остальным. С прибором нет связи:
+        выход, который включил сценарий, выключится, когда прибор снова подключится (координатор);
+        остальное (частоты...) так не возвращается - после переподключения это было бы неожиданно."""
+        lost: dict[str, list[str]] = {}
+
+        def later(dev: Device, key: str, value) -> None:
+            if value is False and key.endswith("output"):
+                run.defer_restore(dev, key, value)
+                lost.setdefault(dev.name, []).append(f"{key} OFF when it reconnects")
+            else:
+                lost.setdefault(dev.name, []).append(f"{key} not returned")
+
         while saved:
             dev, key, value = saved.pop()
-            if value is None or not dev.connected:
+            if value is None:
+                continue
+            if not dev.connected:
+                later(dev, key, value)
                 continue
             try:
                 yield dev.set(key, value)
             except ScenarioError as exc:
-                run.log(f"could not restore {dev.name} {key}: {exc}")
+                if dev.connected:
+                    run.log(f"could not restore {dev.name} {key}: {exc}")
+                else:
+                    later(dev, key, value)
+        for name, items in lost.items():
+            run.log(f"{name}: no connection - " + ", ".join(items))
 
 
 @dataclass
@@ -177,13 +246,14 @@ class AutoCalibration(FrequencySweep):
         duty = self.duty_db if self.pulsed else 0.0
         response = [(f, p + duty - level) for f, p, level in self.points]
         gain, table = fit_gain_table(response)
+        spread = max(d for _f, d in table) - min(d for _f, d in table) if table else 0.0
         if self.path is not None:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 save_csv(self.path, table)
             except OSError as exc:
                 raise ScenarioError(f"cannot save {self.path.name}: {exc}") from None
-        run.log(f"done: GAIN {gain:+.2f} dB, {len(table)} points" + (f", DUTY {duty:+.2f} dB" if duty else "")
-                + (f", table {self.path.stem}" if self.path is not None else ""))
+        run.log(f"done: GAIN {gain:+.2f} dB, flatness {spread:.2f} dB p-p, {len(table)} points"
+                + (f", DUTY {duty:+.2f} dB" if duty else "") + (f", table {self.path.stem}" if self.path is not None else ""))
         return AcalResult(gain=gain, table=table, response=response, duty_db=duty, path=self.path,
                           points=list(self.points))

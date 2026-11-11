@@ -28,9 +28,12 @@ def nice_range(lo: float, hi: float, divs: int) -> tuple[float, float, float]:
     span = (hi - lo) * 1.1
     e = math.floor(math.log10(span / divs))
     for step in (st * 10.0 ** k for k in (e, e + 1, e + 2) for st in (1, 2, 5)):
-        bottom = math.floor((lo - (step * divs - (hi - lo)) / 2) / step + 1e-9) * step
-        if bottom + step * divs >= hi and bottom <= lo:
-            return bottom, bottom + step * divs, step
+        # данные посередине; не влезли из-за округления низа - низ по самому нижнему значению
+        # (иначе -120..-5 dBm получали 50 dB/дел вместо 20)
+        centered = math.floor((lo - (step * divs - (hi - lo)) / 2) / step + 1e-9) * step
+        for bottom in (centered, math.floor(lo / step + 1e-9) * step):
+            if bottom + step * divs >= hi and bottom <= lo:
+                return bottom, bottom + step * divs, step
     return lo, hi, (hi - lo) / divs
 
 
