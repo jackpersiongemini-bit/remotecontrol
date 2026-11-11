@@ -37,7 +37,7 @@ def _wait(qtbot, cond):
 
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
-    assert [ln.name for ln in win.preset_panel.table.lines] == ["CH", "MEM", "MATH", "POW", "CW", "CORR"]
+    assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "MATH", "POW", "CW", "CORR"]
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "TRIG", "PWR", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
@@ -77,7 +77,7 @@ def test_cw_generator_and_correction(qtbot, vna):
     win.cw_button.click()
     _wait(qtbot, lambda: proxy.value("gen.state") is True and sim.c["type"] == "CW")
     assert win.cw_button.indicated() and proxy.value("sweep.type") == "CW"
-    assert [b.isEnabled() for b in win.stim_channels.buttons()] == [True, False]      # канал 2 стоит
+    assert [b.isEnabled() for b in win.trace_editor.chips.buttons()] == [True, True, False]   # канал 2 стоит
     win.widgets["rf.output"].set_value(True)
     win.widgets["cal.state"].set_value(True)
     _wait(qtbot, lambda: sim.c["corr"] is True and sim.c["outp"] is True)
@@ -86,7 +86,7 @@ def test_cw_generator_and_correction(qtbot, vna):
     win.cw_button.click()                                      # всё как было до генератора
     _wait(qtbot, lambda: sim.c["type"] == "LIN" and proxy.value("gen.state") is False)
     assert sim.c["outp"] is False and sim.c["cw"] == pytest.approx(2.5e9)
-    assert all(b.isEnabled() for b in win.stim_channels.buttons())
+    assert all(b.isEnabled() for b in win.trace_editor.chips.buttons())
 
 
 def _chips(te):
@@ -97,7 +97,7 @@ def test_trace_chips_read_and_mem_math(qtbot, vna):
     proxy, win, _s, sim = vna
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
-    assert _chips(te) == ["C1 S11\nMLOG", "C1 S21\nMLOG", "C2 S12\nMLOG"]
+    assert _chips(te) == ["1·S11", "1·S21", "2·S12"]
     assert te.current == (1, "CH1_S11_1") and te.chips.checked_index() == 0       # выбран первый
     assert not te.chips.buttons()[0].indicated() and not te.chips.buttons()[2].indicated()   # выбран / не читается
     te.chips.buttons()[2].click()                              # выбрать трейс канала 2
@@ -127,7 +127,7 @@ def test_trace_edit_create_move_delete(qtbot, vna):
     te.format.on_pick("PHASE")                                 # трейс, который не читается
     _wait(qtbot, lambda: sim.meas["USER_S21"]["fmt"] == "PHAS" and te.format.text() == "PHAS")
     te.sparam.on_pick("S12")
-    _wait(qtbot, lambda: te.sparam.text() == "S12" and _chips(te)[1] == "C1 S12\nPHAS")
+    _wait(qtbot, lambda: te.sparam.text() == "S12" and _chips(te)[1] == "1·S12")
     assert [n for n, _v in te.channel.choices] == ["C1", "C2", "C3 NEW"]
     te.channel.on_pick(3)                                      # перенос в новый канал 3 - выбран перенесённый
     _wait(qtbot, lambda: te.current == (3, "CH3_S12_1") and "USER_S21" not in sim.meas)
@@ -136,6 +136,7 @@ def test_trace_edit_create_move_delete(qtbot, vna):
     _wait(qtbot, lambda: te.current == (3, "CH3_S21_1") and len(te.chips.buttons()) == 4)
     assert te.chips.checked_index() == 3
     te.chips.buttons()[1].click()
+    _wait(qtbot, lambda: proxy.value("stim.channel") == 2)
     assert te.delete()                                         # − : удалить CH2_S12
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3 and "CH2_S12" not in sim.meas)
     assert te.current == (1, "CH1_S11_1")
@@ -162,11 +163,10 @@ def test_trace_chips_fill_width_and_selected_has_no_indicator(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    win.set_page(0)
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
     _wait(qtbot, lambda: sum(b.width() for b in te.chips.buttons()) + 8 >= te.scroll.viewport().width())
-    assert all(b.height() == win.add_button.height() * 2 + 4 or b.height() == 56 for b in te.chips.buttons())
+    assert all(b.height() == 30 for b in te.chips.buttons())
     first = te.chips.buttons()[0]
     assert first.isChecked() and te.is_read(1, "CH1_S11_1") and not first.indicated()   # выбран - без индикатора
     te.chips.buttons()[1].click()
@@ -177,29 +177,34 @@ def test_plus_minus_at_right_edge(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    for page in (0, 4):                                        # TRAC и SAVE
+    for page, tools, width in ((0, win._trc_tools, 70), (4, win.add_button.parentWidget(), 40)):   # TRC и SAVE
         win.set_page(page)
         qtbot.wait(50)
-        tools = win._trc_tools if page == 0 else win.add_button.parentWidget()
         line = tools.parentWidget()
         assert line.width() - tools.geometry().right() <= 2
-        assert tools.width() <= 40
+        assert tools.width() <= width
 
 
-def test_stim_channel_chips(qtbot, vna):
+def test_trace_selects_channel(qtbot, vna):
     proxy, win, _s, sim = vna
-    sc = win.stim_channels
-    _wait(qtbot, lambda: sc.channels == [1, 2])
-    assert [b.text() for b in sc.buttons()] == ["1", "2"] and sc.checked_index() == 0
-    assert all(b.sizeHint() == QSize(30, 30) for b in sc.buttons())
-    sc.buttons()[1].click()                                    # STIM -> канал 2
+    te = win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    assert proxy.value("stim.channel") == 1 and te.chips.checked_index() == 0
+    assert all(b.sizeHint().height() == 30 for b in te.chips.buttons())
+    te.chips.buttons()[2].click()                              # трейс канала 2 -> канал окна 2
     _wait(qtbot, lambda: proxy.value("stim.channel") == 2 and proxy.value("sweep.points") == 101)
     win.widgets["sweep.points"].set_value(21)
     _wait(qtbot, lambda: sim.stim(2)["poin"] == 21)
-    assert sim.c["poin"] == 201 and sc.checked_index() == 1
-    win.trace_editor.chips.buttons()[2].click()                # перенос трейса канала 2 в новый канал 3
-    win.trace_editor.channel.on_pick(3)
-    _wait(qtbot, lambda: sc.channels == [1, 2, 3] or sc.channels == [1, 3])
+    assert sim.c["poin"] == 201 and te.chips.checked_index() == 2
+    te.chips.buttons()[1].click()
+    _wait(qtbot, lambda: proxy.value("stim.channel") == 1)
+    te.chips.buttons()[2].click()
+    _wait(qtbot, lambda: proxy.value("stim.channel") == 2)
+    te.channel.on_pick(3)                                      # перенос в новый канал 3 - канал окна следом
+    _wait(qtbot, lambda: proxy.value("stim.channel") == 3 and te.current[0] == 3)
+    sim.meas["CH1_S21_2"] = {"s": "S21", "fmt": "PHAS", "ch": 1}
+    proxy.action("meas_table")                                 # два S21 на канале 1 - различаются форматом
+    _wait(qtbot, lambda: "1·S21 PHAS" in _chips(te) and "1·S21 MLOG" in _chips(te))
 
 
 def test_trig_tab(qtbot, vna):

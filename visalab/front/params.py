@@ -835,6 +835,7 @@ class Panel(QFrame):
         }
         Panel PSButton:disabled, Panel PLineEdit:disabled, Panel QPushButton#chip:disabled { color: $UI_COLOR_BORDER; }
         Panel QPushButton#chip { padding: 2px 8px; min-height: 0; max-height: 1000px; }
+        Panel QPushButton#chip[tight="true"] { padding: 2px 4px; }
         Panel QPushButton#chip:checked {
             background-color: $UI_COLOR_INVERT;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
