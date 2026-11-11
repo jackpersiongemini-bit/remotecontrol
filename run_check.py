@@ -22,7 +22,7 @@ from pathlib import Path
 from PyQt6.QtCore import QCoreApplication, QSettings
 
 from run_main import WINDOWS
-from visalab.applog import close_logging, default_log_path, setup_logging
+from visalab.applog import FORMAT, close_logging, default_log_path, setup_logging
 from visalab.check import format_report, run_check
 from visalab.core import InstrumentProxy
 from visalab.drivers import DRIVERS, make_transport
@@ -31,10 +31,20 @@ from visalab.front.models import all_models
 
 
 def _quiet_console() -> None:
-    """В консоли - только отчёт; подробности - в журнале (logs/visalab.log)."""
-    for h in logging.getLogger().handlers:
+    """В консоли - только отчёт; подробности - в журнале (logs/visalab.log). Вывод в файл на Windows идёт в
+    кодировке системы (cp1251): знак, которого в ней нет, - замена, а не ошибка (отчёт целиком - в файле).
+    Вызывать до ``setup_logging``: строка «старт» - уже только в журнал."""
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=logging.INFO, format=FORMAT)
+    for h in root.handlers:
         if type(h) is logging.StreamHandler:
             h.setLevel(logging.ERROR)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 
 def main(argv=None) -> int:
@@ -55,8 +65,8 @@ def main(argv=None) -> int:
         ap.error(f"неизвестные приборы: {', '.join(unknown)} (есть: {', '.join(WINDOWS)})")
 
     app = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])  # noqa: F841 - цикл событий потоков
-    log_file = setup_logging(args.log or default_log_path(args.ini))
     _quiet_console()
+    log_file = setup_logging(args.log or default_log_path(args.ini))
     settings = QSettings(args.ini, QSettings.Format.IniFormat)
     targets = []
     for key in keys:
