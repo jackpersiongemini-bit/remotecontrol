@@ -228,7 +228,7 @@ def test_data_save_csv(qtbot, vna, tmp_path):
     proxy, win, settings, sim = vna
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
-    assert [ln.name for ln in win.pages[6].lines] == ["VNA", "STAT", "PC", "NAME", "DATA"]
+    assert [ln.name for ln in win.pages[6].lines] == ["VNA", "STAT", "PC", "NAME", "DATA", "S2P"]
     te.chips.buttons()[2].click()                              # трейс канала 2 (другая ось) - тоже читать
     te.read.click()
     te.format.on_pick("POLAR")                                 # комплексный формат - два столбца
@@ -385,3 +385,21 @@ def test_cal_tab_guided_calibration(qtbot, vna):
     cw.close()                                                 # закрыть посреди калибровки - прервать
     _wait(qtbot, lambda: not wz.steps and proxy.value("meas.armed") is True)
     assert not win.cal_button.indicated()
+
+
+def test_save_s2p_of_selected_channel(qtbot, vna, tmp_path):
+    proxy, win, _s, sim = vna
+    te = win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    te.chips.buttons()[2].click()                              # канал 2
+    _wait(qtbot, lambda: proxy.value("stim.channel") == 2)
+    win.dir_edit.setText(str(tmp_path))
+    win.name_edit.setText("DUT")
+    win.s2p_button.click()
+    _wait(qtbot, lambda: win.s2p_button.text() == "SAVED")
+    files = list(tmp_path.glob("DUT_CH2_*.s2p"))
+    assert len(files) == 1
+    lines = files[0].read_text().splitlines()
+    data = [ln for ln in lines if ln and ln[0] not in "!#"]
+    assert "# HZ S RI R 50" in lines and len(data) == sim.stim(2)["poin"] and len(data[0].split()) == 9
+    assert float(data[0].split()[0]) == pytest.approx(sim.stim(2)["start"])

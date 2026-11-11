@@ -560,3 +560,25 @@ def test_guided_calibration(make):
     assert actions[-1][1][0] == ["Connect ECal module to port 1"]
     drv.run_action("cal_abort")
     assert drv._cal is None and drv._armed and not rec.comm
+
+
+def test_snp_read_for_touchstone(make, tmp_path):
+    from visalab.core.export import write_touchstone
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
+    for k, v in (("freq.start", 1e9), ("freq.stop", 3e9), ("sweep.points", 11)):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    drv.run_action("snp_read", "1,2")
+    sp = actions[-1][1]
+    assert list(sp) == ["S11", "S21", "S12", "S22"] and sim.snp_form == "RI"
+    s21 = sp["S21"]
+    assert s21.is_complex and len(s21) == 11 and s21.x[0] == 1e9 and s21.x[-1] == 3e9
+    assert s21.complex_y()[5] == pytest.approx(sim.s("S21", 2e9))
+    path = write_touchstone(tmp_path / "dut.s2p", sp, ["test"])
+    lines = path.read_text().splitlines()
+    assert lines[0] == "! test" and "# HZ S RI R 50" in lines and len(lines) == 3 + 11
+    assert len(lines[-1].split()) == 9
+    drv.run_action("snp_read", "2")
+    assert list(actions[-1][1]) == ["S22"]
+    assert drv._armed and not rec.comm

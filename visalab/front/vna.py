@@ -31,7 +31,7 @@ from typing import Any
 from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QFileDialog, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
-from ..core.export import write_traces_csv
+from ..core.export import write_touchstone, write_traces_csv
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
@@ -1042,6 +1042,17 @@ class VNAWindow(InstrumentWindow):
                 lambda: self.settings.setValue(f"{pre}/DATA_NAME", self.name_edit.text().strip()))
             save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit),
                      PanelLine("DATA", self.data_button)]
+            if "snp_read" in proxy.actions:           # S-параметры канала выбранного трейса -> .s2p
+                b = self.s2p_button = QPushButton("SAVE")
+                b.setObjectName("choice")
+                b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setToolTip("Save S11 S21 S12 S22 of the selected trace channel to a Touchstone .s2p file\n"
+                             "(one fresh sweep; folder and name - PC / NAME)")
+                b.clicked.connect(self.save_s2p)
+                for sig in (proxy.comm_error, proxy.instrument_error):     # snp_read не прошёл
+                    sig.connect(lambda *_a: self.s2p_button.text() == "…" and self._flash("ERROR", self.s2p_button))
+                save.append(PanelLine("S2P", b))
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
 
@@ -1123,14 +1134,7 @@ class VNAWindow(InstrumentWindow):
         if not traces:
             self._flash("NO DATA")
             return None
-        name = (getattr(self, "name_edit", None) and self.name_edit.text().strip()) or ""
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        base = re.sub(r"[^\w.-]+", "_", f"{name}_{stamp}" if name else stamp)
-        folder = Path(self.dir_edit.text().strip()) if getattr(self, "dir_edit", None) and \
-            self.dir_edit.text().strip() else self.data_dir()
-        path, k = folder / f"{base}.csv", 2
-        while path.exists():
-            path, k = folder / f"{base}-{k}.csv", k + 1
+        path = self._data_path("", "csv")
         comments = [f"{self.windowTitle() or 'VNA'}, saved {time.strftime('%Y-%m-%d %H:%M:%S')}"]
         for label, t in traces:
             m = t.meta
@@ -1148,15 +1152,52 @@ class VNAWindow(InstrumentWindow):
         self.data_button.setToolTip(f"Last file: {path}")
         return path
 
-    def _flash(self, text: str) -> None:
+    def _flash(self, text: str, b: QPushButton | None = None) -> None:
         """Итог на кнопке на 1.5 с (таймер - дочерний кнопки: умирает вместе с окном)."""
-        b = self.data_button
-        if not hasattr(self, "_flash_timer"):
-            self._flash_timer = QTimer(b)
-            self._flash_timer.setSingleShot(True)
-            self._flash_timer.timeout.connect(lambda: b.setText("SAVE"))
+        b = b or self.data_button
+        timer = getattr(b, "_flash_timer", None)
+        if timer is None:
+            timer = b._flash_timer = QTimer(b)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: b.setText("SAVE"))
         b.setText(text)
-        self._flash_timer.start(1500)
+        timer.start(1500)
+
+    def _data_path(self, tag: str, ext: str) -> Path:
+        """Новый файл в папке PC: <NAME>_<tag>_<дата_время>.<ext> (без перезаписи)."""
+        name = (getattr(self, "name_edit", None) and self.name_edit.text().strip()) or ""
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = re.sub(r"[^\w.-]+", "_", "_".join(p for p in (name, tag, stamp) if p))
+        folder = Path(self.dir_edit.text().strip()) if getattr(self, "dir_edit", None) and \
+            self.dir_edit.text().strip() else self.data_dir()
+        path, k = folder / f"{base}.{ext}", 2
+        while path.exists():
+            path, k = folder / f"{base}-{k}.{ext}", k + 1
+        return path
+
+    def save_s2p(self) -> None:
+        """S2P SAVE: прибор читает S-параметры канала (snp_read), файл пишется по ответу."""
+        if self.proxy.is_connected:
+            self.s2p_button.setText("…")
+            self.proxy.action("snp_read", "1,2")
+
+    def _write_s2p(self, sparams: dict) -> Path | None:
+        t = next(iter(sparams.values()))
+        m = t.meta
+        path = self._data_path(f"CH{m.get('channel', '')}", "s2p")
+        comments = [f"{self.windowTitle() or 'VNA'}, saved {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"channel {m.get('channel')}, {len(t)} points, cal set {m.get('cal.set') or '-'}, "
+                    f"correction {'ON' if m.get('cal.state') else 'OFF'}, IFBW {m.get('bw.if')}, "
+                    f"power {m.get('source.power')} dBm"]
+        try:
+            write_touchstone(path, sparams, comments)
+        except (OSError, ValueError) as e:
+            self._flash("ERROR", self.s2p_button)
+            self.s2p_button.setToolTip(f"Not saved: {e}")
+            return None
+        self._flash("SAVED", self.s2p_button)
+        self.s2p_button.setToolTip(f"Last file: {path}")
+        return path
 
     def restore_rank(self, key: str) -> int:
         if key.endswith(("_auto", "_state")) or key == "avg.count":
@@ -1226,7 +1267,9 @@ class VNAWindow(InstrumentWindow):
         self.proxy.action("state_recall", preset[0])
 
     def _on_action(self, name: str, result) -> None:
-        if name == "state_dirs" and self._dirs_asked and isinstance(result, (list, tuple)) and len(result) == 2:
+        if name == "snp_read" and isinstance(result, dict) and result and hasattr(self, "s2p_button"):
+            self._write_s2p(result)
+        elif name == "state_dirs" and self._dirs_asked and isinstance(result, (list, tuple)) and len(result) == 2:
             self._dirs_asked = False
             self._dirs_menu(str(result[0]), [str(d) for d in result[1]])
         elif name == "state_list" and isinstance(result, (list, tuple)):
