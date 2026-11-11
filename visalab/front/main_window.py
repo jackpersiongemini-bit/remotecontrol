@@ -218,6 +218,8 @@ class MainWindow(Window):
         self.setWindowTitle("LAB")
         self.monitor = monitor or ActivityMonitor(parent=self)
         self.quit_on_close = False
+        #: вызывается при закрытии главного окна до выхода (окна приборов ещё в прежнем виде)
+        self.before_quit: list = []
         self.tiles: dict[object, InstrumentTile] = {}
         self.panels: dict[object, LivePanel] = {}
 
@@ -399,8 +401,9 @@ class MainWindow(Window):
     # ------------------------------------------------------------ окна приборов
     def open_instrument(self, proxy) -> None:
         """Показать окно прибора (окна открыты в этом же процессе, возможно скрыты)."""
+        from .instrument_window import InstrumentWindow       # не вспомогательные окна (TraceEditor, CAL...)
         for w in QApplication.topLevelWidgets():
-            if getattr(w, "proxy", None) is proxy and w is not self:
+            if isinstance(w, InstrumentWindow) and w.proxy is proxy:
                 if w.isMinimized():
                     w.showNormal()
                 w.show()
@@ -409,7 +412,11 @@ class MainWindow(Window):
                 return
 
     def closeEvent(self, event):  # noqa: N802 - Qt
+        if self.quit_on_close:
+            for fn in self.before_quit:
+                fn()
         super().closeEvent(event)
         if self.quit_on_close:
+            self.monitor.stop()
             QApplication.quit()
 

@@ -12,10 +12,10 @@ from PyQt6.QtWidgets import QApplication
 
 from ..core import InstrumentProxy
 from ..drivers import DRIVERS, make_transport
-from .instrument_window import saved_connection
+from .instrument_window import saved_connection, saved_delay
 from .models import all_models
 
-__all__ = ["run_window", "run_windows"]
+__all__ = ["run_window", "run_windows", "remember_windows"]
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,12 +34,18 @@ def run_window(window_cls, lab_key: str, doc: str = "", argv=None) -> int:
     return run_windows([(window_cls, lab_key)], doc, argv)
 
 
-def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool = True, setup=None) -> int:
+def _log_exception(kind, value, tb) -> None:
+    """Ошибка в слоте Qt: в журнал, а не аварийный выход всей программы (так делает PyQt6 по умолчанию)."""
+    logging.getLogger("visalab").error("необработанная ошибка", exc_info=(kind, value, tb))
+
+
+def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None = True, setup=None) -> int:
     """Несколько окон в одном процессе (окна видят приборы друг друга через LINKS).
 
     ``specs`` - [(window_cls, lab_key)]; ``--address`` относится к первому окну. ``parser`` -
     готовый ArgumentParser (если обёртке нужны свои флаги). ``show=False`` - окна приборов создаются
-    скрытыми (их показывает главное окно). ``setup(opened, args, settings)`` - вызывается после
+    скрытыми (их показывает главное окно); ``show=None`` - как были при выходе (ini WINDOWS/<прибор>/VISIBLE,
+    сначала скрыты). ``setup(opened, args, settings)`` - вызывается после
     создания окон (главное окно, стенд симуляторов); что вернёт - живёт до выхода."""
     ap = parser or argparse.ArgumentParser(description=doc, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--address", metavar="ADDR")
@@ -52,14 +58,25 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool = True,
     args, _rest = ap.parse_known_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    sys.excepthook = _log_exception
     app = QApplication.instance() or QApplication(sys.argv[:1])
     settings = QSettings(args.ini, QSettings.Format.IniFormat)
     opened: list[dict] = []
     for n, (window_cls, lab_key) in enumerate(specs):
-        opened.append(_open(window_cls, lab_key, args, settings, args.address if n == 0 else None, show))
+        visible = settings.value(f"WINDOWS/{lab_key}/VISIBLE", False, type=bool) if show is None else show
+        opened.append(_open(window_cls, lab_key, args, settings, args.address if n == 0 else None, visible))
+        opened[-1]["lab_key"] = lab_key
     keep = setup(opened, args, settings) if setup else None  # noqa: F841 - держим ссылку до выхода
+
     app.aboutToQuit.connect(lambda: [cur["proxy"].shutdown() for cur in opened])
     return app.exec()
+
+
+def remember_windows(opened: list[dict], settings: QSettings) -> None:
+    """Запомнить, какие окна приборов открыты (вызывать ДО выхода: quit сам закрывает окна)."""
+    for cur in opened:
+        settings.setValue(f"WINDOWS/{cur['lab_key']}/VISIBLE", bool(cur["win"].isVisible()))
+    settings.sync()
 
 
 def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None,
@@ -67,7 +84,10 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
     """Создать прокси и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win} (обновляется)."""
     lab = _lab(args.lab, lab_key)
     saved = saved_connection(settings, window_cls.CONNECTION_GROUP)     # выбранное в окне (адрес -> APPLY)
-    kind, model, delay = saved["driver"] or window_cls.DEFAULT_KIND, saved["model"] or None, None
+    kind, model = saved["driver"] or window_cls.DEFAULT_KIND, saved["model"] or None
+    delay = saved_delay(settings, window_cls.CONNECTION_GROUP)          # DLY на странице адреса
+    if delay is None:
+        delay = lab.get("delay")
     if args.sim:
         address = "sim"
     elif cli_address:
@@ -76,7 +96,7 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
         address = saved["address"]
     else:
         address = lab.get("address", "sim")
-        model, delay = model or lab.get("model"), lab.get("delay")
+        model = model or lab.get("model")
     current: dict = {}
 
     def build(kind: str, address: str, model: str | None, pos=None, visible: bool = True) -> None:

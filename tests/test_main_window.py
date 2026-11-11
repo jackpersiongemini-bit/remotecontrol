@@ -217,3 +217,74 @@ def test_thresholds_in_main_window_settings(qtbot, lab, tmp_path):
     win2 = MainWindow(settings, ActivityMonitor(links))   # из ini
     qtbot.addWidget(win2)
     assert win2.tabs.currentIndex() == 1 and win2.monitor.th.vna_refl_db == -60.0 and win2.fields["vna_refl_db"].text() == "-60 dB"
+
+
+def test_open_instrument_picks_the_instrument_window_not_helpers(qtbot, tmp_path):
+    from PyQt6.QtWidgets import QWidget
+    from visalab.front import VNAWindow
+    settings = QSettings(str(tmp_path / "w.ini"), QSettings.Format.IniFormat)
+    links = ProxyLinks()
+    proxy = _proxy("pna")
+    links.add(proxy)
+    helper = QWidget()                                  # вспомогательное окно с тем же прибором (как TraceEditor)
+    helper.proxy = proxy
+    qtbot.addWidget(helper)
+    vna = VNAWindow(proxy, settings)
+    qtbot.addWidget(vna)
+    win = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win)
+    win.open_instrument(proxy)
+    assert vna.isVisible() and not helper.isVisible()
+    win.monitor.stop()
+    proxy.shutdown()
+
+
+def test_delay_on_address_page(qtbot, tmp_path):
+    from visalab.front import PulseGenWindow
+    from visalab.front.instrument_window import saved_delay
+    settings = QSettings(str(tmp_path / "d.ini"), QSettings.Format.IniFormat)
+    proxy = _proxy("sdg")
+    win = PulseGenWindow(proxy, settings)
+    qtbot.addWidget(win)
+    names = [ln.name for ln in win.connection_page.lines]
+    assert names[:4] == ["DRV", "MDL", "ADDR", "DLY"]
+    win.delay_edit.setText("120m")
+    assert win.apply_delay()
+    assert saved_delay(settings, win.CONNECTION_GROUP) == pytest.approx(0.12) and win.delay_edit.text() == "120 ms"
+    qtbot.waitUntil(lambda: proxy._worker.command_delay_s == pytest.approx(0.12), timeout=3000)
+    win.delay_edit.setText("junk")
+    assert not win.apply_delay() and win.delay_edit.text() == "120 ms"
+    win.delay_edit.setText("")
+    assert win.apply_delay() and saved_delay(settings, win.CONNECTION_GROUP) is None
+    proxy.shutdown()
+
+
+def test_windows_restored_as_at_exit(qtbot, tmp_path, monkeypatch):
+    import run_main
+    from PyQt6.QtWidgets import QApplication
+    from visalab.coord import LINKS
+    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    ini = str(tmp_path / "v.ini")
+    QSettings(ini, QSettings.Format.IniFormat).setValue("WINDOWS/pna/VISIBLE", True)
+    made = []
+    orig = run_main.MainWindow.__init__
+
+    def track(self, *a, **k):
+        orig(self, *a, **k)
+        made.append(self)
+    monkeypatch.setattr(run_main.MainWindow, "__init__", track)
+    monkeypatch.setattr(QApplication, "quit", lambda *a: None)
+    before = set(LINKS.proxies())
+    assert run_main.main(["--sim", "--ini", ini, "--no-connect", "--only", "pna,e8267d"]) == 0
+    from visalab.front.instrument_window import InstrumentWindow
+    wins = {w.proxy: w for w in QApplication.topLevelWidgets() if isinstance(w, InstrumentWindow)
+            and w.proxy not in before}
+    shown = sorted(made[0].monitor.name(p)[:3] for p, w in wins.items() if w.isVisible())
+    assert shown == ["VNA"]                              # GEN был скрыт (по умолчанию)
+    gen = next(w for p, w in wins.items() if made[0].monitor.name(p).startswith("GEN"))
+    gen.show()
+    made[0].close()                                      # запомнить перед выходом
+    s = QSettings(ini, QSettings.Format.IniFormat)
+    assert s.value("WINDOWS/e8267d/VISIBLE", type=bool) is True and s.value("WINDOWS/pna/VISIBLE", type=bool) is True
+    for p in wins:
+        p.shutdown()

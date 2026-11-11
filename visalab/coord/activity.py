@@ -27,6 +27,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from PyQt6 import sip
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from ..core.params import ConnectionState
@@ -178,14 +179,31 @@ class ActivityMonitor(QObject):
     def name(self, proxy) -> str:
         return short_name(proxy, self.proxies())
 
-    def _sync_roster(self) -> None:
-        current = self.proxies()
-        for p in [p for p in self._conns if p not in current]:
-            for sig, slot in self._conns.pop(p):
+    def stop(self) -> None:
+        """Отключиться от реестра и приборов (выход из программы: объекты Qt уже удаляются)."""
+        self._timer.stop()
+        try:
+            self.links.changed.disconnect(self._sync_roster)
+        except (TypeError, RuntimeError):
+            pass
+        for p in list(self._conns):
+            self._drop(p)
+
+    def _drop(self, p) -> None:
+        conns = self._conns.pop(p, [])
+        if not sip.isdeleted(p):                 # у удалённого QObject отключать нечего (иначе segfault)
+            for sig, slot in conns:
                 try:
                     sig.disconnect(slot)
                 except (TypeError, RuntimeError):
                     pass
+
+    def _sync_roster(self) -> None:
+        if sip.isdeleted(self):
+            return
+        current = self.proxies()
+        for p in [p for p in self._conns if p not in current]:
+            self._drop(p)
             for d in (self._last_signal, self._updated, self._sa, self._measuring, self.history):
                 d.pop(p, None)
         for p in current:

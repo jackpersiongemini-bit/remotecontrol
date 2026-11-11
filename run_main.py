@@ -3,10 +3,10 @@
     python run_main.py                 # все приборы из lab.json (адреса из ini окон, иначе lab.json)
     python run_main.py --sim           # все на симуляторах; генератор подаёт сигнал на SA и ваттметр
     python run_main.py --only pna,e4446a,u2021xa,e8267d
-    python run_main.py --hide-windows  # окна приборов скрыты, открываются кликом по плитке
+    python run_main.py --show-windows  # показать все окна приборов (иначе - как были при выходе)
 
-Открываются главное окно и окна всех приборов. Плитка прибора: класс и состояние, индикатор - прибор
-измеряет или выход включён; клик - поднять окно прибора.
+Плитка прибора: класс и состояние, индикатор - прибор измеряет или выход включён; клик - окно прибора. Окна приборов
+открываются такими, какими были при выходе (скрытые - скрытыми).
 Панели ниже - приёмники, которые сейчас измеряют (ВАЦ - трейсы, ваттметр - точки, анализатор - спектр).
 """
 from __future__ import annotations
@@ -15,10 +15,11 @@ import argparse
 import sys
 
 from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QApplication
 
 from visalab.coord import ActivityMonitor
 from visalab.front import PowerMeterWindow, PSUWindow, PulseGenWindow, RFGenWindow, SpectrumWindow, VNAWindow
-from visalab.front.launch import run_windows
+from visalab.front.launch import remember_windows, run_windows
 from visalab.front.main_window import MainWindow
 
 #: запись lab.json -> окно; порядок - порядок плиток
@@ -33,6 +34,8 @@ def _sim(proxy):
 def setup(opened, args, settings):
     win = MainWindow(settings, ActivityMonitor())
     win.quit_on_close = True
+    QApplication.instance().aboutToQuit.connect(win.monitor.stop)    # до остановки приборов
+    win.before_quit.append(lambda: remember_windows(opened, settings))
     win.show()
     keep = {"main": win}
     if args.sim:                                       # стенд: генератор -> анализатор и ваттметр
@@ -58,14 +61,14 @@ def setup(opened, args, settings):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", default="", help="записи lab.json через запятую")
-    ap.add_argument("--hide-windows", action="store_true", help="окна приборов скрыты (открываются по плитке)")
+    ap.add_argument("--show-windows", action="store_true", help="показать все окна приборов")
     known = ap.parse_known_args(argv)[0]
     keys = [k.strip() for k in known.only.split(",") if k.strip()] or list(WINDOWS)
     unknown = [k for k in keys if k not in WINDOWS]
     if unknown:
         ap.error(f"неизвестные приборы: {', '.join(unknown)} (есть: {', '.join(WINDOWS)})")
     specs = [(WINDOWS[k], k) for k in keys]
-    return run_windows(specs, __doc__, argv, parser=ap, show=not known.hide_windows, setup=setup)
+    return run_windows(specs, __doc__, argv, parser=ap, show=True if known.show_windows else None, setup=setup)
 
 
 if __name__ == "__main__":
