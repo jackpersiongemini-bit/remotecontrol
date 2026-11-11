@@ -85,46 +85,56 @@ def test_cw_generator_and_correction(qtbot, vna):
     _wait(qtbot, lambda: sim.c["type"] == "LIN")
 
 
-def test_trace_table_read_and_mem_math(qtbot, vna):
+def _chips(te):
+    return [b.text() for b in te.chips.buttons()]
+
+
+def test_trace_chips_read_and_mem_math(qtbot, vna):
     proxy, win, _s, sim = vna
-    tt = win.trace_table
-    _wait(qtbot, lambda: len(tt.rows) == 3)
-    assert [(r.channel_menu.text(), r.sparam.text(), r.format.text(), r.math.text()) for r in tt.rows] == [
-        ("C1", "S11", "MLOG", "DATA"), ("C1", "S21", "MLOG", "DATA"), ("C2", "S12", "MLOG", "DATA")]
-    assert tt.is_read(1, "CH1_S11_1") and not tt.is_read(2, "CH2_S12")
-    tt.rows[2].read.click()                                    # канал 2: свободный слот
-    _wait(qtbot, lambda: tt.is_read(2, "CH2_S12"))
-    n = tt.slot_of(2, "CH2_S12")
+    te = win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    assert _chips(te) == ["C1 S11\nMLOG", "C1 S21\nMLOG", "C2 S12\nMLOG"]
+    assert te.current == (1, "CH1_S11_1") and te.chips.checked_index() == 0       # выбран первый
+    assert te.chips.buttons()[0].indicated() and not te.chips.buttons()[2].indicated()   # индикатор - читается
+    te.chips.buttons()[2].click()                              # выбрать трейс канала 2
+    assert te.current == (2, "CH2_S12") and te.channel.text() == "C2" and not te.read.indicated()
+    te.read.click()                                            # READ: свободный слот
+    _wait(qtbot, lambda: te.is_read(2, "CH2_S12") and te.read.indicated())
+    n = te.slot_of(2, "CH2_S12")
     _wait(qtbot, lambda: proxy.value(f"m{n}.trace") is not None)
-    tt.rows[0].read.click()                                    # m1 больше не читается
+    te.chips.buttons()[0].click()
+    te.read.click()                                            # m1 больше не читается
     _wait(qtbot, lambda: proxy.value("m1.enabled") is False)
     assert win.math_button.slots() == [n]
     proxy.action("mem_store")
     _wait(qtbot, lambda: sim.meas["CH2_S12"].get("mem") is not None)
     assert sim.meas["CH1_S11_1"].get("mem") is None            # только читаемые
     win.math_button.set_value("DIV")
-    _wait(qtbot, lambda: win.math_button.text() == "D/M" and tt.rows[2].math.text() == "D/M")
+    te.chips.buttons()[2].click()
+    _wait(qtbot, lambda: win.math_button.text() == "D/M" and te.math.text() == "D/M")
     assert sim.meas["CH2_S12"]["math"] == "DIV"
 
 
-def test_trace_table_edit_create_delete(qtbot, vna):
+def test_trace_edit_create_move_delete(qtbot, vna):
     proxy, win, _s, sim = vna
-    tt = win.trace_table
-    _wait(qtbot, lambda: len(tt.rows) == 3)
-    tt.rows[1].format.on_pick("PHASE")                         # трейс, который не читается
-    _wait(qtbot, lambda: sim.meas["USER_S21"]["fmt"] == "PHAS" and tt.rows[1].format.text() == "PHAS")
-    tt.rows[1].sparam.on_pick("S12")
-    _wait(qtbot, lambda: tt.rows[1].sparam.text() == "S12")
-    assert [n for n, _v in tt.rows[0].channel_menu.choices] == ["C1", "C2", "C3 NEW", None, "DEL"]
-    tt.create()                                                # + : S21 на канале последней строки (2)
-    _wait(qtbot, lambda: len(tt.rows) == 4)
-    assert sim.meas["CH2_S21_1"]["ch"] == 2
-    tt.rows[1].channel_menu.on_pick(3)                         # перенос USER_S21 в новый канал 3
-    _wait(qtbot, lambda: "USER_S21" not in sim.meas and "CH3_S12_1" in sim.meas)
-    _wait(qtbot, lambda: [r.channel_menu.text() for r in tt.rows] == ["C1", "C2", "C2", "C3"])
-    assert sim.meas["CH3_S12_1"]["fmt"] == "PHAS"
-    tt.rows[1].channel_menu.on_pick("DEL")                     # удалить CH2_S12
-    _wait(qtbot, lambda: len(tt.rows) == 3 and "CH2_S12" not in sim.meas)
+    te = win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    te.chips.buttons()[1].click()
+    te.format.on_pick("PHASE")                                 # трейс, который не читается
+    _wait(qtbot, lambda: sim.meas["USER_S21"]["fmt"] == "PHAS" and te.format.text() == "PHAS")
+    te.sparam.on_pick("S12")
+    _wait(qtbot, lambda: te.sparam.text() == "S12" and _chips(te)[1] == "C1 S12\nPHAS")
+    assert [n for n, _v in te.channel.choices] == ["C1", "C2", "C3 NEW"]
+    te.channel.on_pick(3)                                      # перенос в новый канал 3 - выбран перенесённый
+    _wait(qtbot, lambda: te.current == (3, "CH3_S12_1") and "USER_S21" not in sim.meas)
+    assert sim.meas["CH3_S12_1"]["fmt"] == "PHAS" and te.channel.text() == "C3"
+    te.create()                                                # + : S21 на канале выбранного (3) - выбран новый
+    _wait(qtbot, lambda: te.current == (3, "CH3_S21_1") and len(te.chips.buttons()) == 4)
+    assert te.chips.checked_index() == 3
+    te.chips.buttons()[1].click()
+    assert te.delete()                                         # − : удалить CH2_S12
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3 and "CH2_S12" not in sim.meas)
+    assert te.current == (1, "CH1_S11_1")
 
 
 def test_states_tab(qtbot, vna):
