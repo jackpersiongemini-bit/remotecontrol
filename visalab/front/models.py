@@ -26,7 +26,7 @@ __all__ = ["FIELD_META", "model_class", "user_models", "all_models", "save_user_
 FIELD_META: dict[str, tuple[str, str]] = {
     "name": ("NAME", ""), "channels": ("CH", ""), "max_freq": ("FMAX", "Hz"), "max_amp_hiz": ("AMAX", "Vpp"),
     "has_cmr": ("CMR", ""), "f_min": ("FMIN", "Hz"), "f_max": ("FMAX", "Hz"), "p_min": ("PMIN", "dBm"),
-    "p_max": ("PMAX", "dBm"), "max_points": ("PTS", ""), "ratings": ("U,I", ""),
+    "p_max": ("PMAX", "dBm"), "max_points": ("PTS", ""), "ratings": ("U,I", ""), "dc_coupling": ("DC", ""),
 }
 
 

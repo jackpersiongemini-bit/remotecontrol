@@ -65,41 +65,41 @@ def test_presets_live_in_analyzer_memory(qtbot, tmp_path):
         proxy.set("freq.span", 100e6)
         _wait(qtbot, proxy, "freq.span", lambda v: v == pytest.approx(100e6))
         win.add_button.click()
-        qtbot.waitUntil(lambda: win.presets.names() == ["2p4GHz_100MHz"], timeout=5000)
-        assert set(sim.files) == {"2p4GHz_100MHz.state"} and win.presets.checked_index() == 0
+        qtbot.waitUntil(lambda: win.presets.names() == ["2G4S100M"], timeout=5000)
+        assert set(sim.files) == {"2G4S100M.STA"} and win.presets.checked_index() == 0
         proxy.set("freq.center", 1e9)
         proxy.set("freq.span", 10e6)
         _wait(qtbot, proxy, "freq.span", lambda v: v == pytest.approx(10e6))
         win.add_button.click()
         qtbot.waitUntil(lambda: len(win.presets.data) == 2, timeout=5000)
-        assert win.presets.selected_name() == "1GHz_10MHz"
+        assert win.presets.selected_name() == "1GS10M"
         # чип вызывает состояние из прибора
         qtbot.mouseClick(win.presets.buttons()[0], Qt.MouseButton.LeftButton)
         _wait(qtbot, proxy, "freq.center", lambda v: v == pytest.approx(2.4e9))
         _wait(qtbot, proxy, "freq.span", lambda v: v == pytest.approx(100e6))
         # в ini - только порядок (последний использованный первым)
-        assert json.loads(settings.value(f"{win._prefix}/SA_PRESETS")) == [["2p4GHz_100MHz"], ["1GHz_10MHz"]]
+        assert json.loads(settings.value(f"{win._prefix}/SA_PRESETS")) == [["2G4S100M"], ["1GS10M"]]
         files = dict(sim.files)
     finally:
         proxy.shutdown()
 
     # новый сеанс: пресеты читаются из прибора, порядок - из ini; лишние имена из ini исчезают
-    settings.setValue(f"{win._prefix}/SA_PRESETS", json.dumps([["1GHz_10MHz"], ["gone"], ["2p4GHz_100MHz"]]))
+    settings.setValue(f"{win._prefix}/SA_PRESETS", json.dumps([["1GS10M"], ["GONE"], ["2G4S100M"]]))
     proxy2 = _proxy()
     proxy2_sim_files = files
     win2 = SpectrumWindow(proxy2, settings)
     qtbot.addWidget(win2)
-    assert win2.presets.names() == ["1GHz_10MHz", "gone", "2p4GHz_100MHz"]      # до подключения - как в ini
+    assert win2.presets.names() == ["1GS10M", "GONE", "2G4S100M"]      # до подключения - как в ini
     with qtbot.waitSignal(proxy2.sync_done, timeout=5000):
         proxy2.open()
     proxy2._worker.transport.sim.files.update(proxy2_sim_files)                 # «прибор» с теми же файлами
     proxy2.action("state_list")
     try:
-        qtbot.waitUntil(lambda: win2.presets.names() == ["1GHz_10MHz", "2p4GHz_100MHz"], timeout=5000)
+        qtbot.waitUntil(lambda: win2.presets.names() == ["1GS10M", "2G4S100M"], timeout=5000)
         win2.presets.set_checked(1)
         win2.remove_button.click()                                              # удаление - из памяти прибора
-        qtbot.waitUntil(lambda: win2.presets.names() == ["1GHz_10MHz"], timeout=5000)
-        assert set(proxy2._worker.transport.sim.files) == {"1GHz_10MHz.state"}
+        qtbot.waitUntil(lambda: win2.presets.names() == ["1GS10M"], timeout=5000)
+        assert set(proxy2._worker.transport.sim.files) == {"1GS10M.STA"}
     finally:
         proxy2.shutdown()
 

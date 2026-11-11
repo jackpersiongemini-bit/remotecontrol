@@ -15,8 +15,13 @@
 * нулевая полоса - ``FREQ:SPAN 0``: ось трассы - время (0...SWE:TIME);
 * трасса ``TRAC:DATA? TRACE1`` в формате ``FORM ASC`` (значения через запятую, dBm);
 * маркер ``CALC:MARK1:STAT``, ``:X``, ``:Y?``, ``:MAX``;
-* состояния в памяти прибора: ``MMEM:STOR:STAT 1,"имя"``, ``MMEM:LOAD:STAT 1,"имя"``,
-  ``MMEM:CAT?`` (файлы ``*.state``), ``MMEM:DEL "имя.state"``;
+* состояния в памяти прибора (диск ``C:``, справка 2.6 "File"): ``MMEM:STOR:STAT 1,'C:\\ИМЯ.STA'``
+  (расширение .STA обязательно), ``MMEM:LOAD:STAT 1,'C:\\ИМЯ.STA'``, ``MMEM:DEL 'C:\\ИМЯ.STA'``,
+  ``MMEM:CAT? 'C:\\'`` -> ``<занято>,<свободно>{,"<файл>,<тип>,<размер>"}``. Имя файла - DOS: до 8 знаков,
+  только A-Z и 0-9 (прибор переводит в верхний регистр); драйвер приводит имя к этому виду и
+  возвращает из ``state_save`` то имя, под которым состояние записано;
+* ``INP:COUP`` есть не у всех моделей: "Not available on 40 GHz or 50 GHz analyzers" (E4446A/47A/48A) -
+  на запрос прибор не отвечает, поэтому у этих моделей ключа ``input.coupling`` нет (``PSAModel.dc_coupling``);
 * ``INIT:CONT OFF`` + ``INIT`` - одна развёртка, конец которой ловится через ``*OPC``.
 
 Драйвер всегда ведёт прибор однократными развёртками (INIT:CONT OFF): после окончания
@@ -44,20 +49,29 @@ F, I, B, E = Kind.FLOAT, Kind.INT, Kind.BOOL, Kind.ENUM
 class PSAModel:
     name: str
     f_max: float
+    #: выбор связи входа AC/DC (``INP:COUP``); у 40 и 50 ГГц моделей его нет
+    dc_coupling: bool = True
 
 
 PSA_MODELS = {
     "E4440A": PSAModel("E4440A", 26.5e9), "E4443A": PSAModel("E4443A", 6.7e9),
-    "E4445A": PSAModel("E4445A", 13.2e9), "E4446A": PSAModel("E4446A", 44.0e9),
-    "E4447A": PSAModel("E4447A", 42.98e9), "E4448A": PSAModel("E4448A", 50.0e9),
+    "E4445A": PSAModel("E4445A", 13.2e9), "E4446A": PSAModel("E4446A", 44.0e9, dc_coupling=False),
+    "E4447A": PSAModel("E4447A", 42.98e9, dc_coupling=False), "E4448A": PSAModel("E4448A", 50.0e9, dc_coupling=False),
 }
 
 FREQ_KEYS = ("freq.center", "freq.span", "freq.start", "freq.stop")
 #: что прибор пересчитывает сам при смене полосы/RBW (связанные «авто»)
 COUPLED = ("bw.res", "bw.video", "sweep.time", "sweep.points")
 SWEEP_TIMEOUT_MS = 60000
-STATE_EXT = ".state"
-_STATE_NAME = re.compile(r"[A-Za-z0-9_\-]{1,32}")
+STATE_EXT = ".STA"
+STATE_DIR = "C:\\"
+#: имя файла PSA: до 8 знаков, только A-Z и 0-9
+_STATE_NAME = re.compile(r"[A-Z0-9]{1,8}")
+
+
+def state_file_name(name: str) -> str:
+    """Имя состояния -> допустимое имя файла PSA (верхний регистр, только A-Z0-9, до 8 знаков)."""
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())[:8]
 
 
 class AgilentPSA(VISAInstrument):
@@ -131,8 +145,6 @@ class AgilentPSA(VISAInstrument):
                   minimum=-327.0, maximum=327.0, tolerance=1e-3),
             Param("preamp", "Предусилитель", B, section=amp, query="POW:GAIN?", write="POW:GAIN {value}",
                   also_read=("atten",)),
-            Param("input.coupling", "Связь входа", E, section=amp, query="INP:COUP?", write="INP:COUP {value}",
-                  choices=("AC", "DC")),
             Param("sweep.type", "Тип развёртки", E, section=sw, query="SWE:TYPE?", write="SWE:TYPE {value}",
                   choices=("AUTO", "SWEPT", "FFT"), enum_map=(("SWEPT", "SWE"),), also_read=("sweep.time",)),
             Param("trace.mode", "Режим трассы", E, section="Спектр/Трасса", query="TRAC:MODE?",
@@ -156,7 +168,8 @@ class AgilentPSA(VISAInstrument):
                   write="CALC:MARK1:X {value}", minimum=0.0, maximum=fmax, tolerance=1e-6,
                   also_read=("marker.level", "marker.state")),
             Param("marker.level", "Уровень маркера", F, "dBm", section=mk, query="<marker>"),
-        ]
+        ] + ([Param("input.coupling", "Связь входа", E, section=amp, query="INP:COUP?", write="INP:COUP {value}",
+                    choices=("AC", "DC"))] if self.model.dc_coupling else [])
 
     def build_actions(self):
         return [Action("single", "Одна развёртка"), Action("abort", "Прервать"),
@@ -246,6 +259,11 @@ class AgilentPSA(VISAInstrument):
         if self._values.get("marker.state"):
             self._read_keys(["marker.freq", "marker.level"])
 
+    def after_poll_timeout(self) -> None:
+        """Чтение трассы прервал таймаут (обмен уже восстановлен): развёртки не должны остановиться."""
+        if self._continuous and not self._armed:
+            self._start_sweep()
+
     def poll(self) -> None:
         if self._armed and self.opc_done("развёртка"):
             self._set_armed(False)
@@ -291,32 +309,37 @@ class AgilentPSA(VISAInstrument):
 
     # ------------------------------------------------- состояния в памяти прибора
     def _state_list(self) -> list[str]:
-        reply = self.query("MMEM:CAT?")
+        reply = self.query(f"MMEM:CAT? '{STATE_DIR}'")
+        entries = re.findall(r'"([^"]*)"', reply) or reply.split(",")   # "ИМЯ.STA,,812" или без кавычек
         names = []
-        for entry in re.findall(r'"([^"]*)"', reply):          # "имя.state,STAT,размер"
-            file = entry.split(",")[0].strip()
-            if file.lower().endswith(STATE_EXT):
-                names.append(file[:-len(STATE_EXT)])
-        return sorted(names)
+        for entry in entries:
+            file = entry.split(",")[0].strip().strip("'")
+            if file.upper().endswith(STATE_EXT):
+                names.append(file[:-len(STATE_EXT)].upper())
+        return sorted(set(names))
 
-    def _state_file_action(self, name: str, args: tuple) -> None:
-        state = str(args[0]) if args else ""
+    def _state_file_action(self, name: str, args: tuple) -> str | None:
+        state = state_file_name(args[0]) if args else ""
         if not _STATE_NAME.fullmatch(state):
-            raise ValueError(f"имя состояния: буквы, цифры, _ и -, до 32 знаков (получено {state!r})")
+            raise ValueError(f"имя состояния: буквы A-Z и цифры, до 8 знаков (получено {args[0] if args else ''!r})")
+        path = f"'{STATE_DIR}{state}{STATE_EXT}'"
         if name == "state_delete":
-            self.write(f'MMEM:DEL "{state}{STATE_EXT}"')
-            return
+            self.write(f"MMEM:DEL {path}")
+            return None
         was_armed = self._armed
         self._abort()
         if name == "state_save":
-            self.write(f'MMEM:STOR:STAT 1,"{state}"')
+            if state in self._state_list():                      # запись поверх: старый файл сначала удалить
+                self.write(f"MMEM:DEL {path}")
+            self.write(f"MMEM:STOR:STAT 1,{path}")
             self._check_errors(context=name)
             if was_armed or self._continuous:
                 self._start_sweep()
-            return
-        self.write(f'MMEM:LOAD:STAT 1,"{state}"')                # state_recall
+            return state
+        self.write(f"MMEM:LOAD:STAT 1,{path}")                   # state_recall
         self._check_errors(context=name)
         self.write("FORM ASC")
         self._sync_all()                                        # значения прибора изменились; развёртка - как была
         if was_armed and not self._armed:
             self._start_sweep()
+        return None
