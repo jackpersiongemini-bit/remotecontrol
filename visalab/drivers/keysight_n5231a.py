@@ -255,7 +255,7 @@ class KeysightPNA(VISAInstrument):
                 Action("meas_create", "Создать измерение"), Action("meas_move", "Перенести измерение в канал"),
                 Action("meas_delete", "Удалить измерение", confirm="Удалить измерение с прибора?"),
                 Action("mem_store", "Данные в память"),
-                Action("state_list", "Состояния в памяти"), Action("state_save", "Сохранить состояние"),
+                Action("state_list", "Состояния в памяти"), Action("state_dirs", "Папки на диске анализатора"), Action("state_save", "Сохранить состояние"),
                 Action("state_recall", "Вызвать состояние"),
                 Action("state_delete", "Удалить состояние", confirm="Удалить состояние из памяти анализатора?"),
                 Action("reset", "Preset *RST",
@@ -627,6 +627,8 @@ class KeysightPNA(VISAInstrument):
             return self._mem_store(args)
         if name == "state_list":
             return self._state_list()
+        if name == "state_dirs":
+            return self._state_dirs()
         if name in ("state_save", "state_recall", "state_delete"):
             return self._state_file_action(name, args)
         if name == "reset":
@@ -654,6 +656,12 @@ class KeysightPNA(VISAInstrument):
         return nums
 
     # ------------------------------------------------- состояния в памяти прибора
+    def _state_dirs(self) -> tuple[str, list[str]]:
+        """(текущая папка, имена её подпапок): элементы ``MMEM:CAT?`` без расширения считаются папками."""
+        path = self.query("MMEM:CDIR?").strip().strip('"')
+        names = [e.strip() for e in re.split(r'[",]', self.query("MMEM:CAT?")) if e.strip()]
+        return path, sorted({n for n in names if "." not in n}, key=str.lower)
+
     def _state_list(self) -> list[str]:
         reply = self.query("MMEM:CAT?")
         names = []
