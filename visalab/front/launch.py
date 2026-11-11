@@ -68,7 +68,7 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None 
         opened[-1]["lab_key"] = lab_key
     keep = setup(opened, args, settings) if setup else None  # noqa: F841 - держим ссылку до выхода
 
-    app.aboutToQuit.connect(lambda: [cur["proxy"].shutdown() for cur in opened])
+    app.aboutToQuit.connect(lambda: InstrumentProxy.shutdown_all(cur["proxy"] for cur in opened))
     return app.exec()
 
 

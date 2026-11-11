@@ -732,6 +732,11 @@ class KeysightPNA(VISAInstrument):
         if self._values.get("mark.state"):
             self._read_keys(["mark.y"])
 
+    def after_poll_timeout(self) -> None:
+        """Чтение трассы прервал таймаут (обмен уже восстановлен): развёртки не должны остановиться."""
+        if self._continuous and not self._armed:
+            self._start_sweep()
+
     def poll(self) -> None:
         if self._cal is not None and self._cal["busy"] is not None:
             if self.opc_done("калибровка"):

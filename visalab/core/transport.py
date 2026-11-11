@@ -86,6 +86,20 @@ class Transport(ABC):
         self.write(message)
         return parse_float_block(self.read().encode("latin-1"))
 
+    def discard_input(self, wait_ms: int = 200, max_reads: int = 50) -> None:
+        """Выбросить ответы, пришедшие с опозданием (после таймаута): читать, пока прибор молчит
+        ``wait_ms``. Таймаут транспорта возвращается прежним."""
+        old = self.timeout_ms
+        self.timeout_ms = wait_ms
+        try:
+            for _ in range(max_reads):
+                try:
+                    self.read()
+                except TransportTimeout:
+                    break
+        finally:
+            self.timeout_ms = old
+
     @abstractmethod
     def read_stb(self) -> int: ...
 
@@ -136,6 +150,12 @@ class PyVisaTransport(Transport):
         except Exception as exc:  # pyvisa.Error, OSError, ValueError ...
             self.close()
             raise TransportError(f"{self.address}: не удалось открыть: {exc}") from exc
+        try:
+            # pyvisa по умолчанию декодирует ascii: любой байт > 127 (имя файла, мусор после сбоя) ронял
+            # чтение UnicodeDecodeError мимо обработки ошибок связи. latin-1 декодирует любой байт.
+            self._res.encoding = "latin-1"
+        except AttributeError:
+            pass
         itype = getattr(self._res, "interface_type", None)
         rclass = getattr(self._res, "resource_class", "")
         self.supports_serial_poll = (
@@ -171,7 +191,7 @@ class PyVisaTransport(Transport):
             if exc.error_code == pyvisa.constants.StatusCode.error_nonsupported_operation:
                 raise TransportNotSupported(f"{self.address}: {exc}") from exc
             raise TransportError(f"{self.address}: {exc}") from exc
-        except (pyvisa.Error, OSError) as exc:
+        except (pyvisa.Error, OSError, UnicodeDecodeError) as exc:
             raise TransportError(f"{self.address}: {exc}") from exc
 
     def write(self, message: str) -> None:
@@ -185,6 +205,18 @@ class PyVisaTransport(Transport):
 
     def read_stb(self) -> int:
         return int(self._call(self._res.read_stb))
+
+    def discard_input(self, wait_ms: int = 200, max_reads: int = 50) -> None:
+        old = self._timeout_ms
+        self.timeout_ms = wait_ms
+        try:
+            for _ in range(max_reads):
+                try:
+                    self._call(self._res.read_raw)      # байты как есть, без декодирования
+                except TransportTimeout:
+                    break
+        finally:
+            self.timeout_ms = old
 
     def clear(self) -> None:
         self._call(self._res.clear)
@@ -218,6 +250,11 @@ class SimTransport(Transport):
         self._ops = 0
         self._open = False
         self._timeout_ms = 2000
+        #: как ведёт себя реальный прибор, ответивший позже таймаута: запросы, начинающиеся с этих строк,
+        #: читаются с таймаутом, а их ответ остаётся в буфере и достаётся следующему чтению (сдвиг)
+        self.late: set[str] = set()
+        self._late_answers: list[str] = []
+        self._last_write = ""
 
     def _tick(self):
         if not self._open:
@@ -242,14 +279,30 @@ class SimTransport(Transport):
 
     def write(self, message: str) -> None:
         self._tick()
+        self._last_write = message
         self.sim.write(message)
+        # опоздавший ответ уже в буфере интерфейса: прибор отменить его не может
+        if self._late_answers:
+            self.sim._out[:0] = self._late_answers
+            self._late_answers = []
 
     def read(self) -> str:
         self._tick()
+        if any(self._last_write.upper().startswith(p.upper()) for p in self.late):
+            self.late = {p for p in self.late if not self._last_write.upper().startswith(p.upper())}
+            data = self.sim.read()
+            if data is not None:
+                self._late_answers.append(data)
+            raise TransportTimeout(f"{self.address}: таймаут (ответ опоздал, симуляция)")
         data = self.sim.read()
         if data is None:
             raise TransportTimeout(f"{self.address}: таймаут (нет данных)")
         return data
+
+    def discard_input(self, wait_ms: int = 200, max_reads: int = 50) -> None:
+        self._tick()
+        self._late_answers = []
+        self.sim._out.clear()
 
     def read_stb(self) -> int:
         self._tick()

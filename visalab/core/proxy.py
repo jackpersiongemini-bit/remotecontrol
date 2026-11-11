@@ -75,15 +75,18 @@ class InstrumentProxy(QObject):
 
         self._worker.moveToThread(self._thread)
         w = self._worker
-        for sig, slot in (
+        self._requests = (
             (self._req_open, w.open_connection), (self._req_close, w.close_connection),
             (self._req_sync, w.sync_all), (self._req_set, w.set_param),
             (self._req_read, w.read_param), (self._req_action, w.run_action),
             (self._req_raw_write, w.raw_write), (self._req_raw_query, w.raw_query),
             (self._req_poll, w.set_poll_interval), (self._req_log_poll, w.set_log_polling),
-            (self._req_delay, w.set_command_delay), (self._req_shutdown, w.shutdown),
-        ):
+            (self._req_delay, w.set_command_delay),
+        )
+        for sig, slot in self._requests:
             sig.connect(slot, _Q)
+        self._req_shutdown.connect(w.shutdown, _Q)
+        self._shut_down = False
         # события воркера -> внутренние обработчики (в GUI-потоке) -> сигналы прокси
         w.state_changed.connect(self._on_state, _Q)
         w.identified.connect(self._on_idn, _Q)
@@ -92,7 +95,10 @@ class InstrumentProxy(QObject):
         for name in ("instrument_error", "comm_error", "scpi_log", "action_done",
                      "sync_done", "raw_response"):
             getattr(w, name).connect(getattr(self, name), _Q)
-        self._thread.finished.connect(w.deleteLater)
+        # Воркер НЕ удаляется через finished -> deleteLater: тогда его (и QTimer) удалял бы поток прибора,
+        # которому для этого нужен GIL, а GUI-поток в ~QThread ждёт этот поток, держа GIL, - взаимная
+        # блокировка (программа виснет на выходе или при смене адреса). Воркером владеет Python; при закрытии
+        # он сам возвращается в GUI-поток (VISAInstrument.shutdown) и удаляется вместе с прокси.
         self._thread.start()
 
     # ------------------------------------------------------------ API GUI
@@ -149,16 +155,51 @@ class InstrumentProxy(QObject):
         if on_status:
             self._status_subs[key].append(on_status)
 
-    def shutdown(self, timeout_ms: int = 3000) -> None:
-        """Корректно закрыть прибор и дождаться завершения потока."""
-        if not self._thread.isRunning():
+    def request_shutdown(self) -> None:
+        """Попросить поток прибора закрыть ресурс и завершиться (не ждать). Запросы после этого
+        прибору не уходят: воркер вернётся в GUI-поток, и обмен с прибором там заблокировал бы окна."""
+        if self._shut_down:
             return
+        self._shut_down = True
         self._req_shutdown.emit()
+        for sig, _slot in self._requests:
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+
+    def shutdown_wait_ms(self) -> int:
+        """Сколько ждать поток: он может быть внутри запроса (до таймаута транспорта) и потом ещё
+        вернуть прибор (on_disconnecting) - несколько команд."""
+        timeout = int(getattr(self._worker.transport, "timeout_ms", 2000) or 2000)
+        return max(3000, 3 * timeout + 2000)
+
+    def wait_shutdown(self, timeout_ms: int | None = None) -> None:
+        """Дождаться завершения потока. ``terminate()`` - только крайний случай: убитый посреди вызова
+        VISA поток может оставить библиотеку VISA (и GIL) занятыми - программа падает или виснет на выходе."""
+        timeout_ms = self.shutdown_wait_ms() if timeout_ms is None else timeout_ms
+        # wait() - без проверки isRunning(): тот в Qt 6 ложен, пока поток ещё завершается (isInFinish), а
+        # прокси, удалённый в этот момент, ждал бы поток в ~QThread с захваченным GIL.
         if not self._thread.wait(timeout_ms):
             log.warning("%s: поток не завершился за %d мс, принудительно", self.name, timeout_ms)
             self._thread.terminate()
-            self._thread.wait()
+            self._thread.wait(2000)
         self.state = ConnectionState.DISCONNECTED   # события из очереди могут прийти позже
+
+    def shutdown(self, timeout_ms: int | None = None) -> None:
+        """Корректно закрыть прибор и дождаться завершения потока."""
+        self.request_shutdown()
+        self.wait_shutdown(timeout_ms)
+
+    @staticmethod
+    def shutdown_all(proxies) -> None:
+        """Закрыть несколько приборов параллельно: сначала всем запрос, потом ждать каждого
+        (иначе на выходе время закрытия приборов складывается)."""
+        proxies = list(proxies)
+        for p in proxies:
+            p.request_shutdown()
+        for p in proxies:
+            p.wait_shutdown()
 
     @property
     def is_connected(self) -> bool:

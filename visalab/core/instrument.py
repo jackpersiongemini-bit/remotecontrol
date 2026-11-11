@@ -35,7 +35,7 @@ import time
 import traceback
 from typing import Any, Callable, Iterable
 
-from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QCoreApplication, QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
 from .params import Action, ConnectionState, Param, PStatus
 from .profile import Profile
@@ -134,6 +134,10 @@ class VISAInstrument(QObject):
         self.log_polling = False
         self.idn = ""
         self.opc_latched = False       # см. read_esr()
+        self._opc_pending = False      # arm_opc() послан, окончание ещё не поймано
+        #: ключи, на запрос которых прибор ответил ошибкой команды и не ответил (нет у этой модели/опции)
+        self._no_answer: set[str] = set()
+        self._resyncing = False
         self._timer = QTimer(self)     # переедет в поток вместе с self
         self._timer.setInterval(self.POLL_INTERVAL_MS)
         self._timer.timeout.connect(self._on_poll)
@@ -289,6 +293,8 @@ class VISAInstrument(QObject):
         if self._state is ConnectionState.CONNECTED:
             return
         self._set_state(ConnectionState.CONNECTING)
+        self._no_answer.clear()
+        self._opc_pending = False
         self.transport.timeout_ms = self.TIMEOUT_MS
         self.transport.open()
         try:
@@ -303,8 +309,8 @@ class VISAInstrument(QObject):
         self.on_connected()
         self._poll_failures = 0
         self._set_state(ConnectionState.CONNECTED)
+        self._timer.start()          # до чтения: если прибор не ответит на что-то при чтении, опрос всё равно идёт
         self._sync_all()
-        self._timer.start()
 
     @pyqtSlot()
     @guarded
@@ -377,6 +383,9 @@ class VISAInstrument(QObject):
         thread = self.thread()
         if thread is not QThread.currentThread() or thread is None:
             return
+        app = QCoreApplication.instance()
+        if app is not None and app.thread() is not thread:
+            self.moveToThread(app.thread())     # удалять воркер будет GUI-поток (см. InstrumentProxy)
         thread.quit()
 
     # ===================================================== внутренняя логика
@@ -403,10 +412,62 @@ class VISAInstrument(QObject):
         self._values.clear()
         self._set_state(state)
 
-    def _on_transport_error(self, exc: TransportError) -> None:
+    def _on_transport_error(self, exc: TransportError, recover: bool = True) -> None:
+        """Ошибка связи. Таймаут у подключённого прибора - сначала восстановить обмен (прибор мог
+        не ответить на одну команду: нет у модели, ошибка в консоли, долго считал); рвать связь,
+        только если прибор не отвечает и после этого."""
         self.comm_error.emit(str(exc))
+        if recover and isinstance(exc, TransportTimeout) and self._state is ConnectionState.CONNECTED \
+                and self._try_resync():
+            return
         if self._state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
             self._close(ConnectionState.ERROR, graceful=False)
+
+    # ---- восстановление обмена после таймаута ----
+    # Реальный прибор, не ответивший вовремя, может ответить позже: тогда каждый следующий запрос
+    # читает ответ на предыдущий (сдвиг). А на запрос, которого у модели нет (ошибка -113), прибор
+    # не отвечает вовсе. Симуляторы такого не делают, поэтому это проверяется отдельно (SimTransport.late).
+    RESYNC_ATTEMPTS = 3
+
+    def _try_resync(self) -> bool:
+        """Выбросить опоздавшие ответы и убедиться по ``*IDN?``, что обмен снова верный.
+        ``*IDN?`` (а не ``*OPC?``) - потому что ``*OPC?`` ждёт конца идущей развёртки."""
+        if self._resyncing:
+            return False
+        self._resyncing = True
+        quiet, self._quiet = self._quiet, True
+        try:
+            for attempt in range(self.RESYNC_ATTEMPTS):
+                if attempt == 1:                       # не помогло - device clear (сбрасывает буферы прибора)
+                    try:
+                        self.transport.clear()
+                    except TransportNotSupported:
+                        pass
+                self.transport.discard_input()
+                try:
+                    answer = self.query("*IDN?")
+                except TransportTimeout:
+                    continue
+                if not self.idn or answer == self.idn:
+                    log.warning("%s: обмен восстановлен после таймаута", self.transport.address)
+                    self.after_resync(cleared=attempt >= 1)
+                    return True
+            return False
+        except TransportError as exc:
+            log.warning("%s: восстановить обмен не удалось: %s", self.transport.address, exc)
+            return False
+        finally:
+            self._quiet = quiet
+            self._resyncing = False
+
+    def after_poll_timeout(self) -> None:
+        """Хук: опрос прервался таймаутом, обмен восстановлен (например, перезапустить развёртки)."""
+
+    def after_resync(self, cleared: bool) -> None:
+        """Хук после восстановления обмена. Device clear (``cleared``) отменяет ожидание ``*OPC``
+        (IEEE 488.2) - взвести его снова, иначе конец идущей развёртки не будет пойман никогда."""
+        if self._opc_pending and cleared:
+            self.write("*OPC")
 
     def _publish(self, key: str, value: Any) -> None:
         self._values[key] = value
@@ -430,10 +491,26 @@ class VISAInstrument(QObject):
                     if v is not None or self._values.get(k) is not None or k not in self._values:
                         self._publish(k, v)
             else:
+                if key in self._no_answer:
+                    continue
                 try:
                     self._publish(key, self.read_param_raw(spec))
                 except ValueError as exc:   # прибор вернул непонятное
                     self.param_status.emit(key, PStatus.ERROR, f"ответ не распознан: {exc}")
+                except TransportTimeout as exc:
+                    self._no_reply(key, exc)
+
+    def _no_reply(self, key: str, exc: TransportTimeout) -> None:
+        """Прибор не ответил на чтение ключа: восстановить обмен (иначе - обрыв связи) и, если прибор
+        сообщил об ошибке команды (-1xx: такой команды у модели / опции нет), больше ключ не читать."""
+        if not self._try_resync():
+            raise exc
+        errors = self._check_errors(context=key)
+        if any(-199 <= code <= -100 for code, _ in errors):
+            self._no_answer.add(key)
+            self.param_status.emit(key, PStatus.ERROR, "прибор не поддерживает (нет у модели или опции)")
+        else:
+            self.param_status.emit(key, PStatus.ERROR, f"нет ответа: {exc}")
 
     def _sync_all(self) -> None:
         self._read_keys(list(self._params))
@@ -505,6 +582,7 @@ class VISAInstrument(QObject):
         for c in commands:
             self.write(c)
         self.write("*OPC")
+        self._opc_pending = True
 
     def opc_done(self, context: str = "измерение") -> bool:
         esr = self.read_esr()
@@ -512,6 +590,7 @@ class VISAInstrument(QObject):
             self._check_errors(context=context, esr=esr)
         if self.opc_latched:
             self.opc_latched = False
+            self._opc_pending = False
             return True
         return False
 
@@ -551,9 +630,14 @@ class VISAInstrument(QObject):
             self.poll()
             self._poll_failures = 0
         except TransportTimeout as exc:
+            # Не ответил на опрос: восстановить обмен (опоздавший ответ сдвинул бы все следующие).
+            # Связь рвётся, если прибор молчит и после этого или не отвечает MAX_POLL_FAILURES опросов подряд.
             self._poll_failures += 1
-            if self._poll_failures >= self.MAX_POLL_FAILURES:
-                self._on_transport_error(exc)
+            if self._poll_failures >= self.MAX_POLL_FAILURES or not self._try_resync():
+                self._on_transport_error(exc, recover=False)
+            else:
+                log.warning("%s: опрос: %s", self.transport.address, exc)
+                self.after_poll_timeout()
         except TransportError as exc:
             self._on_transport_error(exc)
         except Exception as exc:  # noqa: BLE001

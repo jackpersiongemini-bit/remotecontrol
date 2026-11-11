@@ -284,6 +284,11 @@ class KeysightU2021XA(VISAInstrument):
                 "gate": (self._values.get("gate.start"), self._values.get("gate.length"))}
         return Trace.linear(start, start + length, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
 
+    def after_poll_timeout(self) -> None:
+        """Чтение результата прервал таймаут (обмен уже восстановлен): взвести измерение снова."""
+        if self._continuous and not self._armed and not (self._free_run and not self._tracing):
+            self._arm()
+
     def poll(self) -> None:
         if self._free_run and self._continuous and not self._tracing:
             self._fetch()
