@@ -22,11 +22,14 @@ STIM (стимул и развёртка), PWR (мощность, RF, списо
 from __future__ import annotations
 
 import re
+import time
+from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtWidgets import QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
+from PyQt6.QtWidgets import QFileDialog, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
+from ..core.export import write_traces_csv
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
@@ -500,6 +503,14 @@ class VNAWindow(InstrumentWindow):
         if sup("m1.math"):
             self.math_button = MathButton(proxy)
             top.append(PanelLine("MATH", self.math_button))
+        if sup("m1.trace"):                           # читаемые трейсы последней развёртки -> CSV на ПК
+            b = self.data_button = QPushButton("SAVE")
+            b.setObjectName("choice")
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip("Save every trace being read (last sweep) to a CSV file; folder and name - SAVE tab")
+            b.clicked.connect(self.save_data)
+            top.append(PanelLine("DATA", b))
         self.power_spin = PowerSpin(proxy, "source.power")
         self.power_spin.levels = self._load_levels()
         pow_ws: list[QWidget] = [self.power_spin]
@@ -587,8 +598,89 @@ class VNAWindow(InstrumentWindow):
             self.page_specs.insert(0, ("TRAC", (), PanelTable(*trac)))
 
         # SAVE: чипы состояний в памяти прибора
-        if "state_list" in proxy.actions:
-            self.page_specs.append(("SAVE", (), PanelTable(self.preset_line("STAT"))))
+        save = [self.preset_line("STAT")] if "state_list" in proxy.actions else []
+        if sup("m1.trace"):                           # куда и под каким именем DATA SAVE пишет CSV
+            self.dir_edit = QLineEdit(str(self.data_dir()))
+            self.dir_edit.setToolTip("Folder for DATA SAVE files")
+            self.dir_edit.editingFinished.connect(
+                lambda: self.settings.setValue(f"{pre}/DATA_DIR", self.dir_edit.text().strip()))
+            browse = self._tool("…", "Choose the folder", self._browse_dir)
+            browse.setFixedWidth(TRACE_CHIP_HEIGHT)
+            self.name_edit = QLineEdit(str(self.settings.value(f"{pre}/DATA_NAME", "")))
+            self.name_edit.setPlaceholderText("file name prefix, e.g. DUT")
+            self.name_edit.setToolTip("Prefix of the file name; date and time are added: <prefix>_YYYYMMDD_HHMMSS.csv")
+            self.name_edit.editingFinished.connect(
+                lambda: self.settings.setValue(f"{pre}/DATA_NAME", self.name_edit.text().strip()))
+            save += [PanelLine("DIR", self.dir_edit, browse), PanelLine("NAME", self.name_edit)]
+        if save:
+            self.page_specs.append(("SAVE", (), PanelTable(*save)))
+
+    # ------------------------------------------------------------ данные в файл (DATA SAVE)
+    def data_dir(self) -> Path:
+        saved = str(self.settings.value(f"{self._prefix}/DATA_DIR", "") or "").strip()
+        return Path(saved) if saved else Path(self.settings.fileName()).resolve().parent / "vna_data"
+
+    def _browse_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Folder for VNA data", str(self.data_dir()))
+        if d:
+            self.dir_edit.setText(d)
+            self.settings.setValue(f"{self._prefix}/DATA_DIR", d)
+
+    def read_traces(self) -> list[tuple[str, Any]]:
+        """Трейсы последней развёртки (читаемые слоты): [(подпись, Trace)]."""
+        out = []
+        for n in range(1, SLOTS + 1):
+            t = self.proxy.value(f"m{n}.trace") if self.proxy.supports(f"m{n}.trace") else None
+            if t is None:
+                continue
+            m = t.meta
+            fmt = next((name for name, d in FORMATS if d == m.get("format")), m.get("format") or "")
+            label = f"{fmt} {m.get('channel', '?')}·{m.get('sparam', t.name)}"
+            if m.get("math") not in (None, "NORM"):
+                label += " " + next((name for name, d in MATH if d == m["math"]), m["math"])
+            out.append((label, t))
+        return out
+
+    def save_data(self) -> Path | None:
+        """DATA SAVE: все читаемые трейсы в один CSV (папка и префикс имени - вкладка SAVE)."""
+        traces = self.read_traces()
+        if not traces:
+            self._flash("NO DATA")
+            return None
+        name = (getattr(self, "name_edit", None) and self.name_edit.text().strip()) or ""
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = re.sub(r"[^\w.-]+", "_", f"{name}_{stamp}" if name else stamp)
+        folder = Path(self.dir_edit.text().strip()) if getattr(self, "dir_edit", None) and \
+            self.dir_edit.text().strip() else self.data_dir()
+        path, k = folder / f"{base}.csv", 2
+        while path.exists():
+            path, k = folder / f"{base}-{k}.csv", k + 1
+        comments = [f"{self.windowTitle() or 'VNA'}, saved {time.strftime('%Y-%m-%d %H:%M:%S')}"]
+        for label, t in traces:
+            m = t.meta
+            extra = ", ".join(f"{k} {m[k]}" for k in ("bw.if", "source.power", "avg.state", "avg.count", "cal.state")
+                              if m.get(k) is not None)
+            comments.append(f"{label}: channel {m.get('channel')}, measurement '{m.get('name')}', {len(t)} points"
+                            + (f", {extra}" if extra else ""))
+        try:
+            write_traces_csv(path, [t for _l, t in traces], [lbl for lbl, _t in traces], comments)
+        except OSError as e:
+            self._flash("ERROR")
+            self.data_button.setToolTip(f"Not saved: {e}")
+            return None
+        self._flash("SAVED")
+        self.data_button.setToolTip(f"Last file: {path}")
+        return path
+
+    def _flash(self, text: str) -> None:
+        """Итог на кнопке на 1.5 с (таймер - дочерний кнопки: умирает вместе с окном)."""
+        b = self.data_button
+        if not hasattr(self, "_flash_timer"):
+            self._flash_timer = QTimer(b)
+            self._flash_timer.setSingleShot(True)
+            self._flash_timer.timeout.connect(lambda: b.setText("SAVE"))
+        b.setText(text)
+        self._flash_timer.start(1500)
 
     def restore_rank(self, key: str) -> int:
         if key.endswith(("_auto", "_state")) or key == "avg.count":
