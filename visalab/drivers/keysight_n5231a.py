@@ -76,8 +76,10 @@ Y_UNITS = {"MLOG": "dB", "PHASE": "deg", "UPHASE": "deg", "GDELAY": "s"}
 FREQ_KEYS = ("freq.start", "freq.stop", "freq.center", "freq.span")
 MEAS_NAME = "VL_MEAS"
 MEAS_SLOTS = 16                  # слотов выбора измерений (m1..m16)
-FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")
-FORMAT_MAP = (("PHASE", "PHAS"), ("UPHASE", "UPH"), ("GDELAY", "GDEL"), ("LIN_MAG", "MLIN"))
+FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG", "POLAR", "SMITH")
+FORMAT_MAP = (("PHASE", "PHAS"), ("UPHASE", "UPH"), ("GDELAY", "GDEL"), ("LIN_MAG", "MLIN"), ("POLAR", "POL"),
+              ("SMITH", "SMIT"))
+COMPLEX_FORMATS = ("POLAR", "SMITH")     # FDATA - пары re,im: трасса с Trace.im
 SWEEP_TYPES = ("LIN", "LOG", "POWER", "CW", "SEGMENT")
 SWEEP_MAP = (("POWER", "POW"), ("SEGMENT", "SEGM"))
 _MEAS_KEY = re.compile(r"m(\d+)\.(\w+)")
@@ -106,7 +108,7 @@ class KeysightPNA(VISAInstrument):
         self.model = model or PNA_MODELS["N5231A"]
         self._continuous = True
         self._armed = False
-        self._complex = True
+        self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
         self._sweep: dict[str, Any] = {}       # последняя завершённая развёртка: ключи m{n}.*, trace, meas.count
         self._slots = [_Slot() for _ in range(MEAS_SLOTS)]
         self._armed_channels: list[int] = [1]
@@ -153,7 +155,8 @@ class KeysightPNA(VISAInstrument):
                   write="CALC1:PAR:MOD:EXT '{value}'", choices=("S11", "S21", "S12", "S22"), **ch),
             Param("format", "Формат", E, section=rs, query="CALC1:FORM?", write="CALC1:FORM {value}",
                   choices=FORMATS,
-                  labels=("ЛогАмп, dB", "Фаза", "Фаза развёрн.", "ГВЗ", "КСВН", "ЛинАмп", "Re", "Im"),
+                  labels=("ЛогАмп, dB", "Фаза", "Фаза развёрн.", "ГВЗ", "КСВН", "ЛинАмп", "Re", "Im", "Полярный",
+                          "Смит"),
                   enum_map=FORMAT_MAP,
                   also_read=("marker.value",), **ch),
             Param("cal.state", "Коррекция", B, section=rs, query="SENS1:CORR:STAT?",
@@ -398,8 +401,12 @@ class KeysightPNA(VISAInstrument):
             math = self._params[f"m{n}.math"].from_scpi(self.query(f"CALC{c}:MATH:FUNC?"))
             y = [parse_number(t) for t in self.query(f"CALC{c}:DATA? FDATA").split(",") if t.strip()]
             meta = {**stim, "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
-            out[f"m{n}.trace"] = Trace.linear(start, stop, y, x_unit=x_unit, y_unit=Y_UNITS.get(fmt, ""),
-                                              name=sparam, meta=meta)
+            if fmt in COMPLEX_FORMATS:                         # пары re,im
+                out[f"m{n}.trace"] = Trace.linear(start, stop, y[0::2], im=y[1::2], x_unit=x_unit, y_unit="",
+                                                  name=sparam, meta=meta)
+            else:
+                out[f"m{n}.trace"] = Trace.linear(start, stop, y, x_unit=x_unit, y_unit=Y_UNITS.get(fmt, ""),
+                                                  name=sparam, meta=meta)
             if self._complex:
                 raw = [parse_number(t) for t in self.query(f"CALC{c}:DATA? SDATA").split(",") if t.strip()]
                 out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit=x_unit, y_unit="",
