@@ -53,8 +53,18 @@ STIM_ROWS = (("STAR", "freq.start", None), ("STOP", "freq.stop", None), ("CENT",
              ("SPAN", "freq.span", None), ("PTS", "sweep.points", None), ("IFBW", "bw.if", None),
              ("TIME", "sweep.time", "sweep.time_auto"), ("TYPE", "sweep.type", None),
              ("AVG", "avg.state", "avg.count"))
+#: вкладка TRIG: (подпись, ключ, кнопки или None - по профилю, подсказка)
+TRIG_ROWS = (("SRC", "trig.source", [("INT", "IMM"), ("EXT", "EXT"), ("MAN", "MAN")],
+              "Trigger source: internal, external input (rear BNC), manual (TRIG button)"),
+             ("SCOP", "trig.scope", [("ALL", "ALL"), ("CH", "CURRENT")],
+              "One trigger sweeps all channels in turn, or only the current one"),
+             ("MODE", "trig.mode", [("CHAN", "CHANNEL"), ("SWP", "SWEEP"), ("PNT", "POINT"), ("TRAC", "TRACE")],
+              "What one trigger does on the CH channel: the whole channel, one sweep, one point, one trace"),
+             ("SLOP", "trig.slope", [("POS", "POS"), ("NEG", "NEG")], "External trigger edge / level polarity"),
+             ("TYPE", "trig.type", [("EDGE", "EDGE"), ("LEVEL", "LEVEL")], "External trigger by edge or by level"),
+             ("DLY", "trig.delay", None, "Delay after the external trigger, s"))
 NOT_SAVED = ("freq.center", "freq.span", "cal.state")       # центр/обзор следуют из старта/стопа; калибровку не вернуть
-RESTORE_RANK = {"freq.start": 0, "freq.stop": 0, "sweep.type": 1, "freq.cw": 1, "rf.output": 5}
+RESTORE_RANK = {"freq.start": 0, "freq.stop": 0, "sweep.type": 1, "freq.cw": 1, "rf.output": 5, "trig.source": 6}
 
 
 def saved_connection(settings: QSettings) -> dict[str, str]:
@@ -557,13 +567,29 @@ class VNAWindow(InstrumentWindow):
                 if w.key not in NOT_SAVED:
                     self.saved_widgets.append(w)
             lines.append(PanelLine(name, *ws))
+        self.page_specs.append(("STIM", (), PanelTable(*lines)))
+
+        # TRIG: запуск развёрток (источник и вход - общие, режим - у канала CH)
+        trig = []
+        for name, key, choices, tip in TRIG_ROWS:
+            if not sup(key):
+                continue
+            w = PSButton(proxy, key, choices) if choices else _auto(proxy, key)
+            w.setToolTip(tip)
+            self.widgets[key] = w
+            self.saved_widgets.append(w)
+            ws = [w]
+            if key == "trig.source" and "trigger" in proxy.actions:
+                ws.append(ActionButton(proxy, "trigger", "TRIG", "Manual trigger (SRC = MAN)"))
+            trig.append(PanelLine(name, *ws))
         if sup("meas.continuous"):
             cont = PSButton(proxy, "meas.continuous", [("CONT", True), ("SINGLE", False)])
             self.widgets["meas.continuous"] = cont
             mode = [cont] + ([ActionButton(proxy, "single", "SWEEP", "Single sweep")] if "single" in proxy.actions
                              else [])
-            lines.append(PanelLine("MODE", *mode))
-        self.page_specs.append(("STIM", (), PanelTable(*lines)))
+            trig.append(PanelLine("RUN", *mode))
+        if trig:
+            self.page_specs.append(("TRIG", (), PanelTable(*trig)))
 
         # PWR
         self.levels_edit = QLineEdit(", ".join(f"{v:g}" for v in self.power_spin.levels))

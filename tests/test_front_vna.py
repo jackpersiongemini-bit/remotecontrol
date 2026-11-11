@@ -38,7 +38,7 @@ def _wait(qtbot, cond):
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
     assert [ln.name for ln in win.preset_panel.table.lines] == ["CH", "MEM", "MATH", "POW", "CW", "CORR"]
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "PWR", "SAVE"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "TRIG", "PWR", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
 
@@ -177,7 +177,7 @@ def test_plus_minus_at_right_edge(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    for page in (0, 3):                                        # TRAC и SAVE
+    for page in (0, 4):                                        # TRAC и SAVE
         win.set_page(page)
         qtbot.wait(50)
         tools = win._trc_tools if page == 0 else win.add_button.parentWidget()
@@ -200,3 +200,18 @@ def test_stim_channel_chips(qtbot, vna):
     win.trace_editor.chips.buttons()[2].click()                # перенос трейса канала 2 в новый канал 3
     win.trace_editor.channel.on_pick(3)
     _wait(qtbot, lambda: sc.channels == [1, 2, 3] or sc.channels == [1, 3])
+
+
+def test_trig_tab(qtbot, vna):
+    proxy, win, _s, sim = vna
+    page = win.pages[[win.tabs.tabText(i) for i in range(win.tabs.count())].index("TRIG")]
+    assert [ln.name for ln in page.lines] == ["SRC", "SCOP", "MODE", "SLOP", "TYPE", "DLY", "RUN"]
+    assert "MODE" not in [ln.name for ln in win.pages[1].lines]               # CONT/SINGLE ушло из STIM
+    win.widgets["trig.source"].set_value("MAN")
+    win.widgets["trig.mode"].set_value("POINT")
+    _wait(qtbot, lambda: sim.trig["sour"] == "MAN" and sim.c["tmode"] == "POIN")
+    done = sim.sweeps_done
+    trig = next(w for ln in page.lines for w in ln.widgets if getattr(w, "name", None) == "trigger")
+    for _ in range(sim.c["poin"]):
+        trig.click()
+    _wait(qtbot, lambda: sim.sweeps_done > done)

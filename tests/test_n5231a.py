@@ -420,3 +420,41 @@ def test_generator_mode_keeps_sweep_modes_of_other_channels(make):
     assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
     assert (sim.stim(2)["mode"], sim.stim(3)["mode"], sim.c["type"]) == ("CONT", "HOLD", "LIN")
     assert not rec.comm
+
+
+def test_trigger_settings_external_and_manual(make):
+    sim = KeysightPNASim()
+    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    v = rec.values
+    assert (v["trig.source"], v["trig.scope"], v["trig.mode"], v["trig.slope"], v["trig.type"], v["trig.delay"]) == \
+        ("IMM", "ALL", "CHANNEL", "POS", "EDGE", 0.0)
+    for k, val in (("trig.slope", "NEG"), ("trig.type", "LEVEL"), ("trig.delay", 0.01), ("trig.scope", "CURRENT")):
+        assert setp(drv, rec, k, val) is PStatus.WRITTEN, k
+    assert sim.trig == {"sour": "IMM", "scop": "CURR", "slop": "NEG", "type": "LEV", "del": 0.01}
+    # режим запуска - у канала CH
+    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.mode", "POINT") is PStatus.WRITTEN
+    assert sim.stim(2)["tmode"] == "POIN" and sim.c["tmode"] == "CHAN"
+    assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN and v["trig.mode"] == "CHANNEL"
+    # внешний: развёртка ждёт импульса на входе
+    assert setp(drv, rec, "trig.source", "EXT") is PStatus.WRITTEN and sim.trig["sour"] == "EXT"
+    done = sim.sweeps_done
+    for _ in range(3):
+        drv.poll()
+    assert sim.sweeps_done == done and v["meas.armed"] is True and not rec.comm     # ждём, без таймаута
+    sim.trigger()
+    drv.poll()
+    assert sim.sweeps_done == done + 1 and v["m1.trace"] is not None
+    # ручной + по точке: каждый TRIG - одна точка
+    assert setp(drv, rec, "sweep.points", 3) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.mode", "POINT") is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.source", "MAN") is PStatus.WRITTEN
+    done = sim.sweeps_done
+    for i in range(3):
+        drv.poll()
+        assert sim.sweeps_done == done
+        drv.run_action("trigger")
+    assert "INIT1:IMM" in sim.history
+    drv.poll()
+    assert sim.sweeps_done == done + 1 and len(v["m1.trace"]) == 3 and not rec.comm

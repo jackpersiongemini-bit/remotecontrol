@@ -12,6 +12,11 @@
   ``SENS1:BWID`` (полоса ПЧ), ``SOUR1:POW1`` (dBm), ``OUTP`` (мощность источника);
 * усреднение ``SENS1:AVER``, ``SENS1:AVER:COUN``; коррекция ``SENS1:CORR:STAT``;
 * маркер ``CALC1:MARK1``, ``CALC1:MARK1:X``, ``CALC1:MARK1:Y?`` (два числа), ``CALC1:MARK1:FUNC:EXEC MAX|MIN``;
+* запуск ``TRIG:SOUR IMM|EXT|MAN`` (внутренний / внешний BNC / ручной), ``TRIG:SCOP ALL|CURR``
+  (триггер на все каналы по очереди или на текущий), режим канала ``SENS1:SWE:TRIG:MODE CHAN|SWE|POIN|TRAC``
+  (один триггер - канал / развёртка / точка / трасса), вход внешнего триггера ``TRIG:SLOP POS|NEG``,
+  ``TRIG:TYPE EDGE|LEV``, ``TRIG:DEL`` (s); ручной запуск ``INIT<c>:IMM``. Однократная развёртка (SING)
+  при EXT / MAN ждёт триггера: ``*OPC`` приходит после него, таймаута нет;
 * развёртка ``SENS1:SWE:MODE SING`` + ``*OPC`` - бит OPC по окончании, ``SENS1:SWE:MODE HOLD`` - стоп;
 * память трассы ``CALC1:MATH:MEM`` (данные -> память выбранного измерения), математика
   ``CALC1:MATH:FUNC NORM|DIV|SUBT|ADD|MULT`` (над комплексными данными, до формата; SDATA - без неё);
@@ -83,7 +88,7 @@ Y_UNITS = {"MLOG": "dB", "PHASE": "deg", "UPHASE": "deg", "GDELAY": "s"}
 FREQ_KEYS = ("freq.start", "freq.stop", "freq.center", "freq.span")
 #: ключи стимула: относятся к каналу ``stim.channel`` (в SCPI ``SENS1:`` / ``SOUR1:`` -> номер канала)
 STIM_KEYS = (*FREQ_KEYS, "freq.cw", "sweep.type", "sweep.points", "sweep.time", "sweep.time_auto", "bw.if",
-             "avg.state", "avg.count", "cal.state", "source.power")
+             "avg.state", "avg.count", "cal.state", "source.power", "trig.mode")
 MEAS_NAME = "VL_MEAS"
 MEAS_SLOTS = 16                  # слотов выбора измерений (m1..m16)
 FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG", "POLAR", "SMITH")
@@ -95,6 +100,9 @@ GEN_KEYS = ("sweep.type", "freq.start", "freq.stop", "sweep.points", "bw.if", "s
             "avg.state", "avg.count", "cal.state", "source.power", "rf.output")
 SWEEP_TYPES = ("LIN", "LOG", "POWER", "CW", "SEGMENT")
 SWEEP_MAP = (("POWER", "POW"), ("SEGMENT", "SEGM"))
+TRIG_SOURCES = ("IMM", "EXT", "MAN")
+TRIG_MODES = ("CHANNEL", "SWEEP", "POINT", "TRACE")
+TRIG_MODE_MAP = (("CHANNEL", "CHAN"), ("SWEEP", "SWE"), ("POINT", "POIN"), ("TRACE", "TRAC"))
 _MEAS_KEY = re.compile(r"m(\d+)\.(\w+)")
 SLOT_KEYS = ("channel", "name", "enabled", "sparam", "format", "math")
 MATH = ("NORM", "DIV", "SUBT", "ADD", "MULT")
@@ -140,6 +148,7 @@ class KeysightPNA(VISAInstrument):
     def build_params(self):
         m = self.model
         st, rs, sw, mk = "Анализ/Стимул", "Анализ/Измерение", "Анализ/Развёртка", "Анализ/Маркер"
+        tg = "Анализ/Запуск"
         freq = dict(kind=F, unit="Hz", minimum=m.f_min, maximum=m.f_max, tolerance=1e-9,
                     also_read=FREQ_KEYS)
         ch = dict(channel=1)          # перед CALC-командой выбрать наше измерение
@@ -211,6 +220,20 @@ class KeysightPNA(VISAInstrument):
             Param("avg.state", "Усреднение", B, section=sw, query="SENS1:AVER?", write="SENS1:AVER {value}"),
             Param("avg.count", "Усреднений", I, section=sw, query="SENS1:AVER:COUN?",
                   write="SENS1:AVER:COUN {value}", minimum=1, maximum=65536),
+            Param("trig.source", "Запуск", E, section=tg, query="TRIG:SOUR?", write="TRIG:SOUR {value}",
+                  choices=TRIG_SOURCES, labels=("Внутренний", "Внешний", "Ручной")),
+            Param("trig.scope", "Область запуска", E, section=tg, query="TRIG:SCOP?", write="TRIG:SCOP {value}",
+                  choices=("ALL", "CURRENT"), labels=("Все каналы", "Текущий канал"),
+                  enum_map=(("CURRENT", "CURR"),)),
+            Param("trig.mode", "Режим запуска канала", E, section=tg, query="SENS1:SWE:TRIG:MODE?",
+                  write="SENS1:SWE:TRIG:MODE {value}", choices=TRIG_MODES,
+                  labels=("Канал", "Развёртка", "Точка", "Трасса"), enum_map=TRIG_MODE_MAP),
+            Param("trig.slope", "Фронт внешнего запуска", E, section=tg, query="TRIG:SLOP?",
+                  write="TRIG:SLOP {value}", choices=("POS", "NEG"), enum_map=(("POS", "POS"), ("NEG", "NEG"))),
+            Param("trig.type", "Тип внешнего запуска", E, section=tg, query="TRIG:TYPE?", write="TRIG:TYPE {value}",
+                  choices=("EDGE", "LEVEL"), labels=("Фронт", "Уровень"), enum_map=(("LEVEL", "LEV"),)),
+            Param("trig.delay", "Задержка запуска", F, "s", section=tg, query="TRIG:DEL?", write="TRIG:DEL {value}",
+                  minimum=0.0, maximum=3.0, tolerance=1e-9),
             Param("marker.state", "Маркер", B, section=mk, query="CALC1:MARK1?", write="CALC1:MARK1 {value}",
                   also_read=("marker.freq", "marker.value"), **ch),
             Param("marker.freq", "Частота маркера", F, "Hz", section=mk, query="CALC1:MARK1:X?",
@@ -221,6 +244,7 @@ class KeysightPNA(VISAInstrument):
 
     def build_actions(self):
         return [Action("single", "Одна развёртка"), Action("abort", "Стоп"),
+                Action("trigger", "Ручной запуск (TRIG:SOUR MAN)"),
                 Action("marker_peak", "Маркер на максимум"), Action("marker_min", "Маркер на минимум"),
                 Action("meas_catalog", "Каталог измерений"), Action("meas_all", "Читать все измерения"),
                 Action("meas_none", "Не читать измерения"),
@@ -548,6 +572,13 @@ class KeysightPNA(VISAInstrument):
         if name == "abort":
             self._abort()
             self.write("SENS1:SWE:MODE HOLD")
+            return None
+        if name == "trigger":
+            if not self._armed:                          # нечего запускать: взвести одну развёртку
+                self._start_sweep()
+            scope = self._values.get("trig.scope")
+            for c in ([self._armed_channels[0]] if scope == "ALL" else self._armed_channels):
+                self.write(f"INIT{c}:IMM")
             return None
         if name == "meas_catalog":
             return [(c, n, sp) for c in self._channels() for n, sp in self._catalog(c).items()]
