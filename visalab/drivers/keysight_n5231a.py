@@ -11,6 +11,10 @@
 * стимул ``SENS1:FREQ:STAR|STOP|CENT|SPAN``, ``SENS1:SWE:POIN``, ``SENS1:SWE:TIME`` (+ ``:AUTO``),
   ``SENS1:BWID`` (полоса ПЧ), ``SOUR1:POW1`` (dBm), ``OUTP`` (мощность источника);
 * усреднение ``SENS1:AVER``, ``SENS1:AVER:COUN``; коррекция ``SENS1:CORR:STAT``;
+* калибровка канала - cal set (набор поправок в памяти прибора): список ``CSET:CAT?`` (действие
+  ``cal_list``), удаление ``CSET:DEL "имя"`` (``cal_delete``); ключ ``cal.set`` канала ``stim.channel`` -
+  ``SENS<c>:CORR:CSET:ACT? NAME`` / ``SENS<c>:CORR:CSET:ACT "имя",<1|0>`` (1 - взять и стимул из cal set,
+  ключ ``cal.stim``), пустое имя - ``SENS<c>:CORR:CSET:DEAC``; интерполяция ``SENS<c>:CORR:INT``;
 * маркер ``CALC1:MARK1``, ``CALC1:MARK1:X``, ``CALC1:MARK1:Y?`` (два числа), ``CALC1:MARK1:FUNC:EXEC MAX|MIN``;
 * запуск ``TRIG:SOUR IMM|EXT|MAN`` (внутренний / внешний BNC / ручной), ``TRIG:SCOP ALL|CURR``
   (триггер на все каналы по очереди или на текущий), режим канала ``SENS1:SWE:TRIG:MODE CHAN|SWE|POIN|TRAC``
@@ -93,7 +97,7 @@ Y_UNITS = {"MLOG": "dB", "PHASE": "deg", "UPHASE": "deg", "GDELAY": "s"}
 FREQ_KEYS = ("freq.start", "freq.stop", "freq.center", "freq.span")
 #: ключи стимула: относятся к каналу ``stim.channel`` (в SCPI ``SENS1:`` / ``SOUR1:`` -> номер канала)
 STIM_KEYS = (*FREQ_KEYS, "freq.cw", "sweep.type", "sweep.points", "sweep.time", "sweep.time_auto", "bw.if",
-             "avg.state", "avg.count", "cal.state", "source.power", "trig.mode")
+             "avg.state", "avg.count", "cal.state", "cal.set", "cal.interp", "source.power", "trig.mode")
 MEAS_NAME = "VL_MEAS"
 MEAS_SLOTS = 16                  # слотов выбора измерений (m1..m16)
 FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG", "POLAR", "SMITH")
@@ -137,6 +141,7 @@ class KeysightPNA(VISAInstrument):
         self._continuous = True
         self._armed = False
         self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
+        self._cal_stim = True                  # cal set применяется вместе со своим стимулом
         self._sweep: dict[str, Any] = {}       # последняя завершённая развёртка: ключи m{n}.*, trace, meas.count
         self._slots = [_Slot() for _ in range(MEAS_SLOTS)]
         self._armed_channels: list[int] = [1]
@@ -215,6 +220,11 @@ class KeysightPNA(VISAInstrument):
                   also_read=("marker.value",), **ch),
             Param("cal.state", "Коррекция", B, section=rs, query="SENS1:CORR:STAT?",
                   write="SENS1:CORR:STAT {value}"),
+            Param("cal.set", "Cal set канала", Kind.STR, section=rs, query="<virtual>", write="<virtual>",
+                  also_read=STIM_KEYS),
+            Param("cal.stim", "Cal set со стимулом", B, section=rs, query="<virtual>", write="<virtual>"),
+            Param("cal.interp", "Интерполяция калибровки", B, section=rs, query="SENS1:CORR:INT?",
+                  write="SENS1:CORR:INT {value}", also_read=("cal.state",)),
             Param("freq.start", "Старт", section=st, query="SENS1:FREQ:STAR?", write="SENS1:FREQ:STAR {value}",
                   **freq),
             Param("freq.stop", "Стоп", section=st, query="SENS1:FREQ:STOP?", write="SENS1:FREQ:STOP {value}",
@@ -280,6 +290,8 @@ class KeysightPNA(VISAInstrument):
                 Action("state_list", "Состояния в памяти"), Action("state_dirs", "Папки на диске анализатора"), Action("state_save", "Сохранить состояние"),
                 Action("state_recall", "Вызвать состояние"),
                 Action("state_delete", "Удалить состояние", confirm="Удалить состояние из памяти анализатора?"),
+                Action("cal_list", "Cal set'ы в памяти прибора"),
+                Action("cal_delete", "Удалить cal set", confirm="Удалить cal set из памяти анализатора?"),
                 Action("reset", "Preset *RST",
                        confirm="Preset удалит измерения и выключит калибровку. Продолжить?")]
 
@@ -356,6 +368,11 @@ class KeysightPNA(VISAInstrument):
         if spec.key == "gen.state":
             self._set_gen(bool(value))
             return
+        if spec.key == "cal.stim":
+            self._cal_stim = bool(value)
+            return
+        if spec.key == "cal.set" and self._gen is not None and self._gen[0] == self._stim_ch:
+            raise ValueError("режим генератора: сначала выключите CW, потом меняйте cal set")
         if spec.key == "trace.sel":
             c, _, name = str(value).partition(":")
             if not c.strip().isdigit() or name not in self._catalog(int(c)):
@@ -380,7 +397,9 @@ class KeysightPNA(VISAInstrument):
         was_armed = self._armed
         self._abort()
         try:
-            if not self._write_slot(spec, value):
+            if spec.key == "cal.set":
+                self._cal_apply(str(value or "").strip())
+            elif not self._write_slot(spec, value):
                 super().write_param(spec, value)
         finally:                                  # отказ записи не должен останавливать развёртки
             if was_armed or self._continuous:
@@ -424,6 +443,11 @@ class KeysightPNA(VISAInstrument):
             return self._stim_ch
         if key == "gen.state":
             return self._gen is not None
+        if key == "cal.stim":
+            return self._cal_stim
+        if key == "cal.set":
+            name = self.query(f"SENS{self._stim_ch}:CORR:CSET:ACT? NAME").strip().strip('"').strip()
+            return "" if not name or name.upper().startswith("NO ") else name
         if key == "trace.sel":
             return f"{self._sel[0]}:{self._sel[1]}" if self._sel else None
         if key in SCALE_KEYS:
@@ -693,6 +717,16 @@ class KeysightPNA(VISAInstrument):
             return self._meas_table()
         if name == "mem_store":
             return self._mem_store(args)
+        if name == "cal_list":
+            return self._cal_list()
+        if name == "cal_delete":
+            cset = str(args[0]) if args else ""
+            if cset not in self._cal_list():
+                raise ValueError(f"нет cal set {cset!r}")
+            self.write(f'CSET:DEL "{cset}"')
+            self._check_errors(context=name)
+            self._read_keys(["cal.set", "cal.state"])
+            return self._cal_list()
         if name == "state_list":
             return self._state_list()
         if name == "state_dirs":
@@ -722,6 +756,23 @@ class KeysightPNA(VISAInstrument):
             self.write(f"CALC{slot.channel}:MATH:MEM")
         self._check_errors(context="mem_store")
         return nums
+
+    # ------------------------------------------------- калибровка (cal set)
+    def _cal_list(self) -> list[str]:
+        names = [e.strip() for e in re.split(r'[",]', self.query("CSET:CAT?")) if e.strip()]
+        return sorted(set(n for n in names if not n.upper().startswith("NO ")), key=str.lower)
+
+    def _cal_apply(self, name: str) -> None:
+        """Cal set ``name`` -> канал ``stim.channel`` (пусто - снять); со стимулом cal set, если ``cal.stim``."""
+        c = self._stim_ch
+        if not name:
+            self.write(f"SENS{c}:CORR:CSET:DEAC")
+        else:
+            if name not in self._cal_list():
+                raise ValueError(f"нет cal set {name!r} в памяти анализатора")
+            self.write(f'SENS{c}:CORR:CSET:ACT "{name}",{1 if self._cal_stim else 0}')
+            self.query("*OPC?")
+        self._check_errors(context="cal.set")
 
     # ------------------------------------------------- состояния в памяти прибора
     def _state_dirs(self) -> tuple[str, list[str]]:

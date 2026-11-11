@@ -29,7 +29,7 @@ class KeysightPNASim(SimInstrument):
     def reset(self) -> None:
         self.c = {"start": 10e6, "stop": 13.5e9, "poin": 201, "bwid": 35e3, "pow": -5.0, "outp": True,
                   "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN",
-                  "form": "ASC", "type": "LIN", "cw": 1e9}
+                  "form": "ASC", "type": "LIN", "cw": 1e9, "cset": "", "interp": True}
         self.meas = {"CH1_S11_1": {"s": "S11", "fmt": "MLOG", "ch": 1}}
         self.selected = ""                               # выбранное измерение канала 1
         self.sel_other: dict[int, str] = {}              # то же у остальных каналов
@@ -45,6 +45,12 @@ class KeysightPNASim(SimInstrument):
             self.dirs: dict[str, dict[str, tuple]] = {DEFAULT_DIR: {}, DEFAULT_DIR + "\\Lab": {}}
             self.cdir = DEFAULT_DIR
             self.files: dict[str, tuple] = self.dirs[self.cdir]     # "имя.csa" -> состояние, текущая папка
+        if not hasattr(self, "csets"):                   # cal set'ы переживают *RST: имя -> стимул калибровки
+            self.csets: dict[str, dict] = {
+                "CAL_1-3G": {"start": 1e9, "stop": 3e9, "poin": 201, "type": "LIN", "cw": 1e9, "bwid": 1e3,
+                             "pow": -10.0},
+                "CAL_FULL": {"start": 10e6, "stop": 13.5e9, "poin": 401, "type": "LIN", "cw": 1e9, "bwid": 10e3,
+                             "pow": -5.0}}
         if not hasattr(self, "dut"):
             self.dut = {"f0": 2e9, "q": 20.0, "il_db": 1.0}
             self.hold_sweeps = False
@@ -70,7 +76,8 @@ class KeysightPNASim(SimInstrument):
             return self.c
         if ch not in self.other:
             st = {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9, "bwid": 35e3, "pow": -5.0,
-                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN"}
+                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN",
+                  "cset": "", "interp": True}
             self._auto_time(st)
             self.other[ch] = st
         return self.other[ch]
@@ -221,7 +228,14 @@ class KeysightPNASim(SimInstrument):
         self.on("SENSe#:BWIDth[:RESolution]", self._bwid_set, self._gs("bwid"))
         self.on("SENSe#:AVERage:COUNt", self._n("coun", 1, 65536, integer=True), lambda a, g: str(self.stim(self._ch(g))["coun"]))
         self.on("SENSe#:AVERage[:STATe]", self._b("aver"), self._gb("aver"))
-        self.on("SENSe#:CORRection[:STATe]", self._b("corr"), self._gb("corr"))
+        self.on("SENSe#:CORRection[:STATe]", self._corr_set, self._gb("corr"))
+        self.on("SENSe#:CORRection:INTerpolate[:STATe]", self._b("interp"), self._gb("interp"))
+        self.on("SENSe#:CORRection:CSET:ACTivate", self._cset_act,
+                lambda a, g: f'"{self.stim(self._ch(g))["cset"] or "No Calset Selected"}"')
+        self.on("SENSe#:CORRection:CSET:DEACtivate", self._cset_deact)
+        self.on("CSET:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.csets)) + '"')
+        self.on("SENSe#:CORRection:CSET:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.csets)) + '"')
+        self.on("CSET:DELete", self._cset_del)
         self.on("SOURce#:POWer#[:LEVel][:IMMediate][:AMPLitude]", self._n("pow", -90, 20),
                 self._gs("pow"))
         self.on("OUTPut[:STATe]", self._b("outp"), self._gb("outp"))
@@ -478,6 +492,44 @@ class KeysightPNASim(SimInstrument):
         if fn != "NORM" and m.get("mem") is None:
             raise SimError(-221, "Settings conflict; no memory trace", ESR_EXE)
         m["math"] = fn
+
+    # ----------------------------------------------------------- калибровка
+    def _corr_set(self, a, g):
+        st = self.stim(self._ch(g))
+        on = self.boolean(a)
+        if on and not st["cset"]:
+            raise SimError(-221, "Settings conflict; no calibration", ESR_EXE)
+        st["corr"] = on
+
+    def _cset_act(self, a, g):
+        name, _, stim = a.rpartition(",")
+        if not name:
+            name, stim = stim, "0"
+        name = name.strip().strip("'\"")
+        if name not in self.csets:
+            raise SimError(-224, "Illegal parameter value; no such cal set", ESR_EXE)
+        st = self.stim(self._ch(g))
+        cal = self.csets[name]
+        if self.boolean(stim):
+            st.update(cal)
+            self._auto_time(st)
+        st["cset"] = name
+        same = all(st[k] == cal[k] for k in ("start", "stop", "poin", "type"))
+        st["corr"] = same or (st["interp"] and st["type"] == cal["type"]
+                              and cal["start"] <= st["start"] and st["stop"] <= cal["stop"])
+
+    def _cset_deact(self, a, g):
+        st = self.stim(self._ch(g))
+        st["cset"], st["corr"] = "", False
+
+    def _cset_del(self, a, g):
+        name = a.strip().strip("'\"")
+        if name not in self.csets:
+            raise SimError(-224, "Illegal parameter value; no such cal set", ESR_EXE)
+        del self.csets[name]
+        for st in (self.c, *self.other.values()):
+            if st.get("cset") == name:
+                st["cset"], st["corr"] = "", False
 
     # ----------------------------------------------------------- файлы состояний
     @staticmethod

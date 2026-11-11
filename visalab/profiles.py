@@ -304,6 +304,9 @@ NETWORK_ANALYZER = Profile(
         Slot("avg.state", B),
         Slot("avg.count", I),
         Slot("cal.state", B, readonly=None, doc="коррекция (калибровка) включена"),
+        Slot("cal.set", S, doc="cal set канала stim.channel (пусто - нет); запись применяет cal set к каналу"),
+        Slot("cal.stim", B, doc="применять cal set вместе с его стимулом (частоты, точки, полоса, мощность)"),
+        Slot("cal.interp", B, doc="интерполяция калибровки при стимуле, отличном от cal set"),
         Slot("marker.state", B),
         Slot("marker.freq", F, "Hz"),
         Slot("marker.value", F, "", readonly=True, doc="значение трассы в маркере, единицы - как у трассы"),
@@ -341,6 +344,8 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("state_save", doc="сохранить состояние в памяти прибора: аргумент - имя"),
         ActionSlot("state_recall", doc="вызвать состояние из памяти прибора: аргумент - имя"),
         ActionSlot("state_delete", doc="удалить состояние из памяти прибора: аргумент - имя"),
+        ActionSlot("cal_list", doc="имена cal set'ов в памяти прибора -> action_done('cal_list', [имя, ...])"),
+        ActionSlot("cal_delete", doc="удалить cal set из памяти прибора: аргумент - имя -> новый список"),
         ActionSlot("reset"),
     ),
 )

@@ -15,7 +15,9 @@
 Вкладки: TRAC (сверху чипы всех трейсов прибора, как пресеты: клик выбирает, + создаёт трейс S21 на
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
-STIM (стимул и развёртка), PWR (мощность, RF, список пресетов мощности), SAVE (состояния в памяти прибора: чип -
+SCAL (масштаб выбранного трейса), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, список
+пресетов мощности), CAL (cal set'ы прибора чипами: клик применяет к каналу выбранного трейса, NONE снимает;
+стимул из cal set или свой, CORR, интерполяция), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
 Окно знает только InstrumentProxy и ключи профиля network_analyzer.
 """
@@ -36,7 +38,7 @@ from ..core.scpi import si_format
 from . import instrument_window as _iw
 from .instrument_window import PRESET_GAP, HScrollArea, InstrumentWindow, PresetGroup
 from .params import IndicatorButton, PBGroup, PLineEdit, PSButton, PSpinBox, PanelLine, PanelTable
-from .power_meter import ActionButton
+from .power_meter import CONFIRM_MS, ActionButton
 from .spectrum import StatePresets
 from .theme import UI_COLUMN_WIDTH_PX
 
@@ -464,6 +466,80 @@ class _ReadButton(IndicatorButton):
         return self.owner.current is not None and self.owner.is_read(*self.owner.current)
 
 
+class CalSets(QWidget):
+    """Cal set'ы в памяти анализатора - чипы (NONE + имена, по два в ряд). Клик применяет cal set к
+    каналу выбранного трейса (``cal.set``), NONE снимает; выбран чип cal set'а этого канала.
+    ↻ перечитывает список, − удаляет cal set канала из памяти прибора (второй клик за 3 с)."""
+
+    NONE = "NONE"
+
+    def __init__(self, proxy: InstrumentProxy, parent=None):
+        super().__init__(parent)
+        self.proxy = proxy
+        self.names: list[str] = []
+        self.chips = PBGroup(columns=2)
+        self.chips.selected.connect(self._clicked)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.chips)
+        self._armed = QTimer(self)                         # − : первый клик взводит, второй удаляет
+        self._armed.setSingleShot(True)
+        self._armed.timeout.connect(lambda: self.delete_button and self.delete_button.setText("−"))
+        self.delete_button: QPushButton | None = None
+        proxy.action_done.connect(self._on_action)
+        proxy.subscribe("cal.set", lambda _v: self._show())
+        proxy.subscribe("gen.state", lambda _v: self._show())
+        self.set_names([])
+
+    def refresh(self) -> None:
+        if self.proxy.is_connected and "cal_list" in self.proxy.actions:
+            self.proxy.action("cal_list")
+
+    def set_names(self, names: list[str]) -> None:
+        self.names = list(names)
+        while self.chips.buttons():
+            self.chips.remove_button(0)
+        for text in (self.NONE, *self.names):
+            b = self.chips.add_button(text)
+            b.setToolTip("Remove the cal set from the channel (correction off)" if text == self.NONE
+                         else f"Apply cal set {text!r} to the channel of the selected trace")
+        self._show()
+
+    def _show(self) -> None:
+        cur = self.proxy.value("cal.set")
+        keys = ["", *self.names]
+        self.chips.set_checked(keys.index(cur) if cur in keys else -1)
+        gen = self.proxy.value("gen.state") is True              # CW: калибровку канала не трогаем
+        for b in self.chips.buttons():
+            b.setEnabled(not gen)
+
+    def _clicked(self, index: int) -> None:
+        name = "" if index == 0 else self.names[index - 1]
+        if self.proxy.value("cal.set") != name:
+            self.proxy.set("cal.set", name)
+        self._show()                                       # чип выбирается, когда прибор подтвердит
+
+    def delete(self) -> bool:
+        """− : cal set канала из памяти прибора; первый клик только взводит (кнопка - «?»)."""
+        name = self.proxy.value("cal.set")
+        b = self.delete_button
+        if not name or name not in self.names:
+            return False
+        if b is not None and not self._armed.isActive():
+            b.setText("?")
+            self._armed.start(CONFIRM_MS)
+            return False
+        self._armed.stop()
+        if b is not None:
+            b.setText("−")
+        self.proxy.action("cal_delete", name)
+        return True
+
+    def _on_action(self, name: str, result) -> None:
+        if name in ("cal_list", "cal_delete") and isinstance(result, (list, tuple)):
+            self.set_names([str(n) for n in result])
+
+
 class VNAWindow(InstrumentWindow):
     CONNECTION_GROUP = CONNECTION_GROUP
     DEFAULT_KIND = "pna"
@@ -475,7 +551,8 @@ class VNAWindow(InstrumentWindow):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
         # столбики «+»/«−» (TRC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
-        for tools in (getattr(self, "_trc_tools", None), getattr(self, "add_button", None) and self.add_button.parentWidget()):
+        for tools in (getattr(self, "_trc_tools", None), getattr(self, "_cal_tools", None),
+                      getattr(self, "add_button", None) and self.add_button.parentWidget()):
             if tools is not None:
                 tools.setMinimumWidth(0)
                 tools.setFixedWidth(max(b.sizeHint().width() for b in tools.findChildren(QPushButton)))
@@ -586,6 +663,35 @@ class VNAWindow(InstrumentWindow):
             pwr.append(PanelLine("RF", PSButton(proxy, "rf.output", ONOFF)))
         pwr.append(PanelLine("LIST", self.levels_edit))
         self.page_specs.append(("PWR", ("rf.output",) if sup("rf.output") else (), PanelTable(*pwr)))
+
+        # CAL: калибровка канала выбранного трейса - cal set из памяти прибора
+        if sup("cal.set") and "cal_list" in proxy.actions:
+            cs = self.cal_sets = CalSets(proxy)
+            tools = QWidget()
+            tl = QVBoxLayout(tools)                   # «↻» над «−», как у пресетов
+            tl.setContentsMargins(0, 0, 0, 0)
+            tl.setSpacing(PRESET_GAP)
+            half = (_iw.PRESET_HEIGHT - PRESET_GAP) // 2
+            tl.addWidget(self._tool("↻", "Re-read the cal sets of the analyzer", cs.refresh, half))
+            if "cal_delete" in proxy.actions:
+                cs.delete_button = self._tool("−", "Delete the cal set of this channel from the analyzer "
+                                                   "(click twice)", cs.delete, half)
+                tl.addWidget(cs.delete_button)
+            tl.addStretch(1)
+            self._cal_tools = tools
+            cal = [PanelLine("CSET", cs, tools)]
+            for name, key, choices, tip in (
+                    ("STIM", "cal.stim", [("CAL", True), ("KEEP", False)],
+                     "Applying a cal set: CAL - take its stimulus too (start, stop, points, IFBW, power),\n"
+                     "KEEP - keep the channel stimulus (interpolated if INT is on)"),
+                    ("CORR", "cal.state", [("OFF", False), ("ON", True)], "Correction on the channel"),
+                    ("INT", "cal.interp", ONOFF, "Interpolate the calibration when the stimulus differs")):
+                if sup(key):
+                    w = PSButton(proxy, key, choices)
+                    w.setToolTip(tip)
+                    self.widgets.setdefault(key, w)
+                    cal.append(PanelLine(name, w))
+            self.page_specs.append(("CAL", ("cal.state",), PanelTable(*cal)))
 
         # TRAC (первая вкладка): трейс, выбранный в избранном (TRC)
         if "meas_table" in proxy.actions:
@@ -787,7 +893,7 @@ class VNAWindow(InstrumentWindow):
         return StatePresets(self.settings, key, self._delete_state)
 
     def refresh_lists(self) -> None:
-        for name in ("state_list", "meas_table"):
+        for name in ("state_list", "meas_table", "cal_list"):
             if name in self.proxy.actions:
                 self.proxy.action(name)
 

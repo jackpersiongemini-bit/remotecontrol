@@ -38,7 +38,7 @@ def _wait(qtbot, cond):
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
     assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "MATH", "POW", "CW", "CORR"]
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "SCAL", "STIM", "TRIG", "PWR", "SAVE"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "SCAL", "STIM", "TRIG", "PWR", "CAL", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
 
@@ -71,6 +71,7 @@ def test_power_preset_mode(qtbot, vna):
 
 def test_cw_generator_and_correction(qtbot, vna):
     proxy, win, _s, sim = vna
+    sim.c["cset"] = "CAL_FULL"                                 # у канала есть калибровка: CORR можно включить
     win.cw_spin.set_value(2.5e9)
     win.widgets["rf.output"].set_value(False)
     _wait(qtbot, lambda: sim.c["cw"] == pytest.approx(2.5e9) and sim.c["outp"] is False)
@@ -177,7 +178,8 @@ def test_plus_minus_at_right_edge(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    for page, tools, width in ((0, win._trc_tools, 40), (5, win.add_button.parentWidget(), 40)):   # TRC и SAVE
+    for page, tools, width in ((0, win._trc_tools, 40), (5, win._cal_tools, 40),
+                                (6, win.add_button.parentWidget(), 40)):   # TRC, CAL и SAVE
         win.set_page(page)
         qtbot.wait(50)
         line = tools.parentWidget()
@@ -226,7 +228,7 @@ def test_data_save_csv(qtbot, vna, tmp_path):
     proxy, win, settings, sim = vna
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
-    assert [ln.name for ln in win.pages[5].lines] == ["VNA", "STAT", "PC", "NAME", "DATA"]
+    assert [ln.name for ln in win.pages[6].lines] == ["VNA", "STAT", "PC", "NAME", "DATA"]
     te.chips.buttons()[2].click()                              # трейс канала 2 (другая ось) - тоже читать
     te.read.click()
     te.format.on_pick("POLAR")                                 # комплексный формат - два столбца
@@ -314,3 +316,31 @@ def test_scal_tab_follows_selected_trace(qtbot, vna):
     te.chips.buttons()[2].click()                              # не показан ни в одном окне - масштаба нет
     _wait(qtbot, lambda: proxy.value("trace.sel") == "2:CH2_S12" and proxy.value("scale.div") is None)
     assert proxy.is_connected
+
+
+def test_cal_tab_cal_sets(qtbot, vna):
+    proxy, win, _s, sim = vna
+    cs, te = win.cal_sets, win.trace_editor
+    _wait(qtbot, lambda: [b.text() for b in cs.chips.buttons()] == ["NONE", "CAL_1-3G", "CAL_FULL"])
+    assert [ln.name for ln in win.pages[5].lines] == ["CSET", "STIM", "CORR", "INT"]
+    assert cs.chips.checked_index() == 0                       # у канала 1 калибровки нет
+    cs.chips.buttons()[1].click()                              # cal set со стимулом
+    _wait(qtbot, lambda: sim.c["cset"] == "CAL_1-3G" and proxy.value("cal.set") == "CAL_1-3G")
+    assert sim.c["corr"] and sim.c["start"] == 1e9 and cs.chips.checked_index() == 1
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    te.chips.buttons()[2].click()                              # трейс канала 2: его калибровка
+    _wait(qtbot, lambda: proxy.value("stim.channel") == 2 and cs.chips.checked_index() == 0)
+    win.widgets["cal.stim"].set_value(False)                   # KEEP: стимул канала остаётся
+    _wait(qtbot, lambda: proxy.value("cal.stim") is False)
+    cs.chips.buttons()[2].click()
+    _wait(qtbot, lambda: sim.stim(2)["cset"] == "CAL_FULL" and cs.chips.checked_index() == 2)
+    assert sim.stim(2)["start"] == 1e9 and sim.stim(2)["poin"] == 101
+    cs.chips.buttons()[0].click()                              # NONE - снять
+    _wait(qtbot, lambda: sim.stim(2)["cset"] == "" and proxy.value("cal.set") == "")
+    te.chips.buttons()[0].click()                              # канал 1: удалить его cal set (два клика)
+    _wait(qtbot, lambda: proxy.value("cal.set") == "CAL_1-3G")
+    cs.delete_button.click()
+    assert cs.delete_button.text() == "?" and "CAL_1-3G" in sim.csets
+    cs.delete_button.click()
+    _wait(qtbot, lambda: [b.text() for b in cs.chips.buttons()] == ["NONE", "CAL_FULL"])
+    assert "CAL_1-3G" not in sim.csets and cs.chips.checked_index() == 0 and cs.delete_button.text() == "−"
