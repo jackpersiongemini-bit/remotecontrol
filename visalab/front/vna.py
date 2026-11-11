@@ -11,7 +11,8 @@
 * CORR - коррекция (калибровка) ON / OFF.
 
 Вкладки: TRAC (все трейсы прибора по каналам: строка - канал, READ, S-параметр, формат, математика;
-+ создаёт трейс на приборе, − удаляет выбранный, ALL / NONE; слоты не видны - READ занимает свободный),
+канал - список: другой канал переносит трейс (пересоздаёт там), DEL удаляет его с прибора;
++ создаёт трейс S21 на канале последней строки, ALL / NONE; слоты не видны - READ занимает свободный),
 STIM (стимул и развёртка), PWR (мощность, RF, список пресетов мощности), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
 Окно знает только InstrumentProxy и ключи профиля network_analyzer.
@@ -21,7 +22,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from PyQt6.QtCore import QSettings, Qt, QTimer
+from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import QGridLayout, QLineEdit, QPushButton, QWidget
 
 from ..core.params import Kind
@@ -208,6 +209,9 @@ class MenuButton(IndicatorButton):
         menu = QMenu(self)
         menu.setObjectName("psmenu")
         for name, data in self.choices:
+            if name is None:
+                menu.addSeparator()
+                continue
             act = menu.addAction(name)
             act.setCheckable(True)
             act.setChecked(data == self.value)
@@ -217,14 +221,13 @@ class MenuButton(IndicatorButton):
 
 
 class TraceRow:
-    """Строка таблицы трейсов: канал (выбор строки) | READ | S-параметр | формат | математика."""
+    """Строка таблицы трейсов: канал (список: перенести / DEL) | READ | S-параметр | формат | математика."""
 
     def __init__(self, table: "TraceTable", channel: int, name: str):
         self.table, self.channel, self.name = table, channel, name
-        self.select = _RowButton(table, self)
-        self.select.setText(f"C{channel}")
-        self.select.setToolTip(f"Channel {channel}, measurement {name!r}: click to select the row for + / −")
-        self.select.clicked.connect(lambda: table.set_selected(self))
+        self.channel_menu = MenuButton(table.channel_choices(), lambda v: table.channel_picked(self, v),
+                                       f"Channel of {name!r}: pick another to move the trace, DEL to delete it")
+        self.channel_menu.show_value(channel)
         self.read = _ReadButton(table, channel, name)
         self.read.setText("READ")
         self.read.setToolTip("Read this trace after every sweep (takes one of 16 slots)")
@@ -233,7 +236,7 @@ class TraceRow:
         self.sparam = MenuButton([(x, x) for x in SPARAMS], cfg("sparam"), "S-parameter")
         self.format = MenuButton(FORMATS, cfg("format"), "Format")
         self.math = MenuButton(MATH, cfg("math"), "Math with the memory trace")
-        self.widgets = (self.select, self.read, self.sparam, self.format, self.math)
+        self.widgets = (self.channel_menu, self.read, self.sparam, self.format, self.math)
 
     def show(self, sparam, fmt, math) -> None:
         self.sparam.show_value(sparam)
@@ -250,7 +253,6 @@ class TraceTable(QWidget):
         self.proxy = proxy
         self.table: list[tuple[int, str, str, str, str]] = []
         self.rows: list[TraceRow] = []
-        self.selected: TraceRow | None = None
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setHorizontalSpacing(6)
@@ -301,61 +303,48 @@ class TraceTable(QWidget):
     def configure(self, row: TraceRow, what: str, value) -> None:
         self.proxy.action("meas_config", row.channel, row.name, what, value)
 
-    def set_selected(self, row: TraceRow | None) -> None:
-        self.selected = row
-        for r in self.rows:
-            r.select.setChecked(r is row)
+    def channels(self) -> list[int]:
+        return sorted({c for c, *_ in self.table}) or [1]
+
+    def channel_choices(self) -> list:
+        """C1..Cn существующих каналов, следующий новый канал, DEL."""
+        chans = self.channels()
+        new = max(chans) + 1
+        return [(f"C{c}", c) for c in chans] + [(f"C{new} NEW", new), (None, None), ("DEL", "DEL")]
+
+    def channel_picked(self, row: TraceRow, value) -> None:
+        if value == "DEL":
+            self.proxy.action("meas_delete", row.channel, row.name)
+        elif value != row.channel:
+            self.proxy.action("meas_move", row.channel, row.name, int(value))
 
     def create(self) -> None:
-        row = self.selected
-        channel, sparam = (row.channel, row.sparam.value or "S21") if row else (1, "S21")
-        self.proxy.action("meas_create", channel, sparam)
-
-    def delete(self) -> None:
-        if self.selected is not None:
-            self.proxy.action("meas_delete", self.selected.channel, self.selected.name)
+        """Новый трейс S21 на канале последней строки."""
+        channel = self.rows[-1].channel if self.rows else 1
+        self.proxy.action("meas_create", channel, "S21")
 
     def _on_action(self, name: str, result) -> None:
-        if name in ("meas_table", "meas_config", "meas_create", "meas_delete") and isinstance(result, (list, tuple)):
+        if name in ("meas_table", "meas_config", "meas_create", "meas_delete", "meas_move") and isinstance(result, (list, tuple)):
             self.set_table([(int(c), str(n), str(s), str(f), str(m)) for c, n, s, f, m in result])
 
     # -------------------------------------------------------- строки
     def set_table(self, table: list[tuple[int, str, str, str, str]]) -> None:
         keys = [(c, n) for c, n, *_ in table]
+        self.table = list(table)
         if keys != [(r.channel, r.name) for r in self.rows]:
-            sel = (self.selected.channel, self.selected.name) if self.selected else None
             for r in self.rows:
                 for w in r.widgets:
                     self._grid.removeWidget(w)
                     w.deleteLater()
-            self.rows, self.selected = [], None
+            self.rows = []
             for i, (c, n) in enumerate(keys):
                 r = TraceRow(self, c, n)
                 for col, w in enumerate(r.widgets):
                     self._grid.addWidget(w, i, col)
                 self.rows.append(r)
-                if (c, n) == sel:
-                    self.selected = r
             self.updateGeometry()
-        self.table = list(table)
         for r, (_c, _n, sp, fmt, math) in zip(self.rows, table):
             r.show(sp, fmt, math)
-        self.set_selected(self.selected)
-
-
-class _RowButton(QPushButton):
-    """Выбор строки - инверсия (как у чипа пресета), не индикатор включения."""
-
-    def __init__(self, owner: TraceTable, row: TraceRow):
-        super().__init__()
-        self.owner, self.row = owner, row
-        self.setObjectName("chip")
-        self.setCheckable(True)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def indicated(self) -> bool:
-        return self.owner.selected is self.row
 
 
 class _ReadButton(IndicatorButton):
@@ -368,31 +357,6 @@ class _ReadButton(IndicatorButton):
 
     def indicated(self) -> bool:
         return self.owner.is_read(self.channel, self.meas)
-
-
-class ConfirmButton(QPushButton):
-    """Опасное действие окна: первый клик - SURE?, второй (за 3 с) выполняет."""
-
-    def __init__(self, text: str, tip: str, slot, parent=None):
-        super().__init__(text, parent)
-        self.setObjectName("tool")
-        self.setToolTip(tip)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._text, self._slot = text, slot
-        self._timer = QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(lambda: self.setText(self._text))
-        self.clicked.connect(self._click)
-
-    def _click(self) -> None:
-        if self._timer.isActive():
-            self._timer.stop()
-            self.setText(self._text)
-            self._slot()
-        else:
-            self.setText("SURE?")
-            self._timer.start(3000)
 
 
 class VNAWindow(InstrumentWindow):
@@ -483,10 +447,7 @@ class VNAWindow(InstrumentWindow):
         if "meas_table" in proxy.actions:
             self.trace_table = TraceTable(proxy)
             trac = [PanelLine("TRC", self.trace_table)]
-            self.delete_button = ConfirmButton("−", "Delete the selected trace from the analyzer",
-                                               self.trace_table.delete)
-            tools = [self._tool("+", "New trace: channel and S-parameter of the selected row", self.trace_table.create),
-                     self.delete_button]
+            tools = [self._tool("+", "New S21 trace on the channel of the last row", self.trace_table.create)]
             tools += [ActionButton(proxy, a, t, tip) for a, t, tip in
                       (("meas_all", "ALL", "Read every trace (first 16)"), ("meas_none", "NONE", "Read nothing"))
                       if a in proxy.actions]

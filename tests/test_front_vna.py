@@ -89,7 +89,7 @@ def test_trace_table_read_and_mem_math(qtbot, vna):
     proxy, win, _s, sim = vna
     tt = win.trace_table
     _wait(qtbot, lambda: len(tt.rows) == 3)
-    assert [(r.select.text(), r.sparam.text(), r.format.text(), r.math.text()) for r in tt.rows] == [
+    assert [(r.channel_menu.text(), r.sparam.text(), r.format.text(), r.math.text()) for r in tt.rows] == [
         ("C1", "S11", "MLOG", "DATA"), ("C1", "S21", "MLOG", "DATA"), ("C2", "S12", "MLOG", "DATA")]
     assert tt.is_read(1, "CH1_S11_1") and not tt.is_read(2, "CH2_S12")
     tt.rows[2].read.click()                                    # канал 2: свободный слот
@@ -115,15 +115,16 @@ def test_trace_table_edit_create_delete(qtbot, vna):
     _wait(qtbot, lambda: sim.meas["USER_S21"]["fmt"] == "PHAS" and tt.rows[1].format.text() == "PHAS")
     tt.rows[1].sparam.on_pick("S12")
     _wait(qtbot, lambda: tt.rows[1].sparam.text() == "S12")
-    tt.rows[2].select.click()                                  # + создаёт трейс на канале выбранной строки
-    tt.create()
+    assert [n for n, _v in tt.rows[0].channel_menu.choices] == ["C1", "C2", "C3 NEW", None, "DEL"]
+    tt.create()                                                # + : S21 на канале последней строки (2)
     _wait(qtbot, lambda: len(tt.rows) == 4)
-    assert ("CH2_S12_1" in sim.meas) and sim.meas["CH2_S12_1"]["ch"] == 2 and tt.rows[2].select.indicated()
-    win.delete_button.click()                                  # первый клик - SURE?
-    assert win.delete_button.text() == "SURE?" and "CH2_S12" in sim.meas
-    win.delete_button.click()
+    assert sim.meas["CH2_S21_1"]["ch"] == 2
+    tt.rows[1].channel_menu.on_pick(3)                         # перенос USER_S21 в новый канал 3
+    _wait(qtbot, lambda: "USER_S21" not in sim.meas and "CH3_S12_1" in sim.meas)
+    _wait(qtbot, lambda: [r.channel_menu.text() for r in tt.rows] == ["C1", "C2", "C2", "C3"])
+    assert sim.meas["CH3_S12_1"]["fmt"] == "PHAS"
+    tt.rows[1].channel_menu.on_pick("DEL")                     # удалить CH2_S12
     _wait(qtbot, lambda: len(tt.rows) == 3 and "CH2_S12" not in sim.meas)
-    assert tt.selected is None and win.delete_button.text() == "−"
 
 
 def test_states_tab(qtbot, vna):

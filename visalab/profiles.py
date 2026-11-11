@@ -309,6 +309,7 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("meas_table", doc="-> action_done('meas_table', [(канал, имя, S-параметр, формат, математика)])"),
         ActionSlot("meas_config", doc="аргументы (канал, имя, 'sparam'|'format'|'math', значение) -> таблица"),
         ActionSlot("meas_create", doc="аргументы (канал, S-параметр): новое измерение на приборе -> таблица"),
+        ActionSlot("meas_move", doc="аргументы (канал, имя, новый канал): пересоздать в другом канале -> таблица"),
         ActionSlot("meas_delete", doc="аргументы (канал, имя): удалить измерение с прибора -> таблица"),
         ActionSlot("meas_none", doc="выключить чтение всех слотов"),
         ActionSlot("mem_store", doc="данные -> память: аргументы - номера слотов, без них - все включённые"),

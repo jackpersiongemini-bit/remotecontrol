@@ -304,3 +304,18 @@ def test_measurement_table_create_config_delete(make):
     drv.run_action("meas_config", (1, "NOPE", "format", "SWR"))
     drv.run_action("meas_create", (1, "S99"))
     assert len(rec.comm) == 2
+
+
+def test_measurement_move_to_other_channel(make):
+    sim = KeysightPNASim()
+    sim.meas["USER_S21"] = _meas("S21", "PHAS")
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    assert setp(drv, rec, "m2.enabled", True) is PStatus.WRITTEN          # USER_S21 читается в m2
+    drv.run_action("meas_move", (1, "USER_S21", 3))
+    assert "USER_S21" not in sim.meas and sim.meas["CH3_S21_1"] == {"s": "S21", "fmt": "PHAS", "ch": 3}
+    assert actions[-1][1] == [(1, "CH1_S11_1", "S11", "MLOG", "NORM"), (3, "CH3_S21_1", "S21", "PHASE", "NORM")]
+    assert rec.values["m2.channel"] == 3 and rec.values["m2.name"] == "CH3_S21_1" and rec.values["m2.enabled"]
+    drv.poll()
+    assert rec.values["m2.trace"].meta["channel"] == 3 and not rec.errors and not rec.comm
