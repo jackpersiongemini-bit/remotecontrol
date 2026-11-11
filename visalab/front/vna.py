@@ -8,10 +8,9 @@
   пресетов колесо и стрелки переключают мощность только по списку из вкладки PWR;
 * CW   - одна частота (ВАЦ как генератор): CW включает тип развёртки CW, повторный клик
   возвращает прежний тип; рядом частота CW;
-* CORR - коррекция (калибровка) ON / OFF.
 
 Первая строка избранного CH - чипы каналов (как пресеты, без «+»/«−»): текущий канал окна, к нему
-относятся POW, CW, CORR и вкладка STIM.
+относятся POW, CW и вкладки STIM, CAL.
 Вкладки: TRAC (сверху чипы всех трейсов прибора, как пресеты: клик выбирает, + создаёт трейс S21 на
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
@@ -286,7 +285,7 @@ class TraceChips(PBGroup):
 
 class TraceEditor(QWidget):
     """Трейсы: чипы всех трейсов прибора (по всем каналам) - строка TRC избранного; выбранный трейс
-    задаёт и текущий канал окна (``stim.channel``: POW / CW / CORR, STIM, режим TRIG). Вкладка TRAC -
+    задаёт и текущий канал окна (``stim.channel``: POW / CW, STIM, CAL, режим TRIG). Вкладка TRAC -
     выбранный трейс: канал (список: перенести в другой канал), READ, S-параметр, формат, математика.
     Слоты не видны: READ сам занимает свободный (до 16 читаемых). В режиме генератора трейсы
     других каналов недоступны."""
@@ -961,7 +960,7 @@ class VNAWindow(InstrumentWindow):
         proxy, sup, pre = self.proxy, self.proxy.supports, self._prefix
         self.widgets: dict[str, Any] = {}
         top = []
-        if "meas_table" in proxy.actions:            # трейсы; выбранный задаёт канал POW / CW / CORR, STIM, TRIG
+        if "meas_table" in proxy.actions:            # трейсы; выбранный задаёт канал POW / CW, STIM, TRIG, CAL
             te = self.trace_editor = TraceEditor(proxy)
             tools = self._trc_tools = QWidget()
             tl = QVBoxLayout(tools)                   # «+» над «−», как у пресетов
@@ -1010,10 +1009,6 @@ class VNAWindow(InstrumentWindow):
             self.cw_spin = PSpinBox(proxy, "freq.cw", ("k", "M", "G"))
             self.widgets["freq.cw"] = self.cw_spin
             top.append(PanelLine("CW", self.cw_button, self.cw_spin))
-        if sup("cal.state"):
-            corr = PSButton(proxy, "cal.state", [("CORR OFF", False), ("CORR ON", True)])
-            self.widgets["cal.state"] = corr
-            top.append(PanelLine("CORR", corr))
         self.top_lines = top
         self.saved_widgets += [self.power_spin, *(w for k, w in self.widgets.items() if k not in NOT_SAVED)]
 
