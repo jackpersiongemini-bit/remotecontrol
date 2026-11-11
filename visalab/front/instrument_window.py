@@ -26,12 +26,12 @@ from ..core.params import ConnectionState, PStatus
 from ..core.proxy import InstrumentProxy
 from ..drivers import DRIVERS
 from .models import ModelWindow, all_models, model_class
-from .params import PBGroup, PChoice, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
+from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
                      Window, short_address)
 
-__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "HScrollArea", "saved_connection", "parse_power_list",
+__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "parse_power_list",
            "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "LINKS", "ProxyLinks"]
 
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
@@ -181,6 +181,29 @@ class PresetGroup(PBGroup):
         del self.data[i]
         self.save()
         return True
+
+
+class PowerSpin(PSpinBox):
+    """Мощность: колесо / стрелки - разряд под курсором, а в режиме пресетов - соседнее значение списка."""
+
+    def __init__(self, proxy: InstrumentProxy, key: str, parent=None):
+        super().__init__(proxy, key, parent=parent)
+        self.preset_mode = False
+        self.levels: list[float] = list(DEFAULT_POWER_LIST)
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802 - Qt
+        if not self.preset_mode or not self.levels:
+            super().stepBy(steps)
+            return
+        cur = self._value if isinstance(self._value, (int, float)) else self.value()
+        if steps > 0:
+            above = [v for v in self.levels if v > cur + 1e-9]
+            target = above[min(steps, len(above)) - 1] if above else self.levels[-1]
+        else:
+            below = [v for v in self.levels if v < cur - 1e-9]
+            target = below[-min(-steps, len(below))] if below else self.levels[0]
+        self.show_value(target, force=True)
+        self.set_value(target)
 
 
 class PowerLevels(QWidget):
@@ -484,7 +507,28 @@ class InstrumentWindow(Window):
         self.levels_changed(levels)
 
     def levels_changed(self, levels: list[float]) -> None:
-        """Список пресетов мощности изменён (наследник может обновить свои виджеты)."""
+        """Список пресетов мощности изменён: режим PRST спинбокса ходит по новому списку."""
+        if getattr(self, "power_spin", None) is not None:
+            self.power_spin.levels = list(levels)
+
+    def power_widgets(self, key: str, tip: str) -> tuple[PowerSpin, IndicatorButton]:
+        """Мощность ``key`` для избранного: спинбокс ``self.power_spin`` и кнопка ``self.prst_button`` -
+        режим пресетов (колесо / стрелки ходят по списку ``power_levels_line``, уровни - POWER_LIST)."""
+        spin = self.power_spin = PowerSpin(self.proxy, key)
+        spin.levels = self._load_levels()
+        b = self.prst_button = IndicatorButton("PRST")
+        b.setObjectName("choice")
+        b.setCheckable(True)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setToolTip(tip)
+        b.toggled.connect(self._set_preset_mode)
+        b.setChecked(self.settings.value(f"{self._prefix}/POWER_PRESET_MODE", False, type=bool))
+        return spin, b
+
+    def _set_preset_mode(self, on: bool) -> None:
+        self.power_spin.preset_mode = bool(on)
+        self.settings.setValue(f"{self._prefix}/POWER_PRESET_MODE", bool(on))
 
     # ------------------------------------------------------------ вид
     def set_expanded(self, on: bool) -> None:

@@ -36,7 +36,7 @@ from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
 from . import instrument_window as _iw
-from .instrument_window import (DEFAULT_POWER_LIST, PRESET_GAP, HScrollArea, InstrumentWindow, PresetGroup,
+from .instrument_window import (PRESET_GAP, HScrollArea, InstrumentWindow, PowerSpin, PresetGroup,
                                 parse_power_list)
 from .params import IndicatorButton, PBGroup, PLineEdit, PSButton, PSpinBox, Panel, PanelLine, PanelTable
 from .power_meter import CONFIRM_MS, ActionButton
@@ -85,29 +85,6 @@ def _auto(proxy: InstrumentProxy, key: str):
     if spec.kind is Kind.ENUM:
         return PSButton(proxy, key, [(c, c) for c in spec.choices])
     return PLineEdit(proxy, key)
-
-
-class PowerSpin(PSpinBox):
-    """Мощность: колесо / стрелки - разряд под курсором, а в режиме пресетов - соседнее значение списка."""
-
-    def __init__(self, proxy: InstrumentProxy, key: str, parent=None):
-        super().__init__(proxy, key, parent=parent)
-        self.preset_mode = False
-        self.levels: list[float] = list(DEFAULT_POWER_LIST)
-
-    def stepBy(self, steps: int) -> None:  # noqa: N802 - Qt
-        if not self.preset_mode or not self.levels:
-            super().stepBy(steps)
-            return
-        cur = self._value if isinstance(self._value, (int, float)) else self.value()
-        if steps > 0:
-            above = [v for v in self.levels if v > cur + 1e-9]
-            target = above[min(steps, len(above)) - 1] if above else self.levels[-1]
-        else:
-            below = [v for v in self.levels if v < cur - 1e-9]
-            target = below[-min(-steps, len(below))] if below else self.levels[0]
-        self.show_value(target, force=True)
-        self.set_value(target)
 
 
 class MathButton(IndicatorButton):
@@ -979,21 +956,14 @@ class VNAWindow(InstrumentWindow):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setToolTip("Save every trace being read (last sweep) to a CSV file; folder and name - SAVE tab")
             b.clicked.connect(self.save_data)
-        self.power_spin = PowerSpin(proxy, "source.power")
-        pow_ws: list[QWidget] = [self.power_spin]
+        spin, prst = self.power_widgets("source.power", "Preset mode: the wheel and arrows step the power "
+                                                        "through the PWR list")
+        pow_ws: list[QWidget] = [spin]
         if sup("rf.output"):
             rf = PSButton(proxy, "rf.output", [("RF OFF", False), ("RF ON", True)])
             self.widgets["rf.output"] = rf
             pow_ws.append(rf)
-        self.prst_button = IndicatorButton("PRST")
-        self.prst_button.setObjectName("choice")
-        self.prst_button.setCheckable(True)
-        self.prst_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.prst_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.prst_button.setToolTip("Preset mode: the wheel and arrows step the power through the PWR list")
-        self.prst_button.toggled.connect(self._set_preset_mode)
-        self.prst_button.setChecked(self.settings.value(f"{pre}/POWER_PRESET_MODE", False, type=bool))
-        pow_ws.append(self.prst_button)
+        pow_ws.append(prst)
         top.append(PanelLine("POW", *pow_ws))
         if sup("gen.state") and sup("freq.cw"):
             self.cw_button = CWButton(proxy)
@@ -1040,7 +1010,6 @@ class VNAWindow(InstrumentWindow):
 
         # PWR
         prst = self.power_levels_line("source.power")
-        self.power_spin.levels = self.power_levels.levels
         pwr = [PanelLine("POW", _auto(proxy, "source.power"))]
         if sup("rf.output"):
             pwr.append(PanelLine("RF", PSButton(proxy, "rf.output", ONOFF)))
@@ -1342,13 +1311,6 @@ class VNAWindow(InstrumentWindow):
         return RESTORE_RANK.get(key, 2)
 
     # ------------------------------------------------------------ мощность: пресеты
-    def levels_changed(self, levels: list[float]) -> None:
-        self.power_spin.levels = list(levels)
-
-    def _set_preset_mode(self, on: bool) -> None:
-        self.power_spin.preset_mode = bool(on)
-        self.settings.setValue(f"{self._prefix}/POWER_PRESET_MODE", bool(on))
-
     # ------------------------------------------------------------ состояния в приборе (вкладка SAVE)
     def create_presets(self, key: str) -> PresetGroup:
         return StatePresets(self.settings, key, self._delete_state)

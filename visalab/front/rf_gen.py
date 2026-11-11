@@ -1,8 +1,8 @@
 """Окно СВЧ генератора (E8267D, SMF100A - профиль signal_generator), по образцу окна SDG.
 
-Избранное: выходы RF / MOD, пресеты мощности чипами (клик ставит мощность, «+» - текущая,
-«−» - выбранная, ← → - соседний уровень) и частота RF спинбоксом (шаг - разряд под курсором).
-Модуляция - на вкладках.
+Избранное, как в векторнике: выходы RF / MOD, мощность спинбоксом с PRST (режим пресетов: колесо /
+стрелки ходят по списку уровней) и частота RF спинбоксом (шаг - разряд под курсором). Список уровней -
+чипы PRST на вкладке RF (клик ставит мощность, «+» - текущая, «−» - выбранная). Модуляция - на вкладках.
 Развёрнутый вид - вкладки RF / AM / FM / PM / PULS (индикатор - режим включён).
 
 Окно знает только InstrumentProxy и ключи профиля signal_generator.
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QPushButton
 
 from ..core.params import Kind
@@ -75,7 +75,7 @@ class RFGenWindow(InstrumentWindow):
         self.widgets: dict[str, Any] = {}
         sup = proxy.supports
 
-        # избранное: выходы, пресеты мощности, частота RF
+        # избранное: выходы, мощность с режимом пресетов, частота RF
         outs = []
         for key, name in (("rf.output", "RF"), ("mod.output", "MOD")):
             if sup(key):
@@ -85,7 +85,9 @@ class RFGenWindow(InstrumentWindow):
                 outs.append(w)
         self.top_lines = [PanelLine("OUT", *outs)]
         if sup("rf.power"):
-            self.top_lines.append(self.power_levels_line("rf.power"))
+            spin, prst = self.power_widgets("rf.power", "Preset mode: the wheel and arrows step the power "
+                                                        "through the PRST list (RF tab)")
+            self.top_lines.append(PanelLine("POW", spin, prst))
         self.freq_spin = PSpinBox(proxy, "rf.frequency", ("k", "M", "G"))
         self.top_lines.append(PanelLine("FREQ", self.freq_spin))
 
@@ -100,18 +102,11 @@ class RFGenWindow(InstrumentWindow):
                 self.widgets.setdefault(k, w)
                 self.saved_widgets.append(w)
                 lines.append(PanelLine(t, w))
+                if k == "rf.power":                   # пресеты мощности - под POW
+                    lines.append(self.power_levels_line("rf.power"))
             self.page_specs.append((title_, (state,) if sup(state) else (), PanelTable(*lines)))
         if "mod.output" in self.widgets:
             self.saved_widgets.append(self.widgets["mod.output"])
 
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
-
-    def keyPressEvent(self, e):  # noqa: N802 - Qt
-        """← → - соседний пресет мощности."""
-        pl = getattr(self, "power_levels", None)
-        if pl is not None and e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
-            pl.step(-1 if e.key() == Qt.Key.Key_Left else 1)
-            e.accept()
-            return
-        super().keyPressEvent(e)
