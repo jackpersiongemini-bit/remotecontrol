@@ -54,6 +54,7 @@ class KeysightPNASim(SimInstrument):
                              "pow": -10.0},
                 "CAL_FULL": {"start": 10e6, "stop": 13.5e9, "poin": 401, "type": "LIN", "cw": 1e9, "bwid": 10e3,
                              "pow": -5.0}}
+        self.snp_form = "MA"
         self.guid = {"conn": {1: "Not used", 2: "Not used"}, "kit": {1: "", 2: ""}, "steps": [], "done": set(),
                      "ch": 1}
         if not hasattr(self, "dut"):
@@ -241,6 +242,9 @@ class KeysightPNASim(SimInstrument):
         self.on("CSET:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.csets)) + '"')
         self.on("SENSe#:CORRection:CSET:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.csets)) + '"')
         self.on("CSET:DELete", self._cset_del)
+        self.on("MMEMory:STORe:TRACe:FORMat:SNP", lambda a, g: setattr(self, "snp_form", a.strip().upper()),
+                lambda a, g: self.snp_form)
+        self.on("CALCulate#:DATA:SNP:PORTs", get=self._snp)
         g = "SENSe#:CORRection:COLLect:GUIDed:"
         self.on(g + "CONNector:CATalog", get=lambda a, g_: '"' + ",".join(CONNECTORS) + '"')
         self.on(g + "CONNector:PORT#", self._guid_conn, lambda a, g_: f'"{self.guid["conn"][int(g_[1])]}"')
@@ -507,6 +511,20 @@ class KeysightPNASim(SimInstrument):
         if fn != "NORM" and m.get("mem") is None:
             raise SimError(-221, "Settings conflict; no memory trace", ESR_EXE)
         m["math"] = fn
+
+    # ----------------------------------------------------------- Touchstone
+    def _snp(self, a, g):
+        """Частоты, затем Re и Im каждого S-параметра (S11 S21 S12 S22) - столбцами, как в SnP-файле."""
+        ports = sorted({int(p) for p in a.strip().strip("'\"").split(",") if p.strip()})
+        if not ports or any(p not in (1, 2) for p in ports) or getattr(self, "snp_form", "RI") != "RI":
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        fs = self.freqs(self._ch(g))
+        out = list(fs)
+        for b in ports:
+            for a_ in ports:
+                vals = [self.s(f"S{a_}{b}", f) for f in fs]
+                out += [v.real for v in vals] + [v.imag for v in vals]
+        return ",".join(f"{v:+.11E}" for v in out)
 
     # ----------------------------------------------------------- калибровка
     def _corr_set(self, a, g):

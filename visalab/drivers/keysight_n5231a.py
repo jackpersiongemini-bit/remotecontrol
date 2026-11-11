@@ -22,6 +22,10 @@
   (номер шага) - ``ACQ STAN<шаг>`` + ``*OPC`` без блокировки (ключ ``cal.busy``); ``cal_status`` -> (шаги,
   измеренные); ``cal_save`` (имя) - ``SAVE:CSET "имя"``, cal set сразу применяется к каналу; ``cal_abort``.
   Пока идёт калибровка, развёртки не запускаются;
+* S-параметры канала для Touchstone: действие ``snp_read`` (порты, по умолчанию "1,2") - одна развёртка
+  канала ``stim.channel`` (при внутреннем запуске), ``MMEM:STOR:TRAC:FORM:SNP RI``,
+  ``CALC<c>:DATA:SNP:PORT? "1,2"`` (частоты, затем Re и Im каждого S-параметра в порядке S11 S21 S12 S22)
+  -> {"S11": Trace(комплексная), ...};
 * маркер ``CALC1:MARK1``, ``CALC1:MARK1:X``, ``CALC1:MARK1:Y?`` (два числа), ``CALC1:MARK1:FUNC:EXEC MAX|MIN``;
 * запуск ``TRIG:SOUR IMM|EXT|MAN`` (внутренний / внешний BNC / ручной), ``TRIG:SCOP ALL|CURR``
   (триггер на все каналы по очереди или на текущий), режим канала ``SENS1:SWE:TRIG:MODE CHAN|SWE|POIN|TRAC``
@@ -306,6 +310,7 @@ class KeysightPNA(VISAInstrument):
                 Action("cal_start", "Начать калибровку"), Action("cal_measure", "Измерить стандарт"),
                 Action("cal_status", "Шаги калибровки"), Action("cal_save", "Сохранить калибровку в cal set"),
                 Action("cal_abort", "Прервать калибровку"),
+                Action("snp_read", "S-параметры канала (Touchstone)"),
                 Action("reset", "Preset *RST",
                        confirm="Preset удалит измерения и выключит калибровку. Продолжить?")]
 
@@ -755,6 +760,8 @@ class KeysightPNA(VISAInstrument):
             self._check_errors(context=name)
             self._read_keys(["cal.set", "cal.state"])
             return self._cal_list()
+        if name == "snp_read":
+            return self._snp_read(args[0] if args else "1,2")
         if name == "state_list":
             return self._state_list()
         if name == "state_dirs":
@@ -801,6 +808,42 @@ class KeysightPNA(VISAInstrument):
             self.write(f'SENS{c}:CORR:CSET:ACT "{name}",{1 if self._cal_stim else 0}')
             self.query("*OPC?")
         self._check_errors(context="cal.set")
+
+    # ------------------------------------------------- S-параметры канала (Touchstone)
+    def _snp_read(self, ports) -> dict[str, Trace]:
+        plist = sorted({int(p) for p in re.findall(r"\d+", str(ports))})
+        if not plist or any(p not in (1, 2) for p in plist):
+            raise ValueError(f"порты 1 и/или 2, получено {ports!r}")
+        if self._cal is not None:
+            raise ValueError("идёт калибровка")
+        names = [f"S{a}{b}" for b in plist for a in plist]          # S11 S21 S12 S22 - порядок Touchstone
+        c = self._stim_ch
+        was_armed = self._armed
+        self._abort()
+        try:
+            self.write("MMEM:STOR:TRAC:FORM:SNP RI")
+            if self.query("TRIG:SOUR?").strip().upper().startswith("IMM"):   # EXT / MAN - последние данные
+                self.write(f"SENS{c}:SWE:MODE SING")
+                self.query("*OPC?")
+            reply = self.query(f'CALC{c}:DATA:SNP:PORT? "{",".join(map(str, plist))}"')
+            self._check_errors(context="snp_read")
+        finally:
+            if was_armed or self._continuous:
+                self._start_sweep()
+        vals = [parse_number(t) for t in reply.split(",") if t.strip()]
+        n, rest = divmod(len(vals), 1 + 2 * len(names))
+        if rest or not n:
+            raise ValueError(f"SNP: {len(vals)} чисел не делятся на {1 + 2 * len(names)} столбцов")
+        freqs = tuple(vals[:n])
+        meta = {"channel": c, "format": "SDATA", "cal.set": self._values.get("cal.set") if c == self._stim_ch else None,
+                "cal.state": self._values.get("cal.state"), "bw.if": self._values.get("bw.if"),
+                "source.power": self._values.get("source.power")}
+        out = {}
+        for k, name in enumerate(names):
+            re_, im = vals[n * (1 + 2 * k):n * (2 + 2 * k)], vals[n * (2 + 2 * k):n * (3 + 2 * k)]
+            out[name] = Trace(freqs, tuple(re_), x_unit="Hz", y_unit="", name=name, im=tuple(im),
+                              meta={**meta, "sparam": name})
+        return out
 
     # ------------------------------------------------- калибровка (guided)
     @staticmethod

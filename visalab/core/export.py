@@ -1,4 +1,4 @@
-"""Сохранение трасс в файл (CSV): одна таблица на несколько трасс.
+"""Сохранение трасс в файл: CSV (одна таблица на несколько трасс) и Touchstone ``.s1p`` / ``.s2p``.
 
 Трассы с одинаковой осью X (один канал ВАЦ) делят столбец X; у трасс с другой осью - свой
 столбец X рядом. Комплексная трасса (``im``) - два столбца, Re и Im. Строки короче самой длинной
@@ -13,7 +13,10 @@ from typing import Iterable, Sequence
 
 from .trace import Trace
 
-__all__ = ["write_traces_csv"]
+__all__ = ["write_traces_csv", "write_touchstone", "TOUCHSTONE_ORDER"]
+
+#: порядок S-параметров в строке Touchstone 1.x (для 2 портов - S11 S21 S12 S22)
+TOUCHSTONE_ORDER = {1: ("S11",), 2: ("S11", "S21", "S12", "S22")}
 
 
 def _head(label: str, unit: str) -> str:
@@ -58,4 +61,31 @@ def write_traces_csv(path, traces: Sequence[Trace], labels: Sequence[str] | None
         w.writerow(header)
         for r in range(rows):
             w.writerow([f"{c[r]:.10g}" if r < len(c) else "" for c in columns])
+    return path
+
+
+def write_touchstone(path, sparams: dict[str, Trace], comments: Iterable[str] = (), z0: float = 50.0) -> Path:
+    """Touchstone 1.x (``.s1p`` / ``.s2p``): ``# HZ S RI R 50``, строка - частота и Re, Im каждого S-параметра.
+
+    ``sparams`` - комплексные трассы {"S11": ..., "S21": ...} с одной осью частот; число портов - по ним.
+    """
+    ports = 2 if len(sparams) > 1 else 1
+    order = TOUCHSTONE_ORDER[ports]
+    missing = [k for k in order if k not in sparams]
+    if missing:
+        raise ValueError(f"нет S-параметров {missing} для s{ports}p")
+    traces = [sparams[k] for k in order]
+    freqs = traces[0].x
+    if any(t.x != freqs or not t.is_complex for t in traces):
+        raise ValueError("S-параметры должны быть комплексными и с одной осью частот")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="\n", encoding="utf-8") as f:
+        for line in comments:
+            f.write(f"! {line}\n")
+        f.write(f"! columns: freq, {', '.join(f'{k} Re, {k} Im' for k in order)}\n")
+        f.write(f"# HZ S RI R {z0:g}\n")
+        for i, fr in enumerate(freqs):
+            vals = " ".join(f"{t.y[i]: .9e} {t.im[i]: .9e}" for t in traces)
+            f.write(f"{fr:.9e} {vals}\n")
     return path
