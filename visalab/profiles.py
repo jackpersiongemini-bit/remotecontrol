@@ -308,6 +308,11 @@ NETWORK_ANALYZER = Profile(
         Slot("cal.stim", B, doc="применять cal set вместе с его стимулом (частоты, точки, полоса, мощность)"),
         Slot("cal.interp", B, doc="интерполяция калибровки при стимуле, отличном от cal set"),
         Slot("cal.busy", B, readonly=True, doc="калибровка: идёт измерение стандарта (cal_measure)"),
+        Slot("mark.n", I, doc="номер маркера (1..10) трейса trace.sel для mark.state / mark.x / mark.y"),
+        Slot("mark.state", B, doc="маркер mark.n трейса trace.sel включён"),
+        Slot("mark.x", F, "Hz", doc="положение маркера (в CW - время, s)"),
+        Slot("mark.y", F, "", readonly=True, doc="значение трейса в маркере (единицы формата трейса), "
+                                                 "перечитывается после каждой развёртки"),
         Slot("marker.state", B),
         Slot("marker.freq", F, "Hz"),
         Slot("marker.value", F, "", readonly=True, doc="значение трассы в маркере, единицы - как у трассы"),
@@ -327,6 +332,10 @@ NETWORK_ANALYZER = Profile(
     actions=(
         ActionSlot("single", doc="одна развёртка"),
         ActionSlot("abort"),
+        ActionSlot("mark_peak", doc="маркер mark.n трейса trace.sel на максимум -> mark_table"),
+        ActionSlot("mark_min", doc="маркер mark.n трейса trace.sel на минимум -> mark_table"),
+        ActionSlot("mark_aoff", doc="выключить все маркеры трейса trace.sel"),
+        ActionSlot("mark_table", doc="-> action_done('mark_table', [(номер, x, y), ...]) включённые маркеры trace.sel"),
         ActionSlot("marker_peak", doc="маркер на максимум"),
         ActionSlot("marker_min", doc="маркер на минимум"),
         ActionSlot("meas_catalog", doc="каталог измерений -> action_done('meas_catalog', [(канал, имя, S-параметр)])"),

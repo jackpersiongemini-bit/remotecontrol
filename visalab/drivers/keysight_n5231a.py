@@ -30,6 +30,10 @@
   ``CALC<c>:DATA:SNP:PORT? "1,2"`` (частоты, затем Re и Im каждого S-параметра в порядке S11 S21 S12 S22)
   -> {"S11": Trace(комплексная), ...};
 * маркер ``CALC1:MARK1``, ``CALC1:MARK1:X``, ``CALC1:MARK1:Y?`` (два числа), ``CALC1:MARK1:FUNC:EXEC MAX|MIN``;
+  маркеры трейса ``trace.sel``: номер ``mark.n`` (1..10), ``mark.state`` / ``mark.x`` / ``mark.y`` -
+  ``CALC<c>:MARK<n>``, ``:X``, ``:Y?`` (первое число) его измерения; действия ``mark_peak`` / ``mark_min``
+  (``:FUNC:EXEC MAX|MIN``), ``mark_aoff`` (``CALC<c>:MARK:AOFF``), ``mark_table`` -> [(n, x, y)] включённых;
+  ``mark.y`` перечитывается после каждой развёртки;
 * запуск ``TRIG:SOUR IMM|EXT|MAN`` (внутренний / внешний BNC / ручной), ``TRIG:SCOP ALL|CURR``
   (триггер на все каналы по очереди или на текущий), режим канала ``SENS1:SWE:TRIG:MODE CHAN|SWE|POIN|TRAC``
   (один триггер - канал / развёртка / точка / трасса), вход внешнего триггера ``TRIG:SLOP POS|NEG``,
@@ -123,6 +127,9 @@ GEN_KEYS = ("sweep.type", "freq.start", "freq.stop", "sweep.points", "bw.if", "s
             "avg.state", "avg.count", "cal.state", "source.power", "rf.output")
 #: ключи трейса ``trace.sel``: масштаб на экране прибора и обработка данных
 SCALE_KEYS = ("scale.div", "scale.ref", "scale.rpos", "scale.edel", "smooth.state", "smooth.aper")
+#: маркер ``mark.n`` трейса ``trace.sel``
+MARK_KEYS = ("mark.state", "mark.x", "mark.y")
+MARKS = 10
 SWEEP_TYPES = ("LIN", "LOG", "POWER", "CW", "SEGMENT")
 SWEEP_MAP = (("POWER", "POW"), ("SEGMENT", "SEGM"))
 TRIG_SOURCES = ("IMM", "EXT", "MAN")
@@ -155,6 +162,7 @@ class KeysightPNA(VISAInstrument):
         self._continuous = True
         self._armed = False
         self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
+        self._mark_n = 1
         self._cal_stim = True                  # cal set применяется вместе со своим стимулом
         #: идущая калибровка: {"channel", "steps": [описание], "done": {шаг}, "busy": шаг | None}
         self._cal: dict | None = None
@@ -208,7 +216,14 @@ class KeysightPNA(VISAInstrument):
             Param("state.dir", "Папка состояний на анализаторе", Kind.STR, section="Память",
                   query="MMEM:CDIR?", write='MMEM:CDIR "{value}"'),
             Param("trace.sel", "Трейс (масштаб)", Kind.STR, section=sc, query="<virtual>", write="<virtual>",
-                  also_read=SCALE_KEYS),
+                  also_read=(*SCALE_KEYS, *MARK_KEYS)),
+            Param("mark.n", "Маркер трейса", I, section=mk, query="<virtual>", write="<virtual>", minimum=1,
+                  maximum=MARKS, also_read=MARK_KEYS),
+            Param("mark.state", "Маркер вкл.", B, section=mk, query="<mark>", write="<mark>",
+                  also_read=("mark.x", "mark.y")),
+            Param("mark.x", "X маркера", F, "Hz", section=mk, query="<mark>", write="<mark>", minimum=0.0,
+                  maximum=m.f_max, tolerance=1e-6, also_read=("mark.state", "mark.y")),
+            Param("mark.y", "Значение маркера", F, "", section=mk, query="<mark>"),
             Param("scale.div", "Цена деления", F, "", section=sc, query="<scale>", write="<scale>",
                   minimum=1e-18, maximum=1e12, tolerance=1e-6),
             Param("scale.ref", "Опорный уровень", F, "", section=sc, query="<scale>", write="<scale>",
@@ -297,6 +312,8 @@ class KeysightPNA(VISAInstrument):
         return [Action("single", "Одна развёртка"), Action("abort", "Стоп"),
                 Action("trigger", "Ручной запуск (TRIG:SOUR MAN)"),
                 Action("autoscale", "Автомасштаб трейса trace.sel"),
+                Action("mark_peak", "Маркер mark.n трейса на максимум"), Action("mark_min", "Маркер на минимум"),
+                Action("mark_aoff", "Выключить маркеры трейса"), Action("mark_table", "Маркеры трейса"),
                 Action("marker_peak", "Маркер на максимум"), Action("marker_min", "Маркер на минимум"),
                 Action("meas_catalog", "Каталог измерений"), Action("meas_all", "Читать все измерения"),
                 Action("meas_none", "Не читать измерения"),
@@ -404,6 +421,16 @@ class KeysightPNA(VISAInstrument):
                 raise ValueError(f"нет трейса {value!r} (нужно «канал:имя»)")
             self._sel = (int(c), name)
             return
+        if spec.key == "mark.n":
+            n = int(value)
+            if not 1 <= n <= MARKS:
+                raise ValueError(f"маркер 1..{MARKS}, получено {n}")
+            self._mark_n = n
+            return
+        if spec.key in ("mark.state", "mark.x"):
+            cmd = self._mark_cmd()
+            self.write((cmd if spec.key == "mark.state" else cmd + ":X") + " " + spec.to_scpi(value))
+            return
         if spec.key in SCALE_KEYS:
             cmd = self._scale_cmd(spec.key)
             if not cmd:
@@ -477,6 +504,18 @@ class KeysightPNA(VISAInstrument):
             return "" if not name or name.upper().startswith("NO ") else name
         if key == "trace.sel":
             return f"{self._sel[0]}:{self._sel[1]}" if self._sel else None
+        if key == "mark.n":
+            return self._mark_n
+        if key in MARK_KEYS:
+            if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
+                return None
+            cmd = self._mark_cmd()
+            on = self.query(cmd + "?").strip() in ("1", "ON")
+            if key == "mark.state":
+                return on
+            if key == "mark.x":
+                return spec.from_scpi(self.query(cmd + ":X?"))
+            return parse_number(self.query(cmd + ":Y?").split(",")[0]) if on else None
         if key in SCALE_KEYS:
             if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
                 return None
@@ -548,6 +587,25 @@ class KeysightPNA(VISAInstrument):
             return spec
         sub = lambda t: t and t.replace("SENS1:", f"SENS{c}:").replace("SOUR1:", f"SOUR{c}:")
         return replace(spec, query=sub(spec.query), write=sub(spec.write))
+
+    # ------------------------------------------------------- маркеры трейса trace.sel
+    def _mark_cmd(self, n: int | None = None) -> str:
+        if not self._sel:
+            raise ValueError("трейс не выбран (trace.sel)")
+        c, name = self._sel
+        self.write(f"CALC{c}:PAR:SEL '{name}'")
+        return f"CALC{c}:MARK{self._mark_n if n is None else n}"
+
+    def _mark_table(self) -> list[tuple[int, float, float | None]]:
+        out = []
+        if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
+            return out
+        for n in range(1, MARKS + 1):
+            cmd = self._mark_cmd(n)
+            if self.query(cmd + "?").strip() in ("1", "ON"):
+                out.append((n, parse_number(self.query(cmd + ":X?")),
+                            parse_number(self.query(cmd + ":Y?").split(",")[0])))
+        return out
 
     # ------------------------------------------------------- масштаб трейса trace.sel
     def _scale_cmd(self, key: str) -> str:
@@ -671,6 +729,8 @@ class KeysightPNA(VISAInstrument):
             self._publish(k, v)
         if self._values.get("marker.state"):
             self._read_keys(["marker.freq", "marker.value"])
+        if self._values.get("mark.state"):
+            self._read_keys(["mark.y"])
 
     def poll(self) -> None:
         if self._cal is not None and self._cal["busy"] is not None:
@@ -729,6 +789,19 @@ class KeysightPNA(VISAInstrument):
                 if was_armed or self._continuous:
                     self._start_sweep()
             return None
+        if name in ("mark_peak", "mark_min"):
+            cmd = self._mark_cmd()
+            self.write(f"{cmd}:FUNC:EXEC {'MAX' if name == 'mark_peak' else 'MIN'}")
+            self._read_keys(MARK_KEYS)
+            return self._mark_table()
+        if name == "mark_aoff":
+            c = self._sel[0]
+            self._mark_cmd()
+            self.write(f"CALC{c}:MARK:AOFF")
+            self._read_keys(MARK_KEYS)
+            return []
+        if name == "mark_table":
+            return self._mark_table()
         if name in ("marker_peak", "marker_min"):
             self.select_channel(1)
             if not self._values.get("marker.state"):
