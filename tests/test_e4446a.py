@@ -228,3 +228,19 @@ def test_zero_span_trace_is_time(sa):
     assert setp(drv, rec, "freq.span", 100e6) is PStatus.WRITTEN
     drv.poll()
     assert rec.values["trace"].x_unit == "Hz"
+
+
+def test_front_panel_frequency_change_reaches_trace_and_window(sa):
+    """Частоты поменяли на самом приборе (передняя панель, Local): ось трассы и ключи - по прибору,
+    а не по кэшу драйвера (иначе трасса подписана старыми частотами до SYNC)."""
+    drv, sim, rec = sa
+    drv.poll()
+    assert rec.values["trace"].x[-1] == pytest.approx(44e9)
+    sim.c.update(center=1.1e9, span=400e6)              # не через драйвер
+    sim._couple()
+    drv.poll()                                          # развёртка уже идёт - её трасса ещё по прибору
+    drv.poll()
+    t = rec.values["trace"]
+    assert t.x[0] == pytest.approx(0.9e9) and t.x[-1] == pytest.approx(1.3e9)
+    assert rec.values["freq.center"] == pytest.approx(1.1e9) and rec.values["freq.span"] == pytest.approx(400e6)
+    assert t.peak()[0] == pytest.approx(1.0e9, abs=2e6)         # пик сигнала на своей частоте

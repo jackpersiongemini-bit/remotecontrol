@@ -4,12 +4,15 @@
   запрос читал бы ответ на предыдущий (``SimTransport.late`` моделирует это).
 * На запрос, которого у модели нет, прибор не отвечает вовсе (-113): это не обрыв связи.
 * Закрытие программы: потоки приборов закрываются параллельно и без ``terminate()``.
+* Таймаут посреди записи: ключ получает ERROR (а не вечное WRITING), очередь записей не теряется.
 """
 import pytest
 
 from visalab.core import ConnectionState, InstrumentProxy, PStatus, SimTransport, TransportTimeout
 from visalab.drivers import AgilentPSA, KeysightE8267D, KeysightPNA
 from visalab.sim import AgilentPSASim, KeysightE8267DSim, KeysightPNASim
+
+from conftest import flush
 
 
 def test_late_answer_does_not_shift_following_reads(make):
@@ -130,3 +133,31 @@ def test_pyvisa_transport_decodes_any_byte_and_discards_late(monkeypatch):
         t.read()
     t.discard_input()
     assert Res.pending == [] and t.timeout_ms == 2000 and t._res.timeout == 2000
+
+
+def test_write_timeout_reports_error_status(make):
+    """Таймаут посреди записи (связь восстановлена): ключ получает ERROR, а не вечное WRITING,
+    и следующие записи из очереди выполняются."""
+    drv, sim, rec = make(KeysightE8267D, KeysightE8267DSim)
+    drv.transport.late = {":POW?"}
+    drv.set_param("rf.power", -3.0)
+    drv.set_param("rf.frequency", 2e9)
+    flush(drv)
+    assert drv.state is ConnectionState.CONNECTED
+    assert rec.last_status("rf.power")[0] is PStatus.ERROR
+    assert rec.last_status("rf.frequency")[0] is PStatus.WRITTEN
+
+
+def test_write_lost_connection_reports_error_for_queued(make):
+    drv, sim, rec = make(KeysightE8267D, KeysightE8267DSim)
+
+    def dead(*_a):
+        raise TransportTimeout("таймаут")
+    drv.transport.read = dead
+    drv.set_param("rf.power", -3.0)
+    drv.set_param("rf.frequency", 2e9)
+    flush(drv)
+    assert drv.state is ConnectionState.ERROR
+    assert ("rf.power", PStatus.ERROR) in [(k, st) for k, st, _m in rec.statuses]
+    assert rec.last_status("rf.power")[0] is not PStatus.WRITING          # не «пишется» навсегда
+    assert rec.last_status("rf.frequency")[0] is PStatus.ERROR             # из очереди - не отправлена

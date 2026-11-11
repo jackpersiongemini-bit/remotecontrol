@@ -137,6 +137,8 @@ class VISAInstrument(QObject):
         self._opc_pending = False      # arm_opc() послан, окончание ещё не поймано
         #: ключи, на запрос которых прибор ответил ошибкой команды и не ответил (нет у этой модели/опции)
         self._no_answer: set[str] = set()
+        #: ключи, которые при последнем чтении не прочитались (нет ответа, ответ не распознан)
+        self._read_failed: set[str] = set()
         self._resyncing = False
         self._timer = QTimer(self)     # переедет в поток вместе с self
         self._timer.setInterval(self.POLL_INTERVAL_MS)
@@ -496,8 +498,10 @@ class VISAInstrument(QObject):
                 try:
                     self._publish(key, self.read_param_raw(spec))
                 except ValueError as exc:   # прибор вернул непонятное
+                    self._read_failed.add(key)
                     self.param_status.emit(key, PStatus.ERROR, f"ответ не распознан: {exc}")
                 except TransportTimeout as exc:
+                    self._read_failed.add(key)
                     self._no_reply(key, exc)
 
     def _no_reply(self, key: str, exc: TransportTimeout) -> None:
@@ -532,8 +536,16 @@ class VISAInstrument(QObject):
             try:
                 self._apply(key, value)
             except TransportError as exc:
+                # запись не подтверждена: статус ERROR (иначе ключ навсегда «пишется», а сценарий
+                # координатора ждёт его до таймаута); остальные записи - дальше, если связь восстановлена
+                self.param_status.emit(key, PStatus.ERROR, str(exc))
+                rest = list(self._pending)
                 self._on_transport_error(exc)
-                return
+                if self._state is not ConnectionState.CONNECTED:
+                    for k in rest:
+                        self.param_status.emit(k, PStatus.ERROR, str(exc))
+                    self._pending.clear()
+                    return
             except Exception as exc:  # noqa: BLE001
                 log.exception("%s: запись %s", self.NAME, key)
                 self.param_status.emit(key, PStatus.ERROR, str(exc))
@@ -554,10 +566,16 @@ class VISAInstrument(QObject):
         self.param_status.emit(key, PStatus.WRITING, "")
         self.write_param(spec, value)
         errors = self._check_errors(context=key) if self.CHECK_AFTER_WRITE else []
+        self._read_failed.discard(key)
         self._read_keys([key, *spec.also_read])      # обратное чтение
         actual = self._values.get(key)
         if errors:
             self.param_status.emit(key, PStatus.ERROR, "; ".join(m for _, m in errors))
+        elif key in self._no_answer:                 # не читается у модели: подтвердить нечем
+            self.param_status.emit(key, PStatus.ERROR, "не подтверждено: прибор не отвечает на чтение")
+        elif key in self._read_failed:
+            # обратное чтение не удалось (статус ERROR уже отправлен) - это не «прибор округлил»
+            pass
         elif spec.same(value, actual):
             self.param_status.emit(key, PStatus.WRITTEN, "")
         else:

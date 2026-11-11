@@ -243,7 +243,13 @@ class AgilentPSA(VISAInstrument):
             self._set_armed(False)
 
     def _read_trace(self) -> None:
+        # Ось - по прибору, а не по кэшу: частоты могли поменять с передней панели (Local) или другой
+        # программой. Изменились - перечитать и связанные ключи, окно покажет новые значения.
+        old = (self._values.get("freq.start"), self._values.get("freq.stop"))
+        self._read_keys(["freq.start", "freq.stop"])
         start, stop = self._values.get("freq.start"), self._values.get("freq.stop")
+        if (start, stop) != old:
+            self._read_keys(["freq.center", "freq.span", "sweep.time"])
         if start is None or stop is None:
             start, stop = self.query_float("FREQ:STAR?"), self.query_float("FREQ:STOP?")
         y = [parse_number(t) for t in self.query("TRAC:DATA? TRACE1").split(",") if t.strip()]

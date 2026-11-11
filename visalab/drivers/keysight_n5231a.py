@@ -675,15 +675,24 @@ class KeysightPNA(VISAInstrument):
             raise first
 
     def _stimulus(self, channel: int) -> tuple[float, float, str]:
-        """Ось X трасс канала: (начало, конец, единица). CW - время развёртки."""
-        cached = channel == self._stim_ch                       # ключи стимула показывают этот канал
-        typ = self._values.get("sweep.type") if cached else None
+        """Ось X трасс канала: (начало, конец, единица). CW - время развёртки.
+
+        Всегда с прибора, а не из кэша: стимул могли поменять на экране PNA. У канала, который показывают
+        ключи стимула (stim.channel), новые значения публикуются - окно увидит их без SYNC."""
+        typ = start = stop = None
+        if channel == self._stim_ch:
+            keys = ("sweep.type", "freq.start", "freq.stop")
+            old = tuple(self._values.get(k) for k in keys)
+            self._read_keys(keys)
+            typ, start, stop = (self._values.get(k) for k in keys)
+            if (typ, start, stop) != old:
+                self._read_keys(("freq.center", "freq.span", "sweep.points", "sweep.time"))
         if typ is None:
             typ = self.query(f"SENS{channel}:SWE:TYPE?").strip().upper()
         if typ == "CW":
             return 0.0, self.query_float(f"SENS{channel}:SWE:TIME?"), "s"
-        if cached and self._values.get("freq.start") is not None and self._values.get("freq.stop") is not None:
-            return self._values["freq.start"], self._values["freq.stop"], "Hz"
+        if start is not None and stop is not None:
+            return start, stop, "Hz"
         return self.query_float(f"SENS{channel}:FREQ:STAR?"), self.query_float(f"SENS{channel}:FREQ:STOP?"), "Hz"
 
     def _read_trace(self) -> None:
