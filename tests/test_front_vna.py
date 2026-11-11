@@ -37,7 +37,7 @@ def _wait(qtbot, cond):
 
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
-    assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "MATH", "POW", "CW", "CORR"]
+    assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "MATH", "DATA", "POW", "CW", "CORR"]
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "TRIG", "PWR", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
@@ -220,3 +220,37 @@ def test_trig_tab(qtbot, vna):
     for _ in range(sim.c["poin"]):
         trig.click()
     _wait(qtbot, lambda: sim.sweeps_done > done)
+
+
+def test_data_save_csv(qtbot, vna, tmp_path):
+    proxy, win, settings, sim = vna
+    te = win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    assert [ln.name for ln in win.pages[4].lines] == ["STAT", "DIR", "NAME"]
+    te.chips.buttons()[2].click()                              # трейс канала 2 (другая ось) - тоже читать
+    te.read.click()
+    te.format.on_pick("POLAR")                                 # комплексный формат - два столбца
+    _wait(qtbot, lambda: len(win.read_traces()) == 2 and win.read_traces()[1][1].is_complex)
+    out = tmp_path / "data"
+    win.dir_edit.setText(str(out))
+    win.dir_edit.editingFinished.emit()
+    win.name_edit.setText("DUT 1")
+    win.name_edit.editingFinished.emit()
+    assert settings.value(f"{win._prefix}/DATA_DIR") == str(out)
+    path = win.save_data()
+    assert path is not None and path.parent == out and path.name.startswith("DUT_1_") and path.suffix == ".csv"
+    assert win.data_button.text() == "SAVED"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    head = next(ln for ln in lines if not ln.startswith("#"))
+    assert head == '"Freq 1, Hz","MLOG 1·S11, dB","Freq 2, Hz",POL 2·S12 Re,POL 2·S12 Im'
+    rows = [ln.split(",") for ln in lines[lines.index(head) + 1:]]
+    assert len(rows) == 201 and float(rows[0][0]) == pytest.approx(10e6) and float(rows[0][2]) == pytest.approx(1e9)
+    assert rows[100][2] != "" and rows[101][2:] == ["", "", ""]                # канал 2 короче: 101 точка
+    assert sum(ln.startswith("#") for ln in lines) == 3
+    assert win.save_data() != path                              # повтор: новое имя, старый файл не затёрт
+    for b in te.chips.buttons()[::2]:                          # ничего не читается - файла нет
+        b.click()
+        if te.read.indicated():
+            te.read.click()
+    _wait(qtbot, lambda: not win.read_traces())
+    assert win.save_data() is None and win.data_button.text() == "NO DATA"
