@@ -332,6 +332,7 @@ class InstrumentWindow(Window):
         self.setWindowTitle(title)
         self._prefix = re.sub(r"\W+", "_", proxy.address).strip("_").upper() or self.DEFAULT_KIND.upper()
         self._resetting = False
+        self._saved: dict[str, Any] = {}        # что уже записано в ini (ключ -> значение)
         self._expanded = False
         self._overlay: str | None = None        # вместо таблицы: "errors" / "connection"
         self.saved_widgets: list = []
@@ -776,7 +777,10 @@ class InstrumentWindow(Window):
         self.on_param(key, value)
         if self._resetting:              # после *RST прибор отдаёт заводские значения - не сохранять
             return
-        if value is not None and any(w.key == key for w in self.saved_widgets):
+        # то же значение не писать: ini переписывается целиком при каждом setValue, а приборы публикуют
+        # некоторые ключи постоянно (ВАЦ - ось трасс после каждой развёртки)
+        if value is not None and any(w.key == key for w in self.saved_widgets) and self._saved.get(key) != value:
+            self._saved[key] = value
             self.settings.setValue(self._settings_key(key), value)
 
     def on_param(self, key: str, value: Any) -> None:

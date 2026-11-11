@@ -471,3 +471,17 @@ def test_mark_tab_markers_of_selected_trace(qtbot, vna):
     assert win.height() == h and all(b.indicated() for b in mp.chips.buttons()[:9])
     next(b for b in win.findChildren(ActionButton) if b.name == "mark_aoff").click()
     _wait(qtbot, lambda: not mp.table and not any(b.indicated() for b in mp.chips.buttons()))
+
+
+def test_sweeps_do_not_rewrite_ini(qtbot, vna):
+    """Ось трасс ВАЦ читается с прибора после каждой развёртки (freq.start / stop, тип развёртки). То же
+    значение в ini не пишется: иначе файл переписывался бы на каждой развёртке, несколько раз в секунду."""
+    proxy, win, settings, sim = vna
+    writes, axis = [], []
+    real = settings.setValue
+    settings.setValue = lambda k, v: (writes.append(k), real(k, v))
+    proxy.param_updated.connect(lambda k, _v: axis.append(k) if k == "freq.start" else None)
+    _wait(qtbot, lambda: len(axis) >= 5)                       # пять развёрток
+    assert not [k for k in writes if k.endswith(("FREQ.START", "FREQ.STOP", "SWEEP.TYPE"))], writes
+    win.widgets["freq.start"].set_value(2e9)                   # новое значение - сохраняется
+    _wait(qtbot, lambda: any(k.endswith("FREQ.START") for k in writes))
