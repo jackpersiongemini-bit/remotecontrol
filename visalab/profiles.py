@@ -287,6 +287,7 @@ NETWORK_ANALYZER = Profile(
         Slot("trig.slope", E, choices=("POS", "NEG"), doc="фронт внешнего запуска"),
         Slot("trig.type", E, choices=("EDGE", "LEVEL"), doc="внешний запуск по фронту или по уровню"),
         Slot("trig.delay", F, "s", doc="задержка после внешнего запуска"),
+        Slot("state.dir", S, doc="папка состояний на диске анализатора (MMEM:CDIR); state_list читает её"),
         Slot("gen.state", B, doc="режим генератора: канал stim.channel в CW, остальные каналы не развёртываются; "
                                   "выключение возвращает настройки канала, как были до включения"),
         Slot("gen.channel", I, readonly=True, doc="канал режима генератора (None - выключен)"),

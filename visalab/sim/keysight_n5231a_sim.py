@@ -20,6 +20,8 @@ _FMT = {"MLOG": "MLOG", "PHAS": "PHAS", "PHASE": "PHAS", "UPH": "UPH", "UPHASE":
         "SMIT": "SMIT", "SMITH": "SMIT"}
 
 
+DEFAULT_DIR = "C:\\Users\\Public\\Documents\\Network Analyzer"
+
 class KeysightPNASim(SimInstrument):
     IDN = "Agilent Technologies,N5231A,MY00000001,A.09.90.02"
     F_MIN, F_MAX = 300e3, 13.5e9
@@ -39,8 +41,10 @@ class KeysightPNASim(SimInstrument):
         self.sweeping = False
         self.opc_pending = False
         self.sweeps_done = 0
-        if not hasattr(self, "files"):
-            self.files: dict[str, tuple] = {}            # "имя.csa" -> состояние (переживает *RST)
+        if not hasattr(self, "dirs"):                    # папки и файлы переживают *RST
+            self.dirs: dict[str, dict[str, tuple]] = {DEFAULT_DIR: {}, DEFAULT_DIR + "\\Lab": {}}
+            self.cdir = DEFAULT_DIR
+            self.files: dict[str, tuple] = self.dirs[self.cdir]     # "имя.csa" -> состояние, текущая папка
         if not hasattr(self, "dut"):
             self.dut = {"f0": 2e9, "q": 20.0, "il_db": 1.0}
             self.hold_sweeps = False
@@ -173,6 +177,7 @@ class KeysightPNASim(SimInstrument):
         self.on("MMEMory:LOAD[:FILE]", self._st_load)
         self.on("MMEMory:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.files)) + '"')
         self.on("MMEMory:DELete", self._file_del)
+        self.on("MMEMory:CDIRectory", self._cdir, lambda a, g: f'"{self.cdir}"')
         self.on("CALCulate#:MARKer#:FUNCtion:EXECute", self._mk_exec)
         self.on("CALCulate#:MARKer#:X", self._mk_x, lambda a, g: f"{self.marker['x']:+.11E}")
         self.on("CALCulate#:MARKer#:Y", get=self._mk_y)
@@ -431,6 +436,13 @@ class KeysightPNASim(SimInstrument):
         self.c = c
         self.selected, self.sel_other = "", {}
         self.sweeping = False
+
+    def _cdir(self, a, g):
+        path = a.strip().strip("'\"").rstrip("\\")
+        key = next((d for d in self.dirs if d.lower() == path.lower()), None)
+        if key is None:
+            raise SimError(-256, "File name not found", ESR_EXE)
+        self.cdir, self.files = key, self.dirs[key]
 
     def _file_del(self, a, g):
         name = self._file(a)
