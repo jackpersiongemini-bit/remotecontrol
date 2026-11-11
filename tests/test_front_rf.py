@@ -1,6 +1,6 @@
 """Окно СВЧ генератора на симуляторе E8267D."""
 import pytest
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, Qt
 
 from visalab.core import InstrumentProxy, SimTransport
 from visalab.drivers import DRIVERS
@@ -32,29 +32,32 @@ def test_layout_tabs_and_favourites(qtbot, rf):
     assert len(win.preset_panel.table.lines) == 3                # модуляция - только на вкладках
 
 
-def test_preset_add_and_apply(qtbot, rf):
-    proxy, win, _s = rf
-    proxy.set("rf.frequency", 2.45e9)
-    proxy.set("rf.power", -5.0)
+def test_power_presets_as_chips(qtbot, rf):
+    proxy, win, settings = rf
+    pl = win.power_levels
+    assert [b.text() for b in pl.chips.buttons()] == ["-20", "-10", "-5", "0"]
+    pl.chips.buttons()[1].click()                                  # чип -10 -> мощность
+    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(-10.0))
+    qtbot.waitUntil(lambda: pl.chips.checked_index() == 1)
+    assert pl.remove_selected() and pl.levels == [-20.0, -5.0, 0.0]     # «−» - выбранный
+    proxy.set("rf.power", 3.0)
+    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(3.0))
+    assert pl.add_current() and not pl.add_current()               # «+» - текущая, без повторов
+    assert pl.levels == [-20.0, -5.0, 0.0, 3.0] and pl.chips.checked_index() == 3
+    assert settings.value(f"{win._prefix}/POWER_LIST") == "-20, -5, 0, 3"
+    win.show()
+    qtbot.waitExposed(win)
+    qtbot.keyClick(win, Qt.Key.Key_Left)                           # ← → - соседний уровень
+    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(0.0))
+    qtbot.keyClick(win, Qt.Key.Key_Left)
     _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(-5.0))
-    win._add_preset()
-    assert win.presets.data[win.presets.checked_index()][:2] == (pytest.approx(2.45e9), pytest.approx(-5.0))
-    win.presets.add(10e9, 0.0, "AM")
-    win._apply_preset(win.presets.find(10e9, 0.0, "AM"))
-    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(10e9))
-    _wait(qtbot, proxy, "am.state", lambda v: v is True)
-    _wait(qtbot, proxy, "mod.output", lambda v: v is True)
-    assert win.current_mod() == "AM"
-    qtbot.waitUntil(lambda: win.tabs.is_on(1))                  # вкладка AM - индикатор
-    win.presets.add(5e9, -20.0, "PULSE")
-    win._apply_preset(win.presets.find(5e9, -20.0, "PULSE"))
-    _wait(qtbot, proxy, "pulse.state", lambda v: v is True)
-    _wait(qtbot, proxy, "am.state", lambda v: v is False)
-    win.presets.add(1e9, -10.0, "CW")
-    win._apply_preset(win.presets.find(1e9, -10.0, "CW"))
-    _wait(qtbot, proxy, "pulse.state", lambda v: v is False)
-    _wait(qtbot, proxy, "mod.output", lambda v: v is False)
-    assert win.current_mod() == "CW"
+    qtbot.keyClick(win, Qt.Key.Key_Right)
+    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(0.0))
+    assert win.presets.data == [] and not hasattr(win, "freq_hold")      # пресетов FREQ/POW/MOD и замка нет
+    win.close()
+    assert settings.value(f"{win._prefix}/None") is None
+    line = win._pwr_tools.parentWidget()                           # «+»/«−» у правого края
+    assert line.width() - win._pwr_tools.geometry().right() <= 2 and win._pwr_tools.width() <= 40
 
 
 def test_spinbox_steps_digit_under_cursor(qtbot, rf):
@@ -97,18 +100,3 @@ def test_rf_launcher(qtbot, tmp_path, monkeypatch):
     made[0].reconnect_requested.emit("smf100a", "sim", "")
     assert len(made) == 2 and made[1].driver_choice.value == "smf100a"
     made[1].proxy.shutdown()
-
-
-def test_freq_hold_keeps_frequency(qtbot, rf):
-    proxy, win, settings = rf
-    proxy.set("rf.frequency", 3e9)
-    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(3e9))
-    win.freq_hold.setChecked(True)
-    win.presets.add(7e9, -3.0, "CW")
-    win._apply_preset(win.presets.find(7e9, -3.0, "CW"))
-    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(-3.0))
-    assert proxy.value("rf.frequency") == pytest.approx(3e9)          # частота не тронута
-    assert settings.value(f"{win._prefix}/FREQ_HOLD", type=bool) is True
-    win.freq_hold.setChecked(False)
-    win._apply_preset(win.presets.find(7e9, -3.0, "CW"))
-    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(7e9))

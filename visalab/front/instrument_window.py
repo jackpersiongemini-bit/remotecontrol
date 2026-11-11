@@ -31,11 +31,21 @@ from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
                      Window, short_address)
 
-__all__ = ["InstrumentWindow", "PresetGroup", "HScrollArea", "saved_connection", "PRESET_HEIGHT", "PRESET_GAP",
-           "LINKS", "ProxyLinks"]
+__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "HScrollArea", "saved_connection", "parse_power_list",
+           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "LINKS", "ProxyLinks"]
 
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
+DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
+
+
+def parse_power_list(text: str) -> list[float]:
+    """``"-20, -10 0;5"`` -> [-20, -10, 0, 5] (по возрастанию, без повторов). ValueError при мусоре."""
+    out = set()
+    for t in re.split(r"[\s,;]+", text.strip()):
+        if t:
+            out.add(float(t))
+    return sorted(out)
 
 
 class ProxyLinks(QObject):
@@ -108,7 +118,7 @@ class PresetGroup(PBGroup):
             self._append(preset)
 
     def _load(self, defaults):
-        raw = self.settings.value(self.key)
+        raw = self.settings.value(self.key) if self.key else None
         try:
             items = defaults if raw is None else json.loads(str(raw))
             return [self.normalize(*p) for p in items]
@@ -121,6 +131,8 @@ class PresetGroup(PBGroup):
         return recent + [p for p in self.data if p not in recent]
 
     def save(self) -> None:
+        if not self.key:                        # окно без пресетов (PRESET_KEY = None)
+            return
         self.settings.setValue(self.key, json.dumps(self.saved_order(), separators=(",", ":")))
 
     def _append(self, preset):
@@ -168,6 +180,85 @@ class PresetGroup(PBGroup):
         self.remove_button(i)
         del self.data[i]
         self.save()
+        return True
+
+
+class PowerLevels(QWidget):
+    """Пресеты мощности: чипы уровней по возрастанию, клик ставит мощность ``key``; выбран чип,
+    равный текущей мощности. ``add_current()`` - текущая мощность, ``remove_selected()`` - выбранный
+    (один уровень остаётся всегда). ``on_change(levels)`` - после изменения списка."""
+
+    COLUMNS = 4
+
+    def __init__(self, proxy: InstrumentProxy, key: str, levels, on_change: Callable | None = None, parent=None):
+        super().__init__(parent)
+        self.proxy, self.key, self.on_change = proxy, key, on_change
+        self._levels: list[float] = []
+        self.chips = PBGroup(columns=self.COLUMNS)
+        self.chips.selected.connect(self._clicked)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.chips)
+        proxy.subscribe(key, lambda _v: self._show())
+        self.set_levels(levels)
+
+    @property
+    def levels(self) -> list[float]:
+        return list(self._levels)
+
+    def set_levels(self, levels) -> None:
+        self._levels = sorted({round(float(v), 3) for v in levels})
+        while self.chips.buttons():
+            self.chips.remove_button(0)
+        for v in self._levels:
+            b = self.chips.add_button(f"{v:g}")
+            b.setToolTip(f"Set the power to {v:g} dBm")
+        self._show()
+
+    def _show(self) -> None:
+        cur = self.proxy.value(self.key)
+        i = next((k for k, v in enumerate(self._levels)
+                  if isinstance(cur, (int, float)) and abs(v - cur) < 1e-6), -1)
+        self.chips.set_checked(i)
+
+    def _clicked(self, index: int) -> None:
+        if 0 <= index < len(self._levels):
+            self.proxy.set(self.key, self._levels[index])
+        self._show()
+
+    def step(self, steps: int) -> None:
+        """Соседний уровень (← →): от выбранного, а если текущая мощность не из списка - ближайший."""
+        if not self._levels:
+            return
+        cur = self.proxy.value(self.key)
+        if not isinstance(cur, (int, float)):
+            target = self._levels[0]
+        elif steps > 0:
+            above = [v for v in self._levels if v > cur + 1e-6]
+            target = above[min(steps, len(above)) - 1] if above else self._levels[-1]
+        else:
+            below = [v for v in self._levels if v < cur - 1e-6]
+            target = below[-min(-steps, len(below))] if below else self._levels[0]
+        self.proxy.set(self.key, target)
+
+    def _changed(self) -> None:
+        if self.on_change is not None:
+            self.on_change(self.levels)
+
+    def add_current(self) -> bool:
+        cur = self.proxy.value(self.key)
+        if not isinstance(cur, (int, float)) or any(abs(v - cur) < 1e-6 for v in self._levels):
+            return False
+        self.set_levels([*self._levels, cur])
+        self._changed()
+        return True
+
+    def remove_selected(self) -> bool:
+        i = self.chips.checked_index()
+        if i < 0 or len(self._levels) <= 1:
+            return False
+        self.set_levels([v for k, v in enumerate(self._levels) if k != i])
+        self._changed()
         return True
 
 
@@ -273,7 +364,7 @@ class InstrumentWindow(Window):
         bar.insert_control_widget(self.expand_button)
 
         # ---------------------------------------------------------- пресеты и содержимое окна
-        self.presets = self.create_presets(f"{self._prefix}/{self.PRESET_KEY}")
+        self.presets = self.create_presets(f"{self._prefix}/{self.PRESET_KEY}" if self.PRESET_KEY else None)
         self.presets.selected.connect(self._apply_preset)
         self.preset_scroll = HScrollArea(self.presets)
         self.build()
@@ -366,6 +457,34 @@ class InstrumentWindow(Window):
         line = PanelLine(name, self.preset_scroll, tools)
         line.line_layout.setAlignment(line._name, Qt.AlignmentFlag.AlignTop)
         return line
+
+    def power_levels_line(self, key: str, name: str = "PRST") -> PanelLine:
+        """Строка пресетов мощности ``key``: чипы ``self.power_levels`` и «+» / «−» столбиком справа.
+        Уровни - в ini (POWER_LIST); после правки вызывается ``levels_changed(levels)``."""
+        pl = self.power_levels = PowerLevels(self.proxy, key, self._load_levels(), self._levels_edited)
+        tools = self._pwr_tools = QWidget()
+        tl = QVBoxLayout(tools)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(PRESET_GAP)
+        half = (PRESET_HEIGHT - PRESET_GAP) // 2
+        tl.addWidget(self._tool("+", "Add the current power to the presets", pl.add_current, half))
+        tl.addWidget(self._tool("−", "Remove the selected power preset", pl.remove_selected, half))
+        tl.addStretch(1)
+        return PanelLine(name, pl, tools)
+
+    def _load_levels(self) -> list[float]:
+        raw = self.settings.value(f"{self._prefix}/POWER_LIST", "")
+        try:
+            return parse_power_list(str(raw)) or list(DEFAULT_POWER_LIST)
+        except ValueError:
+            return list(DEFAULT_POWER_LIST)
+
+    def _levels_edited(self, levels: list[float]) -> None:
+        self.settings.setValue(f"{self._prefix}/POWER_LIST", ", ".join(f"{v:g}" for v in levels))
+        self.levels_changed(levels)
+
+    def levels_changed(self, levels: list[float]) -> None:
+        """Список пресетов мощности изменён (наследник может обновить свои виджеты)."""
 
     # ------------------------------------------------------------ вид
     def set_expanded(self, on: bool) -> None:

@@ -1,7 +1,8 @@
 """Окно СВЧ генератора (E8267D, SMF100A - профиль signal_generator), по образцу окна SDG.
 
-Избранное: выходы RF / MOD, пресеты (частота, мощность, тип модуляции) и частота RF спинбоксом
-(шаг - разряд под курсором) с HOLD: пресет не меняет частоту. Модуляция - на вкладках.
+Избранное: выходы RF / MOD, пресеты мощности чипами (клик ставит мощность, «+» - текущая,
+«−» - выбранная, ← → - соседний уровень) и частота RF спинбоксом (шаг - разряд под курсором).
+Модуляция - на вкладках.
 Развёрнутый вид - вкладки RF / AM / FM / PM / PULS (индикатор - режим включён).
 
 Окно знает только InstrumentProxy и ключи профиля signal_generator.
@@ -10,39 +11,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtWidgets import QPushButton
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format
 from . import instrument_window as _iw
-from .instrument_window import InstrumentWindow, PresetGroup
+from .instrument_window import InstrumentWindow
 from .params import PLineEdit, PSButton, PSpinBox, PanelLine, PanelTable
 from .theme import UI_COLUMN_WIDTH_PX
-from .window import CustomLockButton
 
-__all__ = ["RFGenWindow", "RF_PRESETS", "MOD_TYPES", "saved_connection"]
+__all__ = ["RFGenWindow", "MOD_TYPES", "saved_connection"]
 
-#: тип модуляции пресета -> префикс ключей профиля (CW - без модуляции)
+#: тип модуляции -> префикс ключей профиля (CW - без модуляции)
 MOD_TYPES = {"CW": None, "PULSE": "pulse", "AM": "am", "FM": "fm", "PM": "pm"}
-RF_PRESETS = ((1e9, -10.0, "CW"),)                 # (FREQ, POW, MOD)
 
 CONNECTION_GROUP = "CONNECTION/RF_GEN"
 
 
 def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
-
-
-def _preset(freq, power, mod="CW") -> tuple[float, float, str]:
-    mod = str(mod).upper()
-    return float(freq), float(power), mod if mod in MOD_TYPES else "CW"
-
-
-def _describe(preset: tuple) -> tuple[str, str]:
-    freq, power, mod = preset
-    f, p = si_format(freq, "Hz", 6), f"{power:g} dBm"
-    return f"{mod}\n{f}\n{p}", f"MOD {mod}\nFREQ {f}\nPOW {p}"
 
 
 def _auto(proxy: InstrumentProxy, key: str):
@@ -72,12 +60,14 @@ RESTORE_RANK = {"rf.frequency": 0, "rf.power": 1, "am.state": 3, "fm.state": 3, 
 class RFGenWindow(InstrumentWindow):
     CONNECTION_GROUP = CONNECTION_GROUP
     DEFAULT_KIND = "e8267d"
-    PRESET_KEY = "RF_PRESETS"
-    PRESET_DEFAULTS = RF_PRESETS
-    PRESET_ADD_TIP = "Add preset from current FREQ / POW / MOD"
+    PRESET_KEY = None                                 # вместо пресетов FREQ/POW/MOD - пресеты мощности
 
     def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "RF generator", parent=None):
         super().__init__(proxy, settings, title, parent)
+        tools = getattr(self, "_pwr_tools", None)     # «+»/«−» - по ширине кнопок, у правого края
+        if tools is not None:
+            tools.setMinimumWidth(0)
+            tools.setFixedWidth(max(b.sizeHint().width() for b in tools.findChildren(QPushButton)))
 
     # ------------------------------------------------------------ сборка
     def build(self) -> None:
@@ -85,7 +75,7 @@ class RFGenWindow(InstrumentWindow):
         self.widgets: dict[str, Any] = {}
         sup = proxy.supports
 
-        # избранное: выходы, пресеты, частота RF
+        # избранное: выходы, пресеты мощности, частота RF
         outs = []
         for key, name in (("rf.output", "RF"), ("mod.output", "MOD")):
             if sup(key):
@@ -93,13 +83,11 @@ class RFGenWindow(InstrumentWindow):
                 w.setMinimumWidth(UI_COLUMN_WIDTH_PX)
                 self.widgets[key] = w
                 outs.append(w)
-        self.top_lines = [PanelLine("OUT", *outs), self.preset_line()]
+        self.top_lines = [PanelLine("OUT", *outs)]
+        if sup("rf.power"):
+            self.top_lines.append(self.power_levels_line("rf.power"))
         self.freq_spin = PSpinBox(proxy, "rf.frequency", ("k", "M", "G"))
-        self.freq_hold = CustomLockButton()           # замок: закрыт - пресет не меняет частоту
-        self.freq_hold.setToolTip("HOLD: presets keep the current frequency (only POW and MOD are applied)")
-        self.freq_hold.setChecked(self.settings.value(f"{self._prefix}/FREQ_HOLD", False, type=bool))
-        self.freq_hold.toggled.connect(lambda on: self.settings.setValue(f"{self._prefix}/FREQ_HOLD", bool(on)))
-        self.top_lines.append(PanelLine("FREQ", self.freq_spin, self.freq_hold))
+        self.top_lines.append(PanelLine("FREQ", self.freq_spin))
 
         # вкладки: один столбец
         for title_, state, rows in PAGES:
@@ -119,37 +107,11 @@ class RFGenWindow(InstrumentWindow):
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
 
-    def current_mod(self) -> str:
-        if self.proxy.supports("mod.output") and self.proxy.value("mod.output") is False:
-            return "CW"
-        for mod in ("PULSE", "AM", "FM", "PM"):
-            if self.proxy.value(f"{MOD_TYPES[mod]}.state") is True:
-                return mod
-        return "CW"
-
-    # ------------------------------------------------------------ пресеты
-    def create_presets(self, key: str) -> PresetGroup:
-        return PresetGroup(self.settings, key, RF_PRESETS, _preset, _describe)
-
-    def preset_from_current(self):
-        freq, power = self.proxy.value("rf.frequency"), self.proxy.value("rf.power")
-        if freq is None or power is None:
-            return None
-        return freq, power, self.current_mod()
-
-    def apply_preset_values(self, preset: tuple) -> None:
-        freq, power, mod = preset
-        w = self.widgets
-        if not self.freq_hold.isChecked():          # HOLD - пресет частоту не меняет
-            w["rf.frequency"].set_value(freq)
-        w["rf.power"].set_value(power)
-        target = MOD_TYPES.get(mod)
-        # сначала выключить лишние модуляции (FM и PM на многих приборах несовместимы), потом нужную
-        for m, prefix in MOD_TYPES.items():
-            key = f"{prefix}.state" if prefix else None
-            if key and key in w and prefix != target and self.proxy.value(key) is not False:
-                w[key].set_value(False, force=True)
-        if target and f"{target}.state" in w:
-            w[f"{target}.state"].set_value(True)
-        if "mod.output" in w:
-            w["mod.output"].set_value(target is not None)
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        """← → - соседний пресет мощности."""
+        pl = getattr(self, "power_levels", None)
+        if pl is not None and e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            pl.step(-1 if e.key() == Qt.Key.Key_Left else 1)
+            e.accept()
+            return
+        super().keyPressEvent(e)
