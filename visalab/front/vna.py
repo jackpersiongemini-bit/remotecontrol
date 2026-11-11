@@ -428,6 +428,11 @@ class VNAWindow(InstrumentWindow):
     def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Network analyzer", parent=None):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
+        # столбики «+»/«−» (TRAC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
+        for tools in (getattr(self, "_trc_tools", None), getattr(self, "add_button", None) and self.add_button.parentWidget()):
+            if tools is not None:
+                tools.setMinimumWidth(0)
+                tools.setFixedWidth(max(b.sizeHint().width() for b in tools.findChildren(QPushButton)))
         proxy.action_done.connect(self._on_action)
         proxy.sync_done.connect(self.refresh_lists)
         if proxy.is_connected:
@@ -506,7 +511,7 @@ class VNAWindow(InstrumentWindow):
         if "meas_table" in proxy.actions:
             te = self.trace_editor = TraceEditor(proxy)
             half = (PRESET_HEIGHT - PRESET_GAP) // 2
-            tools = QWidget()
+            tools = self._trc_tools = QWidget()
             tl = QVBoxLayout(tools)
             tl.setContentsMargins(0, 0, 0, 0)
             tl.setSpacing(PRESET_GAP)
