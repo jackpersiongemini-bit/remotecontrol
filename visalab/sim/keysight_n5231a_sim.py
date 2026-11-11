@@ -26,13 +26,15 @@ class KeysightPNASim(SimInstrument):
 
     def reset(self) -> None:
         self.c = {"start": 10e6, "stop": 13.5e9, "poin": 201, "bwid": 35e3, "pow": -5.0, "outp": True,
-                  "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "corr": False, "mode": "CONT",
+                  "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN",
                   "form": "ASC", "type": "LIN", "cw": 1e9}
         self.meas = {"CH1_S11_1": {"s": "S11", "fmt": "MLOG", "ch": 1}}
         self.selected = ""                               # выбранное измерение канала 1
         self.sel_other: dict[int, str] = {}              # то же у остальных каналов
         self.other: dict[int, dict] = {}                 # стимул каналов 2...
         self.marker = {"on": False, "x": 1e9}
+        self.trig = {"sour": "IMM", "scop": "ALL", "slop": "POS", "type": "EDGE", "del": 0.0}
+        self.trig_count = 0                              # триггеров в текущей развёртке (режим POINT)
         self.windows: dict[int, dict[int, str]] = {1: {1: "CH1_S11_1"}}     # окно -> {номер трейса: измерение}
         self.sweeping = False
         self.opc_pending = False
@@ -64,7 +66,7 @@ class KeysightPNASim(SimInstrument):
             return self.c
         if ch not in self.other:
             st = {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9, "bwid": 35e3, "pow": -5.0,
-                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False, "mode": "CONT"}
+                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN"}
             self._auto_time(st)
             self.other[ch] = st
         return self.other[ch]
@@ -195,6 +197,19 @@ class KeysightPNASim(SimInstrument):
                 self._gs("pow"))
         self.on("OUTPut[:STATe]", self._b("outp"), self._gb("outp"))
         self.on("ABORt", lambda a, g: setattr(self, "sweeping", False))
+        self.on("TRIGger[:SEQuence]:SOURce", self._tenum("sour", {"IMM": "IMM", "IMMEDIATE": "IMM", "EXT": "EXT",
+                                                                   "EXTERNAL": "EXT", "MAN": "MAN", "MANUAL": "MAN"}),
+                lambda a, g: self.trig["sour"])
+        self.on("TRIGger[:SEQuence]:SCOPe", self._tenum("scop", {"ALL": "ALL", "CURR": "CURR", "CURRENT": "CURR"}),
+                lambda a, g: self.trig["scop"])
+        self.on("TRIGger[:SEQuence]:SLOPe", self._tenum("slop", {"POS": "POS", "POSITIVE": "POS", "NEG": "NEG",
+                                                                  "NEGATIVE": "NEG"}),
+                lambda a, g: self.trig["slop"])
+        self.on("TRIGger[:SEQuence]:TYPE", self._tenum("type", {"EDGE": "EDGE", "LEV": "LEV", "LEVEL": "LEV"}),
+                lambda a, g: self.trig["type"])
+        self.on("TRIGger[:SEQuence]:DELay", self._trig_delay, lambda a, g: f"{self.trig['del']:+.11E}")
+        self.on("SENSe#:SWEep:TRIGger:MODE", self._tmode_set, lambda a, g: self.stim(self._ch(g))["tmode"])
+        self.on("INITiate#[:IMMediate]", lambda a, g: self.trigger())
 
     def _err(self, a, g):
         code, msg = self.errors.popleft() if self.errors else (0, "No error")
@@ -321,10 +336,40 @@ class KeysightPNASim(SimInstrument):
         self.stim(self._ch(g))["mode"] = mode
         if mode == "SING":
             self.sweeping = True
-            if not self.hold_sweeps:
+            self.trig_count = 0
+            if not self.hold_sweeps and self.trig["sour"] == "IMM":     # EXT / MAN - ждать триггера
                 self.finish_sweep()
         elif mode == "HOLD":
             self.sweeping = False
+
+    # ------------------------------------------------------------ запуск
+    def _tenum(self, key, table):
+        def fn(a, g):
+            t = a.strip().upper()
+            if t not in table:
+                raise SimError(-224, "Illegal parameter value", ESR_EXE)
+            self.trig[key] = table[t]
+        return fn
+
+    def _trig_delay(self, a, g):
+        self.trig["del"] = self.num(a, 0, 3)
+
+    def _tmode_set(self, a, g):
+        t = a.strip().upper()
+        mode = {"CHAN": "CHAN", "CHANNEL": "CHAN", "SWE": "SWE", "SWEEP": "SWE", "POIN": "POIN", "POINT": "POIN",
+                "TRAC": "TRAC", "TRACE": "TRAC"}.get(t)
+        if mode is None:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        self.stim(self._ch(g))["tmode"] = mode
+
+    def trigger(self) -> None:
+        """Импульс на входе внешнего запуска (или INIT:IMM при ручном): в режиме POINT - одна точка."""
+        if not self.sweeping:
+            return
+        self.trig_count += 1
+        points = self.c["poin"] if self.c["tmode"] == "POIN" else 1
+        if self.trig_count >= points and not self.hold_sweeps:
+            self.finish_sweep()
 
     def _mk_state(self, a, g):
         self.marker["on"] = self.boolean(a)
