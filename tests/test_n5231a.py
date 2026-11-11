@@ -403,3 +403,20 @@ def test_generator_mode_restored_on_disconnect(vna):
     assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN and sim.c["type"] == "CW"
     drv.close_connection()
     assert sim.c["type"] == "LIN"
+
+
+def test_generator_mode_keeps_sweep_modes_of_other_channels(make):
+    sim = KeysightPNASim()
+    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)           # не читается, на приборе CONT
+    sim.meas["CH3_S11"] = _meas("S11", "MLOG", 3)
+    sim.stim(3)["mode"] = "HOLD"                             # пользователь остановил канал 3
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert sim.stim(2)["mode"] == "CONT"
+    assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN
+    assert (sim.stim(2)["mode"], sim.stim(3)["mode"], sim.c["type"]) == ("HOLD", "HOLD", "CW")
+    del sim.history[:]
+    drv.poll()
+    assert not any(c.startswith(("SENS2:SWE:MODE", "SENS3:SWE:MODE")) for c in sim.history)
+    assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
+    assert (sim.stim(2)["mode"], sim.stim(3)["mode"], sim.c["type"]) == ("CONT", "HOLD", "LIN")
+    assert not rec.comm

@@ -39,7 +39,9 @@
 Режим генератора ``gen.state``: канал ``stim.channel`` переходит в CW, остальные каналы не
 развёртываются (стоят в HOLD, их слоты не читаются), канал стимула закреплён (``gen.channel``).
 Перед включением запоминаются тип развёртки, старт/стоп, точки, полоса ПЧ, время, усреднение,
-коррекция, мощность и ``OUTP`` канала; выключение возвращает всё как было (частота CW остаётся).
+коррекция, мощность и ``OUTP`` канала, а также режим развёртки ``SENS<c>:SWE:MODE`` всех каналов
+(остальные ставятся в HOLD); выключение возвращает всё как было (частота CW остаётся; SING / GROUP
+возвращаются как HOLD, чтобы не запустить развёртку).
 Отключение от прибора в режиме генератора тоже возвращает настройки.
 Как и анализатор спектра, ВАЦ ведётся однократными развёртками: наружу уходят только
 целые трассы. Ось X считается линейной от ``SENS<c>:FREQ:STAR`` до ``STOP`` канала измерения
@@ -125,7 +127,8 @@ class KeysightPNA(VISAInstrument):
         self._armed_channels: list[int] = [1]
         self.meas_name = ""
         self._stim_ch = 1
-        self._gen: tuple[int, dict[str, Any]] | None = None     # режим генератора: (канал, снимок GEN_KEYS)
+        #: режим генератора: (канал, снимок GEN_KEYS, {канал: SWE:MODE до включения})
+        self._gen: tuple[int, dict[str, Any], dict[int, str]] | None = None
         super().__init__(transport, parent, command_delay_s)
 
     @property
@@ -254,10 +257,9 @@ class KeysightPNA(VISAInstrument):
         if self._armed:
             self._abort()
         if self._gen is not None:             # не оставлять прибор в режиме генератора
-            c, snap = self._gen
-            self._gen = None
+            gen, self._gen = self._gen, None
             try:
-                self._gen_restore(c, snap)
+                self._gen_restore(*gen)
             except Exception:                 # отключение не должно срываться
                 pass
 
@@ -436,18 +438,22 @@ class KeysightPNA(VISAInstrument):
                 c = self._stim_ch
                 snap = {k: super(KeysightPNA, self).read_param_raw(self._stim_spec(self._params[k], c))
                         for k in GEN_KEYS}
+                modes = {ch: self.query(f"SENS{ch}:SWE:MODE?").strip().upper() for ch in self._channels()}
+                self._gen = (c, snap, modes)
+                for ch, mode in modes.items():               # остальные каналы стоят (в т.ч. бывшие CONT)
+                    if ch != c and mode != "HOLD":
+                        self.write(f"SENS{ch}:SWE:MODE HOLD")
                 self.write(f"SENS{c}:SWE:TYPE CW")
-                self._gen = (c, snap)
             else:
-                c, snap = self._gen
-                self._gen = None
-                self._gen_restore(c, snap)
+                gen, self._gen = self._gen, None
+                self._gen_restore(*gen)
         finally:
             if was_armed or self._continuous:
                 self._start_sweep()
 
-    def _gen_restore(self, channel: int, snap: dict[str, Any]) -> None:
-        """Вернуть настройки канала, запомненные при включении генератора (ошибка одной не мешает остальным)."""
+    def _gen_restore(self, channel: int, snap: dict[str, Any], modes: dict[int, str]) -> None:
+        """Вернуть настройки канала и режимы развёртки всех каналов, запомненные при включении генератора
+        (ошибка одной настройки не мешает остальным)."""
         first: Exception | None = None
         for k in GEN_KEYS:
             v = snap.get(k)
@@ -455,6 +461,15 @@ class KeysightPNA(VISAInstrument):
                 continue
             try:
                 super().write_param(self._stim_spec(self._params[k], channel), v)
+            except Exception as e:  # noqa: BLE001
+                first = first or e
+        existing = set(self._channels())
+        for ch, mode in modes.items():
+            if ch not in existing:                           # канал удалили в режиме генератора
+                continue
+            mode = "HOLD" if mode.startswith(("SING", "GRO")) else mode
+            try:
+                self.write(f"SENS{ch}:SWE:MODE {mode}")
             except Exception as e:  # noqa: BLE001
                 first = first or e
         if first is not None:
