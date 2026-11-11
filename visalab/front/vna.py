@@ -364,11 +364,15 @@ class TraceEditor(QWidget):
             self._follow_channel()
 
     def _follow_channel(self) -> None:
-        """Канал окна - канал выбранного трейса."""
+        """Канал окна - канал выбранного трейса; вкладка SCAL - сам выбранный трейс (``trace.sel``)."""
         p = self.proxy
-        if self.current is not None and p.supports("stim.channel") and p.is_connected and \
-                p.value("stim.channel") != self.current[0]:
+        if self.current is None or not p.is_connected:
+            return
+        if p.supports("stim.channel") and p.value("stim.channel") != self.current[0]:
             p.set("stim.channel", self.current[0])
+        sel = f"{self.current[0]}:{self.current[1]}"
+        if p.supports("trace.sel") and p.value("trace.sel") != sel:
+            p.set("trace.sel", sel)
 
     def _on_stim_channel(self, value) -> None:
         """Канал сменился не кликом (вызов состояния, отказ в генераторе): выбрать трейс этого канала."""
@@ -595,6 +599,27 @@ class VNAWindow(InstrumentWindow):
             if quick:
                 trac.append(PanelLine("SET", *quick))
             self.page_specs.insert(0, ("TRAC", (), PanelTable(*trac)))
+
+        # SCAL: масштаб выбранного трейса на экране прибора, задержка и сглаживание (меняют данные)
+        if sup("trace.sel"):
+            scal = []
+            if "autoscale" in proxy.actions:
+                scal.append(PanelLine("AUTO", ActionButton(proxy, "autoscale", "AUTOSCALE",
+                                                           "Autoscale the selected trace on the analyzer screen")))
+            for name, keys, tip in (("DIV", ("scale.div",), "Scale per division, units of the trace format"),
+                                    ("REF", ("scale.ref",), "Reference level"),
+                                    ("RPOS", ("scale.rpos",), "Reference position, divisions from the bottom"),
+                                    ("EDEL", ("scale.edel",), "Electrical delay: removes the phase slope of a "
+                                                              "cable (changes the data read)"),
+                                    ("SMO", ("smooth.state", "smooth.aper"), "Smoothing on/off and aperture, % "
+                                                                             "of span (changes the data read)")):
+                ws = [_auto(proxy, k) for k in keys if sup(k)]
+                for w in ws:
+                    w.setToolTip(tip)
+                    self.widgets[w.key] = w
+                if ws:
+                    scal.append(PanelLine(name, *ws))
+            self.page_specs.insert(1 if "meas_table" in proxy.actions else 0, ("SCAL", (), PanelTable(*scal)))
 
         # SAVE: чипы состояний в памяти прибора
         save = []

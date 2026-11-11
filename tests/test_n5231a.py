@@ -458,3 +458,38 @@ def test_trigger_settings_external_and_manual(make):
     assert "INIT1:IMM" in sim.history
     drv.poll()
     assert sim.sweeps_done == done + 1 and len(v["m1.trace"]) == 3 and not rec.comm
+
+
+def test_scale_and_processing_of_selected_trace(make):
+    sim = KeysightPNASim()
+    sim.meas["CH2_S21"] = _meas("S21", "PHAS", 2)
+    sim.windows[2] = {1: "CH2_S21"}
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    v = rec.values
+    assert v["trace.sel"] == "1:CH1_S11_1" and v["scale.div"] == 10.0 and v["scale.rpos"] == 5.0
+    assert v["smooth.state"] is False and v["scale.edel"] == 0.0
+    assert setp(drv, rec, "trace.sel", "2:CH2_S21") is PStatus.WRITTEN
+    for k, val in (("scale.div", 45.0), ("scale.ref", -90.0), ("scale.rpos", 8.0)):
+        assert setp(drv, rec, k, val) is PStatus.WRITTEN, k
+    m = sim.meas["CH2_S21"]
+    assert (m["pdiv"], m["rlev"], m["rpos"]) == (45.0, -90.0, 8.0) and "pdiv" not in sim.meas["CH1_S11_1"]
+    assert "DISP:WIND2:TRAC1:Y:PDIV 45" in sim.history
+    drv.run_action("autoscale")
+    assert m["pdiv"] != 45.0 and v["scale.div"] == m["pdiv"] and v["scale.rpos"] == 5.0
+    # задержка и сглаживание меняют читаемые данные
+    assert setp(drv, rec, "m2.channel", 2) is PStatus.WRITTEN and setp(drv, rec, "m2.name", "CH2_S21") is PStatus.WRITTEN
+    assert setp(drv, rec, "m2.enabled", True) is PStatus.WRITTEN
+    drv.poll()
+    raw = list(v["m2.trace"].y)
+    assert setp(drv, rec, "scale.edel", 1e-9) is PStatus.WRITTEN and m["edel"] == 1e-9
+    drv.poll()
+    assert list(v["m2.trace"].y) != raw
+    assert setp(drv, rec, "scale.edel", 0.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "smooth.aper", 10.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "smooth.state", True) is PStatus.WRITTEN and m["smo"] and m["aper"] == 10.0
+    drv.poll()
+    sm = list(v["m2.trace"].y)
+    assert sm != raw and max(sm) - min(sm) < max(raw) - min(raw)          # сглаженная - ровнее
+    assert setp(drv, rec, "smooth.aper", 50.0) is not PStatus.WRITTEN      # больше 25 % нельзя
+    assert setp(drv, rec, "trace.sel", "2:NOPE") is PStatus.ERROR
+    assert not rec.comm

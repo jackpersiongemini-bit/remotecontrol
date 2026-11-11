@@ -91,9 +91,21 @@ class KeysightPNASim(SimInstrument):
         return out
 
     def fdata(self, name: str) -> list[float]:
+        """Данные в формате измерения; сглаживание - скользящее среднее по апертуре (% точек)."""
+        out = self._fdata(name)
+        m = self.meas[name]
+        if not m.get("smo") or m["fmt"] in ("POL", "SMIT") or len(out) < 3:
+            return out
+        half = max(1, round(m.get("aper", 1.5) / 100 * len(out))) // 2 or 1
+        return [sum(out[max(0, i - half):i + half + 1]) / len(out[max(0, i - half):i + half + 1])
+                for i in range(len(out))]
+
+    def _fdata(self, name: str) -> list[float]:
         m = self.meas[name]
         fs = self.freqs(m["ch"])
         vals = [self.s(m["s"], f) for f in fs]
+        if m.get("edel"):                                # электрическая задержка: компенсация набега фазы
+            vals = [v * cmath.exp(2j * math.pi * f * m["edel"]) for v, f in zip(vals, fs)]
         mem, fn = m.get("mem"), m.get("math", "NORM")
         if fn != "NORM" and mem is not None and len(mem) == len(vals):
             op = {"DIV": lambda d, p: d / p if p else 0j, "SUBT": lambda d, p: d - p,
@@ -170,6 +182,18 @@ class KeysightPNASim(SimInstrument):
         self.on("DISPlay:WINDow#:CATalog", get=self._win_cat)
         self.on("DISPlay:WINDow#:TRACe#:FEED", self._feed)
         self.on("CALCulate#:FORMat", self._fmt_set, lambda a, g: self._cur(g)["fmt"])
+        self.on("CALCulate#:PARameter:WNUMber", get=lambda a, g: str(self._place(g)[0]))
+        self.on("CALCulate#:PARameter:TNUMber", get=lambda a, g: str(self._place(g)[1]))
+        for scpi, key, lo, hi, dflt in (("PDIVision", "pdiv", 1e-18, 1e12, 10.0),
+                                        ("RLEVel", "rlev", -1e12, 1e12, 0.0), ("RPOSition", "rpos", 0, 20, 5.0)):
+            self.on(f"DISPlay:WINDow#:TRACe#:Y[:SCALe]:{scpi}", self._scale_set(key, lo, hi),
+                    lambda a, g, k=key, d=dflt: f"{self._wt(g).get(k, d):+.11E}")
+        self.on("DISPlay:WINDow#:TRACe#:Y[:SCALe]:AUTO", self._autoscale)
+        self.on("CALCulate#:CORRection:EDELay[:TIME]", self._meas_num("edel", -10, 10),
+                lambda a, g: f"{self._cur(g).get('edel', 0.0):+.11E}")
+        self.on("CALCulate#:SMOothing:APERture", self._meas_num("aper", 1, 25),
+                lambda a, g: f"{self._cur(g).get('aper', 1.5):+.11E}")
+        self.on("CALCulate#:SMOothing[:STATe]", self._smo_set, lambda a, g: "1" if self._cur(g).get("smo") else "0")
         self.on("CALCulate#:DATA", get=self._data)
         self.on("CALCulate#:MATH:MEMorize", self._memorize)
         self.on("CALCulate#:MATH:FUNCtion", self._math_set, lambda a, g: self._cur(g).get("math", "NORM"))
@@ -307,6 +331,45 @@ class KeysightPNASim(SimInstrument):
             self.selected = name
         else:
             self.sel_other[ch] = name
+
+    # ------------------------------------------------------------ масштаб и обработка
+    def _place(self, g) -> tuple[int, int]:
+        """(окно, трейс) выбранного измерения канала; (0, 0) - измерение не показано ни в одном окне."""
+        name = self._cur(g) and self._selected(self._ch(g))
+        for w, traces in self.windows.items():
+            for t, n in traces.items():
+                if n == name:
+                    return w, t
+        return 0, 0
+
+    def _wt(self, g) -> dict:
+        name = self.windows.get(int(g[0]), {}).get(int(g[1]))
+        if name not in self.meas:
+            raise SimError(-221, "Settings conflict; no such trace", ESR_EXE)
+        return self.meas[name]
+
+    def _scale_set(self, key, lo, hi):
+        def fn(a, g):
+            self._wt(g)[key] = self.num(a, lo, hi)
+        return fn
+
+    def _autoscale(self, a, g):
+        m = self._wt(g)
+        name = next(n for n, mm in self.meas.items() if mm is m)
+        data = self.fdata(name)
+        lo, hi = min(data), max(data)
+        step = max((hi - lo) / 8, 1e-12)
+        nice = 10 ** math.floor(math.log10(step))
+        step = next(k * nice for k in (1, 2, 5, 10) if k * nice >= step)
+        m.update(pdiv=step, rlev=round((hi + lo) / 2 / step) * step, rpos=5.0)
+
+    def _meas_num(self, key, lo, hi):
+        def fn(a, g):
+            self._cur(g)[key] = self.num(a, lo, hi)
+        return fn
+
+    def _smo_set(self, a, g):
+        self._cur(g)["smo"] = self.boolean(a)
 
     def _define(self, a, g):
         name, s = (t.strip().strip("'\"") for t in a.split(","))
