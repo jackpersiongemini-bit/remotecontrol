@@ -25,7 +25,7 @@ import re
 from typing import Any
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
@@ -45,7 +45,7 @@ ONOFF = [("OFF", False), ("ON", True)]
 AUTO = [("MAN", False), ("AUTO", True)]
 SLOTS = 16
 MATH = (("DATA", "NORM"), ("D/M", "DIV"), ("D−M", "SUBT"), ("D+M", "ADD"), ("D·M", "MULT"))
-TRACE_CHIP_HEIGHT = 30            # чипы трейсов в избранном - высотой с обычную кнопку строки
+TRACE_CHIP_HEIGHT = 44            # чипы трейсов в избранном: две строки (формат / канал·S-параметр)
 DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
 
 #: вкладка STIM: (подпись, ключ, второй ключ или None)
@@ -419,7 +419,7 @@ class TraceEditor(QWidget):
         gen = self.proxy.value("gen.state") is True
         cur_ch = self.proxy.value("stim.channel")
         for b, (c, n, sp, fmt, math) in zip(self.chips.buttons(), self.table):
-            b.setText(f"{c}·{sp} {next((n for n, d in FORMATS if d == fmt), fmt)}")
+            b.setText(f"{next((n for n, d in FORMATS if d == fmt), fmt)}\n{c}·{sp}")
             b.setToolTip(f"Channel {c}, measurement {n!r}\n{sp} {fmt} {math}")
             b.setEnabled(not gen or c == cur_ch)
             b.update()
@@ -468,14 +468,11 @@ class VNAWindow(InstrumentWindow):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
         # столбики «+»/«−» (TRAC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
-        trc = getattr(self, "_trc_tools", None)
-        if trc is not None:                           # «+» и «−» трейсов - рядом, квадратами
-            trc.setMinimumWidth(0)
-            trc.setFixedWidth(2 * TRACE_CHIP_HEIGHT + PRESET_GAP)
-        save = getattr(self, "add_button", None) and self.add_button.parentWidget()
-        if save is not None:
-            save.setMinimumWidth(0)
-            save.setFixedWidth(max(b.sizeHint().width() for b in save.findChildren(QPushButton)))
+        # столбики «+»/«−» (TRC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
+        for tools in (getattr(self, "_trc_tools", None), getattr(self, "add_button", None) and self.add_button.parentWidget()):
+            if tools is not None:
+                tools.setMinimumWidth(0)
+                tools.setFixedWidth(max(b.sizeHint().width() for b in tools.findChildren(QPushButton)))
         proxy.action_done.connect(self._on_action)
         proxy.sync_done.connect(self.refresh_lists)
         if proxy.is_connected:
@@ -489,14 +486,13 @@ class VNAWindow(InstrumentWindow):
         if "meas_table" in proxy.actions:            # трейсы; выбранный задаёт канал POW / CW / CORR, STIM, TRIG
             te = self.trace_editor = TraceEditor(proxy)
             tools = self._trc_tools = QWidget()
-            tl = QHBoxLayout(tools)
+            tl = QVBoxLayout(tools)                   # «+» над «−», как у пресетов
             tl.setContentsMargins(0, 0, 0, 0)
             tl.setSpacing(PRESET_GAP)
+            half = (TRACE_CHIP_HEIGHT - PRESET_GAP) // 2
             for text, tip, slot in (("+", "New S21 trace on the channel of the selected one", te.create),
                                     ("−", "Delete the selected trace from the analyzer", te.delete)):
-                b = self._tool(text, tip, slot, TRACE_CHIP_HEIGHT)
-                b.setFixedWidth(TRACE_CHIP_HEIGHT)
-                tl.addWidget(b)
+                tl.addWidget(self._tool(text, tip, slot, half))
             top.append(PanelLine("TRC", te.scroll, tools))
         if "mem_store" in proxy.actions:
             top.append(PanelLine("MEM", ActionButton(proxy, "mem_store", "CAPTURE",

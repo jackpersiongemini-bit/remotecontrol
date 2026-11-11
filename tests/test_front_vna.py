@@ -97,7 +97,7 @@ def test_trace_chips_read_and_mem_math(qtbot, vna):
     proxy, win, _s, sim = vna
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
-    assert _chips(te) == ["1·S11 MLOG", "1·S21 MLOG", "2·S12 MLOG"]
+    assert _chips(te) == ["MLOG\n1·S11", "MLOG\n1·S21", "MLOG\n2·S12"]
     assert te.current == (1, "CH1_S11_1") and te.chips.checked_index() == 0       # выбран первый
     assert not te.chips.buttons()[0].indicated() and not te.chips.buttons()[2].indicated()   # выбран / не читается
     te.chips.buttons()[2].click()                              # выбрать трейс канала 2
@@ -127,7 +127,7 @@ def test_trace_edit_create_move_delete(qtbot, vna):
     te.format.on_pick("PHASE")                                 # трейс, который не читается
     _wait(qtbot, lambda: sim.meas["USER_S21"]["fmt"] == "PHAS" and te.format.text() == "PHAS")
     te.sparam.on_pick("S12")
-    _wait(qtbot, lambda: te.sparam.text() == "S12" and _chips(te)[1] == "1·S12 PHAS")
+    _wait(qtbot, lambda: te.sparam.text() == "S12" and _chips(te)[1] == "PHAS\n1·S12")
     assert [n for n, _v in te.channel.choices] == ["C1", "C2", "C3 NEW"]
     te.channel.on_pick(3)                                      # перенос в новый канал 3 - выбран перенесённый
     _wait(qtbot, lambda: te.current == (3, "CH3_S12_1") and "USER_S21" not in sim.meas)
@@ -166,7 +166,7 @@ def test_trace_chips_fill_width_and_selected_has_no_indicator(qtbot, vna):
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
     _wait(qtbot, lambda: sum(b.width() for b in te.chips.buttons()) + 8 >= te.scroll.viewport().width())
-    assert all(b.height() == 30 for b in te.chips.buttons())
+    assert all(b.height() == 44 for b in te.chips.buttons())
     first = te.chips.buttons()[0]
     assert first.isChecked() and te.is_read(1, "CH1_S11_1") and not first.indicated()   # выбран - без индикатора
     te.chips.buttons()[1].click()
@@ -177,7 +177,7 @@ def test_plus_minus_at_right_edge(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    for page, tools, width in ((0, win._trc_tools, 70), (4, win.add_button.parentWidget(), 40)):   # TRC и SAVE
+    for page, tools, width in ((0, win._trc_tools, 40), (4, win.add_button.parentWidget(), 40)):   # TRC и SAVE
         win.set_page(page)
         qtbot.wait(50)
         line = tools.parentWidget()
@@ -190,7 +190,7 @@ def test_trace_selects_channel(qtbot, vna):
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
     assert proxy.value("stim.channel") == 1 and te.chips.checked_index() == 0
-    assert all(b.sizeHint().height() == 30 for b in te.chips.buttons())
+    assert all(b.sizeHint().height() == 44 for b in te.chips.buttons())
     te.chips.buttons()[2].click()                              # трейс канала 2 -> канал окна 2
     _wait(qtbot, lambda: proxy.value("stim.channel") == 2 and proxy.value("sweep.points") == 101)
     win.widgets["sweep.points"].set_value(21)
@@ -204,7 +204,7 @@ def test_trace_selects_channel(qtbot, vna):
     _wait(qtbot, lambda: proxy.value("stim.channel") == 3 and te.current[0] == 3)
     sim.meas["CH1_S21_2"] = {"s": "S21", "fmt": "PHAS", "ch": 1}
     proxy.action("meas_table")                                 # формат - в подписи каждого чипа
-    _wait(qtbot, lambda: "1·S21 PHAS" in _chips(te) and "1·S21 MLOG" in _chips(te))
+    _wait(qtbot, lambda: "PHAS\n1·S21" in _chips(te) and "MLOG\n1·S21" in _chips(te))
 
 
 def test_trig_tab(qtbot, vna):
