@@ -280,6 +280,9 @@ NETWORK_ANALYZER = Profile(
         Slot("sweep.type", E, choices=("LIN", "LOG", "POWER", "CW", "SEGMENT"),
              doc="CW - одна частота freq.cw (ВАЦ как генератор), ось трассы - время, s"),
         Slot("freq.cw", F, "Hz", doc="частота в режиме CW"),
+        Slot("gen.state", B, doc="режим генератора: канал stim.channel в CW, остальные каналы не развёртываются; "
+                                  "выключение возвращает настройки канала, как были до включения"),
+        Slot("gen.channel", I, readonly=True, doc="канал режима генератора (None - выключен)"),
         Slot("bw.if", F, "Hz", required=True, doc="полоса ПЧ"),
         Slot("source.power", F, "dBm", required=True),
         Slot("rf.output", B, doc="мощность источника включена"),

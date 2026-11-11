@@ -359,3 +359,47 @@ def test_stimulus_of_selected_channel(make):
     assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN
     assert rec.values["freq.start"] == pytest.approx(10e6) and rec.values["sweep.type"] == "LIN"
     assert not rec.comm
+
+
+def test_generator_mode_stops_other_channels_and_restores(make):
+    sim = KeysightPNASim()
+    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    drv.run_action("meas_all")
+    drv.poll()
+    assert rec.values["m2.trace"] is not None and rec.values["gen.state"] is False
+    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN
+    for k, v in (("sweep.type", "LOG"), ("source.power", -15.0), ("rf.output", False), ("avg.state", True),
+                 ("bw.if", 10e3)):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
+    before = dict(sim.stim(2))
+    assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN
+    assert sim.stim(2)["type"] == "CW" and rec.values["sweep.type"] == "CW" and rec.values["gen.channel"] == 2
+    # в генераторе меняем что угодно
+    for k, v in (("freq.cw", 3e9), ("source.power", 5.0), ("rf.output", True), ("avg.state", False),
+                 ("bw.if", 1e3), ("sweep.points", 3)):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
+    assert setp(drv, rec, "stim.channel", 1) is PStatus.ERROR            # канал закреплён
+    del sim.history[:]
+    drv.poll()
+    assert "SENS1:SWE:MODE SING" not in sim.history and "SENS2:SWE:MODE SING" in sim.history
+    assert rec.values["m1.trace"] is None and rec.values["m2.trace"].x_unit == "s"   # канал 1 стоит
+    # выключили - всё как было, частота CW осталась
+    assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
+    after = sim.stim(2)
+    for k in ("type", "start", "stop", "poin", "bwid", "pow", "aver", "coun", "swt_auto", "corr"):
+        assert after[k] == before[k], k
+    assert after["cw"] == 3e9 and sim.c["outp"] is False
+    assert rec.values["sweep.type"] == "LOG" and rec.values["source.power"] == pytest.approx(-15.0)
+    assert rec.values["gen.channel"] is None and rec.values["stim.channel"] == 2
+    del sim.history[:]
+    drv.poll()
+    assert "SENS1:SWE:MODE SING" in sim.history and rec.values["m1.trace"] is not None
+    assert not rec.comm
+
+
+def test_generator_mode_restored_on_disconnect(vna):
+    drv, sim, rec = vna
+    assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN and sim.c["type"] == "CW"
+    drv.close_connection()
+    assert sim.c["type"] == "LIN"
