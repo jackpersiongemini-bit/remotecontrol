@@ -2,7 +2,8 @@
 
 Только для работы без железа (``run_main.py --sim``): каждые ``interval`` мс включённые генераторы
 (rf.output / rf.frequency / rf.power) становятся сигналами анализатора (``signals``) и мощностью
-на датчике ваттметра (сумма, непрерывный сигнал) с потерями тракта ``loss_db``.
+на датчике ваттметра (сумма, непрерывный сигнал) с потерями тракта ``loss_db`` (+ ``slope_db_per_ghz``
+на каждый ГГц частоты: кабель теряет больше на высоких частотах - есть что калибровать ACAL).
 """
 from __future__ import annotations
 
@@ -12,11 +13,16 @@ __all__ = ["SimBench"]
 
 
 class SimBench:
-    def __init__(self, generators=(), analyzers=(), meters=(), loss_db: float = 10.0):
+    def __init__(self, generators=(), analyzers=(), meters=(), loss_db: float = 10.0, slope_db_per_ghz: float = 0.0):
         self.generators = list(generators)       # RFGenSim (ячейки s["rf.output"], ...)
         self.analyzers = list(analyzers)         # AgilentPSASim (signals)
         self.meters = list(meters)               # KeysightU2021XASim (set_signal)
         self.loss_db = loss_db
+        self.slope_db_per_ghz = slope_db_per_ghz
+
+    def loss(self, freq: float) -> float:
+        """Потери тракта на частоте, dB (положительное число)."""
+        return self.loss_db + self.slope_db_per_ghz * float(freq) / 1e9
 
     def tones(self) -> list[tuple[float, float]]:
         """[(частота, dBm на входе приёмника)] включённых генераторов."""
@@ -24,7 +30,8 @@ class SimBench:
         for g in self.generators:
             s = getattr(g, "s", {})
             if s.get("rf.output"):
-                out.append((float(s["rf.frequency"]), float(s["rf.power"]) - self.loss_db))
+                f = float(s["rf.frequency"])
+                out.append((f, float(s["rf.power"]) - self.loss(f)))
         return out
 
     def step(self) -> None:

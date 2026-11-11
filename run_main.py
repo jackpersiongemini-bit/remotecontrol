@@ -6,7 +6,8 @@
     python run_main.py --show-windows  # показать все окна приборов (иначе - как были при выходе)
 
 Плитка прибора: класс и состояние, индикатор - прибор измеряет или выход включён; клик - окно прибора. Окна приборов
-открываются такими, какими были при выходе (скрытые - скрытыми).
+открываются такими, какими были при выходе (скрытые - скрытыми). Идущий сценарий координатора (ACAL из окна
+ваттметра) - фишка «ACAL n/N» в той же полосе; при выходе сценарий сначала возвращает приборы.
 Панели ниже - приёмники, которые сейчас измеряют (ВАЦ - трейсы, ваттметр - точки, анализатор - спектр).
 """
 from __future__ import annotations
@@ -31,6 +32,14 @@ def _sim(proxy):
     return getattr(getattr(proxy._worker, "transport", None), "sim", None)
 
 
+def _after_sync(proxy, fn) -> None:
+    """Один раз: fn(proxy) после первой синхронизации прибора (подключён и прочитан)."""
+    def run():
+        proxy.sync_done.disconnect(run)
+        fn(proxy)
+    proxy.sync_done.connect(run)
+
+
 def setup(opened, args, settings):
     win = MainWindow(settings, ActivityMonitor())
     win.quit_on_close = True
@@ -46,10 +55,13 @@ def setup(opened, args, settings):
             sim = _sim(cur["proxy"])
             if sim is not None:
                 by.setdefault(profile_name(cur["proxy"]), []).append(sim)
-        for sa in by.get("spectrum_analyzer", []):     # обзор вокруг частоты генератора по умолчанию
-            sa.c.update(center=1e9, span=100e6)
-            sa._couple()
-        bench = SimBench(by.get("signal_generator", []), by.get("spectrum_analyzer", []), by.get("power_meter", []))
+            if profile_name(cur["proxy"]) == "spectrum_analyzer":
+                # обзор вокруг частоты генератора - ключами профиля, когда анализатор подключится (не в обход
+                # драйвера: иначе ось трассы и окно показывали бы старые частоты)
+                _after_sync(cur["proxy"], lambda p: (p.set("freq.center", 1e9), p.set("freq.span", 100e6)))
+        # тракт 10 dB + 0.2 dB/ГГц: ACAL ваттметра на стенде даёт GAIN и наклон таблицы
+        bench = SimBench(by.get("signal_generator", []), by.get("spectrum_analyzer", []), by.get("power_meter", []),
+                         loss_db=10.0, slope_db_per_ghz=0.2)
         timer = QTimer(win)
         timer.setInterval(200)
         timer.timeout.connect(bench.step)

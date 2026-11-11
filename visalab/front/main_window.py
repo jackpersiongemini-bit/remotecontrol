@@ -9,6 +9,7 @@
 * анализатор спектра - трасса, пик, шумовая дорожка.
 
 У панели - источник сигнала, если координатор его нашёл: «← GEN 1 GHz  PATH −10.0 dB».
+Пока идёт сценарий координатора (ACAL...), в полосе плиток - его фишка «ACAL 12/101» (клик - окно прибора).
 ALL - показывать и приёмники, которые сейчас ничего не измеряют. Вкладки: LIVE - живые данные,
 SET - пороги «измеряет / не измеряет» (сохраняются в ini, группа MAIN/THRESHOLDS). Окно знает только ключи профилей.
 """
@@ -17,7 +18,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
-from ..coord import ActivityMonitor, profile_name
+from ..coord import COORD, ActivityMonitor, Coordinator, profile_name
 from ..coord.activity import Activity
 from ..core.params import ConnectionState
 from ..core.scpi import si_format, si_parse
@@ -27,7 +28,7 @@ from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar
 from .theme import WINDOW_BAR_HEIGHT
 from .window import Window, short_address
 
-__all__ = ["MainWindow", "InstrumentTile", "LivePanel"]
+__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip"]
 
 #: сколько секунд показаний ваттметра на графике
 PM_WINDOW_S = 60.0
@@ -97,6 +98,35 @@ class InstrumentTile(IndicatorButton):
     def show_state(self, name: str, line: str, active: bool) -> None:
         self.setText(f"{name}\n{line}")
         self.active = active
+        self.update()
+
+
+class ScenarioChip(IndicatorButton):
+    """Идущие сценарии координатора: имя и прогресс; клик - окно прибора, которым сценарий меряет."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("chip")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumWidth(72)
+        self.runs: list = []
+
+    def indicated(self) -> bool:
+        return bool(self.runs)
+
+    def show_runs(self, runs: list) -> None:
+        self.runs = list(runs)
+        self.setVisible(bool(self.runs))
+        if not self.runs:
+            return
+        run = self.runs[0]
+        more = f" +{len(self.runs) - 1}" if len(self.runs) > 1 else ""
+        self.setText(f"{run.name}{more}\n{run.done}/{run.total}" if run.total else f"{run.name}{more}\nRUN")
+        who = " + ".join(d.name for d in run.devices.values())
+        self.setToolTip("\n".join(f"{r.name}: {' + '.join(d.name for d in r.devices.values())}"
+                                  + (f"  {r.done}/{r.total} {r.text}" if r.total else "") for r in self.runs)
+                        + f"\nClick - open the {who.split(' + ')[-1]} window")
         self.update()
 
 
@@ -213,10 +243,12 @@ class MainWindow(Window):
     SETTINGS_GROUP = "MAIN"
     TABS = ("LIVE", "SET")
 
-    def __init__(self, settings: QSettings, monitor: ActivityMonitor | None = None, parent=None):
+    def __init__(self, settings: QSettings, monitor: ActivityMonitor | None = None, parent=None,
+                 coordinator: Coordinator | None = None):
         super().__init__(settings, parent)
         self.setWindowTitle("LAB")
         self.monitor = monitor or ActivityMonitor(parent=self)
+        self.coord = coordinator if coordinator is not None else COORD
         self.quit_on_close = False
         #: вызывается при закрытии главного окна до выхода (окна приборов ещё в прежнем виде)
         self.before_quit: list = []
@@ -235,7 +267,11 @@ class MainWindow(Window):
         self.all_button.setToolTip("Show all receivers, also those that measure nothing now")
         self.all_button.setChecked(settings.value(f"{self.SETTINGS_GROUP}/SHOW_ALL", False, type=bool))
         self.all_button.toggled.connect(self._on_all)
+        self.scenario_chip = ScenarioChip()
+        self.scenario_chip.clicked.connect(self._open_scenario)
+        self.scenario_chip.hide()
         self.strip_layout.addStretch()
+        self.strip_layout.addWidget(self.scenario_chip)
         self.strip_layout.addWidget(self.all_button)
         self.strip_panel = Panel(strip)
         self.strip_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -295,6 +331,9 @@ class MainWindow(Window):
 
         self.monitor.roster_changed.connect(self._rebuild)
         self.monitor.changed.connect(self._on_changed)
+        for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):
+            sig.connect(self._on_runs)
+        self._on_runs()
         self._timer = QTimer(self)                  # время на графике ваттметра идёт и без новых точек
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
@@ -354,6 +393,14 @@ class MainWindow(Window):
         else:
             on = connected and _output_on(proxy)
             tile.show_state(name, ("OUT ON" if on else "ON") if connected else "OFF", on)
+
+    def _on_runs(self, *_args) -> None:
+        self.scenario_chip.show_runs(self.coord.runs())
+
+    def _open_scenario(self) -> None:
+        runs = self.coord.runs()
+        if runs and runs[0].devices:
+            self.open_instrument(list(runs[0].devices.values())[-1].proxy)
 
     def _tick(self) -> None:
         for p, panel in self.panels.items():
@@ -418,5 +465,10 @@ class MainWindow(Window):
         super().closeEvent(event)
         if self.quit_on_close:
             self.monitor.stop()
+            for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):
+                try:
+                    sig.disconnect(self._on_runs)
+                except TypeError:
+                    pass
             QApplication.quit()
 

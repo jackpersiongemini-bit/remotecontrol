@@ -10,6 +10,7 @@ from pathlib import Path
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
+from ..coord import COORD
 from ..core import InstrumentProxy
 from ..drivers import DRIVERS, make_transport
 from .instrument_window import saved_connection, saved_delay
@@ -18,6 +19,8 @@ from .models import all_models
 __all__ = ["run_window", "run_windows", "remember_windows"]
 
 ROOT = Path(__file__).resolve().parents[2]
+#: при выходе - сколько ждать, пока идущий сценарий вернёт приборы
+QUIT_SCENARIO_WAIT_MS = 5000
 
 
 def _lab(path: str, key: str) -> dict:
@@ -68,8 +71,15 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None 
         opened[-1]["lab_key"] = lab_key
     keep = setup(opened, args, settings) if setup else None  # noqa: F841 - держим ссылку до выхода
 
-    app.aboutToQuit.connect(lambda: InstrumentProxy.shutdown_all(cur["proxy"] for cur in opened))
+    app.aboutToQuit.connect(lambda: _quit(opened))
     return app.exec()
+
+
+def _quit(opened: list[dict]) -> None:
+    """Выход: сначала сценарии координатора возвращают приборы (генератор - ВЧ как было...), потом
+    приборы закрываются параллельно."""
+    COORD.stop_all(wait_ms=QUIT_SCENARIO_WAIT_MS)
+    InstrumentProxy.shutdown_all(cur["proxy"] for cur in opened)
 
 
 def remember_windows(opened: list[dict], settings: QSettings) -> None:
