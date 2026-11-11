@@ -217,9 +217,10 @@ class KeysightPNASim(SimInstrument):
         self.on("MMEMory:DELete", self._file_del)
         self.on("MMEMory:CDIRectory", self._cdir, lambda a, g: f'"{self.cdir}"')
         self.on("CALCulate#:MARKer#:FUNCtion:EXECute", self._mk_exec)
-        self.on("CALCulate#:MARKer#:X", self._mk_x, lambda a, g: f"{self.marker['x']:+.11E}")
+        self.on("CALCulate#:MARKer#:X", self._mk_x, lambda a, g: f"{self._mk(g)['x']:+.11E}")
+        self.on("CALCulate#:MARKer:AOFF", self._mk_aoff)
         self.on("CALCulate#:MARKer#:Y", get=self._mk_y)
-        self.on("CALCulate#:MARKer#[:STATe]", self._mk_state, lambda a, g: "1" if self.marker["on"] else "0")
+        self.on("CALCulate#:MARKer#[:STATe]", self._mk_state, lambda a, g: "1" if self._mk(g)["on"] else "0")
         self.on("SENSe#:FREQuency:STARt", self._f("start"), self._gs("start"))
         self.on("SENSe#:FREQuency:STOP", self._f("stop"), self._gs("stop"))
         self.on("SENSe#:FREQuency:CENTer", self._f("center"), self._gs("center"))
@@ -477,29 +478,46 @@ class KeysightPNASim(SimInstrument):
         if self.trig_count >= points and not self.hold_sweeps:
             self.finish_sweep()
 
+    def _mk(self, g) -> dict:
+        """Маркер ``g[1]`` выбранного измерения канала ``g[0]`` (у каждого измерения свои маркеры 1..15)."""
+        ch, n = self._ch(g), int(g[1]) if len(g) > 1 and g[1] else 1
+        name = self._selected(ch)
+        if name not in self.meas or not 1 <= n <= 15:
+            raise SimError(-221, "Settings conflict; no measurement selected", ESR_EXE)
+        return self.meas[name].setdefault("marks", {}).setdefault(n, {"on": False, "x": 1e9})
+
     def _mk_state(self, a, g):
-        self.marker["on"] = self.boolean(a)
+        self._mk(g)["on"] = self.boolean(a)
+
+    def _mk_aoff(self, a, g):
+        name = self._selected(self._ch(g))
+        for mk in self.meas.get(name, {}).get("marks", {}).values():
+            mk["on"] = False
 
     def _mk_x(self, a, g):
-        self.marker["x"] = self.num(a, 0, self.F_MAX)
-        self.marker["on"] = True
+        mk = self._mk(g)
+        mk["x"] = self.num(a, 0, self.F_MAX)
+        mk["on"] = True
 
     def _mk_y(self, a, g):
-        if not self.marker["on"]:
+        mk = self._mk(g)
+        if not mk["on"]:
             raise SimError(-221, "Settings conflict", ESR_EXE)
-        data, fs = self.fdata(self.selected), self.freqs()
-        i = min(range(len(fs)), key=lambda k: abs(fs[k] - self.marker["x"]))
+        ch = self._ch(g)
+        data, fs = self.fdata(self._selected(ch)), self.freqs(ch)
+        i = min(range(len(fs)), key=lambda k: abs(fs[k] - mk["x"]))
         if len(data) == 2 * len(fs):                      # комплексный формат
             return f"{data[2 * i]:+.10E},{data[2 * i + 1]:+.10E}"
         return f"{data[i]:+.10E},+0.00000000000E+000"
 
     def _mk_exec(self, a, g):
-        data, fs = self.fdata(self.selected), self.freqs()
+        mk, ch = self._mk(g), self._ch(g)
+        data, fs = self.fdata(self._selected(ch)), self.freqs(ch)
         if len(data) == 2 * len(fs):                      # комплексный формат - по модулю
             data = [math.hypot(a, b) for a, b in zip(data[0::2], data[1::2])]
         pick = max if a.strip().upper().startswith("MAX") else min
         i = pick(range(len(data)), key=data.__getitem__)
-        self.marker.update(on=True, x=fs[i])
+        mk.update(on=True, x=fs[i])
 
     # ------------------------------------------------------- память, математика
     def _memorize(self, a, g):

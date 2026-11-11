@@ -15,7 +15,8 @@
 Вкладки: TRAC (сверху чипы всех трейсов прибора, как пресеты: клик выбирает, + создаёт трейс S21 на
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
-SCAL (масштаб выбранного трейса), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, список
+SCAL (масштаб выбранного трейса), MARK (маркеры выбранного трейса: чипы 1..10, STAT, X, Y, MAX / MIN,
+OFF всех, список), STIM (стимул и развёртка), TRIG (запуск), PWR (мощность, RF, список
 пресетов мощности), CAL (cal set'ы прибора чипами: клик применяет к каналу выбранного трейса, NONE снимает;
 стимул из cal set или свой, CORR, интерполяция; CALIBRATE открывает отдельное окно калибровки), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
@@ -466,6 +467,93 @@ class _ReadButton(IndicatorButton):
 
     def indicated(self) -> bool:
         return self.owner.current is not None and self.owner.is_read(*self.owner.current)
+
+
+#: единица значения трейса по формату
+FORMAT_UNITS = {"MLOG": "dB", "PHASE": "°", "UPHASE": "°", "GDELAY": "s"}
+
+
+class _MarkChip(IndicatorButton):
+    """Чип номера маркера: выбор - инверсия, индикатор - маркер включён (у выбранного не рисуется)."""
+
+    def __init__(self, owner: "MarkerPanel", n: int):
+        super().__init__(str(n))
+        self.owner, self.n = owner, n
+        self.setObjectName("chip")
+        self.setProperty("tight", True)
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def indicated(self) -> bool:
+        return not self.isChecked() and self.n in self.owner.table
+
+
+class MarkerPanel(QWidget):
+    """Маркеры выбранного трейса (``trace.sel``): чипы 1..10 (выбор ``mark.n``, индикатор - включён),
+    значение выбранного и список всех включённых (перечитывается после каждой развёртки)."""
+
+    MARKS = 10
+
+    def __init__(self, proxy: InstrumentProxy, trace_row=None, parent=None):
+        super().__init__(parent)
+        self.proxy, self.trace_row = proxy, trace_row
+        self.table: dict[int, tuple[float, float | None]] = {}
+        self.chips = PBGroup(columns=5)
+        for n in range(1, self.MARKS + 1):
+            b = _MarkChip(self, n)
+            self.chips._group.addButton(b, n - 1)
+            self.chips._buttons.append(b)
+        self.chips._relayout()
+        self.chips.selected.connect(lambda i: proxy.set("mark.n", i + 1))
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.chips)
+        self.value = QLabel("")
+        self.value.setObjectName("lineName")
+        self.value.setToolTip("Value of the selected marker on the selected trace")
+        self.list = QLabel("")
+        self.list.setObjectName("lineName")
+        self.list.setToolTip("All markers of the selected trace")
+        self.relayout = None                               # окно: подогнать высоту, когда строк в списке стало больше
+        proxy.subscribe("mark.n", lambda _v: self._show())
+        proxy.subscribe("mark.y", lambda _v: self._show())
+        for key in ("trace.sel", "mark.state", "mark.x"):
+            proxy.subscribe(key, lambda _v: self.refresh())
+        proxy.subscribe("meas.armed", lambda v: v is False and self.table and self.refresh())
+        proxy.action_done.connect(self._on_action)
+        self._show()
+
+    def refresh(self) -> None:
+        if self.proxy.is_connected and "mark_table" in self.proxy.actions:
+            self.proxy.action("mark_table")
+
+    def unit(self) -> str:
+        row = self.trace_row() if self.trace_row is not None else None
+        return FORMAT_UNITS.get(row[3], "") if row is not None else ""
+
+    def text(self, x, y) -> str:
+        xs = "?" if x is None else si_format(x, "Hz", 6)
+        ys = "-" if y is None else f"{y:.4f} {self.unit()}".rstrip()
+        return f"{xs}   {ys}"
+
+    def _on_action(self, name: str, result) -> None:
+        if name in ("mark_table", "mark_peak", "mark_min", "mark_aoff") and isinstance(result, (list, tuple)):
+            self.table = {int(n): (x, y) for n, x, y in result}
+            self._show()
+
+    def _show(self) -> None:
+        n = self.proxy.value("mark.n")
+        self.chips.set_checked(n - 1 if isinstance(n, int) and 1 <= n <= self.MARKS else -1)
+        for b in self.chips.buttons():
+            b.update()
+        on = self.proxy.value("mark.state") is True
+        self.value.setText(self.text(self.proxy.value("mark.x"), self.proxy.value("mark.y")) if on else "OFF")
+        lines = self.list.text().count("\n")
+        self.list.setText("\n".join(f"M{k}  {self.text(x, y)}" for k, (x, y) in sorted(self.table.items()))
+                          or "no markers")
+        if self.list.text().count("\n") != lines and self.relayout is not None:
+            self.relayout()
 
 
 class CalSets(QWidget):
@@ -1056,6 +1144,28 @@ class VNAWindow(InstrumentWindow):
                     scal.append(PanelLine(name, *ws))
             self.page_specs.insert(1 if "meas_table" in proxy.actions else 0, ("SCAL", (), PanelTable(*scal)))
 
+        # MARK: маркеры выбранного трейса (после SCAL)
+        if sup("mark.n") and "mark_table" in proxy.actions:
+            mp = self.marker_panel = MarkerPanel(proxy, self.trace_editor.row if hasattr(self, "trace_editor")
+                                                 else None)
+            state = PSButton(proxy, "mark.state", ONOFF)
+            state.setToolTip("Selected marker on / off")
+            mx = PSpinBox(proxy, "mark.x", ("k", "M", "G"))
+            mx.setToolTip("Marker position")
+            self.widgets["mark.state"], self.widgets["mark.x"] = state, mx
+            mark = [PanelLine("MKR", mp), PanelLine("STAT", state), PanelLine("X", mx), PanelLine("Y", mp.value)]
+            search = [ActionButton(proxy, a, t, tip) for a, t, tip in
+                      (("mark_peak", "MAX", "Selected marker to the maximum"),
+                       ("mark_min", "MIN", "Selected marker to the minimum")) if a in proxy.actions]
+            if search:
+                mark.append(PanelLine("SRCH", *search))
+            if "mark_aoff" in proxy.actions:
+                mark.append(PanelLine("ALL", ActionButton(proxy, "mark_aoff", "OFF", "All markers of the trace off")))
+            mark.append(PanelLine("LIST", mp.list))
+            mp.relayout = self._fit_height
+            pos = next((i + 1 for i, (n, *_r) in enumerate(self.page_specs) if n == "SCAL"), len(self.page_specs))
+            self.page_specs.insert(pos, ("MARK", ("mark.state",), PanelTable(*mark)))
+
         # SAVE: чипы состояний в памяти прибора
         save = []
         if "state_list" in proxy.actions:             # состояния в памяти анализатора: папка на его диске и чипы
@@ -1277,7 +1387,7 @@ class VNAWindow(InstrumentWindow):
     def refresh_lists(self) -> None:
         if hasattr(self, "cal_wizard"):
             self.cal_wizard.refresh()
-        for name in ("state_list", "meas_table", "cal_list"):
+        for name in ("state_list", "meas_table", "cal_list", "mark_table"):
             if name in self.proxy.actions:
                 self.proxy.action(name)
 

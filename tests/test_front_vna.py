@@ -1,5 +1,7 @@
 """Окно ВАЦ на симуляторе N5231A: избранное, режим пресетов мощности, CW, выбор измерений, состояния."""
 import pytest
+
+from visalab.front.power_meter import ActionButton
 from PyQt6.QtCore import QSettings, QSize
 
 from visalab.core import InstrumentProxy, SimTransport
@@ -38,7 +40,7 @@ def _wait(qtbot, cond):
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
     assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "MATH", "POW", "CW", "CORR"]
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "SCAL", "STIM", "TRIG", "PWR", "CAL", "SAVE"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "SCAL", "MARK", "STIM", "TRIG", "PWR", "CAL", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
 
@@ -178,8 +180,8 @@ def test_plus_minus_at_right_edge(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    for page, tools, width in ((0, win._trc_tools, 40), (5, win._cal_tools, 40),
-                                (6, win.add_button.parentWidget(), 40)):   # TRC, CAL и SAVE
+    for page, tools, width in ((0, win._trc_tools, 40), (6, win._cal_tools, 40),
+                                (7, win.add_button.parentWidget(), 40)):   # TRC, CAL и SAVE
         win.set_page(page)
         qtbot.wait(50)
         line = tools.parentWidget()
@@ -213,7 +215,7 @@ def test_trig_tab(qtbot, vna):
     proxy, win, _s, sim = vna
     page = win.pages[[win.tabs.tabText(i) for i in range(win.tabs.count())].index("TRIG")]
     assert [ln.name for ln in page.lines] == ["SRC", "SCOP", "MODE", "SLOP", "TYPE", "DLY", "RUN"]
-    assert "MODE" not in [ln.name for ln in win.pages[2].lines]               # CONT/SINGLE ушло из STIM
+    assert "MODE" not in [ln.name for ln in win.pages[3].lines]               # CONT/SINGLE ушло из STIM
     win.widgets["trig.source"].set_value("MAN")
     win.widgets["trig.mode"].set_value("POINT")
     _wait(qtbot, lambda: sim.trig["sour"] == "MAN" and sim.c["tmode"] == "POIN")
@@ -228,7 +230,7 @@ def test_data_save_csv(qtbot, vna, tmp_path):
     proxy, win, settings, sim = vna
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
-    assert [ln.name for ln in win.pages[6].lines] == ["VNA", "STAT", "PC", "NAME", "DATA", "S2P"]
+    assert [ln.name for ln in win.pages[7].lines] == ["VNA", "STAT", "PC", "NAME", "DATA", "S2P"]
     te.chips.buttons()[2].click()                              # трейс канала 2 (другая ось) - тоже читать
     te.read.click()
     te.format.on_pick("POLAR")                                 # комплексный формат - два столбца
@@ -322,7 +324,7 @@ def test_cal_tab_cal_sets(qtbot, vna):
     proxy, win, _s, sim = vna
     cs, te = win.cal_sets, win.trace_editor
     _wait(qtbot, lambda: [b.text() for b in cs.chips.buttons()] == ["NONE", "CAL_1-3G", "CAL_FULL"])
-    assert [ln.name for ln in win.pages[5].lines] == ["CSET", "STIM", "CORR", "INT", "NEW"]
+    assert [ln.name for ln in win.pages[6].lines] == ["CSET", "STIM", "CORR", "INT", "NEW"]
     assert cs.chips.checked_index() == 0                       # у канала 1 калибровки нет
     cs.chips.buttons()[1].click()                              # cal set со стимулом
     _wait(qtbot, lambda: sim.c["cset"] == "CAL_1-3G" and proxy.value("cal.set") == "CAL_1-3G")
@@ -351,7 +353,7 @@ def test_cal_tab_guided_calibration(qtbot, vna):
     wz, cw = win.cal_wizard, win.cal_window
     win.show()
     win.set_expanded(True)
-    win.set_page(5)
+    win.set_page(6)
     assert not cw.isVisible()
     win.cal_button.click()                                     # отдельное окно калибровки
     assert cw.isVisible() and cw.windowTitle() == "CAL CH1"
@@ -430,3 +432,25 @@ def test_cal_window_thru_response(qtbot, vna):
     _wait(qtbot, lambda: sim.c["cset"] == "THRU_CAL" and not wz.steps)
     wz.type_button.click()                                     # обратно FULL
     assert wz.kind == "FULL" and wz.port_lines[0].isVisible()
+
+
+def test_mark_tab_markers_of_selected_trace(qtbot, vna):
+    proxy, win, _s, sim = vna
+    te, mp = win.trace_editor, win.marker_panel
+    assert [ln.name for ln in win.pages[2].lines] == ["MKR", "STAT", "X", "Y", "SRCH", "ALL", "LIST"]
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    te.chips.buttons()[1].click()                              # 1·S21
+    _wait(qtbot, lambda: proxy.value("trace.sel") == "1:USER_S21")
+    assert mp.chips.checked_index() == 0 and mp.value.text() == "OFF" and mp.list.text() == "no markers"
+    next(b for b in win.findChildren(ActionButton) if b.name == "mark_peak").click()
+    _wait(qtbot, lambda: 1 in mp.table and proxy.value("mark.state") is True)
+    assert proxy.value("mark.x") == pytest.approx(2e9, rel=5e-2) and "dB" in mp.value.text()   # шаг 67 МГц
+    assert "GHz" in mp.value.text() and mp.list.text().startswith("M1 ")
+    mp.chips.buttons()[2].click()                              # M3: поставить на 1.5 ГГц
+    _wait(qtbot, lambda: proxy.value("mark.n") == 3 and proxy.value("mark.state") is False)
+    assert mp.chips.buttons()[0].indicated() and not mp.chips.buttons()[2].indicated()
+    win.widgets["mark.x"].set_value(1.5e9)
+    _wait(qtbot, lambda: sorted(mp.table) == [1, 3])
+    assert sim.meas["USER_S21"]["marks"][3] == {"on": True, "x": 1.5e9}
+    next(b for b in win.findChildren(ActionButton) if b.name == "mark_aoff").click()
+    _wait(qtbot, lambda: not mp.table and mp.list.text() == "no markers")

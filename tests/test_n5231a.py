@@ -602,3 +602,30 @@ def test_thru_response_calibration(make):
     drv.run_action("cal_save", "THRU_CAL")
     assert "THRU_CAL" in actions[-1][1] and sim.c["cset"] == "THRU_CAL" and sim.c["corr"]
     assert "SENS1:CORR:COLL:METH TRAN1" in sim.history and drv._armed and not rec.comm
+
+
+def test_markers_of_selected_trace(make):
+    sim = KeysightPNASim()
+    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
+    sim.windows[2] = {1: "CH2_S21"}
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    v = rec.values
+    assert v["mark.n"] == 1 and v["mark.state"] is False and v["mark.y"] is None
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    assert setp(drv, rec, "trace.sel", "2:CH2_S21") is PStatus.WRITTEN
+    drv.run_action("mark_peak")                                 # M1 на максимум S21 канала 2 (1..2 ГГц)
+    assert v["mark.state"] is True and v["mark.x"] == pytest.approx(2e9, rel=1e-2)
+    assert v["mark.y"] == pytest.approx(-1.0, abs=0.1) and actions[-1][1][0][0] == 1
+    assert setp(drv, rec, "mark.n", 3) is PStatus.WRITTEN and v["mark.state"] is False
+    assert setp(drv, rec, "mark.x", 1.5e9) is PStatus.WRITTEN and v["mark.state"] is True
+    assert sim.meas["CH2_S21"]["marks"][3]["x"] == 1.5e9 and not any(m["on"] for m in sim.meas["CH1_S11_1"].get("marks", {}).values())
+    drv.run_action("mark_table")
+    assert [n for n, _x, _y in actions[-1][1]] == [1, 3]
+    assert setp(drv, rec, "mark.state", False) is PStatus.WRITTEN and v["mark.y"] is None
+    assert setp(drv, rec, "trace.sel", "1:CH1_S11_1") is PStatus.WRITTEN and v["mark.state"] is False  # свои маркеры
+    assert setp(drv, rec, "trace.sel", "2:CH2_S21") is PStatus.WRITTEN
+    drv.run_action("mark_aoff")
+    assert not any(m["on"] for m in sim.meas["CH2_S21"]["marks"].values()) and actions[-1] == ("mark_aoff", [])
+    assert setp(drv, rec, "mark.n", 11) is not PStatus.WRITTEN
+    assert not rec.comm
