@@ -226,7 +226,7 @@ def test_data_save_csv(qtbot, vna, tmp_path):
     proxy, win, settings, sim = vna
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
-    assert [ln.name for ln in win.pages[4].lines] == ["STAT", "DIR", "NAME"]
+    assert [ln.name for ln in win.pages[4].lines] == ["VNA", "STAT", "PC", "NAME"]
     te.chips.buttons()[2].click()                              # трейс канала 2 (другая ось) - тоже читать
     te.read.click()
     te.format.on_pick("POLAR")                                 # комплексный формат - два столбца
@@ -254,3 +254,19 @@ def test_data_save_csv(qtbot, vna, tmp_path):
             te.read.click()
     _wait(qtbot, lambda: not win.read_traces())
     assert win.save_data() is None and win.data_button.text() == "NO DATA"
+
+
+def test_states_folder_on_analyzer(qtbot, vna):
+    from visalab.sim.keysight_n5231a_sim import DEFAULT_DIR
+    proxy, win, _s, sim = vna
+    import copy
+    sim.dirs[DEFAULT_DIR + "\\Lab"]["old.csa"] = copy.deepcopy((sim.c, sim.meas, sim.other, sim.marker))
+    _wait(qtbot, lambda: proxy.value("state.dir") == DEFAULT_DIR and win.presets.names() == [])
+    win.widgets["state.dir"].set_value(DEFAULT_DIR + "\\Lab")              # другая папка - другой список
+    _wait(qtbot, lambda: sim.cdir.endswith("Lab") and win.presets.names() == ["old"])
+    win._add_preset()                                          # сохраняется в выбранную папку
+    _wait(qtbot, lambda: len(win.presets.names()) == 2)
+    assert len(sim.dirs[DEFAULT_DIR + "\\Lab"]) == 2 and not sim.dirs[DEFAULT_DIR]
+    win.widgets["state.dir"].set_value("C:\\nope")                         # нет такой папки - остаётся прежняя
+    _wait(qtbot, lambda: proxy.value("state.dir", None) is not None and sim.cdir.endswith("Lab"))
+    assert win.presets.names() and len(win.presets.names()) == 2

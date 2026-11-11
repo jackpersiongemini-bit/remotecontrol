@@ -21,7 +21,8 @@
 * память трассы ``CALC1:MATH:MEM`` (данные -> память выбранного измерения), математика
   ``CALC1:MATH:FUNC NORM|DIV|SUBT|ADD|MULT`` (над комплексными данными, до формата; SDATA - без неё);
 * состояния в памяти прибора: ``MMEM:STOR "имя.csa"`` (состояние + калибровка), ``MMEM:LOAD``,
-  ``MMEM:DEL``, ``MMEM:CAT?`` (список файлов текущей папки; читаются только имена).
+  ``MMEM:DEL``, ``MMEM:CAT?`` (список файлов текущей папки; читаются только имена); папка -
+  ``MMEM:CDIR "C:\\..."`` (ключ ``state.dir``, путь на диске анализатора).
 
 Подключение не создаёт и не удаляет измерения пользователя (если измерений нет - создаётся
 ``VL_MEAS``). Что читать, выбирает пользователь: ``MEAS_SLOTS`` слотов ``m1..m16``, у слота -
@@ -175,6 +176,8 @@ class KeysightPNA(VISAInstrument):
             Param("meas.count", "Измерений", I, section=rs, group="SWEEP"),
             Param("stim.channel", "Канал стимула", I, section=st, query="<virtual>", write="<virtual>",
                   minimum=1, maximum=200, also_read=STIM_KEYS),
+            Param("state.dir", "Папка состояний на анализаторе", Kind.STR, section="Память",
+                  query="MMEM:CDIR?", write='MMEM:CDIR "{value}"'),
             Param("gen.state", "Режим генератора", B, section=st, query="<virtual>", write="<virtual>",
                   also_read=(*STIM_KEYS, "rf.output", "gen.channel", "stim.channel")),
             Param("gen.channel", "Канал генератора", I, section=st, query="<virtual>"),

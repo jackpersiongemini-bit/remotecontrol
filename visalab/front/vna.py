@@ -470,7 +470,6 @@ class VNAWindow(InstrumentWindow):
     def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Network analyzer", parent=None):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
-        # столбики «+»/«−» (TRAC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
         # столбики «+»/«−» (TRC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
         for tools in (getattr(self, "_trc_tools", None), getattr(self, "add_button", None) and self.add_button.parentWidget()):
             if tools is not None:
@@ -598,10 +597,19 @@ class VNAWindow(InstrumentWindow):
             self.page_specs.insert(0, ("TRAC", (), PanelTable(*trac)))
 
         # SAVE: чипы состояний в памяти прибора
-        save = [self.preset_line("STAT")] if "state_list" in proxy.actions else []
+        save = []
+        if "state_list" in proxy.actions:             # состояния в памяти анализатора: папка на его диске и чипы
+            if sup("state.dir"):
+                vdir = PLineEdit(proxy, "state.dir")
+                vdir.setToolTip("Folder on the analyzer disk with the state files (*.csa), e.g.\n"
+                                "C:\\Users\\Public\\Documents\\Network Analyzer")
+                self.widgets["state.dir"] = vdir
+                save.append(PanelLine("VNA", vdir))
+                proxy.subscribe("state.dir", lambda _v: self.proxy.is_connected and self.proxy.action("state_list"))
+            save.append(self.preset_line("STAT"))
         if sup("m1.trace"):                           # куда и под каким именем DATA SAVE пишет CSV
             self.dir_edit = QLineEdit(str(self.data_dir()))
-            self.dir_edit.setToolTip("Folder for DATA SAVE files")
+            self.dir_edit.setToolTip("Folder on this PC for DATA SAVE files")
             self.dir_edit.editingFinished.connect(
                 lambda: self.settings.setValue(f"{pre}/DATA_DIR", self.dir_edit.text().strip()))
             browse = self._tool("…", "Choose the folder", self._browse_dir)
@@ -611,7 +619,7 @@ class VNAWindow(InstrumentWindow):
             self.name_edit.setToolTip("Prefix of the file name; date and time are added: <prefix>_YYYYMMDD_HHMMSS.csv")
             self.name_edit.editingFinished.connect(
                 lambda: self.settings.setValue(f"{pre}/DATA_NAME", self.name_edit.text().strip()))
-            save += [PanelLine("DIR", self.dir_edit, browse), PanelLine("NAME", self.name_edit)]
+            save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit)]
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
 
