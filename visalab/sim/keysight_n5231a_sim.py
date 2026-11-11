@@ -64,7 +64,7 @@ class KeysightPNASim(SimInstrument):
             return self.c
         if ch not in self.other:
             st = {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9, "bwid": 35e3, "pow": -5.0,
-                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False}
+                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False, "mode": "CONT"}
             self._auto_time(st)
             self.other[ch] = st
         return self.other[ch]
@@ -129,7 +129,9 @@ class KeysightPNASim(SimInstrument):
             return
         self.sweeping = False
         self.sweeps_done += 1
-        self.c["mode"] = "HOLD"
+        for st in (self.c, *self.other.values()):       # однократные развёртки закончились
+            if st["mode"] == "SING":
+                st["mode"] = "HOLD"
         if self.opc_pending:
             self.opc_pending = False
             self.esr |= ESR_OPC
@@ -184,7 +186,7 @@ class KeysightPNASim(SimInstrument):
         self.on("SENSe#:FREQuency:FIXed", self._cw_set, self._gs("cw"))
         self.on("SENSe#:SWEep:TIME:AUTO", self._b("swt_auto"), self._gb("swt_auto"))
         self.on("SENSe#:SWEep:TIME", self._n("swt", 0, 86400, auto="swt_auto"), self._gs("swt"))
-        self.on("SENSe#:SWEep:MODE", self._mode_set, lambda a, g: self.c["mode"])
+        self.on("SENSe#:SWEep:MODE", self._mode_set, lambda a, g: self.stim(self._ch(g))["mode"])
         self.on("SENSe#:BWIDth[:RESolution]", self._bwid_set, self._gs("bwid"))
         self.on("SENSe#:AVERage:COUNt", self._n("coun", 1, 65536, integer=True), lambda a, g: str(self.stim(self._ch(g))["coun"]))
         self.on("SENSe#:AVERage[:STATe]", self._b("aver"), self._gb("aver"))
@@ -316,7 +318,7 @@ class KeysightPNASim(SimInstrument):
         mode = {"HOLD": "HOLD", "CONT": "CONT", "CONTINUOUS": "CONT", "SING": "SING", "SINGLE": "SING"}.get(t)
         if mode is None:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        self.c["mode"] = mode
+        self.stim(self._ch(g))["mode"] = mode
         if mode == "SING":
             self.sweeping = True
             if not self.hold_sweeps:
