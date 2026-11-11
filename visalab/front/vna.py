@@ -10,6 +10,7 @@
   возвращает прежний тип; рядом частота CW;
 * CORR - коррекция (калибровка) ON / OFF.
 
+Вкладка STIM - настройки одного канала: сверху чипы каналов (как пресеты, без «+»/«−»).
 Вкладки: TRAC (сверху чипы всех трейсов прибора, как пресеты: клик выбирает, + создаёт трейс S21 на
 канале выбранного, − удаляет выбранный с прибора; под ними выбранный трейс: CH - список каналов (другой
 канал переносит трейс, пересоздавая там), READ, SPAR, FMT, MATH; ALL / NONE; слоты не видны),
@@ -218,6 +219,66 @@ class MenuButton(IndicatorButton):
             act.triggered.connect(lambda _=False, d=data: self.on_pick(d))
         menu.setMinimumWidth(self.width())
         menu.popup(self.mapToGlobal(self.rect().bottomLeft()))
+
+
+class _ChannelChip(QPushButton):
+    def __init__(self, channel: int):
+        super().__init__(f"C{channel}")
+        self.channel = channel
+        self.setObjectName("chip")
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"STIM settings of channel {channel}")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def sizeHint(self):  # noqa: N802 - Qt; высота - как у пресета (QSS чипа иначе перебивает)
+        return QSize(super().sizeHint().width(), PRESET_HEIGHT)
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt
+        return self.sizeHint()
+
+
+class StimChannels(PBGroup):
+    """Каналы прибора чипами (как пресеты, без «+»/«−»): выбранный - канал вкладки STIM (``stim.channel``).
+    Список каналов - из таблицы трейсов (``meas_table`` и действия, которые её возвращают)."""
+
+    def __init__(self, proxy: InstrumentProxy, parent=None):
+        self.proxy = proxy
+        super().__init__(parent=parent)
+        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.channels: list[int] = []
+        self.scroll = HScrollArea(self)
+        self.selected.connect(lambda i: proxy.set("stim.channel", self.channels[i]))
+        proxy.subscribe("stim.channel", lambda _v: self._show())
+        proxy.action_done.connect(self._on_action)
+        self.set_channels([1])
+
+    def add_button(self, name: str) -> QPushButton:  # чипы создаёт set_channels
+        raise NotImplementedError
+
+    def _on_action(self, name: str, result) -> None:
+        if name in ("meas_table", "meas_config", "meas_create", "meas_delete", "meas_move") and \
+                isinstance(result, (list, tuple)):
+            self.set_channels(sorted({int(r[0]) for r in result}) or [1])
+
+    def set_channels(self, channels: list[int]) -> None:
+        cur = self.proxy.value("stim.channel")
+        channels = sorted(set(channels) | ({cur} if isinstance(cur, int) else set()))
+        if channels != self.channels:
+            while self._buttons:
+                self.remove_button(0)
+            for c in channels:
+                b = _ChannelChip(c)
+                self._group.addButton(b, len(self._buttons))
+                self._buttons.append(b)
+            self._relayout()
+            self.channels = channels
+        self._show()
+
+    def _show(self) -> None:
+        cur = self.proxy.value("stim.channel")
+        self.set_checked(self.channels.index(cur) if cur in self.channels else -1)
 
 
 class _TraceChip(IndicatorButton):
@@ -478,8 +539,11 @@ class VNAWindow(InstrumentWindow):
         self.top_lines = top
         self.saved_widgets += [self.power_spin, *(w for k, w in self.widgets.items() if k not in NOT_SAVED)]
 
-        # STIM
+        # STIM: настройки канала, выбранного в CH
         lines = []
+        if sup("stim.channel"):
+            self.stim_channels = StimChannels(proxy)
+            lines.append(PanelLine("CH", self.stim_channels.scroll))
         for name, key, extra in STIM_ROWS:
             if not sup(key):
                 continue

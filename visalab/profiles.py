@@ -268,6 +268,8 @@ NETWORK_ANALYZER = Profile(
         Slot("sparam", E, required=True, choices=("S11", "S21", "S12", "S22")),
         Slot("format", E, required=True,
              choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG", "POLAR", "SMITH")),
+        Slot("stim.channel", I, doc="канал, к которому относятся ключи стимула (freq.*, sweep.*, bw.if, avg.*, "
+                                     "cal.state, source.power)"),
         Slot("freq.start", F, "Hz", required=True),
         Slot("freq.stop", F, "Hz", required=True),
         Slot("freq.center", F, "Hz"),

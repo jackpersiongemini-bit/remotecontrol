@@ -338,3 +338,24 @@ def test_complex_formats_and_sdata_off_by_default(vna):
     assert abs(z[0]) == pytest.approx(1.0, abs=0.05)                         # S11 вне полосы ~ 1
     drv.run_action("marker_peak")
     assert not rec.errors and not rec.comm
+
+
+def test_stimulus_of_selected_channel(make):
+    sim = KeysightPNASim()
+    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert rec.values["stim.channel"] == 1 and rec.values["freq.start"] == pytest.approx(10e6)
+    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN
+    assert rec.values["freq.start"] == pytest.approx(1e9) and rec.values["sweep.points"] == 101   # канал 2 перечитан
+    for k, v in (("freq.start", 3e9), ("freq.stop", 4e9), ("sweep.points", 11), ("bw.if", 1e3), ("avg.state", True),
+                 ("source.power", -20.0), ("sweep.type", "CW"), ("freq.cw", 3.5e9)):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
+    st2 = sim.stim(2)
+    assert (st2["start"], st2["stop"], st2["poin"], st2["bwid"], st2["aver"], st2["pow"], st2["type"], st2["cw"]) == \
+        (3e9, 4e9, 11, 1e3, True, -20.0, "CW", 3.5e9)
+    assert (sim.c["start"], sim.c["poin"], sim.c["pow"], sim.c["type"]) == (10e6, 201, -5.0, "LIN")   # канал 1 не тронут
+    assert "SENS2:FREQ:STAR 3000000000" in sim.history and "SOUR2:POW1 -20" in sim.history
+    assert setp(drv, rec, "stim.channel", 7) is PStatus.ERROR                      # нет такого канала
+    assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN
+    assert rec.values["freq.start"] == pytest.approx(10e6) and rec.values["sweep.type"] == "LIN"
+    assert not rec.comm
