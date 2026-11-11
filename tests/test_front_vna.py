@@ -355,7 +355,9 @@ def test_cal_tab_guided_calibration(qtbot, vna):
     assert not cw.isVisible()
     win.cal_button.click()                                     # отдельное окно калибровки
     assert cw.isVisible() and cw.windowTitle() == "CAL CH1"
-    assert [ln.name for ln in cw.table.lines] == ["P1", "P2", "RUN", "STEP", "NAME"]
+    assert [ln.name for ln in cw.table.lines] == ["TYPE", "P1", "P2", "RUN", "STEP", "NAME"]
+    if wz.kind != "FULL":
+        wz.next_type()
     _wait(qtbot, lambda: wz.kit(1) == "Ideal 3.5mm" and wz.kit(2) == "Ideal 3.5mm")   # идеальный - по умолчанию
     assert wz.conn_buttons[1].text() == "3.5 F" and not wz.run_lines[0].isVisible()
     wz.set_conn(2, "Type N (50) male")
@@ -403,3 +405,28 @@ def test_save_s2p_of_selected_channel(qtbot, vna, tmp_path):
     data = [ln for ln in lines if ln and ln[0] not in "!#"]
     assert "# HZ S RI R 50" in lines and len(data) == sim.stim(2)["poin"] and len(data[0].split()) == 9
     assert float(data[0].split()[0]) == pytest.approx(sim.stim(2)["start"])
+
+
+def test_cal_window_thru_response(qtbot, vna):
+    proxy, win, _s, sim = vna
+    wz, cw, te = win.cal_wizard, win.cal_window, win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    win.show()
+    win.open_cal_window()
+    if wz.kind != "THRU":
+        wz.type_button.click()
+    assert wz.kind == "THRU" and not wz.port_lines[0].isVisible() and wz.trace_label.isVisible()
+    assert te.current == (1, "CH1_S11_1") and not wz.start_button.isEnabled()   # S11 - не перемычка
+    te.chips.buttons()[1].click()                              # 1·S21
+    _wait(qtbot, lambda: proxy.value("trace.sel") == "1:USER_S21" and wz.start_button.isEnabled())
+    assert wz.trace_label.text() == "1·S21"
+    wz.start_button.click()
+    _wait(qtbot, lambda: len(wz.step_buttons()) == 1)
+    assert wz.step_buttons()[0].text().startswith("1. THRU between P1 and P2")
+    wz.step_buttons()[0].click()
+    _wait(qtbot, lambda: wz.save_button.isEnabled())
+    wz.name_edit.setText("THRU_CAL")
+    wz.save_button.click()
+    _wait(qtbot, lambda: sim.c["cset"] == "THRU_CAL" and not wz.steps)
+    wz.type_button.click()                                     # обратно FULL
+    assert wz.kind == "FULL" and wz.port_lines[0].isVisible()
