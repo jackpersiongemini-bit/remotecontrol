@@ -1,6 +1,6 @@
 """Окно СВЧ генератора на симуляторе E8267D."""
 import pytest
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QSettings
 
 from visalab.core import InstrumentProxy, SimTransport
 from visalab.drivers import DRIVERS
@@ -27,35 +27,39 @@ def _wait(qtbot, proxy, key, pred):
 def test_layout_tabs_and_favourites(qtbot, rf):
     _proxy, win, _s = rf
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["RF", "AM", "FM", "PM", "PULS"]
-    assert [ln.name for ln in win.preset_panel.table.lines][:3] == ["OUT", "PRST", "FREQ"]
+    assert [ln.name for ln in win.preset_panel.table.lines][:3] == ["OUT", "POW", "FREQ"]
+    assert [ln.name for ln in win.pages[0].lines][:4] == ["OUT", "FREQ", "POW", "PRST"]      # чипы - на вкладке RF
     assert win.freq_spin.key == "rf.frequency"
     assert len(win.preset_panel.table.lines) == 3                # модуляция - только на вкладках
 
 
-def test_power_presets_as_chips(qtbot, rf):
+def test_power_presets_as_in_vna(qtbot, rf):
     proxy, win, settings = rf
-    pl = win.power_levels
+    pl, spin = win.power_levels, win.power_spin
     assert [b.text() for b in pl.chips.buttons()] == ["-20", "-10", "-5", "0"]
     pl.chips.buttons()[1].click()                                  # чип -10 -> мощность
     _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(-10.0))
     qtbot.waitUntil(lambda: pl.chips.checked_index() == 1)
-    assert pl.remove_selected() and pl.levels == [-20.0, -5.0, 0.0]     # «−» - выбранный
+    assert pl.remove_selected() and pl.levels == spin.levels == [-20.0, -5.0, 0.0]     # «−» - выбранный
     proxy.set("rf.power", 3.0)
     _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(3.0))
     assert pl.add_current() and not pl.add_current()               # «+» - текущая, без повторов
-    assert pl.levels == [-20.0, -5.0, 0.0, 3.0] and pl.chips.checked_index() == 3
+    assert spin.levels == [-20.0, -5.0, 0.0, 3.0] and pl.chips.checked_index() == 3
     assert settings.value(f"{win._prefix}/POWER_LIST") == "-20, -5, 0, 3"
-    win.show()
-    qtbot.waitExposed(win)
-    qtbot.keyClick(win, Qt.Key.Key_Left)                           # ← → - соседний уровень
+    win.prst_button.setChecked(True)                               # PRST в избранном: шаг по списку
+    assert settings.value(f"{win._prefix}/POWER_PRESET_MODE", type=bool) is True
+    spin.stepBy(-1)
     _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(0.0))
-    qtbot.keyClick(win, Qt.Key.Key_Left)
-    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(-5.0))
-    qtbot.keyClick(win, Qt.Key.Key_Right)
-    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(0.0))
+    spin.stepBy(-2)
+    _wait(qtbot, proxy, "rf.power", lambda v: v == pytest.approx(-20.0))
+    win.prst_button.setChecked(False)
+    spin.stepBy(1)                                                 # обычный режим: разряд под курсором
+    _wait(qtbot, proxy, "rf.power", lambda v: v > -20.0 and v not in (-5.0, 0.0, 3.0))
     assert win.presets.data == [] and not hasattr(win, "freq_hold")      # пресетов FREQ/POW/MOD и замка нет
-    win.close()
-    assert settings.value(f"{win._prefix}/None") is None
+    win.show()
+    win.set_expanded(True)
+    win.set_page(0)
+    qtbot.wait(50)
     line = win._pwr_tools.parentWidget()                           # «+»/«−» у правого края
     assert line.width() - win._pwr_tools.geometry().right() <= 2 and win._pwr_tools.width() <= 40
 
