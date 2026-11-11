@@ -6,6 +6,8 @@
   ``CALC1:PAR:DEF:EXT 'имя','S11'`` + ``DISP:WIND1:TRAC1:FEED 'имя'`` - создать;
 * формат ``CALC1:FORM MLOG|PHAS|UPH|GDEL|SWR|MLIN|REAL|IMAG``, данные ``CALC1:DATA? FDATA``
   (в формате измерения) и ``CALC1:DATA? SDATA`` (комплексные, пары re,im) при ``FORM:DATA ASCII,0``;
+* тип развёртки ``SENS1:SWE:TYPE LIN|LOG|POW|CW|SEGM``; в CW частота ``SENS1:FREQ:CW``
+  (ВАЦ как генератор: мощность ``SOUR1:POW1``, ``OUTP``), ось трассы - время 0..``SWE:TIME``;
 * стимул ``SENS1:FREQ:STAR|STOP|CENT|SPAN``, ``SENS1:SWE:POIN``, ``SENS1:SWE:TIME`` (+ ``:AUTO``),
   ``SENS1:BWID`` (полоса ПЧ), ``SOUR1:POW1`` (dBm), ``OUTP`` (мощность источника);
 * усреднение ``SENS1:AVER``, ``SENS1:AVER:COUN``; коррекция ``SENS1:CORR:STAT``;
@@ -30,7 +32,8 @@
 / ``state_delete``; после вызова состояния каталог измерений перечитывается и слоты собираются
 заново (как при подключении: включён m1).
 Как и анализатор спектра, ВАЦ ведётся однократными развёртками: наружу уходят только
-целые трассы. Ось X считается линейной от ``SENS<c>:FREQ:STAR`` до ``STOP`` канала измерения.
+целые трассы. Ось X считается линейной от ``SENS<c>:FREQ:STAR`` до ``STOP`` канала измерения
+(в CW - от 0 до времени развёртки, в секундах).
 """
 from __future__ import annotations
 
@@ -70,6 +73,8 @@ MEAS_NAME = "VL_MEAS"
 MEAS_SLOTS = 16                  # слотов выбора измерений (m1..m16)
 FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")
 FORMAT_MAP = (("PHASE", "PHAS"), ("UPHASE", "UPH"), ("GDELAY", "GDEL"), ("LIN_MAG", "MLIN"))
+SWEEP_TYPES = ("LIN", "LOG", "POWER", "CW", "SEGMENT")
+SWEEP_MAP = (("POWER", "POW"), ("SEGMENT", "SEGM"))
 _MEAS_KEY = re.compile(r"m(\d+)\.(\w+)")
 SLOT_KEYS = ("channel", "name", "enabled", "sparam", "format", "math")
 MATH = ("NORM", "DIV", "SUBT", "ADD", "MULT")
@@ -156,6 +161,12 @@ class KeysightPNA(VISAInstrument):
                   **freq),
             Param("freq.span", "Полоса", section=st, query="SENS1:FREQ:SPAN?", write="SENS1:FREQ:SPAN {value}",
                   **{**freq, "minimum": 0.0}),
+            Param("sweep.type", "Тип развёртки", E, section=sw, query="SENS1:SWE:TYPE?",
+                  write="SENS1:SWE:TYPE {value}", choices=SWEEP_TYPES,
+                  labels=("Лин.", "Лог.", "Мощность", "CW", "Сегменты"), enum_map=SWEEP_MAP,
+                  also_read=("sweep.time", "freq.cw")),
+            Param("freq.cw", "Частота CW", section=st, query="SENS1:FREQ:CW?", write="SENS1:FREQ:CW {value}",
+                  **{**freq, "also_read": ()}),
             Param("source.power", "Мощность", F, "dBm", section=st, query="SOUR1:POW1?",
                   write="SOUR1:POW1 {value}", minimum=-90.0, maximum=20.0, tolerance=1e-3),
             Param("rf.output", "Источник вкл.", B, section=st, query="OUTP?", write="OUTP {value}"),
@@ -346,16 +357,22 @@ class KeysightPNA(VISAInstrument):
                 self.write(f"SENS{c}:SWE:MODE HOLD")
             self._set_armed(False)
 
-    def _stimulus(self, channel: int) -> tuple[float, float]:
+    def _stimulus(self, channel: int) -> tuple[float, float, str]:
+        """Ось X трасс канала: (начало, конец, единица). CW - время развёртки."""
+        typ = self._values.get("sweep.type") if channel == 1 else None
+        if typ is None:
+            typ = self.query(f"SENS{channel}:SWE:TYPE?").strip().upper()
+        if typ == "CW":
+            return 0.0, self.query_float(f"SENS{channel}:SWE:TIME?"), "s"
         if channel == 1 and self._values.get("freq.start") is not None and self._values.get("freq.stop") is not None:
-            return self._values["freq.start"], self._values["freq.stop"]
-        return self.query_float(f"SENS{channel}:FREQ:STAR?"), self.query_float(f"SENS{channel}:FREQ:STOP?")
+            return self._values["freq.start"], self._values["freq.stop"], "Hz"
+        return self.query_float(f"SENS{channel}:FREQ:STAR?"), self.query_float(f"SENS{channel}:FREQ:STOP?"), "Hz"
 
     def _read_trace(self) -> None:
         """Включённые слоты после завершённой развёртки: форматированные и комплексные данные."""
         stim = {k: self._values.get(k) for k in ("bw.if", "source.power", "avg.state", "avg.count", "cal.state")}
         cats: dict[int, dict[str, str]] = {}
-        axes: dict[int, tuple[float, float]] = {}
+        axes: dict[int, tuple[float, float, str]] = {}
         out: dict[str, Any] = {}
         count = 0
         for n, slot in enumerate(self._slots, 1):
@@ -367,17 +384,17 @@ class KeysightPNA(VISAInstrument):
             sparam = cat.get(slot.name)
             if sparam is None:                                 # удалено на приборе
                 continue
-            start, stop = axes.setdefault(c, self._stimulus(c))
+            start, stop, x_unit = axes.setdefault(c, self._stimulus(c))
             self._select(slot)
             fmt = self._params[f"m{n}.format"].from_scpi(self.query(f"CALC{c}:FORM?"))
             math = self._params[f"m{n}.math"].from_scpi(self.query(f"CALC{c}:MATH:FUNC?"))
             y = [parse_number(t) for t in self.query(f"CALC{c}:DATA? FDATA").split(",") if t.strip()]
             meta = {**stim, "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
-            out[f"m{n}.trace"] = Trace.linear(start, stop, y, x_unit="Hz", y_unit=Y_UNITS.get(fmt, ""),
+            out[f"m{n}.trace"] = Trace.linear(start, stop, y, x_unit=x_unit, y_unit=Y_UNITS.get(fmt, ""),
                                               name=sparam, meta=meta)
             if self._complex:
                 raw = [parse_number(t) for t in self.query(f"CALC{c}:DATA? SDATA").split(",") if t.strip()]
-                out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit="Hz", y_unit="",
+                out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit=x_unit, y_unit="",
                                                   name=sparam, meta={**meta, "format": "SDATA", "math": "NORM"})
             count += 1
             for k, v in ((f"m{n}.sparam", sparam), (f"m{n}.format", fmt), (f"m{n}.math", math)):
