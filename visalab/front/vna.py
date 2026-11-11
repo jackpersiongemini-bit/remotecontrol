@@ -25,13 +25,13 @@ import re
 from typing import Any
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtWidgets import QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QSizePolicy, QWidget
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
 from ..core.scpi import si_format
 from . import instrument_window as _iw
-from .instrument_window import PRESET_GAP, PRESET_HEIGHT, HScrollArea, InstrumentWindow, PresetGroup
+from .instrument_window import PRESET_GAP, HScrollArea, InstrumentWindow, PresetGroup
 from .params import IndicatorButton, PBGroup, PLineEdit, PSButton, PSpinBox, PanelLine, PanelTable
 from .power_meter import ActionButton
 from .spectrum import StatePresets
@@ -45,7 +45,7 @@ ONOFF = [("OFF", False), ("ON", True)]
 AUTO = [("MAN", False), ("AUTO", True)]
 SLOTS = 16
 MATH = (("DATA", "NORM"), ("D/M", "DIV"), ("D−M", "SUBT"), ("D+M", "ADD"), ("D·M", "MULT"))
-CHANNEL_CHIP_HEIGHT = 30          # чипы каналов - высотой с обычную кнопку строки
+TRACE_CHIP_HEIGHT = 30            # чипы трейсов в избранном - высотой с обычную кнопку строки
 DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
 
 #: вкладка STIM: (подпись, ключ, второй ключ или None)
@@ -231,85 +231,22 @@ class MenuButton(IndicatorButton):
         menu.popup(self.mapToGlobal(self.rect().bottomLeft()))
 
 
-class _ChannelChip(QPushButton):
-    def __init__(self, channel: int):
-        super().__init__(str(channel))
-        self.channel = channel
-        self.setObjectName("chip")
-        self.setCheckable(True)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"Channel {channel}: POW / CW / CORR and the STIM tab")
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-    def sizeHint(self):  # noqa: N802 - Qt; квадрат высотой с обычную строку (QSS чипа иначе перебивает)
-        return QSize(CHANNEL_CHIP_HEIGHT, CHANNEL_CHIP_HEIGHT)
-
-    def minimumSizeHint(self):  # noqa: N802 - Qt
-        return self.sizeHint()
-
-
-class StimChannels(PBGroup):
-    """Каналы прибора чипами (как пресеты, без «+»/«−»): выбранный - канал вкладки STIM (``stim.channel``).
-    Список каналов - из таблицы трейсов (``meas_table`` и действия, которые её возвращают)."""
-
-    def __init__(self, proxy: InstrumentProxy, parent=None):
-        self.proxy = proxy
-        super().__init__(parent=parent)
-        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.channels: list[int] = []
-        self.scroll = HScrollArea(self, CHANNEL_CHIP_HEIGHT)
-        self.selected.connect(lambda i: proxy.set("stim.channel", self.channels[i]))
-        proxy.subscribe("stim.channel", lambda _v: self._show())
-        proxy.subscribe("gen.state", lambda _v: self._show())          # генератор: остальные каналы недоступны
-        proxy.action_done.connect(self._on_action)
-        self.set_channels([1])
-
-    def add_button(self, name: str) -> QPushButton:  # чипы создаёт set_channels
-        raise NotImplementedError
-
-    def _on_action(self, name: str, result) -> None:
-        if name in ("meas_table", "meas_config", "meas_create", "meas_delete", "meas_move") and \
-                isinstance(result, (list, tuple)):
-            self.set_channels(sorted({int(r[0]) for r in result}) or [1])
-
-    def set_channels(self, channels: list[int]) -> None:
-        cur = self.proxy.value("stim.channel")
-        channels = sorted(set(channels) | ({cur} if isinstance(cur, int) else set()))
-        if channels != self.channels:
-            while self._buttons:
-                self.remove_button(0)
-            for c in channels:
-                b = _ChannelChip(c)
-                self._group.addButton(b, len(self._buttons))
-                self._buttons.append(b)
-            self._relayout()
-            self.channels = channels
-        self._show()
-
-    def _show(self) -> None:
-        cur = self.proxy.value("stim.channel")
-        self.set_checked(self.channels.index(cur) if cur in self.channels else -1)
-        gen = self.proxy.value("gen.state") is True
-        for c, b in zip(self.channels, self._buttons):
-            b.setEnabled(not gen or c == cur)
-
-
 class _TraceChip(IndicatorButton):
     """Чип трейса: выбор - инверсия (как у пресета), индикатор снизу - трейс читается (у выбранного
-    не рисуется: выбор и включение не смешиваются). Высота - как у «+»/«−», ширина - вся строка."""
+    не рисуется: выбор и включение не смешиваются). Высота - строка избранного, ширина - вся строка."""
 
     def __init__(self, owner: "TraceEditor", key: tuple[int, str]):
         super().__init__()
         self.owner, self.trace_key = owner, key
         self.setObjectName("chip")
+        self.setProperty("tight", True)                    # узкие поля: больше трейсов в строке без прокрутки
         self.setCheckable(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def sizeHint(self):  # noqa: N802 - Qt; QSS чипа (min/max-height) иначе перебивает setFixedHeight
-        return QSize(super().sizeHint().width(), PRESET_HEIGHT)
+        return QSize(super().sizeHint().width(), TRACE_CHIP_HEIGHT)
 
     def minimumSizeHint(self):  # noqa: N802 - Qt
         return self.sizeHint()
@@ -340,9 +277,11 @@ class TraceChips(PBGroup):
 
 
 class TraceEditor(QWidget):
-    """Вкладка TRAC: сверху чипы всех трейсов прибора (по всем каналам), под ними - выбранный трейс:
-    канал (список: перенести в другой канал), READ, S-параметр, формат, математика.
-    Слоты не видны: READ сам занимает свободный (до 16 читаемых)."""
+    """Трейсы: чипы всех трейсов прибора (по всем каналам) - строка TRC избранного; выбранный трейс
+    задаёт и текущий канал окна (``stim.channel``: POW / CW / CORR, STIM, режим TRIG). Вкладка TRAC -
+    выбранный трейс: канал (список: перенести в другой канал), READ, S-параметр, формат, математика.
+    Слоты не видны: READ сам занимает свободный (до 16 читаемых). В режиме генератора трейсы
+    других каналов недоступны."""
 
     def __init__(self, proxy: InstrumentProxy, parent=None):
         super().__init__(parent)
@@ -351,7 +290,7 @@ class TraceEditor(QWidget):
         self.current: tuple[int, str] | None = None
         self.chips = TraceChips(self)
         self.chips.selected.connect(self._chip_clicked)
-        self.scroll = HScrollArea(self.chips)
+        self.scroll = HScrollArea(self.chips, TRACE_CHIP_HEIGHT)
         cfg = lambda what: (lambda v: self.configure(what, v))
         self.channel = MenuButton([], self._channel_picked, "Channel: pick another to move the trace there")
         self.read = _ReadButton(self)
@@ -364,6 +303,8 @@ class TraceEditor(QWidget):
         self.math.indicated = lambda: self.math.value not in (None, "NORM")
         self.editors = (self.channel, self.read, self.sparam, self.format, self.math)
         proxy.action_done.connect(self._on_action)
+        proxy.subscribe("stim.channel", self._on_stim_channel)
+        proxy.subscribe("gen.state", lambda _v: self._show_current())
         for n in range(1, SLOTS + 1):
             for what in ("channel", "name", "enabled", "sparam", "format", "math"):
                 if proxy.supports(f"m{n}.{what}"):
@@ -417,6 +358,22 @@ class TraceEditor(QWidget):
         if 0 <= index < len(self.table):
             self.current = self.table[index][:2]
             self._show_current()
+            self._follow_channel()
+
+    def _follow_channel(self) -> None:
+        """Канал окна - канал выбранного трейса."""
+        p = self.proxy
+        if self.current is not None and p.supports("stim.channel") and p.is_connected and \
+                p.value("stim.channel") != self.current[0]:
+            p.set("stim.channel", self.current[0])
+
+    def _on_stim_channel(self, value) -> None:
+        """Канал сменился не кликом (вызов состояния, отказ в генераторе): выбрать трейс этого канала."""
+        if isinstance(value, int) and self.current is not None and self.current[0] != value:
+            first = next(((c, n) for c, n, *_ in self.table if c == value), None)
+            if first is not None:
+                self.current = first
+        self._show_current()
 
     def _channel_picked(self, value) -> None:
         if self.current is not None and value != self.current[0]:
@@ -452,14 +409,23 @@ class TraceEditor(QWidget):
             if old and len(added) == 1:                    # новый трейс (+ или перенос) - выбрать его
                 self.current = added[0]
             elif self.current not in keys:
-                self.current = keys[0] if keys else None
+                cur = self.proxy.value("stim.channel")
+                self.current = next((k for k in keys if k[0] == cur), keys[0] if keys else None)
             self.chips.updateGeometry()
         self._show_current()
+        self._follow_channel()
 
     def _show_current(self) -> None:
+        gen = self.proxy.value("gen.state") is True
+        cur_ch = self.proxy.value("stim.channel")
+        pairs = [(c, sp) for c, _n, sp, *_ in self.table]
         for b, (c, n, sp, fmt, math) in zip(self.chips.buttons(), self.table):
-            b.setText(f"C{c} {sp}\n{next((n for n, d in FORMATS if d == fmt), fmt)}")
+            label = f"{c}·{sp}"
+            if pairs.count((c, sp)) > 1:                   # одинаковые S-параметры канала - различить форматом
+                label += " " + next((n for n, d in FORMATS if d == fmt), fmt)
+            b.setText(label)
             b.setToolTip(f"Channel {c}, measurement {n!r}\n{sp} {fmt} {math}")
+            b.setEnabled(not gen or c == cur_ch)
             b.update()
         keys = [(c, n) for c, n, *_ in self.table]
         self.chips.set_checked(keys.index(self.current) if self.current in keys else -1)
@@ -504,10 +470,14 @@ class VNAWindow(InstrumentWindow):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
         # столбики «+»/«−» (TRAC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)
-        for tools in (getattr(self, "_trc_tools", None), getattr(self, "add_button", None) and self.add_button.parentWidget()):
-            if tools is not None:
-                tools.setMinimumWidth(0)
-                tools.setFixedWidth(max(b.sizeHint().width() for b in tools.findChildren(QPushButton)))
+        trc = getattr(self, "_trc_tools", None)
+        if trc is not None:                           # «+» и «−» трейсов - рядом, квадратами
+            trc.setMinimumWidth(0)
+            trc.setFixedWidth(2 * TRACE_CHIP_HEIGHT + PRESET_GAP)
+        save = getattr(self, "add_button", None) and self.add_button.parentWidget()
+        if save is not None:
+            save.setMinimumWidth(0)
+            save.setFixedWidth(max(b.sizeHint().width() for b in save.findChildren(QPushButton)))
         proxy.action_done.connect(self._on_action)
         proxy.sync_done.connect(self.refresh_lists)
         if proxy.is_connected:
@@ -518,9 +488,18 @@ class VNAWindow(InstrumentWindow):
         proxy, sup, pre = self.proxy, self.proxy.supports, self._prefix
         self.widgets: dict[str, Any] = {}
         top = []
-        if sup("stim.channel"):                       # текущий канал окна: POW / CW / CORR и вкладка STIM
-            self.stim_channels = StimChannels(proxy)
-            top.append(PanelLine("CH", self.stim_channels.scroll))
+        if "meas_table" in proxy.actions:            # трейсы; выбранный задаёт канал POW / CW / CORR, STIM, TRIG
+            te = self.trace_editor = TraceEditor(proxy)
+            tools = self._trc_tools = QWidget()
+            tl = QHBoxLayout(tools)
+            tl.setContentsMargins(0, 0, 0, 0)
+            tl.setSpacing(PRESET_GAP)
+            for text, tip, slot in (("+", "New S21 trace on the channel of the selected one", te.create),
+                                    ("−", "Delete the selected trace from the analyzer", te.delete)):
+                b = self._tool(text, tip, slot, TRACE_CHIP_HEIGHT)
+                b.setFixedWidth(TRACE_CHIP_HEIGHT)
+                tl.addWidget(b)
+            top.append(PanelLine("TRC", te.scroll, tools))
         if "mem_store" in proxy.actions:
             top.append(PanelLine("MEM", ActionButton(proxy, "mem_store", "CAPTURE",
                                                      "Copy data to memory for every measurement being read")))
@@ -601,19 +580,10 @@ class VNAWindow(InstrumentWindow):
         pwr.append(PanelLine("LIST", self.levels_edit))
         self.page_specs.append(("PWR", ("rf.output",) if sup("rf.output") else (), PanelTable(*pwr)))
 
-        # TRAC (первая вкладка): чипы всех трейсов прибора, под ними - выбранный трейс
+        # TRAC (первая вкладка): трейс, выбранный в избранном (TRC)
         if "meas_table" in proxy.actions:
-            te = self.trace_editor = TraceEditor(proxy)
-            half = (PRESET_HEIGHT - PRESET_GAP) // 2
-            tools = self._trc_tools = QWidget()
-            tl = QVBoxLayout(tools)
-            tl.setContentsMargins(0, 0, 0, 0)
-            tl.setSpacing(PRESET_GAP)
-            tl.addWidget(self._tool("+", "New S21 trace on the channel of the selected one", te.create, half))
-            tl.addWidget(self._tool("−", "Delete the selected trace from the analyzer", te.delete, half))
-            chips = PanelLine("TRC", te.scroll, tools)
-            chips.line_layout.setAlignment(chips._name, Qt.AlignmentFlag.AlignTop)
-            trac = [chips, PanelLine("CH", te.channel, te.read), PanelLine("SPAR", te.sparam),
+            te = self.trace_editor
+            trac = [PanelLine("CH", te.channel, te.read), PanelLine("SPAR", te.sparam),
                     PanelLine("FMT", te.format), PanelLine("MATH", te.math)]
             quick = [ActionButton(proxy, a, t, tip) for a, t, tip in
                      (("meas_all", "ALL", "Read every trace (first 16)"), ("meas_none", "NONE", "Read nothing"))
