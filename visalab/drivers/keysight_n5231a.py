@@ -36,6 +36,11 @@
 слотов, без аргументов - все включённые). Состояния: ``state_list`` / ``state_save`` / ``state_recall``
 / ``state_delete``; после вызова состояния каталог измерений перечитывается и слоты собираются
 заново (как при подключении: включён m1).
+Режим генератора ``gen.state``: канал ``stim.channel`` переходит в CW, остальные каналы не
+развёртываются (стоят в HOLD, их слоты не читаются), канал стимула закреплён (``gen.channel``).
+Перед включением запоминаются тип развёртки, старт/стоп, точки, полоса ПЧ, время, усреднение,
+коррекция, мощность и ``OUTP`` канала; выключение возвращает всё как было (частота CW остаётся).
+Отключение от прибора в режиме генератора тоже возвращает настройки.
 Как и анализатор спектра, ВАЦ ведётся однократными развёртками: наружу уходят только
 целые трассы. Ось X считается линейной от ``SENS<c>:FREQ:STAR`` до ``STOP`` канала измерения
 (в CW - от 0 до времени развёртки, в секундах).
@@ -83,6 +88,9 @@ FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG"
 FORMAT_MAP = (("PHASE", "PHAS"), ("UPHASE", "UPH"), ("GDELAY", "GDEL"), ("LIN_MAG", "MLIN"), ("POLAR", "POL"),
               ("SMITH", "SMIT"))
 COMPLEX_FORMATS = ("POLAR", "SMITH")     # FDATA - пары re,im: трасса с Trace.im
+#: что режим генератора запоминает и возвращает (в этом порядке)
+GEN_KEYS = ("sweep.type", "freq.start", "freq.stop", "sweep.points", "bw.if", "sweep.time_auto", "sweep.time",
+            "avg.state", "avg.count", "cal.state", "source.power", "rf.output")
 SWEEP_TYPES = ("LIN", "LOG", "POWER", "CW", "SEGMENT")
 SWEEP_MAP = (("POWER", "POW"), ("SEGMENT", "SEGM"))
 _MEAS_KEY = re.compile(r"m(\d+)\.(\w+)")
@@ -117,6 +125,7 @@ class KeysightPNA(VISAInstrument):
         self._armed_channels: list[int] = [1]
         self.meas_name = ""
         self._stim_ch = 1
+        self._gen: tuple[int, dict[str, Any]] | None = None     # режим генератора: (канал, снимок GEN_KEYS)
         super().__init__(transport, parent, command_delay_s)
 
     @property
@@ -154,6 +163,9 @@ class KeysightPNA(VISAInstrument):
             Param("meas.count", "Измерений", I, section=rs, group="SWEEP"),
             Param("stim.channel", "Канал стимула", I, section=st, query="<virtual>", write="<virtual>",
                   minimum=1, maximum=200, also_read=STIM_KEYS),
+            Param("gen.state", "Режим генератора", B, section=st, query="<virtual>", write="<virtual>",
+                  also_read=(*STIM_KEYS, "rf.output", "gen.channel", "stim.channel")),
+            Param("gen.channel", "Канал генератора", I, section=st, query="<virtual>"),
             Param("meas.complex", "Комплексные данные", B, section=rs, query="<virtual>", write="<virtual>"),
             Param("meas.armed", "Идёт развёртка", B, section=sw, query="<virtual>"),
             Param("meas.continuous", "Непрерывно", B, section=sw, query="<virtual>", write="<virtual>"),
@@ -223,6 +235,7 @@ class KeysightPNA(VISAInstrument):
     def on_connected(self) -> None:
         self._armed = False
         self._stim_ch = 1
+        self._gen = None                      # после *RST / вызова состояния возвращать нечего
         self._sweep = {}
         self.write("FORM:DATA ASCII,0")
         cat = self._catalog()
@@ -240,6 +253,13 @@ class KeysightPNA(VISAInstrument):
     def on_disconnecting(self) -> None:
         if self._armed:
             self._abort()
+        if self._gen is not None:             # не оставлять прибор в режиме генератора
+            c, snap = self._gen
+            self._gen = None
+            try:
+                self._gen_restore(c, snap)
+            except Exception:                 # отключение не должно срываться
+                pass
 
     def _catalog(self, channel: int = 1) -> dict[str, str]:
         """{имя измерения: S-параметр} канала."""
@@ -267,7 +287,9 @@ class KeysightPNA(VISAInstrument):
         return None
 
     def _active_channels(self) -> list[int]:
-        """Каналы, которые нужно развернуть: включённые слоты (иначе - канал 1)."""
+        """Каналы, которые нужно развернуть: включённые слоты (иначе - канал 1); генератор - только его канал."""
+        if self._gen is not None:
+            return [self._gen[0]]
         return sorted({s.channel for s in self._slots if s.enabled and s.name}) or [1]
 
     def write_param(self, spec: Param, value: Any) -> None:
@@ -279,8 +301,13 @@ class KeysightPNA(VISAInstrument):
         if spec.key == "meas.complex":
             self._complex = bool(value)
             return
+        if spec.key == "gen.state":
+            self._set_gen(bool(value))
+            return
         if spec.key == "stim.channel":
             c = int(value)
+            if self._gen is not None and c != self._gen[0]:
+                raise ValueError(f"режим генератора на канале {self._gen[0]}: сначала выключите CW")
             if c not in self._channels():
                 raise ValueError(f"нет канала {c} (каналы: {self._channels()})")
             self._stim_ch = c
@@ -331,6 +358,10 @@ class KeysightPNA(VISAInstrument):
             return self._complex
         if key == "stim.channel":
             return self._stim_ch
+        if key == "gen.state":
+            return self._gen is not None
+        if key == "gen.channel":
+            return self._gen[0] if self._gen is not None else None
         if key in STIM_KEYS:
             return super().read_param_raw(self._stim_spec(spec))
         if key == "sparam":
@@ -386,13 +417,48 @@ class KeysightPNA(VISAInstrument):
                 self.write(f"SENS{c}:SWE:MODE HOLD")
             self._set_armed(False)
 
-    def _stim_spec(self, spec: Param) -> Param:
-        """Ключ стимула -> команды для канала ``stim.channel``."""
-        if spec.key not in STIM_KEYS or self._stim_ch == 1:
+    def _stim_spec(self, spec: Param, channel: int | None = None) -> Param:
+        """Ключ стимула -> команды для канала ``channel`` (по умолчанию ``stim.channel``)."""
+        c = self._stim_ch if channel is None else channel
+        if spec.key not in STIM_KEYS or c == 1:
             return spec
-        c = self._stim_ch
         sub = lambda t: t and t.replace("SENS1:", f"SENS{c}:").replace("SOUR1:", f"SOUR{c}:")
         return replace(spec, query=sub(spec.query), write=sub(spec.write))
+
+    # ------------------------------------------------------- режим генератора
+    def _set_gen(self, on: bool) -> None:
+        if on == (self._gen is not None):
+            return
+        was_armed = self._armed
+        self._abort()
+        try:
+            if on:
+                c = self._stim_ch
+                snap = {k: super(KeysightPNA, self).read_param_raw(self._stim_spec(self._params[k], c))
+                        for k in GEN_KEYS}
+                self.write(f"SENS{c}:SWE:TYPE CW")
+                self._gen = (c, snap)
+            else:
+                c, snap = self._gen
+                self._gen = None
+                self._gen_restore(c, snap)
+        finally:
+            if was_armed or self._continuous:
+                self._start_sweep()
+
+    def _gen_restore(self, channel: int, snap: dict[str, Any]) -> None:
+        """Вернуть настройки канала, запомненные при включении генератора (ошибка одной не мешает остальным)."""
+        first: Exception | None = None
+        for k in GEN_KEYS:
+            v = snap.get(k)
+            if v is None or (k == "sweep.time" and snap.get("sweep.time_auto")):
+                continue
+            try:
+                super().write_param(self._stim_spec(self._params[k], channel), v)
+            except Exception as e:  # noqa: BLE001
+                first = first or e
+        if first is not None:
+            raise first
 
     def _stimulus(self, channel: int) -> tuple[float, float, str]:
         """Ось X трасс канала: (начало, конец, единица). CW - время развёртки."""
@@ -415,8 +481,8 @@ class KeysightPNA(VISAInstrument):
         count = 0
         for n, slot in enumerate(self._slots, 1):
             out[f"m{n}.trace"] = out[f"m{n}.sdata"] = None
-            if not (slot.enabled and slot.name):
-                continue
+            if not (slot.enabled and slot.name) or (self._gen is not None and slot.channel != self._gen[0]):
+                continue                                       # генератор: остальные каналы не развёртываются
             c = slot.channel
             cat = cats.setdefault(c, self._catalog(c))
             sparam = cat.get(slot.name)

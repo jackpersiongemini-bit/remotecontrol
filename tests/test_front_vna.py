@@ -72,17 +72,21 @@ def test_power_preset_mode(qtbot, vna):
 def test_cw_generator_and_correction(qtbot, vna):
     proxy, win, _s, sim = vna
     win.cw_spin.set_value(2.5e9)
-    _wait(qtbot, lambda: sim.c["cw"] == pytest.approx(2.5e9))
+    win.widgets["rf.output"].set_value(False)
+    _wait(qtbot, lambda: sim.c["cw"] == pytest.approx(2.5e9) and sim.c["outp"] is False)
     win.cw_button.click()
-    _wait(qtbot, lambda: proxy.value("sweep.type") == "CW" and sim.c["type"] == "CW")
-    assert win.cw_button.indicated()
+    _wait(qtbot, lambda: proxy.value("gen.state") is True and sim.c["type"] == "CW")
+    assert win.cw_button.indicated() and proxy.value("sweep.type") == "CW"
+    assert [b.isEnabled() for b in win.stim_channels.buttons()] == [True, False]      # канал 2 стоит
     win.widgets["rf.output"].set_value(True)
     win.widgets["cal.state"].set_value(True)
     _wait(qtbot, lambda: sim.c["corr"] is True and sim.c["outp"] is True)
     win.widgets["cal.state"].next_value()                      # CORR OFF
     _wait(qtbot, lambda: sim.c["corr"] is False)
-    win.cw_button.click()                                      # обратно к прежней развёртке
-    _wait(qtbot, lambda: sim.c["type"] == "LIN")
+    win.cw_button.click()                                      # всё как было до генератора
+    _wait(qtbot, lambda: sim.c["type"] == "LIN" and proxy.value("gen.state") is False)
+    assert sim.c["outp"] is False and sim.c["cw"] == pytest.approx(2.5e9)
+    assert all(b.isEnabled() for b in win.stim_channels.buttons())
 
 
 def _chips(te):

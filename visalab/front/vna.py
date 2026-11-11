@@ -155,34 +155,32 @@ class MathButton(IndicatorButton):
 
 
 class CWButton(IndicatorButton):
-    """CW (одна частота): включена, когда тип развёртки CW; повторный клик - прежний тип (ini)."""
+    """CW - режим генератора (``gen.state``): канал CH в CW, остальные каналы стоят; повторный клик
+    возвращает настройки канала, как были до включения (это делает драйвер)."""
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+    def __init__(self, proxy: InstrumentProxy, parent=None):
         super().__init__("CW", parent)
-        self.proxy, self.settings, self._key = proxy, settings, f"{prefix}/LAST_SWEEP_TYPE"
+        self.proxy = proxy
         self.setObjectName("choice")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("CW: one frequency, the analyzer works as a generator. Click again to restore the sweep")
-        self._type: str | None = None
-        self.last_type = str(settings.value(self._key, "LIN"))
+        self.setToolTip("Generator mode: the CH channel goes to CW, other channels stop.\n"
+                        "Click again to restore everything as it was")
+        self._on: bool | None = None
         self.clicked.connect(self.toggle)
-        proxy.subscribe("sweep.type", self._on_type)
+        proxy.subscribe("gen.state", self._on_state)
 
     def indicated(self) -> bool:
-        return self._type == "CW"
+        return bool(self._on)
 
-    def _on_type(self, value) -> None:
-        self._type = value
-        if value and value != "CW":
-            self.last_type = str(value)
-            self.settings.setValue(self._key, self.last_type)
+    def _on_state(self, value) -> None:
+        self._on = value
         self.update()
 
     def toggle(self) -> None:
-        if not self.proxy.is_connected or self._type is None:
+        if not self.proxy.is_connected or self._on is None:
             return
-        self.proxy.set("sweep.type", self.last_type if self._type == "CW" else "CW")
+        self.proxy.set("gen.state", not self._on)
 
 
 SPARAMS = ("S11", "S21", "S12", "S22")
@@ -253,6 +251,7 @@ class StimChannels(PBGroup):
         self.scroll = HScrollArea(self, CHANNEL_CHIP_HEIGHT)
         self.selected.connect(lambda i: proxy.set("stim.channel", self.channels[i]))
         proxy.subscribe("stim.channel", lambda _v: self._show())
+        proxy.subscribe("gen.state", lambda _v: self._show())          # генератор: остальные каналы недоступны
         proxy.action_done.connect(self._on_action)
         self.set_channels([1])
 
@@ -281,6 +280,9 @@ class StimChannels(PBGroup):
     def _show(self) -> None:
         cur = self.proxy.value("stim.channel")
         self.set_checked(self.channels.index(cur) if cur in self.channels else -1)
+        gen = self.proxy.value("gen.state") is True
+        for c, b in zip(self.channels, self._buttons):
+            b.setEnabled(not gen or c == cur)
 
 
 class _TraceChip(IndicatorButton):
@@ -532,8 +534,8 @@ class VNAWindow(InstrumentWindow):
         self.prst_button.setChecked(self.settings.value(f"{pre}/POWER_PRESET_MODE", False, type=bool))
         pow_ws.append(self.prst_button)
         top.append(PanelLine("POW", *pow_ws))
-        if sup("sweep.type") and sup("freq.cw"):
-            self.cw_button = CWButton(proxy, self.settings, pre)
+        if sup("gen.state") and sup("freq.cw"):
+            self.cw_button = CWButton(proxy)
             self.cw_spin = PSpinBox(proxy, "freq.cw", ("k", "M", "G"))
             self.widgets["freq.cw"] = self.cw_spin
             top.append(PanelLine("CW", self.cw_button, self.cw_spin))
