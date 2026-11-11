@@ -197,9 +197,11 @@ def test_thresholds_in_main_window_settings(qtbot, lab, tmp_path):
     win = MainWindow(settings, ActivityMonitor(links, Thresholds(hold_s=0.5)))
     qtbot.addWidget(win)
     win.show()
-    assert not win.settings_panel.isVisible()
-    win.set_button.click()
-    assert win.settings_panel.isVisible() and set(win.fields) >= {"vna_thru_db", "vna_refl_db", "pm_floor_dbm"}
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["LIVE", "SET"]
+    assert win.live_page.isVisible() and not win.settings_panel.isVisible()
+    win.tabs.setCurrentIndex(1)                         # SET - настройки вместо живых данных
+    assert win.settings_panel.isVisible() and not win.live_page.isVisible()
+    assert settings.value("MAIN/TAB", type=int) == 1 and set(win.fields) >= {"vna_thru_db", "vna_refl_db", "pm_floor_dbm"}
     qtbot.waitUntil(lambda: win.monitor.activity(vna).measuring, timeout=10000)
     f = win.fields["vna_refl_db"]                       # фильтр в S11 ~ -34 dB: порог ниже - не измеряет
     f.setText("-60")
@@ -214,4 +216,4 @@ def test_thresholds_in_main_window_settings(qtbot, lab, tmp_path):
     assert win.monitor.th.freq_tol_rel == pytest.approx(0.005)
     win2 = MainWindow(settings, ActivityMonitor(links))   # из ini
     qtbot.addWidget(win2)
-    assert win2.monitor.th.vna_refl_db == -60.0 and win2.fields["vna_refl_db"].text() == "-60 dB"
+    assert win2.tabs.currentIndex() == 1 and win2.monitor.th.vna_refl_db == -60.0 and win2.fields["vna_refl_db"].text() == "-60 dB"

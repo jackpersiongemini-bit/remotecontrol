@@ -9,8 +9,8 @@
 * анализатор спектра - трасса, пик, шумовая дорожка.
 
 У панели - источник сигнала, если координатор его нашёл: «← GEN 1 GHz  PATH −10.0 dB».
-ALL - показывать и приёмники, которые сейчас ничего не измеряют. SET - пороги «измеряет / не измеряет»
-(сохраняются в ini, группа MAIN/THRESHOLDS). Окно знает только ключи профилей.
+ALL - показывать и приёмники, которые сейчас ничего не измеряют. Вкладки: LIVE - живые данные,
+SET - пороги «измеряет / не измеряет» (сохраняются в ini, группа MAIN/THRESHOLDS). Окно знает только ключи профилей.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from ..core.params import ConnectionState
 from ..core.scpi import si_format, si_parse
 from ..core.trace import Trace
 from .live_plot import LivePlot
-from .params import IndicatorButton, Panel, PanelLine, PanelTable
+from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar
 from .theme import WINDOW_BAR_HEIGHT
 from .window import Window, short_address
 
@@ -211,6 +211,7 @@ class MainWindow(Window):
     """Главное окно лаборатории: плитки приборов и живые данные того, что измеряет."""
 
     SETTINGS_GROUP = "MAIN"
+    TABS = ("LIVE", "SET")
 
     def __init__(self, settings: QSettings, monitor: ActivityMonitor | None = None, parent=None):
         super().__init__(settings, parent)
@@ -232,15 +233,8 @@ class MainWindow(Window):
         self.all_button.setToolTip("Show all receivers, also those that measure nothing now")
         self.all_button.setChecked(settings.value(f"{self.SETTINGS_GROUP}/SHOW_ALL", False, type=bool))
         self.all_button.toggled.connect(self._on_all)
-        self.set_button = QPushButton("SET")
-        self.set_button.setObjectName("chip")
-        self.set_button.setCheckable(True)
-        self.set_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.set_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.set_button.setToolTip("Thresholds: when an instrument counts as measuring")
         self.strip_layout.addStretch()
         self.strip_layout.addWidget(self.all_button)
-        self.strip_layout.addWidget(self.set_button)
         self.strip_panel = Panel(strip)
         self.strip_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
@@ -265,23 +259,37 @@ class MainWindow(Window):
             lines.append(line)
         self.settings_panel = Panel(PanelTable(*lines))
         self.settings_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.settings_panel.setVisible(False)
-        self.set_button.toggled.connect(self.settings_panel.setVisible)
 
         self.idle = QLabel("NOTHING IS MEASURING")
         self.idle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.idle.setStyleSheet("color: #8a8a8a; padding: 24px;")
+        self.live_page = QWidget()
+        live = QVBoxLayout(self.live_page)
+        live.setContentsMargins(0, 0, 0, 0)
+        live.setSpacing(8)
         self.live_layout = QVBoxLayout()
         self.live_layout.setSpacing(8)
+        live.addLayout(self.live_layout)
+        live.addWidget(self.idle)
+
+        # вкладки: LIVE - что измеряется, SET - пороги (как вкладки в окнах приборов)
+        self.tabs = PTabBar()
+        for title in self.TABS:
+            self.tabs.addTab(title)
+        self.tabs.setTabToolTip(1, "Thresholds: when an instrument counts as measuring")
+        self.tabs_panel = Panel(self.tabs)
+        self.tabs_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
         lay.setSpacing(8)
         lay.addWidget(self.strip_panel)
+        lay.addWidget(self.tabs_panel)
+        lay.addWidget(self.live_page)
         lay.addWidget(self.settings_panel)
-        lay.addLayout(self.live_layout)
-        lay.addWidget(self.idle)
         lay.addStretch()
+        self.tabs.currentChanged.connect(self.set_page)
+        self.set_page(settings.value(f"{self.SETTINGS_GROUP}/TAB", 0, type=int))
 
         self.monitor.roster_changed.connect(self._rebuild)
         self.monitor.changed.connect(self._on_changed)
@@ -350,6 +358,16 @@ class MainWindow(Window):
             if panel.isVisible() and panel.profile == "power_meter":
                 panel.refresh(self.monitor.activity(p))
 
+    def set_page(self, index: int) -> None:
+        """0 - LIVE (живые данные), 1 - SET (пороги)."""
+        index = index if 0 <= index < len(self.TABS) else 0
+        if self.tabs.currentIndex() != index:
+            self.tabs.setCurrentIndex(index)            # вызовет set_page ещё раз
+            return
+        self.live_page.setVisible(index == 0)
+        self.settings_panel.setVisible(index == 1)
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/TAB", index)
+
     def _apply_setting(self, name: str) -> None:
         f = self.fields[name]
         try:
@@ -370,13 +388,13 @@ class MainWindow(Window):
         shown = 0
         for p, panel in self.panels.items():
             vis = show_all or self.monitor.activity(p).measuring
-            if panel.isVisibleTo(self) != vis:
+            if panel.isVisibleTo(self.live_page) != vis:
                 panel.setVisible(vis)
             shown += vis
         self.idle.setVisible(shown == 0)
 
     def visible_panels(self) -> list[LivePanel]:
-        return [panel for panel in self.panels.values() if panel.isVisibleTo(self)]
+        return [panel for panel in self.panels.values() if panel.isVisibleTo(self.live_page)]
 
     # ------------------------------------------------------------ окна приборов
     def open_instrument(self, proxy) -> None:
