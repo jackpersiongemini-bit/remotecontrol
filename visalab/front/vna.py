@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QSize, Qt, QTimer
-from PyQt6.QtWidgets import QFileDialog, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (QFileDialog, QFrame, QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy,
+                             QVBoxLayout, QWidget)
 
 from ..core.export import write_touchstone, write_traces_csv
 from ..core.params import Kind
@@ -494,6 +495,7 @@ class MarkerPanel(QWidget):
     значение выбранного и список всех включённых (перечитывается после каждой развёртки)."""
 
     MARKS = 10
+    LIST_LINES = 3                                         # строк списка маркеров: окно от числа маркеров не растёт
 
     def __init__(self, proxy: InstrumentProxy, trace_row=None, parent=None):
         super().__init__(parent)
@@ -514,8 +516,14 @@ class MarkerPanel(QWidget):
         self.value.setToolTip("Value of the selected marker on the selected trace")
         self.list = QLabel("")
         self.list.setObjectName("lineName")
-        self.list.setToolTip("All markers of the selected trace")
-        self.relayout = None                               # окно: подогнать высоту, когда строк в списке стало больше
+        self.list.setToolTip("All markers of the selected trace (wheel - scroll)")
+        self.list.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        area = self.list_area = QScrollArea()                 # высота - LIST_LINES строк, дальше колесо
+        area.setWidget(self.list)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         proxy.subscribe("mark.n", lambda _v: self._show())
         proxy.subscribe("mark.y", lambda _v: self._show())
         for key in ("trace.sel", "mark.state", "mark.x"):
@@ -549,11 +557,9 @@ class MarkerPanel(QWidget):
             b.update()
         on = self.proxy.value("mark.state") is True
         self.value.setText(self.text(self.proxy.value("mark.x"), self.proxy.value("mark.y")) if on else "OFF")
-        lines = self.list.text().count("\n")
         self.list.setText("\n".join(f"M{k}  {self.text(x, y)}" for k, (x, y) in sorted(self.table.items()))
                           or "no markers")
-        if self.list.text().count("\n") != lines and self.relayout is not None:
-            self.relayout()
+        self.list_area.setFixedHeight(self.list.fontMetrics().lineSpacing() * self.LIST_LINES + 8)
 
 
 class CalSets(QWidget):
@@ -1161,8 +1167,7 @@ class VNAWindow(InstrumentWindow):
                 mark.append(PanelLine("SRCH", *search))
             if "mark_aoff" in proxy.actions:
                 mark.append(PanelLine("ALL", ActionButton(proxy, "mark_aoff", "OFF", "All markers of the trace off")))
-            mark.append(PanelLine("LIST", mp.list))
-            mp.relayout = self._fit_height
+            mark.append(PanelLine("LIST", mp.list_area))
             pos = next((i + 1 for i, (n, *_r) in enumerate(self.page_specs) if n == "SCAL"), len(self.page_specs))
             self.page_specs.insert(pos, ("MARK", ("mark.state",), PanelTable(*mark)))
 

@@ -452,5 +452,19 @@ def test_mark_tab_markers_of_selected_trace(qtbot, vna):
     win.widgets["mark.x"].set_value(1.5e9)
     _wait(qtbot, lambda: sorted(mp.table) == [1, 3])
     assert sim.meas["USER_S21"]["marks"][3] == {"on": True, "x": 1.5e9}
+    win.show()
+    win.set_expanded(True)
+    win.set_page(2)
+    qtbot.wait(50)
+    h, area = win.height(), mp.list_area.height()
+    for n in (2, *range(4, 11)):                               # 10 маркеров: окно не растёт, список - прокрутка
+        proxy.set("mark.n", n)
+        _wait(qtbot, lambda: proxy.value("mark.n") == n)
+        proxy.set("mark.x", 1e9 + n * 1e8)
+        _wait(qtbot, lambda: n in mp.table)
+    _wait(qtbot, lambda: len(mp.table) == 10)
+    qtbot.wait(50)
+    assert win.height() == h and mp.list_area.height() == area and mp.list.text().count("\n") == 9
+    assert mp.list_area.verticalScrollBar().maximum() > 0
     next(b for b in win.findChildren(ActionButton) if b.name == "mark_aoff").click()
     _wait(qtbot, lambda: not mp.table and mp.list.text() == "no markers")
