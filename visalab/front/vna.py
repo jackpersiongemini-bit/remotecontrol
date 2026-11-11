@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QSize, Qt, QTimer
-from PyQt6.QtWidgets import QFileDialog, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.export import write_touchstone, write_traces_csv
 from ..core.params import Kind
@@ -527,11 +527,6 @@ class MarkerPanel(QWidget):
         row = self.trace_row() if self.trace_row is not None else None
         return FORMAT_UNITS.get(row[3], "") if row is not None else ""
 
-    def text(self, x, y) -> str:
-        xs = "?" if x is None else si_format(x, "Hz", 6)
-        ys = "-" if y is None else f"{y:.4f} {self.unit()}".rstrip()
-        return f"{xs}   {ys}"
-
     def _on_action(self, name: str, result) -> None:
         if name in ("mark_table", "mark_peak", "mark_min", "mark_aoff") and isinstance(result, (list, tuple)):
             self.table = {int(n): (x, y) for n, x, y in result}
@@ -543,7 +538,8 @@ class MarkerPanel(QWidget):
         for b in self.chips.buttons():
             b.update()
         on = self.proxy.value("mark.state") is True
-        self.value.setText(self.text(self.proxy.value("mark.x"), self.proxy.value("mark.y")) if on else "OFF")
+        y = self.proxy.value("mark.y")
+        self.value.setText(("-" if y is None else f"{y:.2f} {self.unit()}".rstrip()) if on else "OFF")
 
 
 
@@ -977,11 +973,14 @@ class VNAWindow(InstrumentWindow):
                 tl.addWidget(self._tool(text, tip, slot, half))
             top.append(PanelLine("TRC", te.scroll, tools))
         if "mem_store" in proxy.actions:
-            top.append(PanelLine("MEM", ActionButton(proxy, "mem_store", "CAPTURE",
-                                                     "Copy data to memory for every measurement being read")))
-        if sup("m1.math"):
+            mem = [ActionButton(proxy, "mem_store", "CAPTURE", "Copy data to memory for every measurement being read")]
+        else:
+            mem = []
+        if sup("m1.math"):                            # MEM и MATH - одной строкой
             self.math_button = MathButton(proxy)
-            top.append(PanelLine("MATH", self.math_button))
+            mem.append(self.math_button)
+        if mem:
+            top.append(PanelLine("MEM", *mem))
         if sup("m1.trace"):                           # читаемые трейсы последней развёртки -> CSV на ПК (вкладка SAVE)
             b = self.data_button = QPushButton("SAVE")
             b.setObjectName("choice")
@@ -1144,7 +1143,17 @@ class VNAWindow(InstrumentWindow):
             mx = PSpinBox(proxy, "mark.x", ("k", "M", "G"))
             mx.setToolTip("Marker position")
             self.widgets["mark.state"], self.widgets["mark.x"] = state, mx
-            mark = [PanelLine("MKR", mp), PanelLine("STAT", state), PanelLine("X", mx), PanelLine("Y", mp.value)]
+            row = QWidget()                           # STAT · X · Y одной строкой (один столбец таблицы)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(6)
+            for w in (state, mx, mp.value):
+                w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            rl.addWidget(state, 2)
+            rl.addWidget(mx, 4)
+            rl.addWidget(mp.value, 3)
+            mp.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            mark = [PanelLine("MKR", mp), PanelLine("STAT", row)]
             search = [ActionButton(proxy, a, t, tip) for a, t, tip in
                       (("mark_peak", "MAX", "Selected marker to the maximum"),
                        ("mark_min", "MIN", "Selected marker to the minimum")) if a in proxy.actions]

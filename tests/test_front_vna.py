@@ -39,7 +39,7 @@ def _wait(qtbot, cond):
 
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
-    assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "MATH", "POW", "CW", "CORR"]
+    assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "POW", "CW", "CORR"]
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "SCAL", "MARK", "STIM", "TRIG", "PWR", "CAL", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
@@ -437,7 +437,7 @@ def test_cal_window_thru_response(qtbot, vna):
 def test_mark_tab_markers_of_selected_trace(qtbot, vna):
     proxy, win, _s, sim = vna
     te, mp = win.trace_editor, win.marker_panel
-    assert [ln.name for ln in win.pages[2].lines] == ["MKR", "STAT", "X", "Y", "SRCH", "ALL"]
+    assert [ln.name for ln in win.pages[2].lines] == ["MKR", "STAT", "SRCH", "ALL"]
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
     te.chips.buttons()[1].click()                              # 1·S21
     _wait(qtbot, lambda: proxy.value("trace.sel") == "1:USER_S21")
@@ -445,7 +445,7 @@ def test_mark_tab_markers_of_selected_trace(qtbot, vna):
     next(b for b in win.findChildren(ActionButton) if b.name == "mark_peak").click()
     _wait(qtbot, lambda: 1 in mp.table and proxy.value("mark.state") is True)
     assert proxy.value("mark.x") == pytest.approx(2e9, rel=5e-2) and "dB" in mp.value.text()   # шаг 67 МГц
-    assert "GHz" in mp.value.text()
+    assert mp.value.parentWidget() is win.widgets["mark.x"].parentWidget()           # STAT · X · Y одной строкой
     mp.chips.buttons()[2].click()                              # M3: поставить на 1.5 ГГц
     _wait(qtbot, lambda: proxy.value("mark.n") == 3 and proxy.value("mark.state") is False)
     assert mp.chips.buttons()[0].indicated() and not mp.chips.buttons()[2].indicated()
