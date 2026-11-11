@@ -38,7 +38,7 @@ def _wait(qtbot, cond):
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
     assert [ln.name for ln in win.preset_panel.table.lines] == ["MEM", "MATH", "POW", "CW", "CORR"]
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["STIM", "PWR", "MEAS", "SAVE"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "PWR", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
 
@@ -85,25 +85,45 @@ def test_cw_generator_and_correction(qtbot, vna):
     _wait(qtbot, lambda: sim.c["type"] == "LIN")
 
 
-def test_choose_measurements_and_mem_math(qtbot, vna):
+def test_trace_table_read_and_mem_math(qtbot, vna):
     proxy, win, _s, sim = vna
-    ml = win.meas_list
-    _wait(qtbot, lambda: len(ml.buttons) == 3)
-    assert [b.text() for b in ml.buttons] == ["C1 S11", "C1 S21", "C2 S12"]
-    assert ml.is_read(1, "CH1_S11_1") and not ml.is_read(2, "CH2_S12")
-    ml.toggle(2, "CH2_S12")                                    # канал 2: свободный слот
-    _wait(qtbot, lambda: ml.is_read(2, "CH2_S12"))
-    n = ml.slot_of(2, "CH2_S12")
+    tt = win.trace_table
+    _wait(qtbot, lambda: len(tt.rows) == 3)
+    assert [(r.select.text(), r.sparam.text(), r.format.text(), r.math.text()) for r in tt.rows] == [
+        ("C1", "S11", "MLOG", "DATA"), ("C1", "S21", "MLOG", "DATA"), ("C2", "S12", "MLOG", "DATA")]
+    assert tt.is_read(1, "CH1_S11_1") and not tt.is_read(2, "CH2_S12")
+    tt.rows[2].read.click()                                    # канал 2: свободный слот
+    _wait(qtbot, lambda: tt.is_read(2, "CH2_S12"))
+    n = tt.slot_of(2, "CH2_S12")
     _wait(qtbot, lambda: proxy.value(f"m{n}.trace") is not None)
-    ml.toggle(1, "CH1_S11_1")                                  # m1 больше не читается
+    tt.rows[0].read.click()                                    # m1 больше не читается
     _wait(qtbot, lambda: proxy.value("m1.enabled") is False)
     assert win.math_button.slots() == [n]
     proxy.action("mem_store")
     _wait(qtbot, lambda: sim.meas["CH2_S12"].get("mem") is not None)
     assert sim.meas["CH1_S11_1"].get("mem") is None            # только читаемые
     win.math_button.set_value("DIV")
-    _wait(qtbot, lambda: win.math_button.text() == "D/M" and win.math_button.indicated())
+    _wait(qtbot, lambda: win.math_button.text() == "D/M" and tt.rows[2].math.text() == "D/M")
     assert sim.meas["CH2_S12"]["math"] == "DIV"
+
+
+def test_trace_table_edit_create_delete(qtbot, vna):
+    proxy, win, _s, sim = vna
+    tt = win.trace_table
+    _wait(qtbot, lambda: len(tt.rows) == 3)
+    tt.rows[1].format.on_pick("PHASE")                         # трейс, который не читается
+    _wait(qtbot, lambda: sim.meas["USER_S21"]["fmt"] == "PHAS" and tt.rows[1].format.text() == "PHAS")
+    tt.rows[1].sparam.on_pick("S12")
+    _wait(qtbot, lambda: tt.rows[1].sparam.text() == "S12")
+    tt.rows[2].select.click()                                  # + создаёт трейс на канале выбранной строки
+    tt.create()
+    _wait(qtbot, lambda: len(tt.rows) == 4)
+    assert ("CH2_S12_1" in sim.meas) and sim.meas["CH2_S12_1"]["ch"] == 2 and tt.rows[2].select.indicated()
+    win.delete_button.click()                                  # первый клик - SURE?
+    assert win.delete_button.text() == "SURE?" and "CH2_S12" in sim.meas
+    win.delete_button.click()
+    _wait(qtbot, lambda: len(tt.rows) == 3 and "CH2_S12" not in sim.meas)
+    assert tt.selected is None and win.delete_button.text() == "−"
 
 
 def test_states_tab(qtbot, vna):

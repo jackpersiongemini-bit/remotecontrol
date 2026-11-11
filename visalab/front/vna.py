@@ -10,8 +10,9 @@
   возвращает прежний тип; рядом частота CW;
 * CORR - коррекция (калибровка) ON / OFF.
 
-Вкладки: STIM (стимул и развёртка), PWR (мощность, RF, список пресетов мощности), MEAS (что читать:
-каталог измерений всех каналов, клик - читать / не читать), SAVE (состояния в памяти прибора: чип -
+Вкладки: TRAC (все трейсы прибора по каналам: строка - канал, READ, S-параметр, формат, математика;
++ создаёт трейс на приборе, − удаляет выбранный, ALL / NONE; слоты не видны - READ занимает свободный),
+STIM (стимул и развёртка), PWR (мощность, RF, список пресетов мощности), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
 Окно знает только InstrumentProxy и ключи профиля network_analyzer.
 """
@@ -20,8 +21,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtWidgets import QGridLayout, QLineEdit, QWidget
+from PyQt6.QtCore import QSettings, Qt, QTimer
+from PyQt6.QtWidgets import QGridLayout, QLineEdit, QPushButton, QWidget
 
 from ..core.params import Kind
 from ..core.proxy import InstrumentProxy
@@ -33,7 +34,7 @@ from .power_meter import ActionButton
 from .spectrum import StatePresets
 from .theme import UI_COLUMN_WIDTH_PX
 
-__all__ = ["VNAWindow", "PowerSpin", "MathButton", "CWButton", "MeasList", "parse_power_list",
+__all__ = ["VNAWindow", "PowerSpin", "MathButton", "CWButton", "TraceTable", "MenuButton", "parse_power_list",
            "saved_connection"]
 
 CONNECTION_GROUP = "CONNECTION/VNA"
@@ -180,25 +181,87 @@ class CWButton(IndicatorButton):
         self.proxy.set("sweep.type", self.last_type if self._type == "CW" else "CW")
 
 
-class MeasList(QWidget):
-    """Каталог измерений всех каналов; кнопка - читать / не читать. Измерение занимает свободный слот."""
+SPARAMS = ("S11", "S21", "S12", "S22")
+#: формат профиля -> короткая подпись
+FORMATS = (("MLOG", "MLOG"), ("PHAS", "PHASE"), ("UPH", "UPHASE"), ("GDEL", "GDELAY"), ("SWR", "SWR"),
+           ("MLIN", "LIN_MAG"), ("REAL", "REAL"), ("IMAG", "IMAG"))
 
-    COLUMNS = 3
+
+class MenuButton(IndicatorButton):
+    """Выбор из списка без привязки к ключу: клик - меню; ``on_pick(значение)`` - только выбор пользователя."""
+
+    def __init__(self, choices, on_pick, tip: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("choice")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(tip)
+        self.choices, self.on_pick, self.value = tuple(choices), on_pick, None
+        self.clicked.connect(self._menu)
+
+    def show_value(self, value) -> None:
+        self.value = value
+        self.setText(next((n for n, d in self.choices if d == value), "" if value is None else str(value)))
+
+    def _menu(self) -> None:
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for name, data in self.choices:
+            act = menu.addAction(name)
+            act.setCheckable(True)
+            act.setChecked(data == self.value)
+            act.triggered.connect(lambda _=False, d=data: self.on_pick(d))
+        menu.setMinimumWidth(self.width())
+        menu.popup(self.mapToGlobal(self.rect().bottomLeft()))
+
+
+class TraceRow:
+    """Строка таблицы трейсов: канал (выбор строки) | READ | S-параметр | формат | математика."""
+
+    def __init__(self, table: "TraceTable", channel: int, name: str):
+        self.table, self.channel, self.name = table, channel, name
+        self.select = _RowButton(table, self)
+        self.select.setText(f"C{channel}")
+        self.select.setToolTip(f"Channel {channel}, measurement {name!r}: click to select the row for + / −")
+        self.select.clicked.connect(lambda: table.set_selected(self))
+        self.read = _ReadButton(table, channel, name)
+        self.read.setText("READ")
+        self.read.setToolTip("Read this trace after every sweep (takes one of 16 slots)")
+        self.read.clicked.connect(lambda: table.toggle(channel, name))
+        cfg = lambda what: (lambda v: table.configure(self, what, v))
+        self.sparam = MenuButton([(x, x) for x in SPARAMS], cfg("sparam"), "S-parameter")
+        self.format = MenuButton(FORMATS, cfg("format"), "Format")
+        self.math = MenuButton(MATH, cfg("math"), "Math with the memory trace")
+        self.widgets = (self.select, self.read, self.sparam, self.format, self.math)
+
+    def show(self, sparam, fmt, math) -> None:
+        self.sparam.show_value(sparam)
+        self.format.show_value(fmt)
+        self.math.show_value(math)
+        self.math.indicated = lambda: self.math.value not in (None, "NORM")
+
+
+class TraceTable(QWidget):
+    """Все измерения (трейсы) прибора по всем каналам. Слоты не видны: READ сам занимает свободный."""
 
     def __init__(self, proxy: InstrumentProxy, parent=None):
         super().__init__(parent)
         self.proxy = proxy
-        self.catalog: list[tuple[int, str, str]] = []
-        self.buttons: list[IndicatorButton] = []
+        self.table: list[tuple[int, str, str, str, str]] = []
+        self.rows: list[TraceRow] = []
+        self.selected: TraceRow | None = None
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setSpacing(4)
+        self._grid.setHorizontalSpacing(6)
+        self._grid.setVerticalSpacing(4)
         proxy.action_done.connect(self._on_action)
         for n in range(1, SLOTS + 1):
-            for what in ("channel", "name", "enabled"):
+            for what in ("channel", "name", "enabled", "sparam", "format", "math"):
                 if proxy.supports(f"m{n}.{what}"):
-                    proxy.subscribe(f"m{n}.{what}", lambda _v: self._refresh())
+                    proxy.subscribe(f"m{n}.{what}", lambda _v, n=n: self._from_slot(n))
 
+    # -------------------------------------------------------- слоты
     def slot_of(self, channel: int, name: str) -> int | None:
         p = self.proxy
         for n in range(1, SLOTS + 1):
@@ -222,36 +285,81 @@ class MeasList(QWidget):
         p.set(f"m{free}.name", name)
         p.set(f"m{free}.enabled", True)
 
+    def _from_slot(self, n: int) -> None:
+        """Слот прочитан (или изменён из избранного): обновить его строку без запроса таблицы."""
+        p = self.proxy
+        for i, (c, name, sp, fmt, math) in enumerate(self.table):
+            if name == p.value(f"m{n}.name") and c == p.value(f"m{n}.channel"):
+                self.table[i] = (c, name, p.value(f"m{n}.sparam") or sp, p.value(f"m{n}.format") or fmt,
+                                 p.value(f"m{n}.math") or math)
+                if i < len(self.rows):
+                    self.rows[i].show(*self.table[i][2:])
+        for r in self.rows:
+            r.read.update()
+
+    # -------------------------------------------------------- действия
+    def configure(self, row: TraceRow, what: str, value) -> None:
+        self.proxy.action("meas_config", row.channel, row.name, what, value)
+
+    def set_selected(self, row: TraceRow | None) -> None:
+        self.selected = row
+        for r in self.rows:
+            r.select.setChecked(r is row)
+
+    def create(self) -> None:
+        row = self.selected
+        channel, sparam = (row.channel, row.sparam.value or "S21") if row else (1, "S21")
+        self.proxy.action("meas_create", channel, sparam)
+
+    def delete(self) -> None:
+        if self.selected is not None:
+            self.proxy.action("meas_delete", self.selected.channel, self.selected.name)
+
     def _on_action(self, name: str, result) -> None:
-        if name == "meas_catalog" and isinstance(result, (list, tuple)):
-            self.set_catalog([(int(c), str(n), str(s)) for c, n, s in result])
+        if name in ("meas_table", "meas_config", "meas_create", "meas_delete") and isinstance(result, (list, tuple)):
+            self.set_table([(int(c), str(n), str(s), str(f), str(m)) for c, n, s, f, m in result])
 
-    def set_catalog(self, catalog: list[tuple[int, str, str]]) -> None:
-        if catalog == self.catalog:
-            self._refresh()
-            return
-        self.catalog = catalog
-        while self.buttons:
-            b = self.buttons.pop()
-            self._grid.removeWidget(b)
-            b.deleteLater()
-        for i, (ch, name, sp) in enumerate(catalog):
-            b = _ReadButton(self, ch, name)
-            b.setText(f"C{ch} {sp}")
-            b.setToolTip(f"Channel {ch}, measurement {name!r} ({sp}): click to read / not read")
-            b.clicked.connect(lambda _=False, c=ch, n=name: self.toggle(c, n))
-            self._grid.addWidget(b, i // self.COLUMNS, i % self.COLUMNS)
-            self.buttons.append(b)
-        self._refresh()
-        self.updateGeometry()
+    # -------------------------------------------------------- строки
+    def set_table(self, table: list[tuple[int, str, str, str, str]]) -> None:
+        keys = [(c, n) for c, n, *_ in table]
+        if keys != [(r.channel, r.name) for r in self.rows]:
+            sel = (self.selected.channel, self.selected.name) if self.selected else None
+            for r in self.rows:
+                for w in r.widgets:
+                    self._grid.removeWidget(w)
+                    w.deleteLater()
+            self.rows, self.selected = [], None
+            for i, (c, n) in enumerate(keys):
+                r = TraceRow(self, c, n)
+                for col, w in enumerate(r.widgets):
+                    self._grid.addWidget(w, i, col)
+                self.rows.append(r)
+                if (c, n) == sel:
+                    self.selected = r
+            self.updateGeometry()
+        self.table = list(table)
+        for r, (_c, _n, sp, fmt, math) in zip(self.rows, table):
+            r.show(sp, fmt, math)
+        self.set_selected(self.selected)
 
-    def _refresh(self) -> None:
-        for b in self.buttons:
-            b.update()
+
+class _RowButton(QPushButton):
+    """Выбор строки - инверсия (как у чипа пресета), не индикатор включения."""
+
+    def __init__(self, owner: TraceTable, row: TraceRow):
+        super().__init__()
+        self.owner, self.row = owner, row
+        self.setObjectName("chip")
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def indicated(self) -> bool:
+        return self.owner.selected is self.row
 
 
 class _ReadButton(IndicatorButton):
-    def __init__(self, owner: MeasList, channel: int, name: str):
+    def __init__(self, owner: TraceTable, channel: int, name: str):
         super().__init__()
         self.owner, self.channel, self.meas = owner, channel, name
         self.setObjectName("choice")
@@ -260,6 +368,31 @@ class _ReadButton(IndicatorButton):
 
     def indicated(self) -> bool:
         return self.owner.is_read(self.channel, self.meas)
+
+
+class ConfirmButton(QPushButton):
+    """Опасное действие окна: первый клик - SURE?, второй (за 3 с) выполняет."""
+
+    def __init__(self, text: str, tip: str, slot, parent=None):
+        super().__init__(text, parent)
+        self.setObjectName("tool")
+        self.setToolTip(tip)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._text, self._slot = text, slot
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(lambda: self.setText(self._text))
+        self.clicked.connect(self._click)
+
+    def _click(self) -> None:
+        if self._timer.isActive():
+            self._timer.stop()
+            self.setText(self._text)
+            self._slot()
+        else:
+            self.setText("SURE?")
+            self._timer.start(3000)
 
 
 class VNAWindow(InstrumentWindow):
@@ -346,18 +479,21 @@ class VNAWindow(InstrumentWindow):
         pwr.append(PanelLine("LIST", self.levels_edit))
         self.page_specs.append(("PWR", ("rf.output",) if sup("rf.output") else (), PanelTable(*pwr)))
 
-        # MEAS
-        self.meas_list = MeasList(proxy)
-        meas = [PanelLine("READ", self.meas_list)]
-        quick = [ActionButton(proxy, a, t, tip) for a, t, tip in
-                 (("meas_all", "ALL", "Read every measurement (first 16)"),
-                  ("meas_none", "NONE", "Read nothing"),
-                  ("meas_catalog", "LIST", "Read the measurement list again")) if a in proxy.actions]
-        if quick:
-            meas.append(PanelLine("SET", *quick))
-        if sup("meas.complex"):
-            meas.append(PanelLine("CPLX", PSButton(proxy, "meas.complex", ONOFF)))
-        self.page_specs.append(("MEAS", (), PanelTable(*meas)))
+        # TRAC (первая вкладка): все трейсы прибора
+        if "meas_table" in proxy.actions:
+            self.trace_table = TraceTable(proxy)
+            trac = [PanelLine("TRC", self.trace_table)]
+            self.delete_button = ConfirmButton("−", "Delete the selected trace from the analyzer",
+                                               self.trace_table.delete)
+            tools = [self._tool("+", "New trace: channel and S-parameter of the selected row", self.trace_table.create),
+                     self.delete_button]
+            tools += [ActionButton(proxy, a, t, tip) for a, t, tip in
+                      (("meas_all", "ALL", "Read every trace (first 16)"), ("meas_none", "NONE", "Read nothing"))
+                      if a in proxy.actions]
+            trac.append(PanelLine("SET", *tools))
+            if sup("meas.complex"):
+                trac.append(PanelLine("CPLX", PSButton(proxy, "meas.complex", ONOFF)))
+            self.page_specs.insert(0, ("TRAC", (), PanelTable(*trac)))
 
         # SAVE: чипы состояний в памяти прибора
         if "state_list" in proxy.actions:
@@ -395,7 +531,7 @@ class VNAWindow(InstrumentWindow):
         return StatePresets(self.settings, key, self._delete_state)
 
     def refresh_lists(self) -> None:
-        for name in ("state_list", "meas_catalog"):
+        for name in ("state_list", "meas_table"):
             if name in self.proxy.actions:
                 self.proxy.action(name)
 
@@ -432,5 +568,5 @@ class VNAWindow(InstrumentWindow):
         if name == "state_list" and isinstance(result, (list, tuple)):
             self.presets.set_names([str(n) for n in result], self._select_after_list)
             self._select_after_list = None
-        elif name in ("state_recall", "meas_all", "meas_none") and "meas_catalog" in self.proxy.actions:
-            self.proxy.action("meas_catalog")
+        elif name == "state_recall" and "meas_table" in self.proxy.actions:
+            self.proxy.action("meas_table")

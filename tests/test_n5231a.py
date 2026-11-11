@@ -274,3 +274,33 @@ def test_cw_mode_as_generator(vna):
     assert setp(drv, rec, "sweep.type", "LIN") is PStatus.WRITTEN
     drv.poll()
     assert rec.values["m1.trace"].x_unit == "Hz" and not rec.errors and not rec.comm
+
+
+def test_measurement_table_create_config_delete(make):
+    sim = KeysightPNASim()
+    sim.meas["USER_S21"] = _meas("S21", "PHAS")
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+    drv.run_action("meas_table")
+    assert actions[-1] == ("meas_table", [(1, "CH1_S11_1", "S11", "MLOG", "NORM"), (1, "USER_S21", "S21", "PHASE", "NORM")])
+    # настройка измерения, которое не читается (не в слоте... m2 занят им по умолчанию - тоже обновится)
+    drv.run_action("meas_config", (1, "USER_S21", "format", "SWR"))
+    assert sim.meas["USER_S21"]["fmt"] == "SWR" and rec.values["m2.format"] == "SWR"
+    drv.run_action("meas_config", (1, "USER_S21", "sparam", "S12"))
+    assert sim.meas["USER_S21"]["s"] == "S12" and actions[-1][1][1][2] == "S12"
+    # создать на канале 2 (новый канал) и на канале 1
+    drv.run_action("meas_create", (2, "S21"))
+    drv.run_action("meas_create", (1, "S21"))
+    table = actions[-1][1]
+    assert (2, "CH2_S21_1", "S21", "MLOG", "NORM") in table and (1, "CH1_S21_1", "S21", "MLOG", "NORM") in table
+    assert sim.windows[2] == {1: "CH2_S21_1"} and sim.windows[1] == {1: "CH1_S11_1", 2: "CH1_S21_1"}
+    assert not rec.errors and not rec.comm
+    # удалить измерение, которое читается в слоте: слот освобождается
+    drv.run_action("meas_delete", (1, "CH1_S11_1"))
+    assert "CH1_S11_1" not in sim.meas and rec.values["m1.name"] is None and rec.values["m1.enabled"] is False
+    drv.poll()
+    assert rec.values["meas.count"] == 0 and not rec.errors and not rec.comm
+    drv.run_action("meas_config", (1, "NOPE", "format", "SWR"))
+    drv.run_action("meas_create", (1, "S99"))
+    assert len(rec.comm) == 2
