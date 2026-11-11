@@ -38,7 +38,7 @@ def _wait(qtbot, cond):
 def test_layout(qtbot, vna):
     proxy, win, _s, _sim = vna
     assert [ln.name for ln in win.preset_panel.table.lines] == ["TRC", "MEM", "MATH", "DATA", "POW", "CW", "CORR"]
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "STIM", "TRIG", "PWR", "SAVE"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["TRAC", "SCAL", "STIM", "TRIG", "PWR", "SAVE"]
     keys = {k for p in win.pages for ln in p.lines for w in ln.widgets for k in [getattr(w, "key", None)] if k}
     assert not any(k == "trace" or k.endswith((".trace", ".sdata")) for k in keys)      # вывода трасс нет
 
@@ -177,7 +177,7 @@ def test_plus_minus_at_right_edge(qtbot, vna):
     proxy, win, _s, _sim = vna
     win.show()
     win.set_expanded(True)
-    for page, tools, width in ((0, win._trc_tools, 40), (4, win.add_button.parentWidget(), 40)):   # TRC и SAVE
+    for page, tools, width in ((0, win._trc_tools, 40), (5, win.add_button.parentWidget(), 40)):   # TRC и SAVE
         win.set_page(page)
         qtbot.wait(50)
         line = tools.parentWidget()
@@ -211,7 +211,7 @@ def test_trig_tab(qtbot, vna):
     proxy, win, _s, sim = vna
     page = win.pages[[win.tabs.tabText(i) for i in range(win.tabs.count())].index("TRIG")]
     assert [ln.name for ln in page.lines] == ["SRC", "SCOP", "MODE", "SLOP", "TYPE", "DLY", "RUN"]
-    assert "MODE" not in [ln.name for ln in win.pages[1].lines]               # CONT/SINGLE ушло из STIM
+    assert "MODE" not in [ln.name for ln in win.pages[2].lines]               # CONT/SINGLE ушло из STIM
     win.widgets["trig.source"].set_value("MAN")
     win.widgets["trig.mode"].set_value("POINT")
     _wait(qtbot, lambda: sim.trig["sour"] == "MAN" and sim.c["tmode"] == "POIN")
@@ -226,7 +226,7 @@ def test_data_save_csv(qtbot, vna, tmp_path):
     proxy, win, settings, sim = vna
     te = win.trace_editor
     _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
-    assert [ln.name for ln in win.pages[4].lines] == ["VNA", "STAT", "PC", "NAME"]
+    assert [ln.name for ln in win.pages[5].lines] == ["VNA", "STAT", "PC", "NAME"]
     te.chips.buttons()[2].click()                              # трейс канала 2 (другая ось) - тоже читать
     te.read.click()
     te.format.on_pick("POLAR")                                 # комплексный формат - два столбца
@@ -291,3 +291,26 @@ def test_states_folder_picked_from_menu(qtbot, vna):
     _wait(qtbot, lambda: proxy.value("state.dir") == DEFAULT_DIR)
     assert VNAWindow.dir_choices("C:\\Users", ["A"]) == [("..", "C:\\"), ("A", "C:\\Users\\A")]
     assert VNAWindow.dir_choices("C:\\", []) == []
+
+
+def test_scal_tab_follows_selected_trace(qtbot, vna):
+    proxy, win, _s, sim = vna
+    sim.windows[1][2] = "USER_S21"                             # показан на экране - у него есть масштаб
+    te = win.trace_editor
+    _wait(qtbot, lambda: len(te.chips.buttons()) == 3)
+    assert [ln.name for ln in win.pages[1].lines] == ["AUTO", "DIV", "REF", "RPOS", "EDEL", "SMO"]
+    _wait(qtbot, lambda: proxy.value("trace.sel") == "1:CH1_S11_1" and proxy.value("scale.div") == 10.0)
+    te.chips.buttons()[1].click()                              # другой трейс - его масштаб
+    _wait(qtbot, lambda: proxy.value("trace.sel") == "1:USER_S21")
+    win.widgets["scale.div"].set_value(2.0)
+    win.widgets["smooth.state"].set_value(True)
+    _wait(qtbot, lambda: sim.meas["USER_S21"].get("pdiv") == 2.0 and sim.meas["USER_S21"].get("smo") is True)
+    assert "pdiv" not in sim.meas["CH1_S11_1"]
+    te.chips.buttons()[0].click()
+    _wait(qtbot, lambda: proxy.value("trace.sel") == "1:CH1_S11_1" and proxy.value("scale.div") == 10.0
+          and proxy.value("smooth.state") is False)
+    proxy.action("autoscale")
+    _wait(qtbot, lambda: sim.meas["CH1_S11_1"].get("pdiv") is not None and proxy.value("scale.div") != 10.0)
+    te.chips.buttons()[2].click()                              # не показан ни в одном окне - масштаба нет
+    _wait(qtbot, lambda: proxy.value("trace.sel") == "2:CH2_S12" and proxy.value("scale.div") is None)
+    assert proxy.is_connected

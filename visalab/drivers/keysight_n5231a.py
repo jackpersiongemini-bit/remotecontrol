@@ -20,6 +20,10 @@
 * развёртка ``SENS1:SWE:MODE SING`` + ``*OPC`` - бит OPC по окончании, ``SENS1:SWE:MODE HOLD`` - стоп;
 * память трассы ``CALC1:MATH:MEM`` (данные -> память выбранного измерения), математика
   ``CALC1:MATH:FUNC NORM|DIV|SUBT|ADD|MULT`` (над комплексными данными, до формата; SDATA - без неё);
+* масштаб и обработка трейса ``trace.sel`` («канал:имя»): окно и номер трейса - ``CALC<c>:PAR:WNUM?`` /
+  ``TNUM?`` выбранного измерения, ``DISP:WIND<w>:TRAC<t>:Y:PDIV|RLEV|RPOS``, ``...:Y:AUTO`` (действие
+  ``autoscale``); электрическая задержка ``CALC<c>:CORR:EDEL:TIME``, сглаживание ``CALC<c>:SMO[:STAT]``,
+  ``CALC<c>:SMO:APER`` (% обзора). Задержка и сглаживание меняют и читаемые данные, масштаб - нет;
 * состояния в памяти прибора: ``MMEM:STOR "имя.csa"`` (состояние + калибровка), ``MMEM:LOAD``,
   ``MMEM:DEL``, ``MMEM:CAT?`` (список файлов текущей папки; читаются только имена); папка -
   ``MMEM:CDIR "C:\\..."`` (ключ ``state.dir``, путь на диске анализатора).
@@ -99,6 +103,8 @@ COMPLEX_FORMATS = ("POLAR", "SMITH")     # FDATA - пары re,im: трасса 
 #: что режим генератора запоминает и возвращает (в этом порядке)
 GEN_KEYS = ("sweep.type", "freq.start", "freq.stop", "sweep.points", "bw.if", "sweep.time_auto", "sweep.time",
             "avg.state", "avg.count", "cal.state", "source.power", "rf.output")
+#: ключи трейса ``trace.sel``: масштаб на экране прибора и обработка данных
+SCALE_KEYS = ("scale.div", "scale.ref", "scale.rpos", "scale.edel", "smooth.state", "smooth.aper")
 SWEEP_TYPES = ("LIN", "LOG", "POWER", "CW", "SEGMENT")
 SWEEP_MAP = (("POWER", "POW"), ("SEGMENT", "SEGM"))
 TRIG_SOURCES = ("IMM", "EXT", "MAN")
@@ -138,6 +144,7 @@ class KeysightPNA(VISAInstrument):
         self._stim_ch = 1
         #: режим генератора: (канал, снимок GEN_KEYS, {канал: SWE:MODE до включения})
         self._gen: tuple[int, dict[str, Any], dict[int, str]] | None = None
+        self._sel: tuple[int, str] | None = None                # trace.sel: (канал, имя измерения)
         super().__init__(transport, parent, command_delay_s)
 
     @property
@@ -150,6 +157,7 @@ class KeysightPNA(VISAInstrument):
         m = self.model
         st, rs, sw, mk = "Анализ/Стимул", "Анализ/Измерение", "Анализ/Развёртка", "Анализ/Маркер"
         tg = "Анализ/Запуск"
+        sc = "Анализ/Масштаб"
         freq = dict(kind=F, unit="Hz", minimum=m.f_min, maximum=m.f_max, tolerance=1e-9,
                     also_read=FREQ_KEYS)
         ch = dict(channel=1)          # перед CALC-командой выбрать наше измерение
@@ -178,6 +186,19 @@ class KeysightPNA(VISAInstrument):
                   minimum=1, maximum=200, also_read=STIM_KEYS),
             Param("state.dir", "Папка состояний на анализаторе", Kind.STR, section="Память",
                   query="MMEM:CDIR?", write='MMEM:CDIR "{value}"'),
+            Param("trace.sel", "Трейс (масштаб)", Kind.STR, section=sc, query="<virtual>", write="<virtual>",
+                  also_read=SCALE_KEYS),
+            Param("scale.div", "Цена деления", F, "", section=sc, query="<scale>", write="<scale>",
+                  minimum=1e-18, maximum=1e12, tolerance=1e-6),
+            Param("scale.ref", "Опорный уровень", F, "", section=sc, query="<scale>", write="<scale>",
+                  minimum=-1e12, maximum=1e12, tolerance=1e-6),
+            Param("scale.rpos", "Опорная клетка", F, "div", section=sc, query="<scale>", write="<scale>",
+                  minimum=0.0, maximum=20.0, tolerance=1e-6),
+            Param("scale.edel", "Электрическая задержка", F, "s", section=sc, query="<scale>", write="<scale>",
+                  minimum=-10.0, maximum=10.0, tolerance=1e-15),
+            Param("smooth.state", "Сглаживание", B, section=sc, query="<scale>", write="<scale>"),
+            Param("smooth.aper", "Апертура сглаживания", F, "%", section=sc, query="<scale>", write="<scale>",
+                  minimum=1.0, maximum=25.0, tolerance=1e-3),
             Param("gen.state", "Режим генератора", B, section=st, query="<virtual>", write="<virtual>",
                   also_read=(*STIM_KEYS, "rf.output", "gen.channel", "stim.channel")),
             Param("gen.channel", "Канал генератора", I, section=st, query="<virtual>"),
@@ -248,6 +269,7 @@ class KeysightPNA(VISAInstrument):
     def build_actions(self):
         return [Action("single", "Одна развёртка"), Action("abort", "Стоп"),
                 Action("trigger", "Ручной запуск (TRIG:SOUR MAN)"),
+                Action("autoscale", "Автомасштаб трейса trace.sel"),
                 Action("marker_peak", "Маркер на максимум"), Action("marker_min", "Маркер на минимум"),
                 Action("meas_catalog", "Каталог измерений"), Action("meas_all", "Читать все измерения"),
                 Action("meas_none", "Не читать измерения"),
@@ -275,6 +297,7 @@ class KeysightPNA(VISAInstrument):
             self.write(f"DISP:WIND1:TRAC1:FEED '{MEAS_NAME}'")
             cat = self._catalog() or {MEAS_NAME: "S11"}
         self.meas_name = next(iter(cat))
+        self._sel = (1, self.meas_name)
         self._slots = [_Slot() for _ in range(MEAS_SLOTS)]
         for slot, name in zip(self._slots, cat):               # по умолчанию - канал 1 по порядку, читаем только m1
             slot.name = name
@@ -333,6 +356,18 @@ class KeysightPNA(VISAInstrument):
         if spec.key == "gen.state":
             self._set_gen(bool(value))
             return
+        if spec.key == "trace.sel":
+            c, _, name = str(value).partition(":")
+            if not c.strip().isdigit() or name not in self._catalog(int(c)):
+                raise ValueError(f"нет трейса {value!r} (нужно «канал:имя»)")
+            self._sel = (int(c), name)
+            return
+        if spec.key in SCALE_KEYS:
+            cmd = self._scale_cmd(spec.key)
+            if not cmd:
+                raise ValueError(f"трейс {self._sel[1]!r} не показан на экране анализатора - масштаба нет")
+            self.write(cmd + " " + spec.to_scpi(value))
+            return
         if spec.key == "stim.channel":
             c = int(value)
             if self._gen is not None and c != self._gen[0]:
@@ -389,6 +424,13 @@ class KeysightPNA(VISAInstrument):
             return self._stim_ch
         if key == "gen.state":
             return self._gen is not None
+        if key == "trace.sel":
+            return f"{self._sel[0]}:{self._sel[1]}" if self._sel else None
+        if key in SCALE_KEYS:
+            if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
+                return None
+            cmd = self._scale_cmd(key)
+            return spec.from_scpi(self.query(cmd + "?")) if cmd else None
         if key == "gen.channel":
             return self._gen[0] if self._gen is not None else None
         if key in STIM_KEYS:
@@ -453,6 +495,25 @@ class KeysightPNA(VISAInstrument):
             return spec
         sub = lambda t: t and t.replace("SENS1:", f"SENS{c}:").replace("SOUR1:", f"SOUR{c}:")
         return replace(spec, query=sub(spec.query), write=sub(spec.write))
+
+    # ------------------------------------------------------- масштаб трейса trace.sel
+    def _scale_cmd(self, key: str) -> str:
+        """Команда (без ?) ключа масштаба/обработки для трейса ``trace.sel``; выбирает его измерение."""
+        if not self._sel:
+            raise ValueError("трейс не выбран (trace.sel)")
+        c, name = self._sel
+        self.write(f"CALC{c}:PAR:SEL '{name}'")
+        if key == "scale.edel":
+            return f"CALC{c}:CORR:EDEL:TIME"
+        if key == "smooth.state":
+            return f"CALC{c}:SMO:STAT"
+        if key == "smooth.aper":
+            return f"CALC{c}:SMO:APER"
+        w = int(parse_number(self.query(f"CALC{c}:PAR:WNUM?")))
+        t = int(parse_number(self.query(f"CALC{c}:PAR:TNUM?")))
+        if w < 1 or t < 1:
+            return ""                                        # измерение не показано ни в одном окне
+        return f"DISP:WIND{w}:TRAC{t}:Y:" + {"scale.div": "PDIV", "scale.ref": "RLEV", "scale.rpos": "RPOS"}[key]
 
     # ------------------------------------------------------- режим генератора
     def _set_gen(self, on: bool) -> None:
@@ -575,6 +636,13 @@ class KeysightPNA(VISAInstrument):
         if name == "abort":
             self._abort()
             self.write("SENS1:SWE:MODE HOLD")
+            return None
+        if name == "autoscale":
+            cmd = self._scale_cmd("scale.div")
+            if not cmd:
+                raise ValueError(f"трейс {self._sel[1]!r} не показан на экране анализатора")
+            self.write(cmd.rsplit(":", 1)[0] + ":AUTO")
+            self._read_keys(SCALE_KEYS)
             return None
         if name == "trigger":
             if not self._armed:                          # нечего запускать: взвести одну развёртку
