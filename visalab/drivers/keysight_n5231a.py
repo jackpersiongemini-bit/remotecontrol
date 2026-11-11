@@ -10,7 +10,11 @@
   ``SENS1:BWID`` (полоса ПЧ), ``SOUR1:POW1`` (dBm), ``OUTP`` (мощность источника);
 * усреднение ``SENS1:AVER``, ``SENS1:AVER:COUN``; коррекция ``SENS1:CORR:STAT``;
 * маркер ``CALC1:MARK1``, ``CALC1:MARK1:X``, ``CALC1:MARK1:Y?`` (два числа), ``CALC1:MARK1:FUNC:EXEC MAX|MIN``;
-* развёртка ``SENS1:SWE:MODE SING`` + ``*OPC`` - бит OPC по окончании, ``SENS1:SWE:MODE HOLD`` - стоп.
+* развёртка ``SENS1:SWE:MODE SING`` + ``*OPC`` - бит OPC по окончании, ``SENS1:SWE:MODE HOLD`` - стоп;
+* память трассы ``CALC1:MATH:MEM`` (данные -> память выбранного измерения), математика
+  ``CALC1:MATH:FUNC NORM|DIV|SUBT|ADD|MULT`` (над комплексными данными, до формата; SDATA - без неё);
+* состояния в памяти прибора: ``MMEM:STOR "имя.csa"`` (состояние + калибровка), ``MMEM:LOAD``,
+  ``MMEM:DEL``, ``MMEM:CAT?`` (список файлов текущей папки; читаются только имена).
 
 Подключение не создаёт и не удаляет измерения пользователя (если измерений нет - создаётся
 ``VL_MEAS``). Что читать, выбирает пользователь: ``MEAS_SLOTS`` слотов ``m1..m16``, у слота -
@@ -21,6 +25,10 @@
 только m1. Действия: ``meas_catalog`` (каталог всех каналов), ``meas_all`` (занять слоты первыми
 измерениями всех каналов и включить), ``meas_none``. Легаси-ключи ``trace`` / ``sparam`` /
 ``format`` и маркер - первое измерение канала 1 (``trace`` = m1.trace).
+Память и математика - у каждого слота: ``m{n}.math``, действие ``mem_store`` (аргументы - номера
+слотов, без аргументов - все включённые). Состояния: ``state_list`` / ``state_save`` / ``state_recall``
+/ ``state_delete``; после вызова состояния каталог измерений перечитывается и слоты собираются
+заново (как при подключении: включён m1).
 Как и анализатор спектра, ВАЦ ведётся однократными развёртками: наружу уходят только
 целые трассы. Ось X считается линейной от ``SENS<c>:FREQ:STAR`` до ``STOP`` канала измерения.
 """
@@ -63,6 +71,10 @@ MEAS_SLOTS = 16                  # слотов выбора измерений 
 FORMATS = ("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")
 FORMAT_MAP = (("PHASE", "PHAS"), ("UPHASE", "UPH"), ("GDELAY", "GDEL"), ("LIN_MAG", "MLIN"))
 _MEAS_KEY = re.compile(r"m(\d+)\.(\w+)")
+SLOT_KEYS = ("channel", "name", "enabled", "sparam", "format", "math")
+MATH = ("NORM", "DIV", "SUBT", "ADD", "MULT")
+STATE_EXT = ".csa"
+_STATE_NAME = re.compile(r"[A-Za-z0-9_\-]{1,32}")
 
 
 @dataclass
@@ -116,6 +128,8 @@ class KeysightPNA(VISAInstrument):
                       choices=("S11", "S21", "S12", "S22")),
                 Param(f"m{n}.format", f"Формат m{n}", E, section=sec, query="<format>", write="<custom>",
                       choices=FORMATS, enum_map=FORMAT_MAP),
+                Param(f"m{n}.math", f"Математика m{n}", E, section=sec, query="<math>", write="<custom>",
+                      choices=MATH, labels=("Данные", "Д/П", "Д-П", "Д+П", "Д*П")),
                 Param(f"m{n}.trace", f"Трасса m{n}", Kind.TRACE, "", section=sec, group="SWEEP"),
                 Param(f"m{n}.sdata", f"Комплексная трасса m{n}", Kind.TRACE, "", section=sec, group="SWEEP"),
             ]
@@ -170,6 +184,10 @@ class KeysightPNA(VISAInstrument):
                 Action("marker_peak", "Маркер на максимум"), Action("marker_min", "Маркер на минимум"),
                 Action("meas_catalog", "Каталог измерений"), Action("meas_all", "Читать все измерения"),
                 Action("meas_none", "Не читать измерения"),
+                Action("mem_store", "Данные в память"),
+                Action("state_list", "Состояния в памяти"), Action("state_save", "Сохранить состояние"),
+                Action("state_recall", "Вызвать состояние"),
+                Action("state_delete", "Удалить состояние", confirm="Удалить состояние из памяти анализатора?"),
                 Action("reset", "Preset *RST",
                        confirm="Preset удалит измерения и выключит калибровку. Продолжить?")]
 
@@ -261,6 +279,8 @@ class KeysightPNA(VISAInstrument):
             self._select(slot)
             if what == "sparam":
                 self.write(f"CALC{slot.channel}:PAR:MOD:EXT '{spec.to_scpi(value)}'")
+            elif what == "math":
+                self.write(f"CALC{slot.channel}:MATH:FUNC {spec.to_scpi(value)}")
             else:
                 self.write(f"CALC{slot.channel}:FORM {spec.to_scpi(value)}")
         return True
@@ -292,7 +312,8 @@ class KeysightPNA(VISAInstrument):
             if what == "sparam":
                 return cat[slot.name]
             self._select(slot)
-            return spec.from_scpi(self.query(f"CALC{slot.channel}:FORM?"))
+            cmd = "MATH:FUNC" if what == "math" else "FORM"
+            return spec.from_scpi(self.query(f"CALC{slot.channel}:{cmd}?"))
         if key in ("marker.value", "marker.freq") and not self._values.get("marker.state"):
             return None
         if key == "marker.value":
@@ -349,16 +370,17 @@ class KeysightPNA(VISAInstrument):
             start, stop = axes.setdefault(c, self._stimulus(c))
             self._select(slot)
             fmt = self._params[f"m{n}.format"].from_scpi(self.query(f"CALC{c}:FORM?"))
+            math = self._params[f"m{n}.math"].from_scpi(self.query(f"CALC{c}:MATH:FUNC?"))
             y = [parse_number(t) for t in self.query(f"CALC{c}:DATA? FDATA").split(",") if t.strip()]
-            meta = {**stim, "channel": c, "name": slot.name, "sparam": sparam, "format": fmt}
+            meta = {**stim, "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
             out[f"m{n}.trace"] = Trace.linear(start, stop, y, x_unit="Hz", y_unit=Y_UNITS.get(fmt, ""),
                                               name=sparam, meta=meta)
             if self._complex:
                 raw = [parse_number(t) for t in self.query(f"CALC{c}:DATA? SDATA").split(",") if t.strip()]
                 out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit="Hz", y_unit="",
-                                                  name=sparam, meta={**meta, "format": "SDATA"})
+                                                  name=sparam, meta={**meta, "format": "SDATA", "math": "NORM"})
             count += 1
-            for k, v in ((f"m{n}.sparam", sparam), (f"m{n}.format", fmt)):
+            for k, v in ((f"m{n}.sparam", sparam), (f"m{n}.format", fmt), (f"m{n}.math", math)):
                 if self._values.get(k) != v:
                     self._publish(k, v)
         out["trace"] = out["m1.trace"]
@@ -401,7 +423,7 @@ class KeysightPNA(VISAInstrument):
                     for slot in self._slots:
                         slot.enabled = False
                 self._read_keys([f"m{n}.{w}" for n in range(1, MEAS_SLOTS + 1)
-                                 for w in ("channel", "name", "enabled", "sparam", "format")])
+                                 for w in SLOT_KEYS])
             finally:
                 if was_armed or self._continuous:
                     self._start_sweep()
@@ -414,6 +436,12 @@ class KeysightPNA(VISAInstrument):
             self.write(f"CALC1:MARK1:FUNC:EXEC {'MAX' if name == 'marker_peak' else 'MIN'}")
             self._read_keys(["marker.state", "marker.freq", "marker.value"])
             return None
+        if name == "mem_store":
+            return self._mem_store(args)
+        if name == "state_list":
+            return self._state_list()
+        if name in ("state_save", "state_recall", "state_delete"):
+            return self._state_file_action(name, args)
         if name == "reset":
             self._abort()
             self.write("*RST")
@@ -422,3 +450,55 @@ class KeysightPNA(VISAInstrument):
             self._sync_all()
             return None
         return super().run_custom_action(name, args)
+
+    # -------------------------------------------------------- память трасс
+    def _mem_store(self, args: tuple) -> list[int]:
+        """Данные -> память у слотов ``args`` (номера), без аргументов - у всех включённых."""
+        nums = [int(a) for a in args] if args else \
+            [n for n, s in enumerate(self._slots, 1) if s.enabled and s.name]
+        for n in nums:
+            if not 1 <= n <= MEAS_SLOTS or not self._slots[n - 1].name:
+                raise ValueError(f"слот m{n} не назначен")
+        for n in nums:                               # между развёртками: в памяти - целая трасса
+            slot = self._slots[n - 1]
+            self._select(slot)
+            self.write(f"CALC{slot.channel}:MATH:MEM")
+        self._check_errors(context="mem_store")
+        return nums
+
+    # ------------------------------------------------- состояния в памяти прибора
+    def _state_list(self) -> list[str]:
+        reply = self.query("MMEM:CAT?")
+        names = []
+        for entry in re.split(r'[",]', reply):                  # "a.csa,b.cst,..." - только имена
+            file = entry.strip()
+            if file.lower().endswith(STATE_EXT):
+                names.append(file[:-len(STATE_EXT)])
+        return sorted(set(names))
+
+    def _state_file_action(self, name: str, args: tuple) -> None:
+        state = str(args[0]) if args else ""
+        if not _STATE_NAME.fullmatch(state):
+            raise ValueError(f"имя состояния: буквы, цифры, _ и -, до 32 знаков (получено {state!r})")
+        file = f'"{state}{STATE_EXT}"'
+        if name == "state_delete":
+            self.write(f"MMEM:DEL {file}")
+            self._check_errors(context=name)
+            return
+        was_armed = self._armed
+        self._abort()
+        if name == "state_save":
+            try:
+                self.write(f"MMEM:STOR {file}")
+                self._check_errors(context=name)
+            finally:
+                if was_armed or self._continuous:
+                    self._start_sweep()
+            return
+        self.write(f"MMEM:LOAD {file}")                          # state_recall
+        self._check_errors(context=name)
+        self.query("*OPC?")
+        self.on_connected()                                      # измерения и каналы могли смениться
+        self._sync_all()                                         # перечитать всё; непрерывная - запустится
+        if was_armed and not self._armed:
+            self._start_sweep()

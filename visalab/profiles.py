@@ -254,7 +254,13 @@ NETWORK_ANALYZER = Profile(
     [(канал, имя, S-параметр), ...] по всем каналам, ``meas_all`` - занять слоты первыми измерениями
     всех каналов и включить, ``meas_none`` - выключить все. По умолчанию слоты занимают измерения
     канала 1 по порядку, включён m1. ``trace`` / ``sparam`` / ``format`` и маркер - первое измерение
-    канала 1 (``trace`` = m1.trace). ``meas.complex`` выключает чтение комплексных данных.""",
+    канала 1 (``trace`` = m1.trace). ``meas.complex`` выключает чтение комплексных данных.
+
+    Память трассы: ``mem_store`` копирует данные в память у слотов (аргументы - номера, без них - все
+    включённые) -> action_done с номерами; ``m{n}.math`` - математика с памятью (NORM - без неё),
+    применяется к ``m{n}.trace``, не к ``m{n}.sdata``. Состояния прибора хранятся в его памяти:
+    ``state_list`` -> action_done с именами (без содержимого), ``state_save`` / ``state_recall`` /
+    ``state_delete`` - аргумент имя; после ``state_recall`` слоты собираются заново, как при подключении.""",
     slots=(
         Slot("trace", T, "", required=True, readonly=True),
         Slot("meas.continuous", B, required=True),
@@ -285,6 +291,8 @@ NETWORK_ANALYZER = Profile(
         Slot("m{n}.enabled", B, doc="читать это измерение после каждой развёртки"),
         Slot("m{n}.sparam", E, choices=("S11", "S21", "S12", "S22")),
         Slot("m{n}.format", E, choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG")),
+        Slot("m{n}.math", E, choices=("NORM", "DIV", "SUBT", "ADD", "MULT"),
+             doc="математика с памятью: данные, Д/П, Д-П, Д+П, Д*П"),
         Slot("m{n}.trace", T, "", readonly=True, doc="трасса измерения в его формате"),
         Slot("m{n}.sdata", T, "", readonly=True, doc="комплексная трасса измерения (Re в y, Im в im)"),
     ),
@@ -296,6 +304,11 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("meas_catalog", doc="каталог измерений -> action_done('meas_catalog', [(канал, имя, S-параметр)])"),
         ActionSlot("meas_all", doc="занять слоты первыми измерениями всех каналов и включить"),
         ActionSlot("meas_none", doc="выключить чтение всех слотов"),
+        ActionSlot("mem_store", doc="данные -> память: аргументы - номера слотов, без них - все включённые"),
+        ActionSlot("state_list", doc="имена состояний в памяти прибора -> action_done('state_list', [имя, ...])"),
+        ActionSlot("state_save", doc="сохранить состояние в памяти прибора: аргумент - имя"),
+        ActionSlot("state_recall", doc="вызвать состояние из памяти прибора: аргумент - имя"),
+        ActionSlot("state_delete", doc="удалить состояние из памяти прибора: аргумент - имя"),
         ActionSlot("reset"),
     ),
 )
