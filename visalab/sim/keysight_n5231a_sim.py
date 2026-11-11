@@ -175,7 +175,7 @@ class KeysightPNASim(SimInstrument):
         self.on("CALCulate#:MATH:FUNCtion", self._math_set, lambda a, g: self._cur(g).get("math", "NORM"))
         self.on("MMEMory:STORe[:FILE]", self._st_store)
         self.on("MMEMory:LOAD[:FILE]", self._st_load)
-        self.on("MMEMory:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.files)) + '"')
+        self.on("MMEMory:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.files) + self.subdirs()) + '"')
         self.on("MMEMory:DELete", self._file_del)
         self.on("MMEMory:CDIRectory", self._cdir, lambda a, g: f'"{self.cdir}"')
         self.on("CALCulate#:MARKer#:FUNCtion:EXECute", self._mk_exec)
@@ -437,9 +437,20 @@ class KeysightPNASim(SimInstrument):
         self.selected, self.sel_other = "", {}
         self.sweeping = False
 
+    def subdirs(self) -> list[str]:
+        """Имена папок внутри текущей (папки-предки известных папок тоже существуют)."""
+        pre, out = self.cdir.lower() + "\\", set()
+        for d in self.dirs:
+            if d.lower().startswith(pre):
+                out.add(d[len(pre):].split("\\")[0])
+        return sorted(out)
+
     def _cdir(self, a, g):
         path = a.strip().strip("'\"").rstrip("\\")
         key = next((d for d in self.dirs if d.lower() == path.lower()), None)
+        if key is None and any(d.lower().startswith(path.lower() + "\\") for d in self.dirs) and path:
+            key = path                                   # папка-предок: есть, файлов в ней нет
+            self.dirs[key] = {}
         if key is None:
             raise SimError(-256, "File name not found", ESR_EXE)
         self.cdir, self.files = key, self.dirs[key]

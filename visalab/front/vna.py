@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
+from PyQt6.QtCore import QPoint, QSettings, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QFileDialog, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.export import write_traces_csv
@@ -604,7 +604,12 @@ class VNAWindow(InstrumentWindow):
                 vdir.setToolTip("Folder on the analyzer disk with the state files (*.csa), e.g.\n"
                                 "C:\\Users\\Public\\Documents\\Network Analyzer")
                 self.widgets["state.dir"] = vdir
-                save.append(PanelLine("VNA", vdir))
+                ws = [vdir]
+                if "state_dirs" in proxy.actions:     # … - выбрать папку из подпапок анализатора
+                    self.vdir_button = self._tool("…", "Choose the folder on the analyzer", self._ask_dirs)
+                    self.vdir_button.setFixedWidth(TRACE_CHIP_HEIGHT)
+                    ws.append(self.vdir_button)
+                save.append(PanelLine("VNA", *ws))
                 proxy.subscribe("state.dir", lambda _v: self.proxy.is_connected and self.proxy.action("state_list"))
             save.append(self.preset_line("STAT"))
         if sup("m1.trace"):                           # куда и под каким именем DATA SAVE пишет CSV
@@ -622,6 +627,41 @@ class VNAWindow(InstrumentWindow):
             save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit)]
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
+
+    # ------------------------------------------------------------ папка состояний на анализаторе
+    _dirs_asked = False
+
+    def _ask_dirs(self) -> None:
+        if self.proxy.is_connected:
+            self._dirs_asked = True
+            self.proxy.action("state_dirs")
+
+    @staticmethod
+    def dir_choices(path: str, subdirs: list[str]) -> list[tuple[str, str]]:
+        """Пункты меню папок: «..» (на уровень выше, если есть) и подпапки -> (подпись, полный путь)."""
+        path = path.rstrip("\\")
+        out = []
+        if "\\" in path:
+            parent = path.rsplit("\\", 1)[0]
+            out.append(("..", parent + "\\" if parent.endswith(":") else parent))
+        base = path + "\\"
+        return out + [(d, base + d) for d in subdirs]
+
+    def _dirs_menu(self, path: str, subdirs: list[str]) -> None:
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        title = menu.addAction(path)
+        title.setEnabled(False)
+        menu.addSeparator()
+        choices = self.dir_choices(path, subdirs)
+        for text, full in choices:
+            menu.addAction(text).triggered.connect(lambda _=False, f=full: self.proxy.set("state.dir", f))
+        if not choices:
+            menu.addAction("(no folders)").setEnabled(False)
+        b = self.vdir_button                          # правым краем к кнопке: «…» стоит у правого края окна
+        menu.popup(b.mapToGlobal(QPoint(b.width() - menu.sizeHint().width(), b.height())))
+        self._dirs_popup = menu
 
     # ------------------------------------------------------------ данные в файл (DATA SAVE)
     def data_dir(self) -> Path:
@@ -756,7 +796,10 @@ class VNAWindow(InstrumentWindow):
         self.proxy.action("state_recall", preset[0])
 
     def _on_action(self, name: str, result) -> None:
-        if name == "state_list" and isinstance(result, (list, tuple)):
+        if name == "state_dirs" and self._dirs_asked and isinstance(result, (list, tuple)) and len(result) == 2:
+            self._dirs_asked = False
+            self._dirs_menu(str(result[0]), [str(d) for d in result[1]])
+        elif name == "state_list" and isinstance(result, (list, tuple)):
             self.presets.set_names([str(n) for n in result], self._select_after_list)
             self._select_after_list = None
         elif name == "state_recall" and "meas_table" in self.proxy.actions:

@@ -270,3 +270,24 @@ def test_states_folder_on_analyzer(qtbot, vna):
     win.widgets["state.dir"].set_value("C:\\nope")                         # нет такой папки - остаётся прежняя
     _wait(qtbot, lambda: proxy.value("state.dir", None) is not None and sim.cdir.endswith("Lab"))
     assert win.presets.names() and len(win.presets.names()) == 2
+
+
+def test_states_folder_picked_from_menu(qtbot, vna):
+    from visalab.sim.keysight_n5231a_sim import DEFAULT_DIR
+    from visalab.front.vna import VNAWindow
+    proxy, win, _s, sim = vna
+    _wait(qtbot, lambda: proxy.value("state.dir") == DEFAULT_DIR)
+    win.vdir_button.click()                                    # меню подпапок текущей папки
+    _wait(qtbot, lambda: getattr(win, "_dirs_popup", None) is not None)
+    items = [a.text() for a in win._dirs_popup.actions() if not a.isSeparator()]
+    assert items == [DEFAULT_DIR, "..", "Lab"]
+    next(a for a in win._dirs_popup.actions() if a.text() == "Lab").trigger()
+    _wait(qtbot, lambda: proxy.value("state.dir") == DEFAULT_DIR + "\\Lab" and sim.cdir.endswith("Lab"))
+    win._dirs_popup.close()
+    win._dirs_popup = None
+    win.vdir_button.click()
+    _wait(qtbot, lambda: getattr(win, "_dirs_popup", None) is not None)
+    next(a for a in win._dirs_popup.actions() if a.text() == "..").trigger()        # наверх
+    _wait(qtbot, lambda: proxy.value("state.dir") == DEFAULT_DIR)
+    assert VNAWindow.dir_choices("C:\\Users", ["A"]) == [("..", "C:\\"), ("A", "C:\\Users\\A")]
+    assert VNAWindow.dir_choices("C:\\", []) == []

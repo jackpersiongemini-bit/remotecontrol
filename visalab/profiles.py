@@ -329,6 +329,7 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("trigger", doc="ручной запуск (trig.source = MAN); если ничего не взведено - взводит одну развёртку"),
         ActionSlot("mem_store", doc="данные -> память: аргументы - номера слотов, без них - все включённые"),
         ActionSlot("state_list", doc="имена состояний в памяти прибора -> action_done('state_list', [имя, ...])"),
+        ActionSlot("state_dirs", doc="-> action_done('state_dirs', (текущая папка, [подпапки])) - для выбора папки"),
         ActionSlot("state_save", doc="сохранить состояние в памяти прибора: аргумент - имя"),
         ActionSlot("state_recall", doc="вызвать состояние из памяти прибора: аргумент - имя"),
         ActionSlot("state_delete", doc="удалить состояние из памяти прибора: аргумент - имя"),
