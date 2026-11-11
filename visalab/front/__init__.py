@@ -4,5 +4,6 @@ from .psu import PSUWindow
 from .pulse_gen import PulseGenWindow
 from .rf_gen import RFGenWindow
 from .spectrum import SpectrumWindow
+from .vna import VNAWindow
 
-__all__ = ["PowerMeterWindow", "PSUWindow", "PulseGenWindow", "RFGenWindow", "SpectrumWindow"]
+__all__ = ["PowerMeterWindow", "PSUWindow", "PulseGenWindow", "RFGenWindow", "SpectrumWindow", "VNAWindow"]

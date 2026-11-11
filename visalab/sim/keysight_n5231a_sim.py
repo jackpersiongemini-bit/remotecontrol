@@ -26,7 +26,7 @@ class KeysightPNASim(SimInstrument):
     def reset(self) -> None:
         self.c = {"start": 10e6, "stop": 13.5e9, "poin": 201, "bwid": 35e3, "pow": -5.0, "outp": True,
                   "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "corr": False, "mode": "CONT",
-                  "form": "ASC"}
+                  "form": "ASC", "type": "LIN", "cw": 1e9}
         self.meas = {"CH1_S11_1": {"s": "S11", "fmt": "MLOG", "ch": 1}}
         self.selected = ""                               # выбранное измерение канала 1
         self.sel_other: dict[int, str] = {}              # то же у остальных каналов
@@ -59,11 +59,13 @@ class KeysightPNASim(SimInstrument):
         """Стимул канала: канал 1 - ``self.c``, остальные создаются при первом обращении."""
         if ch == 1:
             return self.c
-        return self.other.setdefault(ch, {"start": 1e9, "stop": 2e9, "poin": 101})
+        return self.other.setdefault(ch, {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9})
 
     def freqs(self, ch: int = 1) -> list[float]:
         st = self.stim(ch)
         n, a, b = st["poin"], st["start"], st["stop"]
+        if st["type"] == "CW":
+            return [st["cw"]] * n
         return [a + (b - a) * i / (n - 1) if n > 1 else a for i in range(n)]
 
     def sdata(self, name: str) -> list[float]:
@@ -165,6 +167,9 @@ class KeysightPNASim(SimInstrument):
         self.on("SENSe#:FREQuency:SPAN", self._f("span"), self._gs("span"))
         self.on("SENSe#:SWEep:POINts", self._n("poin", 1, 32001, integer=True),
                 lambda a, g: str(self.stim(self._ch(g))["poin"]))
+        self.on("SENSe#:SWEep:TYPE", self._type_set, lambda a, g: self.stim(self._ch(g))["type"])
+        self.on("SENSe#:FREQuency:CW", self._cw_set, self._gs("cw"))
+        self.on("SENSe#:FREQuency:FIXed", self._cw_set, self._gs("cw"))
         self.on("SENSe#:SWEep:TIME:AUTO", self._b("swt_auto"), self._gb("swt_auto"))
         self.on("SENSe#:SWEep:TIME", self._n("swt", 0, 86400, auto="swt_auto"), self._g(lambda: self.c["swt"]))
         self.on("SENSe#:SWEep:MODE", self._mode_set, lambda a, g: self.c["mode"])
@@ -367,3 +372,14 @@ class KeysightPNASim(SimInstrument):
         if name not in self.files:
             raise SimError(-256, "File name not found", ESR_EXE)
         del self.files[name]
+
+    # ----------------------------------------------------------------- CW
+    def _type_set(self, a, g):
+        t = {"LIN": "LIN", "LINEAR": "LIN", "LOG": "LOG", "LOGARITHMIC": "LOG", "POW": "POW", "POWER": "POW",
+             "CW": "CW", "SEGM": "SEGM", "SEGMENT": "SEGM"}.get(a.strip().upper())
+        if t is None:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        self.stim(self._ch(g))["type"] = t
+
+    def _cw_set(self, a, g):
+        self.stim(self._ch(g))["cw"] = self.num(a, self.F_MIN, self.F_MAX)

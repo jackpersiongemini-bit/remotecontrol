@@ -258,3 +258,19 @@ def test_state_save_recall(make):
     assert any("state_recall" in m for _, m in rec.errors)              # нет файла - ошибка прибора
     drv.run_action("state_delete", "filt_a")
     assert "filt_a.csa" not in sim.files
+
+
+def test_cw_mode_as_generator(vna):
+    drv, sim, rec = vna
+    assert rec.values["sweep.type"] == "LIN"
+    for k, v in (("sweep.type", "CW"), ("freq.cw", 2e9), ("source.power", 0.0), ("rf.output", True),
+                 ("cal.state", False)):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
+    assert sim.c["type"] == "CW" and sim.c["cw"] == 2e9 and sim.c["outp"] and not sim.c["corr"]
+    drv.poll()
+    t = rec.values["m1.trace"]
+    assert t.x_unit == "s" and t.x[0] == 0 and t.x[-1] == pytest.approx(rec.values["sweep.time"])
+    assert max(t.y) - min(t.y) < 1e-9                                     # одна частота во всех точках
+    assert setp(drv, rec, "sweep.type", "LIN") is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["m1.trace"].x_unit == "Hz" and not rec.errors and not rec.comm
