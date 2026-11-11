@@ -2,7 +2,7 @@
 
 Трассы здесь не выводятся (для этого будет отдельный виджет). Избранное:
 
-* MEM  - DATA→MEM: данные -> память у всех читаемых измерений;
+* MEM  - CAPTURE: данные -> память у всех читаемых измерений;
 * MATH - математика с памятью у всех читаемых измерений: DATA, D/M, D−M, D+M, D·M;
 * POW  - мощность источника (колесо / стрелки - разряд под курсором), RF ON/OFF и PRST: в режиме
   пресетов колесо и стрелки переключают мощность только по списку из вкладки PWR;
@@ -510,7 +510,7 @@ class VNAWindow(InstrumentWindow):
             self.stim_channels = StimChannels(proxy)
             top.append(PanelLine("CH", self.stim_channels.scroll))
         if "mem_store" in proxy.actions:
-            top.append(PanelLine("MEM", ActionButton(proxy, "mem_store", "DATA→MEM",
+            top.append(PanelLine("MEM", ActionButton(proxy, "mem_store", "CAPTURE",
                                                      "Copy data to memory for every measurement being read")))
         if sup("m1.math"):
             self.math_button = MathButton(proxy)
