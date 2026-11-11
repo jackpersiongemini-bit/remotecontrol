@@ -144,12 +144,14 @@ class PyVisaTransport(Transport):
         )
 
     def close(self) -> None:
-        for obj in (self._res, self._rm):
-            if obj is not None:
-                try:
-                    obj.close()
-                except Exception as exc:  # закрытие не должно ронять поток
-                    log.debug("close %s: %s", self.address, exc)
+        """Закрыть только свой ресурс. ResourceManager у pyvisa ОДИН на процесс (на библиотеку VISA):
+        закрыть его - оборвать сессии всех остальных приборов («session ... does not support this
+        operation» / «invalid session»)."""
+        if self._res is not None:
+            try:
+                self._res.close()
+            except Exception as exc:  # закрытие не должно ронять поток
+                log.debug("close %s: %s", self.address, exc)
         self._res = None
         self._rm = None
 
