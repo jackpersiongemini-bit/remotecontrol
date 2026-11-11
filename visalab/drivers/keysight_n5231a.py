@@ -15,6 +15,13 @@
   ``cal_list``), удаление ``CSET:DEL "имя"`` (``cal_delete``); ключ ``cal.set`` канала ``stim.channel`` -
   ``SENS<c>:CORR:CSET:ACT? NAME`` / ``SENS<c>:CORR:CSET:ACT "имя",<1|0>`` (1 - взять и стимул из cal set,
   ключ ``cal.stim``), пустое имя - ``SENS<c>:CORR:CSET:DEAC``; интерполяция ``SENS<c>:CORR:INT``;
+* сама калибровка канала ``stim.channel`` - пошаговая (guided) ``SENS<c>:CORR:COLL:GUID:...``: разъёмы
+  ``CONN:CAT?`` (``cal_conns``), наборы разъёма ``CKIT:CAT? "разъём"`` (``cal_kits``, наборы с «ideal» в
+  имени - первыми), ``cal_start`` (разъём и набор порта 1, порта 2; пустой разъём - порт не калибруется):
+  ``CONN:PORT<n>``, ``CKIT:PORT<n>``, ``INIT``, ``STEPS?``, ``DESC? <шаг>`` -> список шагов; ``cal_measure``
+  (номер шага) - ``ACQ STAN<шаг>`` + ``*OPC`` без блокировки (ключ ``cal.busy``); ``cal_status`` -> (шаги,
+  измеренные); ``cal_save`` (имя) - ``SAVE:CSET "имя"``, cal set сразу применяется к каналу; ``cal_abort``.
+  Пока идёт калибровка, развёртки не запускаются;
 * маркер ``CALC1:MARK1``, ``CALC1:MARK1:X``, ``CALC1:MARK1:Y?`` (два числа), ``CALC1:MARK1:FUNC:EXEC MAX|MIN``;
 * запуск ``TRIG:SOUR IMM|EXT|MAN`` (внутренний / внешний BNC / ручной), ``TRIG:SCOP ALL|CURR``
   (триггер на все каналы по очереди или на текущий), режим канала ``SENS1:SWE:TRIG:MODE CHAN|SWE|POIN|TRAC``
@@ -142,6 +149,8 @@ class KeysightPNA(VISAInstrument):
         self._armed = False
         self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
         self._cal_stim = True                  # cal set применяется вместе со своим стимулом
+        #: идущая калибровка: {"channel", "steps": [описание], "done": {шаг}, "busy": шаг | None}
+        self._cal: dict | None = None
         self._sweep: dict[str, Any] = {}       # последняя завершённая развёртка: ключи m{n}.*, trace, meas.count
         self._slots = [_Slot() for _ in range(MEAS_SLOTS)]
         self._armed_channels: list[int] = [1]
@@ -223,6 +232,7 @@ class KeysightPNA(VISAInstrument):
             Param("cal.set", "Cal set канала", Kind.STR, section=rs, query="<virtual>", write="<virtual>",
                   also_read=STIM_KEYS),
             Param("cal.stim", "Cal set со стимулом", B, section=rs, query="<virtual>", write="<virtual>"),
+            Param("cal.busy", "Идёт измерение стандарта", B, section=rs, query="<virtual>"),
             Param("cal.interp", "Интерполяция калибровки", B, section=rs, query="SENS1:CORR:INT?",
                   write="SENS1:CORR:INT {value}", also_read=("cal.state",)),
             Param("freq.start", "Старт", section=st, query="SENS1:FREQ:STAR?", write="SENS1:FREQ:STAR {value}",
@@ -292,12 +302,17 @@ class KeysightPNA(VISAInstrument):
                 Action("state_delete", "Удалить состояние", confirm="Удалить состояние из памяти анализатора?"),
                 Action("cal_list", "Cal set'ы в памяти прибора"),
                 Action("cal_delete", "Удалить cal set", confirm="Удалить cal set из памяти анализатора?"),
+                Action("cal_conns", "Разъёмы для калибровки"), Action("cal_kits", "Наборы для разъёма"),
+                Action("cal_start", "Начать калибровку"), Action("cal_measure", "Измерить стандарт"),
+                Action("cal_status", "Шаги калибровки"), Action("cal_save", "Сохранить калибровку в cal set"),
+                Action("cal_abort", "Прервать калибровку"),
                 Action("reset", "Preset *RST",
                        confirm="Preset удалит измерения и выключит калибровку. Продолжить?")]
 
     # --------------------------------------------------------------- хуки
     def on_connected(self) -> None:
         self._armed = False
+        self._cal = None
         self._stim_ch = 1
         self._gen = None                      # после *RST / вызова состояния возвращать нечего
         self._sweep = {}
@@ -316,6 +331,7 @@ class KeysightPNA(VISAInstrument):
         self._slots[0].enabled = True
 
     def on_disconnecting(self) -> None:
+        self._cal = None
         if self._armed:
             self._abort()
         if self._gen is not None:             # не оставлять прибор в режиме генератора
@@ -445,6 +461,8 @@ class KeysightPNA(VISAInstrument):
             return self._gen is not None
         if key == "cal.stim":
             return self._cal_stim
+        if key == "cal.busy":
+            return self._cal is not None and self._cal["busy"] is not None
         if key == "cal.set":
             name = self.query(f"SENS{self._stim_ch}:CORR:CSET:ACT? NAME").strip().strip('"').strip()
             return "" if not name or name.upper().startswith("NO ") else name
@@ -502,6 +520,8 @@ class KeysightPNA(VISAInstrument):
             self._publish("meas.armed", armed)
 
     def _start_sweep(self) -> None:
+        if self._cal is not None:                  # калибровка: стандарты меряет cal_measure
+            return
         self._armed_channels = self._active_channels()
         self.arm_opc(*[f"SENS{c}:SWE:MODE SING" for c in self._armed_channels])
         self._set_armed(True)
@@ -644,6 +664,12 @@ class KeysightPNA(VISAInstrument):
             self._read_keys(["marker.freq", "marker.value"])
 
     def poll(self) -> None:
+        if self._cal is not None and self._cal["busy"] is not None:
+            if self.opc_done("калибровка"):
+                self._cal["done"].add(self._cal["busy"])
+                self._cal["busy"] = None
+                self._publish("cal.busy", False)
+            return
         if self._armed and self.opc_done("развёртка"):
             self._set_armed(False)
             self._read_trace()
@@ -719,6 +745,8 @@ class KeysightPNA(VISAInstrument):
             return self._mem_store(args)
         if name == "cal_list":
             return self._cal_list()
+        if name.startswith("cal_") and name not in ("cal_delete",):
+            return self._cal_action(name, args)
         if name == "cal_delete":
             cset = str(args[0]) if args else ""
             if cset not in self._cal_list():
@@ -773,6 +801,87 @@ class KeysightPNA(VISAInstrument):
             self.write(f'SENS{c}:CORR:CSET:ACT "{name}",{1 if self._cal_stim else 0}')
             self.query("*OPC?")
         self._check_errors(context="cal.set")
+
+    # ------------------------------------------------- калибровка (guided)
+    @staticmethod
+    def _names(reply: str) -> list[str]:
+        return [e.strip() for e in re.split(r'[",]', reply) if e.strip()]
+
+    def _cal_action(self, name: str, args: tuple) -> Any:
+        c = self._cal["channel"] if self._cal is not None else self._stim_ch
+        guid = f"SENS{c}:CORR:COLL:GUID"
+        if name == "cal_conns":
+            return [n for n in self._names(self.query(f"{guid}:CONN:CAT?")) if n.lower() != "not used"]
+        if name == "cal_kits":
+            kits = self._names(self.query(f'{guid}:CKIT:CAT? "{args[0] if args else ""}"'))
+            return sorted(kits, key=lambda k: "ideal" not in k.lower())        # идеальные - первыми
+        if name == "cal_status":
+            return self._cal_status()
+        if name == "cal_start":
+            if self._gen is not None:
+                raise ValueError("режим генератора: сначала выключите CW")
+            conn1, kit1, conn2, kit2 = (list(args) + ["", "", "", ""])[:4]
+            ports = [(n, str(conn).strip(), str(kit).strip()) for n, conn, kit in ((1, conn1, kit1), (2, conn2, kit2))]
+            if not any(conn for _n, conn, _k in ports):
+                raise ValueError("калибровка: задайте разъём хотя бы одного порта")
+            for n, conn, kit in ports:
+                if conn and not kit:
+                    raise ValueError(f"калибровка: нет набора для порта {n}")
+            self._abort()
+            c = self._stim_ch
+            guid = f"SENS{c}:CORR:COLL:GUID"
+            for n, conn, kit in ports:
+                self.write(f'{guid}:CONN:PORT{n} "{conn or "Not used"}"')
+                if conn:
+                    self.write(f'{guid}:CKIT:PORT{n} "{kit}"')
+            self.write(f"{guid}:INIT")
+            self._check_errors(context=name)
+            steps = int(parse_number(self.query(f"{guid}:STEP?")))
+            self._cal = {"channel": c, "done": set(), "busy": None,
+                         "steps": [self.query(f"{guid}:DESC? {k}").strip().strip('"') for k in range(1, steps + 1)]}
+            return self._cal_status()
+        if self._cal is None:
+            raise ValueError("калибровка не начата (cal_start)")
+        if name == "cal_measure":
+            k = int(args[0]) if args else 0
+            if not 1 <= k <= len(self._cal["steps"]):
+                raise ValueError(f"шаг 1..{len(self._cal['steps'])}, получено {k}")
+            if self._cal["busy"] is not None:
+                raise ValueError(f"идёт измерение шага {self._cal['busy']}")
+            self.arm_opc(f"{guid}:ACQ STAN{k}")
+            self._cal["busy"] = k
+            self._publish("cal.busy", True)
+            return k
+        if name == "cal_save":
+            cset = str(args[0]).strip() if args else ""
+            if not _STATE_NAME.fullmatch(cset):
+                raise ValueError(f"имя cal set: буквы, цифры, _ и -, до 32 знаков (получено {cset!r})")
+            if self._cal["busy"] is not None or len(self._cal["done"]) < len(self._cal["steps"]):
+                raise ValueError("калибровка: измерены не все стандарты")
+            self.write(f'{guid}:SAVE:CSET "{cset}"')
+            self.query("*OPC?")
+            self._check_errors(context=name)
+            self._cal_end()
+            return self._cal_list()
+        if name == "cal_abort":
+            self._cal_end()
+            return None
+        return super().run_custom_action(name, args)
+
+    def _cal_status(self) -> tuple[list[str], list[int]]:
+        if self._cal is None:
+            return [], []
+        return list(self._cal["steps"]), sorted(self._cal["done"])
+
+    def _cal_end(self) -> None:
+        """Выйти из калибровки: перечитать калибровку и стимул канала, продолжить развёртки."""
+        c = self._cal["channel"] if self._cal else self._stim_ch
+        self._cal = None
+        self._publish("cal.busy", False)
+        if c == self._stim_ch:
+            self._read_keys(STIM_KEYS)
+        if self._continuous:
+            self._start_sweep()
 
     # ------------------------------------------------- состояния в памяти прибора
     def _state_dirs(self) -> tuple[str, list[str]]:

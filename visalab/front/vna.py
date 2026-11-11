@@ -486,6 +486,7 @@ class CalSets(QWidget):
         self._armed.setSingleShot(True)
         self._armed.timeout.connect(lambda: self.delete_button and self.delete_button.setText("−"))
         self.delete_button: QPushButton | None = None
+        self.relayout = None                               # окно: подогнать высоту под новые чипы
         proxy.action_done.connect(self._on_action)
         proxy.subscribe("cal.set", lambda _v: self._show())
         proxy.subscribe("gen.state", lambda _v: self._show())
@@ -504,6 +505,8 @@ class CalSets(QWidget):
             b.setToolTip("Remove the cal set from the channel (correction off)" if text == self.NONE
                          else f"Apply cal set {text!r} to the channel of the selected trace")
         self._show()
+        if self.relayout is not None:
+            self.relayout()
 
     def _show(self) -> None:
         cur = self.proxy.value("cal.set")
@@ -536,8 +539,209 @@ class CalSets(QWidget):
         return True
 
     def _on_action(self, name: str, result) -> None:
-        if name in ("cal_list", "cal_delete") and isinstance(result, (list, tuple)):
+        if name in ("cal_list", "cal_delete", "cal_save") and isinstance(result, (list, tuple)):
             self.set_names([str(n) for n in result])
+
+
+def short_conn(name: str) -> str:
+    """Короткая подпись разъёма: «Type N (50) female» -> «N F», «APC 3.5 male» -> «3.5 M»."""
+    words = [w for w in re.sub(r"\(\d+\)", "", name).split() if w.lower() not in ("type", "apc")]
+    return " ".join({"female": "F", "male": "M"}.get(w.lower(), w) for w in words) or name
+
+
+def short_step(text: str, conns=()) -> str:
+    """Короткий шаг: «Connect APC 3.5 female OPEN to port 1» -> «3.5 F OPEN to P1»."""
+    for c in sorted(conns, key=len, reverse=True):
+        text = text.replace(c, short_conn(c))
+    text = re.sub(r"^\s*connect\s+", "", text, flags=re.I)
+    return re.sub(r"\bport\s*(\d+)", r"P\1", text, flags=re.I)
+
+
+class _StepButton(IndicatorButton):
+    """Шаг калибровки: клик - измерить стандарт, индикатор - измерен."""
+
+    def __init__(self, text: str, step: int):
+        super().__init__(text)
+        self.step, self.done = step, False
+        self.setObjectName("choice")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def indicated(self) -> bool:
+        return self.done
+
+
+class CalWizard(QWidget):
+    """Калибровка канала выбранного трейса (guided): разъём и набор порта 1 и 2 (P2 OFF - однопортовая),
+    START - прибор выдаёт шаги; клик по шагу меряет стандарт (индикатор - измерен); SAVE - в cal set с
+    именем NAME и сразу на канал. Набор по умолчанию - первый в списке прибора (идеальные первыми)."""
+
+    OFF = "OFF"
+
+    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+        super().__init__(parent)
+        self.proxy, self.settings, self.prefix = proxy, settings, prefix
+        self.conns: list[str] = []
+        self.kits: dict[str, list[str]] = {}
+        self._kits_pending: list[str] = []
+        self.port_conn = {p: str(settings.value(f"{prefix}/CAL_P{p}_CONN", "") or "") for p in (1, 2)}
+        self.port_kit = {p: str(settings.value(f"{prefix}/CAL_P{p}_KIT", "") or "") for p in (1, 2)}
+        self.steps: list[str] = []
+        self.done: set[int] = set()
+        self.conn_buttons = {p: MenuButton([], lambda v, p=p: self.set_conn(p, v), f"Port {p} connector")
+                             for p in (1, 2)}
+        self.kit_buttons = {p: MenuButton([], lambda v, p=p: self.set_kit(p, v), f"Port {p} cal kit")
+                            for p in (1, 2)}
+        self.start_button = self._button("START", "Start the calibration of the selected trace channel:\n"
+                                                  "P1 and P2 - 2-port, P2 OFF - 1-port", self.start)
+        self.abort_button = self._button("ABORT", "Stop the calibration, sweeps go on", self.abort)
+        self.steps_box = QWidget()
+        self.steps_layout = QVBoxLayout(self.steps_box)
+        self.steps_layout.setContentsMargins(0, 0, 0, 0)
+        self.steps_layout.setSpacing(4)
+        self.name_edit = QLineEdit()
+        self.name_edit.setToolTip("Name of the new cal set (letters, digits, _ and -)")
+        self.save_button = self._button("SAVE", "Save the calibration to the cal set NAME and apply it", self.save)
+        proxy.action_done.connect(self._on_action)
+        proxy.subscribe("cal.busy", self._on_busy)
+        proxy.subscribe("gen.state", lambda _v: self._show())
+        self.run_lines: list[QWidget] = []                 # строки шагов и имени - только во время калибровки
+        self.relayout = None                               # окно: подогнать высоту (шаги появились / исчезли)
+        proxy.state_changed.connect(lambda _s: self._show())
+        self._show()
+
+    @staticmethod
+    def _button(text: str, tip: str, slot) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName("choice")
+        b.setToolTip(tip)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.clicked.connect(slot)
+        return b
+
+    # -------------------------------------------------------- разъёмы и наборы
+    def refresh(self) -> None:
+        if self.proxy.is_connected and "cal_conns" in self.proxy.actions:
+            self.proxy.action("cal_conns")
+
+    def _ask_kits(self, conn: str) -> None:
+        if conn and conn != self.OFF and conn not in self.kits and conn not in self._kits_pending:
+            self._kits_pending.append(conn)
+            self.proxy.action("cal_kits", conn)
+
+    def set_conn(self, port: int, conn: str) -> None:
+        self.port_conn[port] = conn
+        self.settings.setValue(f"{self.prefix}/CAL_P{port}_CONN", conn)
+        self._ask_kits(conn)
+        self._show()
+
+    def set_kit(self, port: int, kit: str) -> None:
+        self.port_kit[port] = kit
+        self.settings.setValue(f"{self.prefix}/CAL_P{port}_KIT", kit)
+        self._show()
+
+    def conn(self, port: int) -> str:
+        """Разъём порта: сохранённый, иначе первый (порт 2 - как порт 1)."""
+        c = self.port_conn[port]
+        if c == self.OFF or c in self.conns:
+            return c
+        return self.conn(1) if port == 2 and self.conns else (self.conns[0] if self.conns else "")
+
+    def kit(self, port: int) -> str:
+        kits = self.kits.get(self.conn(port), [])
+        return self.port_kit[port] if self.port_kit[port] in kits else (kits[0] if kits else "")
+
+    # -------------------------------------------------------- калибровка
+    def start(self) -> None:
+        args = []
+        for p in (1, 2):
+            c = self.conn(p)
+            args += ["", ""] if c in ("", self.OFF) else [c, self.kit(p)]
+        self.proxy.action("cal_start", *args)
+
+    def measure(self, step: int) -> None:
+        self.proxy.action("cal_measure", step)
+
+    def abort(self) -> None:
+        self.proxy.action("cal_abort")
+
+    def save(self) -> None:
+        name = self.name_edit.text().strip() or self.default_name()
+        self.name_edit.setText(name)
+        self.proxy.action("cal_save", name)
+
+    def default_name(self) -> str:
+        return f"CAL_CH{self.proxy.value('stim.channel') or 1}_{time.strftime('%Y%m%d_%H%M')}"
+
+    def _on_busy(self, busy) -> None:
+        if busy is False and self.steps:
+            self.proxy.action("cal_status")
+        self._show()
+
+    def _on_action(self, name: str, result) -> None:
+        if name == "cal_conns" and isinstance(result, (list, tuple)):
+            self.conns = [str(c) for c in result]
+            for p in (1, 2):
+                self._ask_kits(self.conn(p))
+        elif name == "cal_kits" and isinstance(result, (list, tuple)) and self._kits_pending:
+            self.kits[self._kits_pending.pop(0)] = [str(k) for k in result]
+        elif name in ("cal_start", "cal_status") and isinstance(result, (list, tuple)) and len(result) == 2:
+            steps, done = result
+            if name == "cal_start" or list(steps) != self.steps:
+                self.steps = [str(t) for t in steps]
+                self._make_steps()
+                self.name_edit.setText(self.default_name())
+            self.done = {int(k) for k in done}
+        elif name in ("cal_save", "cal_abort"):
+            self.steps, self.done = [], set()
+            self._make_steps()
+        else:
+            return
+        self._show()
+        if name != "cal_status" and self.relayout is not None:
+            self.relayout()
+
+    def _make_steps(self) -> None:
+        while self.steps_layout.count():
+            w = self.steps_layout.takeAt(0).widget()
+            if w is not None:
+                w.deleteLater()
+        for k, text in enumerate(self.steps, 1):
+            b = _StepButton(f"{k}. {short_step(text, self.conns)}", k)
+            b.setToolTip(f"{text}\nConnect the standard, then click to measure it")
+            b.clicked.connect(lambda _=False, k=k: self.measure(k))
+            self.steps_layout.addWidget(b)
+
+    def step_buttons(self) -> list[_StepButton]:
+        return [self.steps_layout.itemAt(i).widget() for i in range(self.steps_layout.count())]
+
+    def _show(self) -> None:
+        on = self.proxy.is_connected
+        running = bool(self.steps)
+        busy = self.proxy.value("cal.busy") is True
+        gen = self.proxy.value("gen.state") is True
+        for p in (1, 2):
+            choices = [(short_conn(c), c) for c in self.conns] + ([(self.OFF, self.OFF)] if p == 2 else [])
+            self.conn_buttons[p].choices = tuple(choices)
+            self.conn_buttons[p].show_value(self.conn(p))
+            self.conn_buttons[p].setToolTip(f"Port {p} connector: {self.conn(p) or '?'}")
+            kits = self.kits.get(self.conn(p), [])
+            self.kit_buttons[p].choices = tuple((k, k) for k in kits)
+            self.kit_buttons[p].show_value(self.kit(p) or None)
+            self.kit_buttons[p].setVisible(self.conn(p) != self.OFF)
+            for b in (self.conn_buttons[p], self.kit_buttons[p]):
+                b.setEnabled(on and not running)
+        self.start_button.setEnabled(on and not running and not gen and bool(self.conn(1)) and bool(self.kit(1)))
+        self.abort_button.setEnabled(on and running and not busy)
+        for b in self.step_buttons():
+            b.done = b.step in self.done
+            b.setEnabled(on and not busy)
+            b.update()
+        complete = running and len(self.done) == len(self.steps)
+        self.save_button.setEnabled(on and complete and not busy)
+        for line in self.run_lines:
+            line.setVisible(running)
 
 
 class VNAWindow(InstrumentWindow):
@@ -691,6 +895,15 @@ class VNAWindow(InstrumentWindow):
                     w.setToolTip(tip)
                     self.widgets.setdefault(key, w)
                     cal.append(PanelLine(name, w))
+            if "cal_start" in proxy.actions:          # сама калибровка канала (guided)
+                wz = self.cal_wizard = CalWizard(proxy, self.settings, pre)
+                wz.run_lines = [PanelLine("STEP", wz.steps_box), PanelLine("NAME", wz.name_edit, wz.save_button)]
+                cal += [PanelLine("P1", wz.conn_buttons[1], wz.kit_buttons[1]),
+                        PanelLine("P2", wz.conn_buttons[2], wz.kit_buttons[2]),
+                        PanelLine("RUN", wz.start_button, wz.abort_button), *wz.run_lines]
+                wz._show()
+                wz.relayout = self._fit_height
+            cs.relayout = self._fit_height
             self.page_specs.append(("CAL", ("cal.state",), PanelTable(*cal)))
 
         # TRAC (первая вкладка): трейс, выбранный в избранном (TRC)
@@ -893,6 +1106,8 @@ class VNAWindow(InstrumentWindow):
         return StatePresets(self.settings, key, self._delete_state)
 
     def refresh_lists(self) -> None:
+        if hasattr(self, "cal_wizard"):
+            self.cal_wizard.refresh()
         for name in ("state_list", "meas_table", "cal_list"):
             if name in self.proxy.actions:
                 self.proxy.action(name)
