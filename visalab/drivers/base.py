@@ -1,14 +1,14 @@
-"""Базовый класс фонового слоя прибора (замена VISAClass).
+"""Слой 2: контракт драйвера - базовый класс ``VISAInstrument`` (замена VISAClass).
 
 Принципы
 --------
 * Один прибор = один объект ``VISAInstrument`` = один собственный ``QThread``.
   Транспорт трогается ТОЛЬКО из этого потока, поэтому блокировки не нужны:
   очередь событий Qt сама сериализует все операции.
-* GUI не вызывает методы прибора напрямую. Он работает через
-  :class:`~visalab.core.proxy.InstrumentProxy`, который шлёт сигналы-запросы,
-  а прибор отвечает сигналами-событиями. Сигналы у каждого экземпляра свои,
-  никакой глобальной шины с фильтрацией по адресу.
+* Методы драйвера напрямую никто не вызывает. Слой выше (абстрактный прибор,
+  :class:`~visalab.instruments.InstrumentProxy`) шлёт сигналы-запросы, драйвер отвечает
+  сигналами-событиями. Сигналы у каждого экземпляра свои, никакой глобальной шины с
+  фильтрацией по адресу. Вниз драйвер говорит только с транспортом (:mod:`visalab.transport`).
 * Любой слот защищён: исключение не роняет приложение (PyQt6 по умолчанию
   вызывает qFatal на необработанном исключении в слоте), а превращается в сигнал.
 * При подключении ничего не сбрасывается (*RST только отдельным действием):
@@ -40,10 +40,10 @@ from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import QCoreApplication, QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
-from .params import Action, ConnectionState, Param, PStatus
-from .profile import Profile
-from .scpi import parse_number, strip_response_header
-from .transport import Transport, TransportError, TransportNotSupported, TransportTimeout
+from ..core.params import Action, ConnectionState, Param, PStatus
+from ..core.profile import Profile
+from ..core.units import parse_number
+from ..transport import Transport, TransportError, TransportNotSupported, TransportTimeout, strip_response_header
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +122,16 @@ class VISAInstrument(QObject):
     raw_response = pyqtSignal(str, str)           # запрос, ответ (консоль)
     #: связи нет, прибор переподключится сам через столько секунд; 0 - не ждём (подключён или отключён)
     reconnect_pending = pyqtSignal(float)
+
+    @property
+    def address(self) -> str:
+        """VISA-адрес прибора (строка транспорта)."""
+        return self.transport.address
+
+    @property
+    def timeout_ms(self) -> int:
+        """Сколько может длиться один запрос к прибору, мс (таймаут транспорта)."""
+        return int(getattr(self.transport, "timeout_ms", 2000) or 2000)
 
     def __init__(self, transport: Transport, parent: QObject | None = None,
                  command_delay_s: float | None = None):

@@ -1,5 +1,8 @@
 """Окно строится из описания параметров и отражает значения прибора."""
-from visalab.core import InstrumentProxy, PStatus, SimTransport
+from visalab.core import PStatus
+from conftest import attach, l3
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import ItechIT6300, SiglentSDG
 from visalab.gui.widgets import NumberField, ToggleField
 from visalab.gui.window import InstrumentWindow
@@ -12,7 +15,7 @@ def _field(win, cls, key):
 
 def test_psu_window_roundtrip(qtbot):
     sim = ItechIT6300Sim()
-    proxy = InstrumentProxy(ItechIT6300, SimTransport(sim))
+    proxy = attach(InstrumentProxy(ItechIT6300, SimTransport(sim)))
     win = InstrumentWindow(proxy)
     qtbot.addWidget(win)
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["Каналы", "Защита", "Общие"]
@@ -32,12 +35,12 @@ def test_psu_window_roundtrip(qtbot):
         toggle.click()
     assert sim.chs[1].output and toggle.isChecked()
     win.close()
-    assert not proxy._thread.isRunning()
+    assert not l3(proxy)._thread.isRunning()
 
 
 def test_bad_input_marks_invalid_without_sending(qtbot):
     sim = SiglentSDGSim()
-    proxy = InstrumentProxy(SiglentSDG, SimTransport(sim))
+    proxy = attach(InstrumentProxy(SiglentSDG, SimTransport(sim)))
     win = InstrumentWindow(proxy)
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):
@@ -59,7 +62,7 @@ def test_rf_generator_windows_identical(qtbot):
     layouts = []
     for drv, sim_cls in ((KeysightE8267D, KeysightE8267DSim), (RSSMF100A, RSSMF100ASim)):
         sim = sim_cls()
-        proxy = InstrumentProxy(drv, SimTransport(sim))
+        proxy = attach(InstrumentProxy(drv, SimTransport(sim)))
         win = InstrumentWindow(proxy)
         qtbot.addWidget(win)
         with qtbot.waitSignal(proxy.sync_done, timeout=5000):
@@ -78,7 +81,7 @@ def test_power_meter_window_updates_reading(qtbot):
     from visalab.sim import KeysightU2021XASim
     sim = KeysightU2021XASim()
     sim.set_signal(on_dbm=-3.0, width=None)
-    proxy = InstrumentProxy(KeysightU2021XA, SimTransport(sim))
+    proxy = attach(InstrumentProxy(KeysightU2021XA, SimTransport(sim)))
     win = InstrumentWindow(proxy)
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.param_updated, timeout=5000,
@@ -94,7 +97,7 @@ def test_spectrum_window_plots_trace(qtbot):
     from visalab.gui.widgets import TracePlot
     from visalab.sim import AgilentPSASim
     sim = AgilentPSASim()
-    proxy = InstrumentProxy(AgilentPSA, SimTransport(sim))
+    proxy = attach(InstrumentProxy(AgilentPSA, SimTransport(sim)))
     win = InstrumentWindow(proxy)
     qtbot.addWidget(win)
     plot = next(iter(win.findChildren(TracePlot)))
@@ -111,7 +114,7 @@ def test_vna_window_plots_trace(qtbot):
     from visalab.drivers import KeysightPNA
     from visalab.gui.widgets import TracePlot
     from visalab.sim import KeysightPNASim
-    proxy = InstrumentProxy(KeysightPNA, SimTransport(KeysightPNASim()))
+    proxy = attach(InstrumentProxy(KeysightPNA, SimTransport(KeysightPNASim())))
     win = InstrumentWindow(proxy)
     qtbot.addWidget(win)
     plot = next(iter(win.findChildren(TracePlot)))

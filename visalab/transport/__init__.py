@@ -1,9 +1,16 @@
-"""Транспортный слой: единый интерфейс поверх pyvisa и симуляторов.
+"""Слой 1: транспорт. Этот модуль - входной порт слоя (им пользуется слой 2, драйверы).
 
-Драйвер прибора общается только с :class:`Transport`, поэтому один и тот же драйвер
-работает с реальным прибором (:class:`PyVisaTransport`) и без железа
-(:class:`SimTransport`). Транспорт не потокобезопасен намеренно: им владеет ровно
-один рабочий поток прибора (см. ``VISAInstrument``).
+Порт:
+
+* :class:`Transport` - контракт: write / read / query, статус (serial poll), device clear, таймаут;
+  реализации - :class:`PyVisaTransport` (pyvisa: USB, LAN, GPIB - решает только строка адреса) и
+  :class:`SimTransport` (симулятор прибора из :mod:`visalab.sim`, без железа);
+* ошибки связи :class:`TransportError`, :class:`TransportTimeout`, :class:`TransportNotSupported`;
+* :func:`list_resources` - какие приборы видит VISA;
+* формат сообщений SCPI (:mod:`visalab.transport.scpi`) и двоичные блоки IEEE 488.2.
+
+Транспорт не потокобезопасен намеренно: им владеет ровно один рабочий поток прибора (см. ``VISAInstrument``).
+Ниже слоя - только pyvisa и симуляторы.
 """
 from __future__ import annotations
 
@@ -15,13 +22,15 @@ import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from .scpi import strip_response_header
+
 if TYPE_CHECKING:  # pragma: no cover
     from ..sim.base import SimInstrument
 
 log = logging.getLogger(__name__)
 
 __all__ = ["TransportError", "TransportTimeout", "TransportNotSupported", "Transport", "PyVisaTransport", "SimTransport",
-           "parse_float_block", "float_block", "lan_endpoint"]
+           "parse_float_block", "float_block", "lan_endpoint", "list_resources", "strip_response_header"]
 
 
 class TransportError(Exception):
@@ -69,6 +78,12 @@ def _log_visa_library(rm) -> None:
         log.info("VISA: %s", rm.visalib)
     except Exception:  # noqa: BLE001
         pass
+
+
+def list_resources(backend: str = "") -> list[str]:
+    """Ресурсы, которые видит библиотека VISA (``backend``: "" - системная, "@py" - pyvisa-py)."""
+    import pyvisa
+    return list(pyvisa.ResourceManager(backend).list_resources())
 
 
 _HISLIP_RE = re.compile(r"^hislip\d*(?:,(\d+))?$", re.IGNORECASE)
@@ -303,14 +318,17 @@ class SimTransport(Transport):
 
     ``latency_s`` добавляет задержку на каждую операцию, чтобы проверить, что GUI не
     блокируется. ``fail_after`` - после стольких операций связь "рвётся" (для тестов).
+    ``bench`` - стенд симуляторов (:class:`visalab.sim.bench.SimBench`): пока ресурс открыт, симулятор
+    стоит на стенде (выход генератора попадает на анализатор и ваттметр).
     """
 
     supports_serial_poll = True
 
     def __init__(self, simulator: "SimInstrument", address: str = "SIM::INSTR",
-                 latency_s: float = 0.0, fail_after: int | None = None):
+                 latency_s: float = 0.0, fail_after: int | None = None, bench=None):
         self.sim = simulator
         self.address = address
+        self.bench = bench
         self.latency_s = latency_s
         self.fail_after = fail_after
         self._ops = 0
@@ -335,9 +353,13 @@ class SimTransport(Transport):
         if not self.sim.powered:
             raise TransportError(f"{self.address}: прибор не найден (симуляция)")
         self._open = True
+        if self.bench is not None:
+            self.bench.join(self.sim)
 
     def close(self) -> None:
         self._open = False
+        if self.bench is not None:
+            self.bench.leave(self.sim)
 
     @property
     def is_open(self) -> bool:

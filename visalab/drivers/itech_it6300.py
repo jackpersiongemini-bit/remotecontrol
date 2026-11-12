@@ -17,9 +17,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.instrument import VISAInstrument
+from .base import VISAInstrument
 from ..core.params import Action, Kind, Param
-from ..core.scpi import parse_number
+from ..core.units import parse_number
 from ..profiles import POWER_SUPPLY
 
 __all__ = ["ItechIT6300", "IT6300Model", "IT6300_MODELS"]

@@ -5,7 +5,7 @@
 выбранный) и таблица параметров по каналам. Каждая запись проверяется драйвером чтением обратно,
 EQPHASE после изменений, влияющих на фазу, драйвер отправляет сам.
 
-Окно знает только InstrumentProxy и ключи профиля function_generator.
+Окно знает только прибор координатора (Instrument) и ключи профиля function_generator.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from typing import Any
 from PyQt6.QtCore import QSettings
 
 from ..core.params import Kind
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format
+from ..coord import Instrument
+from ..core.units import si_format
 from . import instrument_window as _iw
 from .instrument_window import PRESET_GAP, PRESET_HEIGHT, HScrollArea, InstrumentWindow  # noqa: F401
 from .params import PLabel, PLineEdit, PNLabel, PSButton, PanelLine, PanelTable
@@ -25,7 +25,7 @@ __all__ = ["PulseGenWindow", "PULSE_PRESETS", "ROWS", "saved_connection"]
 
 PULSE_PRESETS = ((400e-3, 30e-6, "PULSE"),)       # (PERI, WID, форма)
 
-def _auto(proxy: InstrumentProxy, key: str):
+def _auto(proxy: Instrument, key: str):
     """Виджет по типу параметра: BOOL - OFF/ON, ENUM - список, число/строка - поле."""
     spec = proxy.params[key]
     if spec.kind is Kind.BOOL:
@@ -119,7 +119,7 @@ class PulseGenWindow(InstrumentWindow):
     PRESET_DEFAULTS = PULSE_PRESETS
     PRESET_ADD_TIP = "Add preset from CH1 TYPE / PERI / WID"
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Pulse generator", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Pulse generator", parent=None):
         super().__init__(proxy, settings, title, parent)
 
     # ------------------------------------------------------------ сборка

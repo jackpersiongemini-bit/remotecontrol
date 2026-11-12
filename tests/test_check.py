@@ -7,7 +7,10 @@ import logging
 
 from visalab.applog import Throttle, close_logging, setup_logging
 from visalab.check import format_report, plural, run_check
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach
+from visalab.coord import COORD
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import KeysightE8267D, KeysightU2021XA
 from visalab.sim import KeysightE8267DSim, KeysightU2021XASim
 
@@ -39,12 +42,12 @@ def test_check_reports_what_the_instrument_does_not_answer(qtbot):
     gen_sim._handlers[j] = (gen_sim._handlers[j][0], gen_sim._handlers[j][1], lambda a, g: "WHAT")  # не число
     off_sim = KeysightU2021XASim()
     off_sim.powered = False                                                # прибор выключен
-    targets = [("e8267d", InstrumentProxy(KeysightE8267D, SimTransport(gen_sim, address="SIM::GEN::INSTR"))),
-               ("u2021xa", InstrumentProxy(KeysightU2021XA, SimTransport(off_sim, address="SIM::PM::INSTR")))]
+    targets = [("e8267d", attach(InstrumentProxy(KeysightE8267D, SimTransport(gen_sim, address="SIM::GEN::INSTR")))),
+               ("u2021xa", attach(InstrumentProxy(KeysightU2021XA, SimTransport(off_sim, address="SIM::PM::INSTR"))))]
     try:
         results = run_check(targets, poll_s=0.3, timeout_s=20)
     finally:
-        InstrumentProxy.shutdown_all(p for _k, p in targets)
+        COORD.close_all([p for _k, p in targets])
     gen, pm = results
     assert gen.status == "WARN" and pm.status == "FAIL"
     assert gen.unsupported == ["am.depth"]
@@ -69,7 +72,7 @@ def test_log_file_gets_instrument_events(qtbot, tmp_path):
     try:
         assert setup_logging(path) is handler                               # второй вызов не дублирует
         sim = KeysightE8267DSim()
-        proxy = InstrumentProxy(KeysightE8267D, SimTransport(sim, address="SIM::GEN::INSTR"))
+        proxy = attach(InstrumentProxy(KeysightE8267D, SimTransport(sim, address="SIM::GEN::INSTR")))
         with qtbot.waitSignal(proxy.sync_done, timeout=5000):
             proxy.open()
         proxy.set("rf.power", 1e6)                                          # вне пределов модели

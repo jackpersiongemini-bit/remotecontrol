@@ -4,7 +4,9 @@ import pytest
 from visalab.front.power_meter import ActionButton
 from PyQt6.QtCore import QSettings, QSize
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import DRIVERS
 from visalab.front import VNAWindow
 from visalab.front.vna import parse_power_list
@@ -13,7 +15,7 @@ from visalab.front.vna import parse_power_list
 def _open(qtbot, tmp_path, sim=None):
     drv, sim_cls = DRIVERS["pna"]
     sim = sim or sim_cls()
-    proxy = InstrumentProxy(drv, SimTransport(sim))
+    proxy = attach(InstrumentProxy(drv, SimTransport(sim)))
     settings = QSettings(str(tmp_path / "vna.ini"), QSettings.Format.IniFormat)
     win = VNAWindow(proxy, settings)
     qtbot.addWidget(win)

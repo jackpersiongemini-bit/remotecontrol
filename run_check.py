@@ -24,8 +24,7 @@ from PyQt6.QtCore import QCoreApplication, QSettings
 from run_main import WINDOWS
 from visalab.applog import FORMAT, close_logging, default_log_path, setup_logging
 from visalab.check import format_report, run_check
-from visalab.core import InstrumentProxy
-from visalab.drivers import DRIVERS, make_transport
+from visalab.coord import COORD
 from visalab.front.launch import ROOT, connection_for
 from visalab.front.models import all_models
 
@@ -72,14 +71,14 @@ def main(argv=None) -> int:
     for key in keys:
         conn = connection_for(WINDOWS[key], key, args.lab, settings, sim=args.sim)
         kind = conn["kind"]
-        proxy = InstrumentProxy(DRIVERS[kind][0], make_transport(kind, conn["address"], args.backend),
-                                model=all_models(settings, kind).get(conn["model"]) if conn["model"] else None,
-                                command_delay_s=None if conn["delay"] is None else float(conn["delay"]))
-        targets.append((key, proxy))
+        inst = COORD.open_instrument(kind, conn["address"],
+                                     model=all_models(settings, kind).get(conn["model"]) if conn["model"] else None,
+                                     delay=conn["delay"], backend=args.backend)
+        targets.append((key, inst))
     try:
         results = run_check(targets, poll_s=args.poll, timeout_s=args.timeout)
     finally:
-        InstrumentProxy.shutdown_all(p for _k, p in targets)
+        COORD.close_all([inst for _k, inst in targets])
     head = [f"Проверка приборов {time.strftime('%Y-%m-%d %H:%M:%S')}",
             "python run_check.py " + " ".join(sys.argv[1:] if argv is None else argv),
             f"ini: {Path(args.ini).resolve()}",

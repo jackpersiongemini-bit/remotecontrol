@@ -1,8 +1,7 @@
 import pytest
 
-from visalab.core.scpi import (compile_pattern, match_header, parse_bool, parse_number,
-                               si_format, si_parse, split_header, split_units, format_number,
-                               strip_response_header)
+from visalab.core.units import format_number, parse_bool, parse_number, si_format, si_parse
+from visalab.transport.scpi import compile_pattern, match_header, split_header, split_units, strip_response_header
 
 
 @pytest.mark.parametrize("text,value", [
@@ -77,7 +76,7 @@ def test_lan_address_shortcut():
 def test_pyvisa_transport_close_keeps_shared_resource_manager(monkeypatch):
     """ResourceManager pyvisa общий на процесс: закрытие одного прибора не должно рвать остальные."""
     import pyvisa
-    from visalab.core import PyVisaTransport
+    from visalab.transport import PyVisaTransport
 
     class Res:
         interface_type = None

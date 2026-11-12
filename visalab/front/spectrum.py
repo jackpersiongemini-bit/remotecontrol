@@ -11,7 +11,7 @@
 AMPL (опорный уровень и его смещение, масштаб, аттенюатор, детектор, предусилитель, связь входа),
 SWP (время, точки, тип развёртки, опора, непрерывно / одна развёртка), TRAC (режим трассы:
 clear-write / max hold / min hold / view / blank, усреднение), TRIG (источник, уровень, фронт, задержка).
-Окно знает только InstrumentProxy и ключи профиля spectrum_analyzer.
+Окно знает только прибор координатора (Instrument) и ключи профиля spectrum_analyzer.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from typing import Any
 
 from PyQt6.QtCore import QSettings, Qt
 
-from ..core.proxy import InstrumentProxy
+from ..coord import Instrument
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow, PresetGroup
 from .params import IndicatorButton, PLineEdit, PSButton, PanelLine, PanelTable
@@ -75,7 +75,7 @@ class ZeroSpan(IndicatorButton):
 
     DEFAULT_SPAN = 1e6
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, prefix: str, parent=None):
         super().__init__("ZERO", parent)
         self.proxy, self.settings, self._key = proxy, settings, f"{prefix}/LAST_SPAN"
         self.setObjectName("choice")
@@ -155,7 +155,7 @@ class SpectrumWindow(InstrumentWindow):
     PRESET_DEFAULTS = ()
     PRESET_ADD_TIP = "Save the current state in the analyzer memory"
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Spectrum analyzer", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Spectrum analyzer", parent=None):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
         proxy.action_done.connect(self._on_action)

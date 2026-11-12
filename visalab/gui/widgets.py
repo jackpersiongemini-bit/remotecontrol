@@ -1,4 +1,4 @@
-"""Виджеты параметров, привязанные к InstrumentProxy.
+"""Виджеты параметров, привязанные к прибору координатора (Instrument).
 
 Каждый виджет знает только свой ``Param`` и прокси: пишет через ``proxy.set``,
 получает значения/статусы через ``proxy.subscribe`` (сигналы Qt из потока прибора).
@@ -13,8 +13,8 @@ from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QComboBox, QLabel, QLineEdit, QPushButton, QSizePolicy, QWidget
 
 from ..core.params import Kind, Param, PStatus
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format, si_parse
+from ..coord import Instrument
+from ..core.units import si_format, si_parse
 
 STYLE = """
 QLineEdit[pstatus="writing"], QComboBox[pstatus="writing"], QPushButton[pstatus="writing"] { border: 1px solid #c9a227; }
@@ -30,7 +30,7 @@ QLabel#led { border-radius: 7px; min-width: 14px; max-width: 14px; min-height: 1
 class ParamWidget:
     """Общая логика: подписка, статус, подсказка."""
 
-    def bind(self, proxy: InstrumentProxy, spec: Param) -> None:
+    def bind(self, proxy: Instrument, spec: Param) -> None:
         self.proxy, self.spec = proxy, spec
         self._value: Any = None
         proxy.subscribe(spec.key, self._on_value, self._on_status)
@@ -238,7 +238,7 @@ class TracePlot(QWidget, ParamWidget):
                        f"{si_format(mx, 'Hz')}  {my:.3g} {t.y_unit}")
 
 
-def make_widget(proxy: InstrumentProxy, spec: Param) -> QWidget:
+def make_widget(proxy: Instrument, spec: Param) -> QWidget:
     if spec.kind is Kind.TRACE:
         return TracePlot(proxy, spec)
     if spec.readonly:

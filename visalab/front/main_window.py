@@ -18,10 +18,9 @@ from __future__ import annotations
 from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
-from ..coord import COORD, ActivityMonitor, Coordinator, profile_name
-from ..coord.activity import Activity
+from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
-from ..core.scpi import si_format, si_parse
+from ..core.units import si_format, si_parse
 from ..core.trace import Trace
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar
@@ -401,7 +400,7 @@ class MainWindow(Window):
     def _open_scenario(self) -> None:
         runs = self.coord.runs()
         if runs and runs[0].devices:
-            self.open_instrument(list(runs[0].devices.values())[-1].proxy)
+            self.open_instrument(list(runs[0].devices.values())[-1].instrument)
 
     def _tick(self) -> None:
         for p, panel in self.panels.items():

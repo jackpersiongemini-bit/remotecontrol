@@ -4,10 +4,12 @@ import math
 import pytest
 from PyQt6.QtCore import QSettings
 
-from visalab.coord import ActivityMonitor, ProxyLinks, Thresholds
+from conftest import sim_of, worker
+from visalab.coord import ActivityMonitor, Instrument, ProxyLinks, Thresholds
 from visalab.coord.activity import (Source, magnitude_db, match_source, short_name, slot_magnitude_db,
                                     spectrum_peak, vna_signal)
-from visalab.core import InstrumentProxy, SimTransport
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.core.trace import Trace
 from visalab.drivers import DRIVERS
 from visalab.front.live_plot import nice_range
@@ -62,12 +64,13 @@ def test_sim_bench_feeds_analyzer_and_meter():
 
 # ------------------------------------------------------------------ монитор и окно на симуляторах
 def _proxy(kind):
+    """Прибор вне координатора процесса (свой реестр у каждого теста)."""
     drv, sim_cls = DRIVERS[kind]
-    return InstrumentProxy(drv, SimTransport(sim_cls()))
+    return Instrument(InstrumentProxy(drv, SimTransport(sim_cls())))
 
 
 def _sim(proxy):
-    return proxy._worker.transport.sim
+    return sim_of(proxy)
 
 
 @pytest.fixture
@@ -252,7 +255,7 @@ def test_delay_on_address_page(qtbot, tmp_path):
     win.delay_edit.setText("120m")
     assert win.apply_delay()
     assert saved_delay(settings, win.CONNECTION_GROUP) == pytest.approx(0.12) and win.delay_edit.text() == "120 ms"
-    qtbot.waitUntil(lambda: proxy._worker.command_delay_s == pytest.approx(0.12), timeout=3000)
+    qtbot.waitUntil(lambda: worker(proxy).command_delay_s == pytest.approx(0.12), timeout=3000)
     win.delay_edit.setText("junk")
     assert not win.apply_delay() and win.delay_edit.text() == "120 ms"
     win.delay_edit.setText("")
@@ -278,8 +281,9 @@ def test_windows_restored_as_at_exit(qtbot, tmp_path, monkeypatch):
     before = set(LINKS.proxies())
     assert run_main.main(["--sim", "--ini", ini, "--no-connect", "--only", "pna,e8267d"]) == 0
     from visalab.front.instrument_window import InstrumentWindow
+    new = [p for p in LINKS.proxies() if p not in before]          # приборы, открытые этим запуском
     wins = {w.proxy: w for w in QApplication.topLevelWidgets() if isinstance(w, InstrumentWindow)
-            and w.proxy not in before}
+            and w.proxy in new}
     shown = sorted(made[0].monitor.name(p)[:3] for p, w in wins.items() if w.isVisible())
     assert shown == ["VNA"]                              # GEN был скрыт (по умолчанию)
     gen = next(w for p, w in wins.items() if made[0].monitor.name(p).startswith("GEN"))

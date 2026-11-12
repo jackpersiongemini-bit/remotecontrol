@@ -1,8 +1,10 @@
-"""GUI-сторона прибора.
+"""Слой 3: абстрактный прибор.
 
-``InstrumentProxy`` живёт в GUI-потоке, создаёт поток прибора и общается с ним
-только сигналами Qt (queued connection). GUI подключается к сигналам прокси, а не
-воркера, и никогда не ждёт ответа прибора синхронно.
+``InstrumentProxy`` живёт в GUI-потоке, создаёт поток прибора и общается с драйвером в нём только
+сигналами Qt (queued connection). Слой выше (координатор) видит прибор только так: ключи и действия
+профиля, значения, статусы записи, состояние связи - и никогда не ждёт ответа прибора синхронно.
+Какой у прибора драйвер и транспорт, отсюда не видно: прокси получает готовый драйвер из каталога
+слоя 2 (:func:`visalab.drivers.create_driver`).
 """
 from __future__ import annotations
 
@@ -13,9 +15,8 @@ from typing import Any, Callable
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 
 from ..applog import Throttle
-from .instrument import VISAInstrument
-from .params import Action, ConnectionState, Param, PStatus
-from .transport import Transport
+from ..core.params import Action, ConnectionState, Param, PStatus
+from ..drivers import VISAInstrument, kind_of
 
 log = logging.getLogger(__name__)
 
@@ -54,14 +55,19 @@ class InstrumentProxy(QObject):
     #: связи нет, прибор переподключится сам через столько секунд; 0 - не ждём (см. ``reconnecting``)
     reconnect_pending = pyqtSignal(float)
 
-    def __init__(self, driver_cls: type[VISAInstrument], transport: Transport,
-                 parent: QObject | None = None, **driver_kwargs):
+    def __init__(self, driver: VISAInstrument | type[VISAInstrument], transport=None,
+                 parent: QObject | None = None, kind: str | None = None, **driver_kwargs):
+        """``driver`` - готовый драйвер (из :func:`visalab.drivers.create_driver`). Тестам и отладке:
+        ``InstrumentProxy(КлассДрайвера, транспорт, **аргументы драйвера)`` - собрать драйвер здесь."""
         super().__init__(parent)
-        self.address = transport.address
-        self.driver_cls = driver_cls                      # для окна настроек подключения
+        if transport is not None:
+            driver = driver(transport, **driver_kwargs)
+        self._worker = driver
+        self.address = driver.address
+        #: тип драйвера в каталоге (``e8267d``...) - окну настроек подключения
+        self.kind = kind or kind_of(driver) or ""
         self._thread = QThread()
-        self._thread.setObjectName(f"{driver_cls.NAME}@{transport.address}")
-        self._worker = driver_cls(transport, **driver_kwargs)
+        self._thread.setObjectName(f"{driver.NAME}@{driver.address}")
         self.name = self._worker.NAME
         # Метаданные неизменяемы (frozen dataclass), их безопасно читать из GUI.
         self.params: dict[str, Param] = dict(self._worker.params)
@@ -184,8 +190,7 @@ class InstrumentProxy(QObject):
     def shutdown_wait_ms(self) -> int:
         """Сколько ждать поток: он может быть внутри запроса (до таймаута транспорта) и потом ещё
         вернуть прибор (on_disconnecting) - несколько команд."""
-        timeout = int(getattr(self._worker.transport, "timeout_ms", 2000) or 2000)
-        return max(3000, 3 * timeout + 2000)
+        return max(3000, 3 * self._worker.timeout_ms + 2000)
 
     def wait_shutdown(self, timeout_ms: int | None = None) -> None:
         """Дождаться завершения потока. ``terminate()`` - только крайний случай: убитый посреди вызова

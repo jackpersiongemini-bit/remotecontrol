@@ -19,7 +19,7 @@ ACAL (вкладка CAL) - автокалибровка через коорди
 после неё исправленное показание равно уровню генератора. Пока идёт ACAL, окно не пишет поправку в
 прибор, кнопка ▶ - стоп (■), в индикаторе вместо CAL - «ACAL n/N».
 
-Окно знает только InstrumentProxy, координатор и ключи профилей power_meter / function_generator.
+Окно знает только координатор (прибор - Instrument) и ключи профилей power_meter / function_generator.
 """
 from __future__ import annotations
 
@@ -33,11 +33,9 @@ from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
                              QVBoxLayout, QWidget)
 
-from ..coord import COORD, AutoCalibration, ScenarioError, acal_file_name
-from ..coord.calibration import interpolate, load_csv, save_csv
+from ..coord import COORD, AutoCalibration, Instrument, ScenarioError, acal_file_name, interpolate, load_csv, save_csv
 from ..core.params import ConnectionState, Kind
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import SI_PREFIXES, si_format, si_parse
+from ..core.units import SI_PREFIXES, si_format, si_parse
 from ..core.trace import Trace
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
@@ -64,7 +62,7 @@ def _dbm_to_w(dbm: float) -> float:
     return 10 ** ((dbm - 30.0) / 10.0)
 
 
-def _auto(proxy: InstrumentProxy, key: str):
+def _auto(proxy: Instrument, key: str):
     spec = proxy.params[key]
     if spec.kind is Kind.BOOL:
         return PSButton(proxy, key, [("OFF", False), ("ON", True)])
@@ -216,7 +214,7 @@ class LNumber(QLineEdit):
 class ActionButton(QPushButton):
     """Действие прибора. ``confirm`` - первый клик спрашивает SURE?, второй (за 3 с) выполняет."""
 
-    def __init__(self, proxy: InstrumentProxy, name: str, text: str, tip: str, confirm: bool = False, parent=None):
+    def __init__(self, proxy: Instrument, name: str, text: str, tip: str, confirm: bool = False, parent=None):
         super().__init__(text, parent)
         self.setObjectName("choice")
         self.proxy, self.name, self._text, self.confirm = proxy, name, text, confirm
@@ -230,6 +228,7 @@ class ActionButton(QPushButton):
         self.clicked.connect(self._click)
         proxy.action_done.connect(self._done)
         proxy.comm_error.connect(lambda _m: self._set_state(""))
+        proxy.refused.connect(lambda _m: self._set_state(""))          # прибор ведёт сценарий: не отправлено
         proxy.state_changed.connect(lambda _s: self.setEnabled(proxy.is_connected))
         self.setEnabled(proxy.is_connected)
 
@@ -550,8 +549,8 @@ class PowerMeterWindow(InstrumentWindow):
     #: ACAL ▶ нажата: (start Hz, stop Hz, точек); саму автокалибровку ведёт координатор (COORD)
     acal_requested = pyqtSignal(float, float, int)
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Power meter", parent=None):
-        self._sdg: InstrumentProxy | None = None
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Power meter", parent=None):
+        self._sdg: Instrument | None = None
         self._acal = None                      # идущая автокалибровка (Run координатора)
         self._acal_curve: list[tuple[float, float]] = []
         super().__init__(proxy, settings, title, parent)
@@ -774,7 +773,7 @@ class PowerMeterWindow(InstrumentWindow):
 
     def _on_run_ended(self, run) -> None:
         """Сценарий с этим ваттметром закончился - вернуть прибору поправку окна."""
-        if self.proxy in run.proxies():
+        if self.proxy in run.instruments():
             self.apply_correction()
 
     def show_plot(self, on: bool) -> None:

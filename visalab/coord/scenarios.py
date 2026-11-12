@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..core.scpi import si_format
+from ..core.units import si_format
 from .calibration import fit_gain_table, save_csv
 from .scenario import MEASURE_TIMEOUT_S, Device, Run, Scenario, ScenarioError
 

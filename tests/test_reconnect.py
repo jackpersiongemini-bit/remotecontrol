@@ -11,9 +11,11 @@ import socket
 import pytest
 from PyQt6.QtCore import QSettings
 
-from visalab.coord import ActivityMonitor, ProxyLinks
-from visalab.core import ConnectionState, InstrumentProxy, SimTransport
-from visalab.core.transport import PyVisaTransport, lan_endpoint
+from visalab.coord import ActivityMonitor, Instrument, ProxyLinks
+from visalab.core import ConnectionState
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
+from visalab.transport import PyVisaTransport, lan_endpoint
 from visalab.drivers import KeysightE8267D
 from visalab.front import RFGenWindow
 from visalab.front.main_window import MainWindow
@@ -144,7 +146,7 @@ def test_program_error_on_connect_is_error_not_connecting(qtbot, gen):
 
 def test_window_switch_shows_retry_and_click_stops(qtbot, gen, tmp_path):
     proxy, sim, tr, _comm, _pending = gen()
-    win = RFGenWindow(proxy, QSettings(str(tmp_path / "rf.ini"), QSettings.Format.IniFormat))
+    win = RFGenWindow(Instrument(proxy), QSettings(str(tmp_path / "rf.ini"), QSettings.Format.IniFormat))
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):
         proxy.open()
@@ -163,16 +165,17 @@ def test_window_switch_shows_retry_and_click_stops(qtbot, gen, tmp_path):
 def test_main_window_tile_shows_retry(qtbot, gen, tmp_path):
     proxy, sim, tr, _comm, _pending = gen()
     links = ProxyLinks()
-    links.add(proxy)
+    inst = Instrument(proxy)
+    links.add(inst)
     win = MainWindow(QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat), ActivityMonitor(links))
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):
         proxy.open()
     _power_off(sim, tr)
-    qtbot.waitUntil(lambda: win.tiles[proxy].text().endswith("RETRY"), timeout=5000)
+    qtbot.waitUntil(lambda: win.tiles[inst].text().endswith("RETRY"), timeout=5000)
     _power_on(sim, tr)
     qtbot.waitUntil(lambda: proxy.is_connected, timeout=5000)
-    qtbot.waitUntil(lambda: not win.tiles[proxy].text().endswith("RETRY"), timeout=5000)
+    qtbot.waitUntil(lambda: not win.tiles[inst].text().endswith("RETRY"), timeout=5000)
 
 
 # ------------------------------------------------------------------ проверка доступности узла LAN

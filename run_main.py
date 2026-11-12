@@ -1,7 +1,7 @@
 """Главное окно лаборатории (visalab/front/main_window.py): что сейчас измеряется.
 
     python run_main.py                 # все приборы из lab.json (адреса из ini окон, иначе lab.json)
-    python run_main.py --sim           # все на симуляторах; генератор подаёт сигнал на SA и ваттметр
+    python run_main.py --sim           # все на симуляторах; генератор подаёт сигнал на SA и ваттметр (стенд симуляторов)
     python run_main.py --only pna,e4446a,u2021xa,e8267d
     python run_main.py --show-windows  # показать все окна приборов (иначе - как были при выходе)
 
@@ -17,10 +17,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
-from visalab.coord import ActivityMonitor
+from visalab.coord import ActivityMonitor, profile_name
 from visalab.front import PowerMeterWindow, PSUWindow, PulseGenWindow, RFGenWindow, SpectrumWindow, VNAWindow
 from visalab.front.launch import remember_windows, run_windows
 from visalab.front.main_window import MainWindow
@@ -28,10 +27,6 @@ from visalab.front.main_window import MainWindow
 #: запись lab.json -> окно; порядок - порядок плиток
 WINDOWS = {"pna": VNAWindow, "e4446a": SpectrumWindow, "u2021xa": PowerMeterWindow, "e8267d": RFGenWindow,
            "sdg": PulseGenWindow, "psu": PSUWindow}
-
-
-def _sim(proxy):
-    return getattr(getattr(proxy._worker, "transport", None), "sim", None)
 
 
 def _after_sync(proxy, fn) -> None:
@@ -48,28 +43,14 @@ def setup(opened, args, settings):
     QApplication.instance().aboutToQuit.connect(win.monitor.stop)    # до остановки приборов
     win.before_quit.append(lambda: remember_windows(opened, settings))
     win.show()
-    keep = {"main": win}
-    if args.sim:                                       # стенд: генератор -> анализатор и ваттметр
-        from visalab.coord import profile_name
-        from visalab.sim.bench import SimBench
-        by = {}
+    if args.sim:
+        # Генератор, анализатор и ваттметр на симуляторах стоят на стенде симуляторов сами (visalab/sim/bench.py:
+        # тракт 10 dB + 0.2 dB/ГГц - ACAL ваттметра даёт GAIN и наклон таблицы). Здесь - только обзор анализатора
+        # вокруг частоты генератора, ключами профиля, когда анализатор подключится.
         for cur in opened:
-            sim = _sim(cur["proxy"])
-            if sim is not None:
-                by.setdefault(profile_name(cur["proxy"]), []).append(sim)
             if profile_name(cur["proxy"]) == "spectrum_analyzer":
-                # обзор вокруг частоты генератора - ключами профиля, когда анализатор подключится (не в обход
-                # драйвера: иначе ось трассы и окно показывали бы старые частоты)
                 _after_sync(cur["proxy"], lambda p: (p.set("freq.center", 1e9), p.set("freq.span", 100e6)))
-        # тракт 10 dB + 0.2 dB/ГГц: ACAL ваттметра на стенде даёт GAIN и наклон таблицы
-        bench = SimBench(by.get("signal_generator", []), by.get("spectrum_analyzer", []), by.get("power_meter", []),
-                         loss_db=10.0, slope_db_per_ghz=0.2)
-        timer = QTimer(win)
-        timer.setInterval(200)
-        timer.timeout.connect(bench.step)
-        timer.start()
-        keep["bench"] = bench
-    return keep
+    return {"main": win}
 
 
 def main(argv=None) -> int:

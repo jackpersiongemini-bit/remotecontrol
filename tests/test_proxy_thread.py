@@ -3,7 +3,9 @@ import time
 
 from PyQt6.QtCore import QThread
 
-from visalab.core import ConnectionState, InstrumentProxy, PStatus, SimTransport
+from visalab.core import ConnectionState, PStatus
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import ItechIT6300, SiglentSDG
 from visalab.sim import ItechIT6300Sim, SiglentSDGSim
 

@@ -633,8 +633,8 @@ def test_markers_of_selected_trace(make):
 
 def test_serial_poll_not_supported_falls_back_to_stb_query(qapp):
     """VI_ERROR_NSUP_OPER на read_stb (LAN): дальше статус через *STB?, без ошибки связи."""
-    from visalab.core import SimTransport
-    from visalab.core.transport import TransportNotSupported
+    from visalab.transport import SimTransport
+    from visalab.transport import TransportNotSupported
     from visalab.drivers import DRIVERS
     drv_cls, sim_cls = DRIVERS["pna"]
 

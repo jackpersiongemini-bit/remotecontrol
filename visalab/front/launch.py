@@ -1,5 +1,7 @@
 """Запуск окна прибора: адрес из аргументов / ini окна / lab.json, пересоздание по APPLY.
 
+Прибор окна открывает и закрывает координатор (``COORD.open_instrument`` / ``close_instrument``) - окно
+получает готовый прибор координатора и о драйверах и транспорте не знает.
 Журнал программы - в ``logs/visalab.log`` рядом с ini (``--log``), см. :mod:`visalab.applog`."""
 from __future__ import annotations
 
@@ -14,8 +16,6 @@ from PyQt6.QtWidgets import QApplication
 
 from ..applog import close_logging, default_log_path, setup_logging
 from ..coord import COORD
-from ..core import InstrumentProxy
-from ..drivers import DRIVERS, make_transport
 from .instrument_window import saved_connection, saved_delay
 from .models import all_models
 
@@ -47,7 +47,7 @@ def _log_exception(kind, value, tb) -> None:
 
 
 def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None = True, setup=None) -> int:
-    """Несколько окон в одном процессе (окна видят приборы друг друга через LINKS).
+    """Несколько окон в одном процессе (окна видят приборы друг друга через координатор).
 
     ``specs`` - [(window_cls, lab_key)]; ``--address`` относится к первому окну. ``parser`` -
     готовый ArgumentParser (если обёртке нужны свои флаги). ``show=False`` - окна приборов создаются
@@ -88,7 +88,7 @@ def _quit(opened: list[dict]) -> None:
     """Выход: сначала сценарии координатора возвращают приборы (генератор - ВЧ как было...), потом
     приборы закрываются параллельно."""
     COORD.stop_all(wait_ms=QUIT_SCENARIO_WAIT_MS)
-    InstrumentProxy.shutdown_all(cur["proxy"] for cur in opened)
+    COORD.close_all([cur["proxy"] for cur in opened])
 
 
 def remember_windows(opened: list[dict], settings: QSettings) -> None:
@@ -122,16 +122,15 @@ def connection_for(window_cls, lab_key: str, lab_path: str, settings: QSettings,
 
 def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None,
           show: bool = True) -> dict:
-    """Создать прокси и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win} (обновляется)."""
+    """Открыть прибор (через координатор) и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win}
+    (обновляется; ``proxy`` - прибор координатора)."""
     conn = connection_for(window_cls, lab_key, args.lab, settings, args.sim, cli_address)
     kind, address, model, delay = conn["kind"], conn["address"], conn["model"], conn["delay"]
     current: dict = {}
 
     def build(kind: str, address: str, model: str | None, pos=None, visible: bool = True) -> None:
-        driver_cls, _ = DRIVERS[kind]
-        proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency),
-                                model=all_models(settings, kind).get(model) if model else None,
-                                command_delay_s=None if delay is None else float(delay))
+        proxy = COORD.open_instrument(kind, address, model=all_models(settings, kind).get(model) if model else None,
+                                      delay=delay, backend=args.backend, latency=args.latency)
         win = window_cls(proxy, settings)
         win.reconnect_requested.connect(reconnect)
         if pos is not None:
@@ -146,7 +145,7 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
         old_proxy, old_win = current["proxy"], current["win"]
         pos, visible = old_win.pos(), old_win.isVisible()
         old_win.hide()
-        old_proxy.shutdown()
+        COORD.close_instrument(old_proxy)
         old_win.deleteLater()
         build(kind, address, model or None, pos, visible)
 

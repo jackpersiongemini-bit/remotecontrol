@@ -8,7 +8,9 @@
 """
 import pytest
 
-from visalab.core import ConnectionState, InstrumentProxy, PStatus, SimTransport, TransportTimeout
+from visalab.core import ConnectionState, PStatus
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport, TransportTimeout
 from visalab.drivers import AgilentPSA, KeysightE8267D, KeysightPNA
 from visalab.sim import AgilentPSASim, KeysightE8267DSim, KeysightPNASim
 
@@ -101,7 +103,7 @@ def test_shutdown_all_closes_in_parallel(qapp):
 def test_pyvisa_transport_decodes_any_byte_and_discards_late(monkeypatch):
     """pyvisa по умолчанию декодирует ascii: байт > 127 давал UnicodeDecodeError мимо обработки ошибок связи."""
     import pyvisa
-    from visalab.core import PyVisaTransport, TransportError
+    from visalab.transport import PyVisaTransport, TransportError
 
     class Res:
         interface_type = None

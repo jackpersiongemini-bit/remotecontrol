@@ -7,8 +7,10 @@
 (выход - клик по вкладке).
 
 Конкретное окно (генератор импульсов, СВЧ генератор...) наследует ``InstrumentWindow`` и
-задаёт в ``build()`` виджеты, строки избранного и вкладки. Окно знает только InstrumentProxy
-и ключи профиля прибора.
+задаёт в ``build()`` виджеты, строки избранного и вкладки. Окно знает только координатор:
+прибор (``proxy`` - :class:`visalab.coord.Instrument`, его выдаёт ``COORD.open_instrument``), ключи профиля
+прибора и каталог драйверов для страницы подключения. Пока прибор ведёт сценарий координатора (ACAL),
+запись из окна в прибор не уходит - отказ виден как ошибка ключа и строка BUSY в журнале окна.
 """
 from __future__ import annotations
 
@@ -22,11 +24,9 @@ from PyQt6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QTimer,
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
                              QSizePolicy, QVBoxLayout, QWidget)
 
+from ..coord import COORD, Instrument
 from ..core.params import ConnectionState, PStatus
-from ..coord.registry import LINKS, ProxyLinks
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format, si_parse
-from ..drivers import DRIVERS
+from ..core.units import si_format, si_parse
 from .models import ModelWindow, all_models, model_class
 from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
@@ -34,7 +34,7 @@ from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomS
                      Window, short_address)
 
 __all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay", "parse_power_list",
-           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "LINKS", "ProxyLinks"]
+           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST"]
 
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
@@ -163,7 +163,7 @@ class PresetGroup(PBGroup):
 class PowerSpin(PSpinBox):
     """Мощность: колесо / стрелки - разряд под курсором, а в режиме пресетов - соседнее значение списка."""
 
-    def __init__(self, proxy: InstrumentProxy, key: str, parent=None):
+    def __init__(self, proxy: Instrument, key: str, parent=None):
         super().__init__(proxy, key, parent=parent)
         self.preset_mode = False
         self.levels: list[float] = list(DEFAULT_POWER_LIST)
@@ -190,7 +190,7 @@ class PowerLevels(QWidget):
 
     COLUMNS = 4
 
-    def __init__(self, proxy: InstrumentProxy, key: str, levels, on_change: Callable | None = None, parent=None):
+    def __init__(self, proxy: Instrument, key: str, levels, on_change: Callable | None = None, parent=None):
         super().__init__(parent)
         self.proxy, self.key, self.on_change = proxy, key, on_change
         self._levels: list[float] = []
@@ -326,7 +326,7 @@ class InstrumentWindow(Window):
         return 2
 
     # ------------------------------------------------------------ сборка
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Instrument", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Instrument", parent=None):
         super().__init__(settings, parent)
         self.proxy = proxy
         self.setWindowTitle(title)
@@ -425,9 +425,8 @@ class InstrumentWindow(Window):
         proxy.param_updated.connect(self._on_param)
         proxy.comm_error.connect(self._on_comm_error)
         proxy.reconnect_pending.connect(self._on_reconnect)
+        proxy.refused.connect(self._on_refused)
         self._on_state(proxy.state)
-        LINKS.add(proxy)
-        self.destroyed.connect(lambda *_a, p=proxy: LINKS.remove(p))
 
         self.address.setMinimumWidth(self.address.sizeHint().width())
         self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.minimumSize().width()))
@@ -658,16 +657,12 @@ class InstrumentWindow(Window):
 
     # ------------------------------------------------------------ подключение
     def _driver_kind(self) -> str:
-        for kind, (cls, _sim) in DRIVERS.items():
-            if cls is getattr(self.proxy, "driver_cls", None):
-                return kind
-        return self.DEFAULT_KIND
+        return self.proxy.kind or self.DEFAULT_KIND
 
     def _build_connection_page(self) -> QWidget:
         kind = self._driver_kind()
-        profile = DRIVERS[kind][0].PROFILE
         saved = saved_connection(self.settings, self.CONNECTION_GROUP)
-        drivers = [(k.upper(), k) for k, (cls, _s) in DRIVERS.items() if cls.PROFILE is profile]
+        drivers = [(k.upper(), k) for k in COORD.kinds(self.proxy.profile.name)]
         self.driver_choice = PChoice(drivers, kind)
         self.driver_choice.setToolTip("Driver (instrument family)")
         self.model_choice = PChoice([("AUTO", "")])
@@ -727,7 +722,7 @@ class InstrumentWindow(Window):
         text = self.delay_edit.text().strip()
         if not text:
             self.settings.remove(f"{self.CONNECTION_GROUP}/DELAY")
-            self.proxy.set_command_delay(getattr(self.proxy.driver_cls, "COMMAND_DELAY_S", 0.0))
+            self.proxy.set_command_delay(COORD.default_delay(self._driver_kind()))
             return True
         try:
             value = max(0.0, si_parse(text, "s"))
@@ -836,6 +831,14 @@ class InstrumentWindow(Window):
 
     def _on_comm_error(self, msg: str) -> None:
         self._log("CONNECTION", msg)
+        self._release_buttons()
+
+    def _on_refused(self, msg: str) -> None:
+        """Прибор ведёт сценарий координатора: запрос окна не отправлен."""
+        self._log("BUSY", msg)
+        self._release_buttons()
+
+    def _release_buttons(self) -> None:
         self._resetting = False
         for b in (self.sync_button, self.init_button):
             if b.status() == "process":

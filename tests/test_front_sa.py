@@ -4,14 +4,16 @@ import json
 import pytest
 from PyQt6.QtCore import QSettings, Qt
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach, sim_of
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import DRIVERS
 from visalab.front import SpectrumWindow
 
 
 def _proxy():
     drv, sim_cls = DRIVERS["e4446a"]
-    return InstrumentProxy(drv, SimTransport(sim_cls()))
+    return attach(InstrumentProxy(drv, SimTransport(sim_cls())))
 
 
 def _open(qtbot, tmp_path, proxy=None, name="sa.ini"):
@@ -59,7 +61,7 @@ def test_edit_settings_and_auto_pair(qtbot, sa):
 def test_presets_live_in_analyzer_memory(qtbot, tmp_path):
     proxy, win, settings = _open(qtbot, tmp_path)
     try:
-        sim = proxy._worker.transport.sim
+        sim = sim_of(proxy)
         assert win.presets.data == []
         proxy.set("freq.center", 2.4e9)
         proxy.set("freq.span", 100e6)
@@ -92,14 +94,14 @@ def test_presets_live_in_analyzer_memory(qtbot, tmp_path):
     assert win2.presets.names() == ["1GS10M", "GONE", "2G4S100M"]      # до подключения - как в ini
     with qtbot.waitSignal(proxy2.sync_done, timeout=5000):
         proxy2.open()
-    proxy2._worker.transport.sim.files.update(proxy2_sim_files)                 # «прибор» с теми же файлами
+    sim_of(proxy2).files.update(proxy2_sim_files)                 # «прибор» с теми же файлами
     proxy2.action("state_list")
     try:
         qtbot.waitUntil(lambda: win2.presets.names() == ["1GS10M", "2G4S100M"], timeout=5000)
         win2.presets.set_checked(1)
         win2.remove_button.click()                                              # удаление - из памяти прибора
         qtbot.waitUntil(lambda: win2.presets.names() == ["1GS10M"], timeout=5000)
-        assert set(proxy2._worker.transport.sim.files) == {"1GS10M.STA"}
+        assert set(sim_of(proxy2).files) == {"1GS10M.STA"}
     finally:
         proxy2.shutdown()
 

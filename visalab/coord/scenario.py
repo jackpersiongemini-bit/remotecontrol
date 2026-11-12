@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from ..core.params import ConnectionState, Kind, PStatus
-from ..core.scpi import si_format
+from ..core.units import si_format
 from .activity import SHORT_NAMES
 from .registry import profile_name
 
@@ -318,12 +318,16 @@ class ActionStep(DeviceStep):
 
 # ===================================================================== прибор
 class Device:
-    """Абстрактный прибор для сценария: класс (профиль) и его ключи. Драйвер не виден."""
+    """Прибор в сценарии: класс (профиль) и его ключи. Драйвер не виден.
 
-    def __init__(self, proxy, name: str = ""):
-        self.proxy = proxy
-        self.profile = profile_name(proxy)
-        self.name = name or SHORT_NAMES.get(self.profile, "") or proxy.name
+    ``instrument`` - прибор координатора (тот же, что у окна); ``proxy`` - абстрактный прибор слоя 3 под
+    ним: шаги сценария пишут в прибор через него, мимо арбитража (окну прибор в это время не отдаётся)."""
+
+    def __init__(self, instrument, name: str = ""):
+        self.instrument = instrument
+        self.proxy = instrument._proxy
+        self.profile = profile_name(instrument)
+        self.name = name or SHORT_NAMES.get(self.profile, "") or instrument.name
 
     # ----------------------------------------------------------- без обращения к прибору
     @property
@@ -407,7 +411,7 @@ class Run(QObject):
         self._seq = 0
         self._stopping = False
         self._first_error: ScenarioError | None = None
-        #: что вернуть, когда прибор снова подключится (связь пропала до возврата): [(proxy, ключ, значение)]
+        #: что вернуть, когда прибор снова подключится (связь пропала до возврата): [(прибор, ключ, значение)]
         self.deferred: list[tuple[Any, str, Any]] = []
 
     # ----------------------------------------------------------- для сценария
@@ -429,8 +433,9 @@ class Run(QObject):
             raise ScenarioError(f"{self.name}: no {profile}")
         return dev
 
-    def proxies(self) -> list:
-        return [d.proxy for d in self.devices.values()]
+    def instruments(self) -> list:
+        """Приборы координатора, которые ведёт сценарий."""
+        return [d.instrument for d in self.devices.values()]
 
     @staticmethod
     def sleep(seconds: float) -> SleepStep:
@@ -454,7 +459,7 @@ class Run(QObject):
     def defer_restore(self, dev: Device, key: str, value: Any) -> None:
         """С прибором нет связи: записать ``key = value``, когда он снова подключится (это сделает координатор
         после конца сценария - например, выключить выход, который сценарий включил)."""
-        self.deferred.append((dev.proxy, key, value))
+        self.deferred.append((dev.instrument, key, value))
 
     # ----------------------------------------------------------- управление
     def start(self) -> None:

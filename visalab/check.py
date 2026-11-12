@@ -67,7 +67,7 @@ class CheckResult:
 
 
 class _Watch:
-    """Сигналы одного прокси -> CheckResult."""
+    """Сигналы одного прибора -> CheckResult."""
 
     def __init__(self, proxy, result: CheckResult, t0: float):
         self.proxy, self.r, self.t0 = proxy, result, t0
@@ -136,7 +136,7 @@ def _spin(until, timeout_s: float) -> bool:
 
 
 def run_check(targets, poll_s: float = 5.0, timeout_s: float = 60.0) -> list[CheckResult]:
-    """``targets`` - [(запись lab.json, InstrumentProxy)] (ещё не подключённые). Подключить все сразу (без
+    """``targets`` - [(запись lab.json, прибор координатора)] (ещё не подключённые). Подключить все сразу (без
     автоподключения: нужна сама ошибка), дождаться чтения всех параметров (не дольше ``timeout_s``),
     опрашивать ``poll_s`` и вернуть результаты. Приборы не закрываются - это делает вызывающий."""
     t0 = time.monotonic()

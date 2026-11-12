@@ -7,9 +7,12 @@ import time
 import pytest
 from PyQt6.QtCore import QSettings, QTimer
 
+from conftest import attach, l3, sim_of, worker
 from visalab.coord import (COORD, LINKS, AutoCalibration, Coordinator, FrequencySweep, ProxyLinks, Scenario,
                            ScenarioError, acal_file_name, frequency_points, load_csv)
-from visalab.core import ConnectionState, InstrumentProxy, SimTransport
+from visalab.core import ConnectionState, PStatus
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import DRIVERS
 from visalab.sim.base import SimError
 from visalab.sim.bench import SimBench
@@ -24,7 +27,7 @@ def _proxy(kind):
 
 
 def _sim(proxy):
-    return proxy._worker.transport.sim
+    return sim_of(proxy)
 
 
 def _open(qtbot, proxy):
@@ -39,7 +42,8 @@ def _wait_value(qtbot, proxy, key, pred, timeout=5000):
 @pytest.fixture
 def lab(qtbot):
     """Генератор + ваттметр на стенде; свой координатор с отдельным реестром."""
-    gen, pm = _proxy("e8267d"), _proxy("u2021xa")
+    coord = Coordinator(ProxyLinks())
+    gen, pm = coord.attach(_proxy("e8267d")), coord.attach(_proxy("u2021xa"))
     for p in (gen, pm):
         _open(qtbot, p)
     pm.set_poll_interval(50)
@@ -52,15 +56,11 @@ def lab(qtbot):
     gen.set("rf.frequency", 5e9)
     _wait_value(qtbot, gen, "rf.power", lambda v: v == pytest.approx(-5.0))
     _wait_value(qtbot, gen, "rf.frequency", lambda v: v == pytest.approx(5e9))
-    links = ProxyLinks()
-    links.add(gen)
-    links.add(pm)
-    coord = Coordinator(links)
     coord.bench = bench                     # тестам: менять тракт
     yield gen, pm, coord
     coord.stop_all(wait_ms=3000)
     timer.stop()
-    InstrumentProxy.shutdown_all([gen, pm])
+    coord.close_all()
 
 
 def _finish(qtbot, run, timeout=30000):
@@ -244,10 +244,9 @@ def pm_window(qtbot, tmp_path, monkeypatch):
     from visalab.front import PowerMeterWindow
     monkeypatch.setattr(FrequencySweep, "SETTLE_S", 0.02)
     settings = QSettings(str(tmp_path / "pm.ini"), QSettings.Format.IniFormat)
-    gen, pm = _proxy("e8267d"), _proxy("u2021xa")
+    gen, pm = attach(_proxy("e8267d")), attach(_proxy("u2021xa"))
     win = PowerMeterWindow(pm, settings)
     qtbot.addWidget(win)
-    LINKS.add(gen)
     for p in (gen, pm):
         _open(qtbot, p)
     pm.set_poll_interval(50)
@@ -261,8 +260,7 @@ def pm_window(qtbot, tmp_path, monkeypatch):
     yield gen, pm, win, settings
     COORD.stop_all(wait_ms=3000)
     timer.stop()
-    LINKS.remove(gen)
-    InstrumentProxy.shutdown_all([gen, pm])
+    COORD.close_all([gen, pm])
 
 
 def _acal_fields(win, start, stop, pts):
@@ -409,19 +407,57 @@ def test_acal_stops_when_generator_is_changed_by_hand(qtbot, lab):
     def by_hand(done, _total, _text):
         if done == 1 and not fiddled:                               # точка 2: частота поставлена, идёт пауза
             fiddled.append(1)
-            QTimer.singleShot(250, lambda: gen.set("rf.frequency", 7e9))
+            QTimer.singleShot(250, lambda: l3(gen).set("rf.frequency", 7e9))   # мимо координатора: другой программой
     run.progress.connect(by_hand)
     _finish(qtbot, run)
     assert run.state == "failed" and "GEN rf.frequency changed during ACAL" in run.error, run.error
     _wait_value(qtbot, gen, "rf.output", lambda v: v is False)
 
 
+def test_window_cannot_change_instrument_during_scenario(qtbot, lab):
+    """Арбитраж координатора: пока генератор ведёт ACAL, запись и действия окна в него не уходят - отказ
+    виден окну (ошибка ключа, ``refused``); чтение идёт; после сценария окно снова пишет."""
+    gen, pm, coord = lab
+    run = coord.start(AutoCalibration(1e9, 3e9, 50, settle_s=0.05))
+    qtbot.waitUntil(lambda: run.done >= 1, timeout=10000)
+    statuses, refused, shown = [], [], []
+    gen.param_status.connect(lambda k, st, m: statuses.append((k, st, m)))
+    gen.refused.connect(refused.append)
+    gen.subscribe("rf.power", shown.append)
+    level = gen.value("rf.power")
+    gen.set("rf.power", -30.0)                                        # окно: другой уровень
+    gen.action("reset")                                               # *RST посреди ACAL
+    gen.write_raw("*RST")
+    assert ("rf.power", PStatus.ERROR, "не отправлено: прибором управляет ACAL") in statuses
+    assert shown[-1] == pytest.approx(level)                          # виджет снова показывает прибор
+    assert len(refused) == 2 and all("ACAL" in m for m in refused)
+    qtbot.wait(300)
+    assert _sim(gen).s["rf.power"] == pytest.approx(level) and run.running   # в прибор не ушло, ACAL идёт
+    run.stop()
+    _finish(qtbot, run)
+    gen.set("rf.power", -30.0)
+    _wait_value(qtbot, gen, "rf.power", lambda v: v == pytest.approx(-30.0))
+
+
+def test_closing_instrument_stops_its_scenario_first(qtbot, lab):
+    """В окне генератора сменили адрес посреди ACAL: координатор сначала останавливает сценарий (он
+    выключает ВЧ), потом закрывает прибор."""
+    gen, pm, coord = lab
+    sim = _sim(gen)
+    run = coord.start(AutoCalibration(1e9, 3e9, 50, settle_s=0.05))
+    qtbot.waitUntil(lambda: run.done >= 1 and sim.s["rf.output"] is True, timeout=10000)
+    coord.close_instrument(gen)
+    assert run.state == "stopped" and coord.runs() == []
+    assert sim.s["rf.output"] is False                                # ВЧ выключен до закрытия
+    assert coord.find("signal_generator") is None and not gen.is_connected
+
+
 def test_generator_lost_during_acal_rf_off_when_it_reconnects(qtbot, lab):
     """Связь с генератором пропала посреди ACAL (сбой LAN): ВЧ у него остался включённым. Сценарий не
     может его выключить - это сделает координатор, когда генератор переподключится сам."""
     gen, pm, coord = lab
-    gen._worker.RECONNECT_DELAYS_S = (0.05,)
-    tr, sim = gen._worker.transport, _sim(gen)
+    worker(gen).RECONNECT_DELAYS_S = (0.05,)
+    tr, sim = worker(gen).transport, _sim(gen)
     run = coord.start(AutoCalibration(1e9, 3e9, 50, settle_s=0.05))
     messages = []
     run.message.connect(messages.append)

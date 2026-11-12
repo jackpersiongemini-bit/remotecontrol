@@ -1,7 +1,7 @@
 """Универсальное окно прибора, которое строится из описания параметров драйвера.
 
 ``section = "Вкладка/Группа"`` -> вкладка QTabWidget, внутри группы QGroupBox
-(до трёх в ряд). Окно общается с прибором только через InstrumentProxy (сигналы).
+(до трёх в ряд). Окно общается с прибором только через прибор координатора (Instrument, сигналы).
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QCheckBox, QDockWidget, QFormLayout, QGridLayout, Q
                              QWidget)
 
 from ..core.params import ConnectionState, Kind
-from ..core.proxy import InstrumentProxy
+from ..coord import Instrument
 from .widgets import STYLE, make_widget
 
 _LED = {
@@ -30,7 +30,7 @@ _LED = {
 class InstrumentWindow(QMainWindow):
     GROUP_COLUMNS = 3
 
-    def __init__(self, proxy: InstrumentProxy, title: str | None = None, parent=None):
+    def __init__(self, proxy: Instrument, title: str | None = None, parent=None):
         super().__init__(parent)
         self.proxy = proxy
         self.setWindowTitle(f"{title or proxy.name} — {proxy.address}")
@@ -51,6 +51,7 @@ class InstrumentWindow(QMainWindow):
         proxy.comm_error.connect(lambda m: self._log(f"ОШИБКА: {m}", error=True))
         proxy.scpi_log.connect(lambda d, t: self._log(f"{d} {t}"))
         proxy.raw_response.connect(lambda q, a: self._log(f"{q} → {a}"))
+        proxy.refused.connect(lambda m: self._log(f"НЕ ОТПРАВЛЕНО: {m}", error=True))
         proxy.param_status.connect(self._on_param_status)
         self._on_state(proxy.state)
 

@@ -34,9 +34,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.instrument import VISAInstrument
+from .base import VISAInstrument
 from ..core.params import Action, Kind, Param
-from ..core.scpi import parse_number
+from ..core.units import parse_number
 from ..core.trace import Trace
 from ..profiles import SPECTRUM_ANALYZER
 

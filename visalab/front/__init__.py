@@ -1,4 +1,4 @@
-"""Окна приборов в стиле Алексея (WindowClass.py / Parameter.py / PulseGen.py) поверх InstrumentProxy."""
+"""Окна приборов в стиле Алексея (WindowClass.py / Parameter.py / PulseGen.py) поверх прибора координатора (Instrument)."""
 from .power_meter import PowerMeterWindow
 from .psu import PSUWindow
 from .pulse_gen import PulseGenWindow
