@@ -1,8 +1,9 @@
 """Модели приборов, заданные пользователем (пределы и функции), и окно их создания.
 
 Модель - frozen dataclass драйвера (SDGModel, RFGenModel, ...). Пользовательские модели
-хранятся в ini окна (``MODELS/<driver>/<name>`` = JSON) и дополняют встроенные ``MODELS``.
-Форма строится по полям dataclass, поэтому окно годится для любого драйвера.
+хранятся в ini окна (``MODELS/<driver>/<name>`` = JSON) и дополняют встроенные (каталог драйверов
+координатора: ``COORD.models``). Форма строится по полям dataclass (``COORD.model_class``), поэтому окно
+годится для любого драйвера.
 """
 from __future__ import annotations
 
@@ -14,8 +15,8 @@ from typing import Any
 from PyQt6.QtCore import QSettings, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
 
-from ..core.scpi import si_format, si_parse
-from ..drivers import MODELS
+from ..coord import COORD
+from ..core.units import si_format, si_parse
 from .params import Panel, PanelLine, PanelTable
 from .theme import UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import Window
@@ -26,14 +27,13 @@ __all__ = ["FIELD_META", "model_class", "user_models", "all_models", "save_user_
 FIELD_META: dict[str, tuple[str, str]] = {
     "name": ("NAME", ""), "channels": ("CH", ""), "max_freq": ("FMAX", "Hz"), "max_amp_hiz": ("AMAX", "Vpp"),
     "has_cmr": ("CMR", ""), "f_min": ("FMIN", "Hz"), "f_max": ("FMAX", "Hz"), "p_min": ("PMIN", "dBm"),
-    "p_max": ("PMAX", "dBm"), "max_points": ("PTS", ""), "ratings": ("U,I", ""),
+    "p_max": ("PMAX", "dBm"), "max_points": ("PTS", ""), "ratings": ("U,I", ""), "dc_coupling": ("DC", ""),
 }
 
 
 def model_class(kind: str):
     """Класс модели драйвера (по встроенным моделям); None - у драйвера моделей нет."""
-    models = MODELS.get(kind) or {}
-    return type(next(iter(models.values()))) if models else None
+    return COORD.model_class(kind)
 
 
 def _hints(cls) -> dict[str, Any]:
@@ -68,7 +68,7 @@ def user_models(settings: QSettings, kind: str) -> dict[str, Any]:
 
 def all_models(settings: QSettings, kind: str) -> dict[str, Any]:
     """Встроенные + пользовательские (пользовательские не перекрывают встроенные)."""
-    return {**user_models(settings, kind), **(MODELS.get(kind) or {})}
+    return {**user_models(settings, kind), **COORD.models(kind)}
 
 
 def save_user_model(settings: QSettings, kind: str, model) -> None:
@@ -194,7 +194,7 @@ class ModelWindow(Window):
             self.status.setText(str(exc).splitlines()[0][:40])
             self.status.setToolTip(str(exc))
             return False
-        if model.name in (MODELS.get(self.kind) or {}):
+        if model.name in COORD.models(self.kind):
             self.status.setText("NAME is built-in")
             return False
         save_user_model(self.settings, self.kind, model)

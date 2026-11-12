@@ -1,20 +1,23 @@
-"""Базовый класс фонового слоя прибора (замена VISAClass).
+"""Слой 2: контракт драйвера - базовый класс ``VISAInstrument`` (замена VISAClass).
 
 Принципы
 --------
 * Один прибор = один объект ``VISAInstrument`` = один собственный ``QThread``.
   Транспорт трогается ТОЛЬКО из этого потока, поэтому блокировки не нужны:
   очередь событий Qt сама сериализует все операции.
-* GUI не вызывает методы прибора напрямую. Он работает через
-  :class:`~visalab.core.proxy.InstrumentProxy`, который шлёт сигналы-запросы,
-  а прибор отвечает сигналами-событиями. Сигналы у каждого экземпляра свои,
-  никакой глобальной шины с фильтрацией по адресу.
+* Методы драйвера напрямую никто не вызывает. Слой выше (абстрактный прибор,
+  :class:`~visalab.instruments.InstrumentProxy`) шлёт сигналы-запросы, драйвер отвечает
+  сигналами-событиями. Сигналы у каждого экземпляра свои, никакой глобальной шины с
+  фильтрацией по адресу. Вниз драйвер говорит только с транспортом (:mod:`visalab.transport`).
 * Любой слот защищён: исключение не роняет приложение (PyQt6 по умолчанию
   вызывает qFatal на необработанном исключении в слоте), а превращается в сигнал.
 * При подключении ничего не сбрасывается (*RST только отдельным действием):
   читаем текущее состояние прибора.
 * Ошибки прибора проверяются через стандартную модель IEEE 488.2:
   STB (serial poll) -> бит ESB -> *ESR? -> очередь ошибок прибора.
+* Связь пропала (или прибор был выключен при подключении) - прибор переподключается сам, с растущими
+  паузами (``RECONNECT_DELAYS_S``), пока его не отключат (``close_connection``). Попытки не засоряют
+  журнал: в нём первая ошибка и одна строка о переподключении.
 
 Как написать драйвер нового прибора
 -----------------------------------
@@ -35,12 +38,12 @@ import time
 import traceback
 from typing import Any, Callable, Iterable
 
-from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QCoreApplication, QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
-from .params import Action, ConnectionState, Param, PStatus
-from .profile import Profile
-from .scpi import parse_number, strip_response_header
-from .transport import Transport, TransportError, TransportTimeout
+from ..core.params import Action, ConnectionState, Param, PStatus
+from ..core.profile import Profile
+from ..core.units import parse_number
+from ..transport import Transport, TransportError, TransportNotSupported, TransportTimeout, strip_response_header
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +105,9 @@ class VISAInstrument(QObject):
     COMMAND_DELAY_S: float = 0.0
     #: команда SCPI очереди ошибок (None - у прибора её нет)
     ERROR_QUERY: str | None = "SYST:ERR?"
+    #: автоподключение после обрыва связи / неудачного подключения: паузы перед попытками, с
+    #: (последняя - дальше всё время). Пусто - не переподключаться.
+    RECONNECT_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 30.0)
 
     # ------------------------------------------- сигналы: прибор -> GUI
     state_changed = pyqtSignal(object)            # ConnectionState
@@ -114,6 +120,18 @@ class VISAInstrument(QObject):
     action_done = pyqtSignal(str, object)         # имя действия, результат
     sync_done = pyqtSignal()
     raw_response = pyqtSignal(str, str)           # запрос, ответ (консоль)
+    #: связи нет, прибор переподключится сам через столько секунд; 0 - не ждём (подключён или отключён)
+    reconnect_pending = pyqtSignal(float)
+
+    @property
+    def address(self) -> str:
+        """VISA-адрес прибора (строка транспорта)."""
+        return self.transport.address
+
+    @property
+    def timeout_ms(self) -> int:
+        """Сколько может длиться один запрос к прибору, мс (таймаут транспорта)."""
+        return int(getattr(self.transport, "timeout_ms", 2000) or 2000)
 
     def __init__(self, transport: Transport, parent: QObject | None = None,
                  command_delay_s: float | None = None):
@@ -134,9 +152,24 @@ class VISAInstrument(QObject):
         self.log_polling = False
         self.idn = ""
         self.opc_latched = False       # см. read_esr()
+        self._opc_pending = False      # arm_opc() послан, окончание ещё не поймано
+        #: ключи, на запрос которых прибор ответил ошибкой команды и не ответил (нет у этой модели/опции)
+        self._no_answer: set[str] = set()
+        #: ключи, которые при последнем чтении не прочитались (нет ответа, ответ не распознан)
+        self._read_failed: set[str] = set()
+        self._resyncing = False
         self._timer = QTimer(self)     # переедет в поток вместе с self
         self._timer.setInterval(self.POLL_INTERVAL_MS)
         self._timer.timeout.connect(self._on_poll)
+        # автоподключение
+        self.auto_reconnect = True
+        self._want_connected = False   # подключили (open) и не отключали (close)
+        self._reconnects = 0           # попыток подряд: пауза растёт
+        self._retry_pending = False    # связи нет, ждём следующую попытку
+        self._auto_attempt = False     # идёт автоматическая попытка: её ошибки в журнал не повторять
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._retry)
 
     # ================================================ описание (переопределять)
     def build_params(self) -> Iterable[Param]:
@@ -286,9 +319,35 @@ class VISAInstrument(QObject):
     @pyqtSlot()
     @guarded
     def open_connection(self) -> None:
+        self._want_connected = True
+        self._retry_timer.stop()
         if self._state is ConnectionState.CONNECTED:
             return
         self._set_state(ConnectionState.CONNECTING)
+        try:
+            self._connect()
+        except TransportError:
+            raise                    # guarded -> _on_transport_error: ERROR и автоподключение
+        except Exception:
+            # Ошибка программы при подключении (ответ прибора не разобран...): не «вечное подключение» -
+            # ERROR и ресурс закрыт. Переподключаться бессмысленно: ошибка повторится.
+            self._cancel_retry()
+            self._close(ConnectionState.ERROR, graceful=False)
+            raise
+        self._poll_failures = 0
+        restored = self._reconnects > 0
+        self._reconnects = 0
+        self._auto_attempt = False   # подключился: ошибки чтения дальше - как обычно, в журнал окна
+        self._set_state(ConnectionState.CONNECTED)
+        if restored:
+            log.warning("%s: связь восстановлена (%s)", self.transport.address, self.NAME)
+        self._cancel_retry()
+        self._timer.start()          # до чтения: если прибор не ответит на что-то при чтении, опрос всё равно идёт
+        self._sync_all()
+
+    def _connect(self) -> None:
+        self._no_answer.clear()
+        self._opc_pending = False
         self.transport.timeout_ms = self.TIMEOUT_MS
         self.transport.open()
         try:
@@ -301,14 +360,12 @@ class VISAInstrument(QObject):
         self.write("*CLS")
         self.write(f"*ESE {self.ESE_MASK}")
         self.on_connected()
-        self._poll_failures = 0
-        self._set_state(ConnectionState.CONNECTED)
-        self._sync_all()
-        self._timer.start()
 
     @pyqtSlot()
     @guarded
     def close_connection(self) -> None:
+        self._want_connected = False
+        self._cancel_retry()
         self._close(ConnectionState.DISCONNECTED, graceful=True)
 
     @pyqtSlot()
@@ -367,9 +424,18 @@ class VISAInstrument(QObject):
     def set_log_polling(self, on: bool) -> None:
         self.log_polling = bool(on)
 
+    @pyqtSlot(bool)
+    def set_auto_reconnect(self, on: bool) -> None:
+        """Переподключаться ли самому после обрыва связи (проверка стенда - нет: ей нужна сама ошибка)."""
+        self.auto_reconnect = bool(on)
+        if not on:
+            self._cancel_retry()
+
     @pyqtSlot()
     def shutdown(self) -> None:
         """Закрыть ресурс и завершить поток. Вызывается прокси при закрытии окна."""
+        self._want_connected = False
+        self._cancel_retry()
         try:
             self._close(ConnectionState.DISCONNECTED, graceful=True)
         except Exception:  # noqa: BLE001
@@ -377,6 +443,9 @@ class VISAInstrument(QObject):
         thread = self.thread()
         if thread is not QThread.currentThread() or thread is None:
             return
+        app = QCoreApplication.instance()
+        if app is not None and app.thread() is not thread:
+            self.moveToThread(app.thread())     # удалять воркер будет GUI-поток (см. InstrumentProxy)
         thread.quit()
 
     # ===================================================== внутренняя логика
@@ -403,10 +472,105 @@ class VISAInstrument(QObject):
         self._values.clear()
         self._set_state(state)
 
-    def _on_transport_error(self, exc: TransportError) -> None:
-        self.comm_error.emit(str(exc))
+    def _on_transport_error(self, exc: TransportError, recover: bool = True) -> None:
+        """Ошибка связи. Таймаут у подключённого прибора - сначала восстановить обмен (прибор мог
+        не ответить на одну команду: нет у модели, ошибка в консоли, долго считал); рвать связь,
+        только если прибор не отвечает и после этого."""
+        if self._auto_attempt:
+            log.info("%s: переподключение не удалось: %s", self.transport.address, exc)
+        else:
+            self.comm_error.emit(str(exc))
+        if recover and isinstance(exc, TransportTimeout) and self._state is ConnectionState.CONNECTED \
+                and self._try_resync():
+            return
         if self._state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
             self._close(ConnectionState.ERROR, graceful=False)
+            self._schedule_reconnect()
+
+    # ---- автоподключение ----
+    def _schedule_reconnect(self) -> None:
+        if not (self._want_connected and self.auto_reconnect and self.RECONNECT_DELAYS_S):
+            return
+        delays = self.RECONNECT_DELAYS_S
+        delay = float(delays[min(self._reconnects, len(delays) - 1)])
+        if not self._retry_pending:
+            self._retry_pending = True
+            log.warning("%s: нет связи, переподключение автоматически", self.transport.address)
+            self.comm_error.emit("переподключение автоматически, пока прибор не ответит (выключатель - отменить)")
+        self._reconnects += 1
+        self._retry_timer.start(max(1, int(delay * 1000)))
+        self.reconnect_pending.emit(delay)
+
+    def _cancel_retry(self) -> None:
+        self._retry_timer.stop()
+        self._reconnects = 0
+        if self._retry_pending:
+            self._retry_pending = False
+            self.reconnect_pending.emit(0.0)
+
+    @pyqtSlot()
+    def _retry(self) -> None:
+        if not self._want_connected or self._state is ConnectionState.CONNECTED:
+            return
+        try:
+            reachable = self.transport.reachable()
+        except Exception:  # noqa: BLE001 - проверка - только подсказка
+            reachable = True
+        if not reachable:          # LAN: узел не отвечает - не ждать долгого open библиотеки VISA
+            log.info("%s: не отвечает, следующая попытка позже", self.transport.address)
+            self._schedule_reconnect()
+            return
+        self._auto_attempt = True
+        try:
+            self.open_connection()
+        finally:
+            self._auto_attempt = False
+
+    # ---- восстановление обмена после таймаута ----
+    # Реальный прибор, не ответивший вовремя, может ответить позже: тогда каждый следующий запрос
+    # читает ответ на предыдущий (сдвиг). А на запрос, которого у модели нет (ошибка -113), прибор
+    # не отвечает вовсе. Симуляторы такого не делают, поэтому это проверяется отдельно (SimTransport.late).
+    RESYNC_ATTEMPTS = 3
+
+    def _try_resync(self) -> bool:
+        """Выбросить опоздавшие ответы и убедиться по ``*IDN?``, что обмен снова верный.
+        ``*IDN?`` (а не ``*OPC?``) - потому что ``*OPC?`` ждёт конца идущей развёртки."""
+        if self._resyncing:
+            return False
+        self._resyncing = True
+        quiet, self._quiet = self._quiet, True
+        try:
+            for attempt in range(self.RESYNC_ATTEMPTS):
+                if attempt == 1:                       # не помогло - device clear (сбрасывает буферы прибора)
+                    try:
+                        self.transport.clear()
+                    except TransportNotSupported:
+                        pass
+                self.transport.discard_input()
+                try:
+                    answer = self.query("*IDN?")
+                except TransportTimeout:
+                    continue
+                if not self.idn or answer == self.idn:
+                    log.warning("%s: обмен восстановлен после таймаута", self.transport.address)
+                    self.after_resync(cleared=attempt >= 1)
+                    return True
+            return False
+        except TransportError as exc:
+            log.warning("%s: восстановить обмен не удалось: %s", self.transport.address, exc)
+            return False
+        finally:
+            self._quiet = quiet
+            self._resyncing = False
+
+    def after_poll_timeout(self) -> None:
+        """Хук: опрос прервался таймаутом, обмен восстановлен (например, перезапустить развёртки)."""
+
+    def after_resync(self, cleared: bool) -> None:
+        """Хук после восстановления обмена. Device clear (``cleared``) отменяет ожидание ``*OPC``
+        (IEEE 488.2) - взвести его снова, иначе конец идущей развёртки не будет пойман никогда."""
+        if self._opc_pending and cleared:
+            self.write("*OPC")
 
     def _publish(self, key: str, value: Any) -> None:
         self._values[key] = value
@@ -430,10 +594,28 @@ class VISAInstrument(QObject):
                     if v is not None or self._values.get(k) is not None or k not in self._values:
                         self._publish(k, v)
             else:
+                if key in self._no_answer:
+                    continue
                 try:
                     self._publish(key, self.read_param_raw(spec))
                 except ValueError as exc:   # прибор вернул непонятное
+                    self._read_failed.add(key)
                     self.param_status.emit(key, PStatus.ERROR, f"ответ не распознан: {exc}")
+                except TransportTimeout as exc:
+                    self._read_failed.add(key)
+                    self._no_reply(key, exc)
+
+    def _no_reply(self, key: str, exc: TransportTimeout) -> None:
+        """Прибор не ответил на чтение ключа: восстановить обмен (иначе - обрыв связи) и, если прибор
+        сообщил об ошибке команды (-1xx: такой команды у модели / опции нет), больше ключ не читать."""
+        if not self._try_resync():
+            raise exc
+        errors = self._check_errors(context=key)
+        if any(-199 <= code <= -100 for code, _ in errors):
+            self._no_answer.add(key)
+            self.param_status.emit(key, PStatus.ERROR, "прибор не поддерживает (нет у модели или опции)")
+        else:
+            self.param_status.emit(key, PStatus.ERROR, f"нет ответа: {exc}")
 
     def _sync_all(self) -> None:
         self._read_keys(list(self._params))
@@ -455,8 +637,16 @@ class VISAInstrument(QObject):
             try:
                 self._apply(key, value)
             except TransportError as exc:
+                # запись не подтверждена: статус ERROR (иначе ключ навсегда «пишется», а сценарий
+                # координатора ждёт его до таймаута); остальные записи - дальше, если связь восстановлена
+                self.param_status.emit(key, PStatus.ERROR, str(exc))
+                rest = list(self._pending)
                 self._on_transport_error(exc)
-                return
+                if self._state is not ConnectionState.CONNECTED:
+                    for k in rest:
+                        self.param_status.emit(k, PStatus.ERROR, str(exc))
+                    self._pending.clear()
+                    return
             except Exception as exc:  # noqa: BLE001
                 log.exception("%s: запись %s", self.NAME, key)
                 self.param_status.emit(key, PStatus.ERROR, str(exc))
@@ -477,10 +667,16 @@ class VISAInstrument(QObject):
         self.param_status.emit(key, PStatus.WRITING, "")
         self.write_param(spec, value)
         errors = self._check_errors(context=key) if self.CHECK_AFTER_WRITE else []
+        self._read_failed.discard(key)
         self._read_keys([key, *spec.also_read])      # обратное чтение
         actual = self._values.get(key)
         if errors:
             self.param_status.emit(key, PStatus.ERROR, "; ".join(m for _, m in errors))
+        elif key in self._no_answer:                 # не читается у модели: подтвердить нечем
+            self.param_status.emit(key, PStatus.ERROR, "не подтверждено: прибор не отвечает на чтение")
+        elif key in self._read_failed:
+            # обратное чтение не удалось (статус ERROR уже отправлен) - это не «прибор округлил»
+            pass
         elif spec.same(value, actual):
             self.param_status.emit(key, PStatus.WRITTEN, "")
         else:
@@ -505,6 +701,7 @@ class VISAInstrument(QObject):
         for c in commands:
             self.write(c)
         self.write("*OPC")
+        self._opc_pending = True
 
     def opc_done(self, context: str = "измерение") -> bool:
         esr = self.read_esr()
@@ -512,6 +709,7 @@ class VISAInstrument(QObject):
             self._check_errors(context=context, esr=esr)
         if self.opc_latched:
             self.opc_latched = False
+            self._opc_pending = False
             return True
         return False
 
@@ -532,7 +730,11 @@ class VISAInstrument(QObject):
 
     def _read_status_byte(self) -> int:
         if self.transport.supports_serial_poll:
-            return self.transport.read_stb()
+            try:
+                return self.transport.read_stb()
+            except TransportNotSupported:          # VI_ERROR_NSUP_OPER: дальше статус через *STB?
+                log.warning("%s: serial poll не поддерживается, статус через *STB?", self.transport.address)
+                self.transport.supports_serial_poll = False
         return self.query_int("*STB?")
 
     @pyqtSlot()
@@ -547,9 +749,14 @@ class VISAInstrument(QObject):
             self.poll()
             self._poll_failures = 0
         except TransportTimeout as exc:
+            # Не ответил на опрос: восстановить обмен (опоздавший ответ сдвинул бы все следующие).
+            # Связь рвётся, если прибор молчит и после этого или не отвечает MAX_POLL_FAILURES опросов подряд.
             self._poll_failures += 1
-            if self._poll_failures >= self.MAX_POLL_FAILURES:
-                self._on_transport_error(exc)
+            if self._poll_failures >= self.MAX_POLL_FAILURES or not self._try_resync():
+                self._on_transport_error(exc, recover=False)
+            else:
+                log.warning("%s: опрос: %s", self.transport.address, exc)
+                self.after_poll_timeout()
         except TransportError as exc:
             self._on_transport_error(exc)
         except Exception as exc:  # noqa: BLE001

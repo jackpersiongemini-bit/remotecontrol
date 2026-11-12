@@ -7,7 +7,7 @@
   пресеты (при применении отправляется только то, что отличается);
 * ``PowerMeterWindow`` - датчик U2021XA: режим Free run / Level, уровень запуска, частота, результат.
 
-С прибором окна говорят только через InstrumentProxy (сигналы Qt) и ключи профилей,
+С прибором окна говорят только через прибор координатора (Instrument, сигналы Qt) и ключи профилей,
 поэтому RFGenWindow одинаково работает с E8267D и SMF100A. Настройки окон и пресеты -
 в QSettings (ini-файл). Интерфейс на английском.
 """
@@ -21,9 +21,9 @@ from PyQt6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
                              QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton, QRadioButton, QScrollArea,
                              QVBoxLayout, QWidget)
 
+from .coord import Instrument
 from .core.params import ConnectionState, PStatus
-from .core.proxy import InstrumentProxy
-from .core.scpi import si_format
+from .core.units import si_format
 from .ui.frame import FramelessFrame
 
 __all__ = ["RFGenWindow", "PSUWindow", "FuncGenWindow", "PowerMeterWindow", "LabWindow", "WINDOWS"]
@@ -113,7 +113,7 @@ class SpinField(QDoubleSpinBox):
     ``scale`` - во сколько раз отображаемая единица больше единицы СИ (MHz -> 1e6).
     """
 
-    def __init__(self, proxy: InstrumentProxy, key: str, suffix: str = "", scale: float = 1.0,
+    def __init__(self, proxy: Instrument, key: str, suffix: str = "", scale: float = 1.0,
                  decimals: int = 3, step: float = 1.0, parent=None):
         super().__init__(parent)
         self.proxy, self.key, self.scale = proxy, key, scale
@@ -168,7 +168,7 @@ class SpinField(QDoubleSpinBox):
 class ToggleButton(QPushButton):
     """Кнопка-переключатель BOOL-ключа. Сама не переключается: ждёт подтверждения прибора."""
 
-    def __init__(self, proxy: InstrumentProxy, key: str, text: str, parent=None):
+    def __init__(self, proxy: Instrument, key: str, text: str, parent=None):
         super().__init__(text, parent)
         self.proxy, self.key, self._text = proxy, key, text
         self.setCheckable(True)
@@ -195,7 +195,7 @@ class ToggleButton(QPushButton):
 class OnOffButtons(QWidget):
     """Отдельные кнопки ON и OFF + состояние выхода (подсвечена та, что сейчас на приборе)."""
 
-    def __init__(self, proxy: InstrumentProxy, key: str, text: str, parent=None):
+    def __init__(self, proxy: Instrument, key: str, text: str, parent=None):
         super().__init__(parent)
         self.proxy, self.key = proxy, key
         lay = QHBoxLayout(self)
@@ -235,7 +235,7 @@ class OnOffButtons(QWidget):
 
 
 class Readout(QLabel):
-    def __init__(self, proxy: InstrumentProxy, key: str, digits: int = 5, role: str = "readout", parent=None):
+    def __init__(self, proxy: Instrument, key: str, digits: int = 5, role: str = "readout", parent=None):
         super().__init__("—", parent)
         spec = proxy.params[key]
         self.unit = spec.unit
@@ -260,7 +260,7 @@ class Readout(QLabel):
 
 
 class EnumBox(QComboBox):
-    def __init__(self, proxy: InstrumentProxy, key: str, items: list[tuple[str, str]], parent=None):
+    def __init__(self, proxy: Instrument, key: str, items: list[tuple[str, str]], parent=None):
         super().__init__(parent)
         self.proxy, self.key = proxy, key
         allowed = set(proxy.params[key].choices)
@@ -297,7 +297,7 @@ class QuickWindow(QFrame):
 
     KIND = "base"
 
-    def __init__(self, proxy: InstrumentProxy, title: str, settings: QSettings, parent=None):
+    def __init__(self, proxy: Instrument, title: str, settings: QSettings, parent=None):
         super().__init__(parent)
         self.proxy, self.settings = proxy, settings
         self.title = title
@@ -332,6 +332,7 @@ class QuickWindow(QFrame):
         self.idn_label = self.title_label            # IDN - в подсказке заголовка
 
         proxy.state_changed.connect(self._on_state)
+        proxy.reconnect_pending.connect(lambda _s: self._on_state(self.proxy.state))
         proxy.identified.connect(lambda idn: self.title_label.setToolTip(f"{idn}\n{proxy.address}"))
         proxy.instrument_error.connect(lambda c, m: self.show_message(f"Instrument error {c}: {m}", True))
         proxy.comm_error.connect(lambda m: self.show_message(m, True))
@@ -349,15 +350,16 @@ class QuickWindow(QFrame):
             self.show_message(f"{key}: {message}", status is not PStatus.COERCED)
 
     def _toggle_connection(self) -> None:
-        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or self.proxy.reconnecting:
             self.proxy.close()
         else:
             self.proxy.open()
 
     def _on_state(self, state: ConnectionState) -> None:
-        self.state_label.setText(_STATE_TEXT[state])
+        retry = state is ConnectionState.ERROR and self.proxy.reconnecting
+        self.state_label.setText("No connection, reconnecting…" if retry else _STATE_TEXT[state])
         self.led.setStyleSheet(f"background: {_LED[state]};")
-        busy = state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
+        busy = state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or retry
         self.connect_btn.setText("Disconnect" if busy else "Connect")
 
     def shutdown(self) -> None:

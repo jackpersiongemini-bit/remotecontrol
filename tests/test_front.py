@@ -2,7 +2,9 @@
 import pytest
 from PyQt6.QtCore import QSettings
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import SiglentSDG
 from visalab.front import PulseGenWindow
 from visalab.front.params import PSButton
@@ -17,7 +19,7 @@ def settings(tmp_path):
 @pytest.fixture
 def opened(qtbot, settings):
     sim = SiglentSDGSim()
-    proxy = InstrumentProxy(SiglentSDG, SimTransport(sim))
+    proxy = attach(InstrumentProxy(SiglentSDG, SimTransport(sim)))
     win = PulseGenWindow(proxy, settings)
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):

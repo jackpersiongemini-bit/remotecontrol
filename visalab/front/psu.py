@@ -28,7 +28,7 @@ from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.params import ConnectionState
-from ..core.proxy import InstrumentProxy
+from ..coord import Instrument
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
 from .params import PLabel, PLineEdit, PSButton, PanelLine, PanelTable, _repolish, paint_indicator
@@ -56,7 +56,7 @@ class SourceField(PLineEdit):
 
     side: QLabel | None = None
 
-    def __init__(self, proxy: InstrumentProxy, key: str, meas_key: str, parent=None):
+    def __init__(self, proxy: Instrument, key: str, meas_key: str, parent=None):
         self.meas_key, self._meas = meas_key, None
         super().__init__(proxy, key, digits=5, parent=parent)
         self.side = QLabel("", self)
@@ -147,7 +147,7 @@ class SourceTile(QFrame):
         SourceTile PLineEdit { background-color: $UI_COLOR_PANEL; border-color: $UI_COLOR_PANEL; }
     """)
 
-    def __init__(self, proxy: InstrumentProxy, n: int, title: str = "", parent=None):
+    def __init__(self, proxy: Instrument, n: int, title: str = "", parent=None):
         super().__init__(parent)
         self.setStyleSheet(self.STYLE)
         self.proxy, self.n = proxy, n
@@ -381,7 +381,7 @@ class PSUWindow(InstrumentWindow):
     DEFAULT_KIND = "it6300"
     PRESET_KEY = "PSU_PRESETS"             # пресетов нет
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Power supply", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Power supply", parent=None):
         super().__init__(proxy, settings, title, parent)
         for n in self.tiles:
             for k in ("output", "meas_v", "meas_i", "meas_p"):

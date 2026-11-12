@@ -12,7 +12,7 @@ import copy
 import math
 import re
 
-from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
+from .base import ESR_CME, ESR_EXE, ESR_OPC, SimError, SimInstrument
 
 __all__ = ["AgilentPSASim"]
 
@@ -33,6 +33,8 @@ def _round_13(x: float) -> float:
 class AgilentPSASim(SimInstrument):
     IDN = "Agilent Technologies, E4446A, MY00000001, A.11.21"
     F_MAX = 44e9
+    #: INP:COUP есть только у моделей до 26.5 ГГц; у E4446A (44 ГГц) - нет: -113 и нет ответа
+    DC_COUPLING = False
 
     def reset(self) -> None:
         self.c = {"center": 22e9, "span": 44e9, "rbw": 3e6, "rbw_auto": True, "vbw": 3e6, "vbw_auto": True,
@@ -168,7 +170,8 @@ class AgilentPSASim(SimInstrument):
         self.on("DISPlay:WINDow[1]:TRACe:Y[:SCALe]:RLEVel:OFFSet", self._n("roff", -327, 327),
                 self._g(lambda: self.c["roff"]))
         self.on("[SENSe:]POWer[:RF]:GAIN[:STATe]", self._b("gain"), self._gb("gain"))
-        self.on("INPut:COUPling", self._enum("coup", {"AC": "AC", "DC": "DC"}), lambda a, g: self.c["coup"])
+        if self.DC_COUPLING:
+            self.on("INPut:COUPling", self._enum("coup", {"AC": "AC", "DC": "DC"}), lambda a, g: self.c["coup"])
         self.on("[SENSe:]SWEep:TYPE", self._enum("swtype", {"AUTO": "AUTO", "SWE": "SWE", "SWEEP": "SWE",
                                                            "FFT": "FFT"}), lambda a, g: self.c["swtype"])
         self.on("TRACe[1]:MODE", self._tmode_set, lambda a, g: self.c["tmode"])
@@ -203,17 +206,24 @@ class AgilentPSASim(SimInstrument):
         self.c["tmode"] = modes[t]
         self.held = None
 
-    # состояния (файлы .state)
+    # состояния: файлы C:\ИМЯ.STA (DOS-имя до 8 знаков A-Z0-9, прибор переводит в верхний регистр)
     @staticmethod
     def _file_name(text: str, with_num: bool) -> str:
-        m = re.fullmatch(r'\s*1\s*,\s*"([^"]+)"\s*' if with_num else r'\s*"([^"]+)"\s*', text)
+        m = re.fullmatch(r"\s*1\s*,\s*(['\"])(.+)\1\s*" if with_num else r"\s*(['\"])(.+)\1\s*", text)
         if not m:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        name = m.group(1)
-        return name if name.lower().endswith(".state") else name + ".state"
+        path = m.group(2).upper()
+        name = path.split("\\")[-1].split(":")[-1]
+        stem, dot, ext = name.partition(".")
+        if not re.fullmatch(r"[A-Z0-9]{1,8}", stem) or (dot and not re.fullmatch(r"[A-Z0-9]{1,3}", ext)):
+            raise SimError(-256, "File name not found", ESR_EXE)
+        return name
 
     def _st_store(self, a, g):
-        self.files[self._file_name(a, True)] = (copy.deepcopy(self.c), copy.deepcopy(self.marker))
+        name = self._file_name(a, True)
+        if not name.endswith(".STA"):                       # "The .sta extension is required"
+            raise SimError(-256, "File name not found", ESR_EXE)
+        self.files[name] = (copy.deepcopy(self.c), copy.deepcopy(self.marker))
 
     def _st_load(self, a, g):
         name = self._file_name(a, True)
@@ -226,7 +236,9 @@ class AgilentPSASim(SimInstrument):
         self._couple()
 
     def _cat(self, a, g):
-        entries = ",".join(f'"{n},STAT,812"' for n in sorted(self.files))
+        if not a.strip():                           # :MMEMory:CATalog? <dir_name> - каталог обязателен
+            raise SimError(-109, "Missing parameter", ESR_CME)
+        entries = ",".join(f'"{n},,812"' for n in sorted(self.files))
         return f"{812 * len(self.files)},1000000,{entries}" if entries else "0,1000000"
 
     def _file_del(self, a, g):

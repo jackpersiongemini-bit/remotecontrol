@@ -102,7 +102,8 @@ def test_connection_lost_during_poll(make):
     for _ in range(20):
         drv._on_poll()
     assert drv.state is ConnectionState.ERROR
-    assert rec.comm and "потеряна" in rec.comm[-1]
+    assert rec.comm and "потеряна" in rec.comm[0]
+    assert "переподключение автоматически" in rec.comm[-1]     # и прибор будет переподключаться сам
 
 
 def test_device_absent(make):

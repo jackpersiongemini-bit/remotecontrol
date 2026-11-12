@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 
-from ..core.transport import float_block
+from ..transport import float_block
 from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
 
 __all__ = ["KeysightU2021XASim"]

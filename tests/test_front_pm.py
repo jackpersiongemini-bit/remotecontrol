@@ -5,16 +5,18 @@ import math
 import pytest
 from PyQt6.QtCore import QSettings
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach, sim_of
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import DRIVERS
 from visalab.front import PowerMeterWindow, PulseGenWindow
-from visalab.front.instrument_window import LINKS
+from visalab.coord import LINKS
 from visalab.front.power_meter import interpolate, load_csv, save_csv
 
 
 def _proxy(kind):
     drv, sim_cls = DRIVERS[kind]
-    return InstrumentProxy(drv, SimTransport(sim_cls()))
+    return attach(InstrumentProxy(drv, SimTransport(sim_cls())))
 
 
 @pytest.fixture
@@ -74,7 +76,7 @@ def test_trigger_toggle_from_readout(qtbot, pm):
     win.readout.trig_button.click()
     _wait(qtbot, proxy, "trig.source", lambda v: v == "EXT")       # внешний запуск: ждём импульс на TRIG IN
     qtbot.waitUntil(lambda: win.readout.trig_button.text() == "EXT · WAIT", timeout=5000)
-    sim = proxy._worker.transport.sim
+    sim = sim_of(proxy)
     before = proxy.value("meas.power")
     sim.set_signal(on_dbm=-3.0, width=None)
     sim.fire_external()

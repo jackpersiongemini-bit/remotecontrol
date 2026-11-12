@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
-from ..core.scpi import si_parse
+from ..core.units import si_parse
 
 UNITS = {"V": "V", "I": "A", "P": "W"}
 OPS = {"<": lambda a, b: a < b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}

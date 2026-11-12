@@ -1,0 +1,268 @@
+"""Слой 3: абстрактный прибор.
+
+``InstrumentProxy`` живёт в GUI-потоке, создаёт поток прибора и общается с драйвером в нём только
+сигналами Qt (queued connection). Слой выше (координатор) видит прибор только так: ключи и действия
+профиля, значения, статусы записи, состояние связи - и никогда не ждёт ответа прибора синхронно.
+Какой у прибора драйвер и транспорт, отсюда не видно: прокси получает готовый драйвер из каталога
+слоя 2 (:func:`visalab.drivers.create_driver`).
+"""
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from typing import Any, Callable
+
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+
+from ..applog import Throttle
+from ..core.params import Action, ConnectionState, Param, PStatus
+from ..drivers import VISAInstrument, kind_of
+
+log = logging.getLogger(__name__)
+
+__all__ = ["InstrumentProxy"]
+
+_Q = Qt.ConnectionType.QueuedConnection
+
+
+class InstrumentProxy(QObject):
+    # ------------------------------------------- запросы GUI -> прибор
+    _req_open = pyqtSignal()
+    _req_close = pyqtSignal()
+    _req_sync = pyqtSignal()
+    _req_set = pyqtSignal(str, object)
+    _req_read = pyqtSignal(str)
+    _req_action = pyqtSignal(str, object)
+    _req_raw_write = pyqtSignal(str)
+    _req_raw_query = pyqtSignal(str)
+    _req_poll = pyqtSignal(int)
+    _req_log_poll = pyqtSignal(bool)
+    _req_delay = pyqtSignal(float)
+    _req_auto = pyqtSignal(bool)
+    _req_shutdown = pyqtSignal()
+
+    # ------------------------------------------- события прибор -> GUI
+    state_changed = pyqtSignal(object)
+    identified = pyqtSignal(str)
+    param_updated = pyqtSignal(str, object)
+    param_status = pyqtSignal(str, object, str)
+    instrument_error = pyqtSignal(int, str)
+    comm_error = pyqtSignal(str)
+    scpi_log = pyqtSignal(str, str)
+    action_done = pyqtSignal(str, object)
+    sync_done = pyqtSignal()
+    raw_response = pyqtSignal(str, str)
+    #: связи нет, прибор переподключится сам через столько секунд; 0 - не ждём (см. ``reconnecting``)
+    reconnect_pending = pyqtSignal(float)
+
+    def __init__(self, driver: VISAInstrument | type[VISAInstrument], transport=None,
+                 parent: QObject | None = None, kind: str | None = None, **driver_kwargs):
+        """``driver`` - готовый драйвер (из :func:`visalab.drivers.create_driver`). Тестам и отладке:
+        ``InstrumentProxy(КлассДрайвера, транспорт, **аргументы драйвера)`` - собрать драйвер здесь."""
+        super().__init__(parent)
+        if transport is not None:
+            driver = driver(transport, **driver_kwargs)
+        self._worker = driver
+        self.address = driver.address
+        #: тип драйвера в каталоге (``e8267d``...) - окну настроек подключения
+        self.kind = kind or kind_of(driver) or ""
+        self._thread = QThread()
+        self._thread.setObjectName(f"{driver.NAME}@{driver.address}")
+        self.name = self._worker.NAME
+        # Метаданные неизменяемы (frozen dataclass), их безопасно читать из GUI.
+        self.params: dict[str, Param] = dict(self._worker.params)
+        self.actions: dict[str, Action] = dict(self._worker.actions)
+        #: класс прибора и поддерживаемые ключи профиля - то, на что опирается GUI
+        self.profile = self._worker.PROFILE
+        self.channels = self._worker.channels
+        self.capabilities: frozenset[str] = self._worker.capabilities
+        self.state = ConnectionState.DISCONNECTED
+        #: связь потеряна, прибор переподключается сам (выключатель окна - отменить: ``close()``)
+        self.reconnecting = False
+        self.idn = ""
+        self._values: dict[str, Any] = {}
+        self._statuses: dict[str, PStatus] = {}
+        self._subs: dict[str, list[Callable]] = defaultdict(list)
+        self._status_subs: dict[str, list[Callable]] = defaultdict(list)
+        self._throttle = Throttle()          # журнал в файл: одинаковое сообщение - не чаще раза в минуту
+
+        self._worker.moveToThread(self._thread)
+        w = self._worker
+        self._requests = (
+            (self._req_open, w.open_connection), (self._req_close, w.close_connection),
+            (self._req_sync, w.sync_all), (self._req_set, w.set_param),
+            (self._req_read, w.read_param), (self._req_action, w.run_action),
+            (self._req_raw_write, w.raw_write), (self._req_raw_query, w.raw_query),
+            (self._req_poll, w.set_poll_interval), (self._req_log_poll, w.set_log_polling),
+            (self._req_delay, w.set_command_delay), (self._req_auto, w.set_auto_reconnect),
+        )
+        for sig, slot in self._requests:
+            sig.connect(slot, _Q)
+        self._req_shutdown.connect(w.shutdown, _Q)
+        self._shut_down = False
+        # события воркера -> внутренние обработчики (в GUI-потоке) -> сигналы прокси
+        w.state_changed.connect(self._on_state, _Q)
+        w.identified.connect(self._on_idn, _Q)
+        w.param_updated.connect(self._on_value, _Q)
+        w.param_status.connect(self._on_status, _Q)
+        w.reconnect_pending.connect(self._on_reconnect, _Q)
+        w.instrument_error.connect(self._on_instrument_error, _Q)
+        w.comm_error.connect(self._on_comm_error, _Q)
+        for name in ("scpi_log", "action_done", "sync_done", "raw_response"):
+            getattr(w, name).connect(getattr(self, name), _Q)
+        # Воркер НЕ удаляется через finished -> deleteLater: тогда его (и QTimer) удалял бы поток прибора,
+        # которому для этого нужен GIL, а GUI-поток в ~QThread ждёт этот поток, держа GIL, - взаимная
+        # блокировка (программа виснет на выходе или при смене адреса). Воркером владеет Python; при закрытии
+        # он сам возвращается в GUI-поток (VISAInstrument.shutdown) и удаляется вместе с прокси.
+        self._thread.start()
+
+    # ------------------------------------------------------------ API GUI
+    def open(self) -> None:
+        self._req_open.emit()
+
+    def close(self) -> None:
+        self._req_close.emit()
+
+    def sync(self) -> None:
+        self._req_sync.emit()
+
+    def set(self, key: str, value: Any) -> None:
+        self._req_set.emit(key, value)
+
+    def read(self, key: str) -> None:
+        self._req_read.emit(key)
+
+    def action(self, name: str, *args) -> None:
+        self._req_action.emit(name, args)
+
+    def write_raw(self, command: str) -> None:
+        self._req_raw_write.emit(command)
+
+    def query_raw(self, command: str) -> None:
+        self._req_raw_query.emit(command)
+
+    def set_poll_interval(self, ms: int) -> None:
+        self._req_poll.emit(int(ms))
+
+    def set_command_delay(self, seconds: float) -> None:
+        """Пауза между командами прибору, с (0 - без паузы)."""
+        self._req_delay.emit(float(seconds))
+
+    def set_log_polling(self, on: bool) -> None:
+        """Показывать ли в журнале трафик периодического опроса."""
+        self._req_log_poll.emit(bool(on))
+
+    def set_auto_reconnect(self, on: bool) -> None:
+        """Переподключаться ли самому после обрыва связи (по умолчанию да)."""
+        self._req_auto.emit(bool(on))
+
+    def supports(self, key: str) -> bool:
+        """Есть ли у прибора этот параметр/действие (стандартный ключ профиля или x.*)."""
+        return key in self.params or key in self.actions
+
+    def value(self, key: str, default: Any = None) -> Any:
+        """Последнее известное значение (кэш в GUI-потоке, без обращения к прибору)."""
+        return self._values.get(key, default)
+
+    def status(self, key: str) -> PStatus:
+        return self._statuses.get(key, PStatus.UNKNOWN)
+
+    def subscribe(self, key: str, on_value: Callable[[Any], None],
+                  on_status: Callable[[PStatus, str], None] | None = None) -> None:
+        """Подписка виджета на один ключ: диспетчеризация словарём, без фильтрации."""
+        self._subs[key].append(on_value)
+        if on_status:
+            self._status_subs[key].append(on_status)
+
+    def request_shutdown(self) -> None:
+        """Попросить поток прибора закрыть ресурс и завершиться (не ждать). Запросы после этого
+        прибору не уходят: воркер вернётся в GUI-поток, и обмен с прибором там заблокировал бы окна."""
+        if self._shut_down:
+            return
+        self._shut_down = True
+        self._req_shutdown.emit()
+        for sig, _slot in self._requests:
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+
+    def shutdown_wait_ms(self) -> int:
+        """Сколько ждать поток: он может быть внутри запроса (до таймаута транспорта) и потом ещё
+        вернуть прибор (on_disconnecting) - несколько команд."""
+        return max(3000, 3 * self._worker.timeout_ms + 2000)
+
+    def wait_shutdown(self, timeout_ms: int | None = None) -> None:
+        """Дождаться завершения потока. ``terminate()`` - только крайний случай: убитый посреди вызова
+        VISA поток может оставить библиотеку VISA (и GIL) занятыми - программа падает или виснет на выходе."""
+        timeout_ms = self.shutdown_wait_ms() if timeout_ms is None else timeout_ms
+        # wait() - без проверки isRunning(): тот в Qt 6 ложен, пока поток ещё завершается (isInFinish), а
+        # прокси, удалённый в этот момент, ждал бы поток в ~QThread с захваченным GIL.
+        if not self._thread.wait(timeout_ms):
+            log.warning("%s: поток не завершился за %d мс, принудительно", self.name, timeout_ms)
+            self._thread.terminate()
+            self._thread.wait(2000)
+        self.state = ConnectionState.DISCONNECTED   # события из очереди могут прийти позже
+
+    def shutdown(self, timeout_ms: int | None = None) -> None:
+        """Корректно закрыть прибор и дождаться завершения потока."""
+        self.request_shutdown()
+        self.wait_shutdown(timeout_ms)
+
+    @staticmethod
+    def shutdown_all(proxies) -> None:
+        """Закрыть несколько приборов параллельно: сначала всем запрос, потом ждать каждого
+        (иначе на выходе время закрытия приборов складывается)."""
+        proxies = list(proxies)
+        for p in proxies:
+            p.request_shutdown()
+        for p in proxies:
+            p.wait_shutdown()
+
+    @property
+    def is_connected(self) -> bool:
+        return self.state is ConnectionState.CONNECTED
+
+    # ------------------------------------------------------ внутреннее
+    def _on_state(self, state: ConnectionState) -> None:
+        if state is not self.state:
+            log.info("%s %s: %s", self.name, self.address, state.value)
+        self.state = state
+        if state is not ConnectionState.CONNECTED:
+            self._values.clear()
+        if state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTED):
+            self.reconnecting = False
+        self.state_changed.emit(state)
+
+    def _on_reconnect(self, seconds: float) -> None:
+        self.reconnecting = seconds > 0 and self.state is not ConnectionState.CONNECTED
+        self.reconnect_pending.emit(float(seconds))
+
+    def _on_idn(self, idn: str) -> None:
+        self.idn = idn
+        log.info("%s %s: *IDN? %s", self.name, self.address, idn)
+        self.identified.emit(idn)
+
+    def _on_comm_error(self, message: str) -> None:
+        if self._throttle("comm", message):
+            log.warning("%s %s: %s", self.name, self.address, message)
+        self.comm_error.emit(message)
+
+    def _on_instrument_error(self, code: int, message: str) -> None:
+        if self._throttle(f"error {code}", message):
+            log.warning("%s %s: ошибка прибора %d: %s", self.name, self.address, code, message)
+        self.instrument_error.emit(code, message)
+
+    def _on_value(self, key: str, value: Any) -> None:
+        self._values[key] = value
+        for cb in self._subs.get(key, ()):
+            cb(value)
+        self.param_updated.emit(key, value)
+
+    def _on_status(self, key: str, status: PStatus, message: str) -> None:
+        if status in (PStatus.ERROR, PStatus.INVALID) and self._throttle(f"key {key}", message):
+            log.warning("%s %s: %s %s: %s", self.name, self.address, key, status.value, message)
+        self._statuses[key] = status
+        for cb in self._status_subs.get(key, ()):
+            cb(status, message)
+        self.param_status.emit(key, status, message)

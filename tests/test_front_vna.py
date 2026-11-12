@@ -4,7 +4,9 @@ import pytest
 from visalab.front.power_meter import ActionButton
 from PyQt6.QtCore import QSettings, QSize
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import DRIVERS
 from visalab.front import VNAWindow
 from visalab.front.vna import parse_power_list
@@ -13,7 +15,7 @@ from visalab.front.vna import parse_power_list
 def _open(qtbot, tmp_path, sim=None):
     drv, sim_cls = DRIVERS["pna"]
     sim = sim or sim_cls()
-    proxy = InstrumentProxy(drv, SimTransport(sim))
+    proxy = attach(InstrumentProxy(drv, SimTransport(sim)))
     settings = QSettings(str(tmp_path / "vna.ini"), QSettings.Format.IniFormat)
     win = VNAWindow(proxy, settings)
     qtbot.addWidget(win)
@@ -471,3 +473,17 @@ def test_mark_tab_markers_of_selected_trace(qtbot, vna):
     assert win.height() == h and all(b.indicated() for b in mp.chips.buttons()[:9])
     next(b for b in win.findChildren(ActionButton) if b.name == "mark_aoff").click()
     _wait(qtbot, lambda: not mp.table and not any(b.indicated() for b in mp.chips.buttons()))
+
+
+def test_sweeps_do_not_rewrite_ini(qtbot, vna):
+    """Ось трасс ВАЦ читается с прибора после каждой развёртки (freq.start / stop, тип развёртки). То же
+    значение в ini не пишется: иначе файл переписывался бы на каждой развёртке, несколько раз в секунду."""
+    proxy, win, settings, sim = vna
+    writes, axis = [], []
+    real = settings.setValue
+    settings.setValue = lambda k, v: (writes.append(k), real(k, v))
+    proxy.param_updated.connect(lambda k, _v: axis.append(k) if k == "freq.start" else None)
+    _wait(qtbot, lambda: len(axis) >= 5)                       # пять развёрток
+    assert not [k for k in writes if k.endswith(("FREQ.START", "FREQ.STOP", "SWEEP.TYPE"))], writes
+    win.widgets["freq.start"].set_value(2e9)                   # новое значение - сохраняется
+    _wait(qtbot, lambda: any(k.endswith("FREQ.START") for k in writes))

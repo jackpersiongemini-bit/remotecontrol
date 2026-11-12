@@ -2,7 +2,9 @@
 import pytest
 from PyQt6.QtCore import QSettings
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import DRIVERS
 from visalab.front import RFGenWindow
 
@@ -11,7 +13,7 @@ from visalab.front import RFGenWindow
 def rf(qtbot, tmp_path):
     settings = QSettings(str(tmp_path / "rf.ini"), QSettings.Format.IniFormat)
     drv, sim_cls = DRIVERS["e8267d"]
-    proxy = InstrumentProxy(drv, SimTransport(sim_cls()))
+    proxy = attach(InstrumentProxy(drv, SimTransport(sim_cls())))
     win = RFGenWindow(proxy, settings)
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):

@@ -11,7 +11,7 @@ from typing import Any
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QComboBox, QLabel, QLineEdit, QPushButton, QWidget
 
-from ..core.scpi import si_format, si_parse
+from ..core.units import si_format, si_parse
 from .model import FieldSpec, InstrumentModel, Kind
 
 __all__ = ["make_editor", "format_value"]

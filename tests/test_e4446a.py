@@ -99,37 +99,83 @@ def test_marker_off_reads_none_without_error(sa):
 
 
 def test_states_in_instrument_memory(sa):
+    """По справке PSA: файлы C:\\ИМЯ.STA, имя DOS (до 8 знаков A-Z0-9), MMEM:CAT? с каталогом."""
     drv, sim, rec = sa
     actions = []
     drv.action_done.connect(lambda n, r: actions.append((n, r)))
     drv.run_action("state_list")
-    assert actions[-1] == ("state_list", [])
+    assert actions[-1] == ("state_list", []) and "MMEM:CAT? 'C:\\'" in sim.history
     for k, v in (("freq.center", 1.1e9), ("freq.span", 400e6)):
         setp(drv, rec, k, v)
     drv.run_action("state_save", ("fund",))
+    assert actions[-1] == ("state_save", "FUND")                 # имя, под которым записано
     setp(drv, rec, "freq.center", 5e9)
     setp(drv, rec, "freq.span", 1e6)
-    drv.run_action("state_save", ("other",))
+    drv.run_action("state_save", ("other_1",))                   # "_" в имени файла PSA нельзя
+    assert actions[-1] == ("state_save", "OTHER1")
     drv.run_action("state_list")
-    assert actions[-1] == ("state_list", ["fund", "other"]) and set(sim.files) == {"fund.state", "other.state"}
+    assert actions[-1] == ("state_list", ["FUND", "OTHER1"]) and set(sim.files) == {"FUND.STA", "OTHER1.STA"}
+    assert "MMEM:STOR:STAT 1,'C:\\FUND.STA'" in sim.history
     drv.run_action("state_recall", ("fund",))
     assert rec.values["freq.center"] == pytest.approx(1.1e9) and rec.values["freq.span"] == pytest.approx(400e6)
     assert sim.c["form"] == "ASC" and not rec.comm
-    drv.run_action("state_delete", ("other",))
+    drv.run_action("state_save", ("FUND",))                     # поверх: старый файл удаляется
+    assert set(sim.files) == {"FUND.STA", "OTHER1.STA"} and not rec.errors
+    drv.run_action("state_delete", ("other1",))
     drv.run_action("state_list")
-    assert actions[-1] == ("state_list", ["fund"])
+    assert actions[-1] == ("state_list", ["FUND"])
     n = len(rec.errors)
     drv.run_action("state_recall", ("missing",))                 # нет файла - ошибка прибора, а не обрыв
     assert len(rec.errors) > n and not rec.comm
-    drv.run_action("state_save", ("bad name",))                  # недопустимое имя в прибор не уходит
-    assert "bad name" not in " ".join(sim.history)
+    drv.run_action("state_save", ("__",))                        # из имени ничего не осталось - в прибор не уходит
+    assert "'C:\\.STA'" not in " ".join(sim.history)
+    drv.run_action("state_save", ("1GHz_100MHz",))               # длиннее 8 знаков - обрезается
+    assert actions[-1] == ("state_save", "1GHZ100M")
+    sim.write(":MMEM:CAT?")                                      # без каталога: как PSA, -109 в очереди
+    assert sim.read() is None and sim.errors[-2][0] == -109
+
+
+def test_e4446a_has_no_input_coupling_query(make):
+    """E4446A (44 ГГц): INP:COUP нет ("Not available on 40 GHz or 50 GHz analyzers"). Раньше драйвер его читал:
+    реальный прибор не отвечает -> таймаут при каждом подключении -> анализатор в ошибке."""
+    drv, sim, rec = make(AgilentPSA, AgilentPSASim)
+    assert "input.coupling" not in drv.params
+    assert not any(h.upper().startswith("INP") for h in sim.history)
+    assert drv.state.name == "CONNECTED" and not rec.comm and not rec.errors
+
+
+class _PSASimDC(AgilentPSASim):
+    IDN = "Agilent Technologies, E4440A, MY00000001, A.11.21"
+    DC_COUPLING = True
+
+
+def test_dc_coupling_on_26ghz_model(make):
+    from visalab.drivers.agilent_e4446a import PSA_MODELS
+    drv, sim, rec = make(AgilentPSA, _PSASimDC, driver_kw={"model": PSA_MODELS["E4440A"]})
+    assert setp(drv, rec, "input.coupling", "DC") is PStatus.WRITTEN and sim.c["coup"] == "DC"
+
+
+def test_unsupported_query_does_not_drop_connection(make):
+    """Модель без функции: прибор не отвечает на запрос (-113). Драйвер остаётся на связи, ключ помечен,
+    больше не читается, остальные ключи читаются."""
+    from visalab.drivers.agilent_e4446a import PSA_MODELS
+    drv, sim, rec = make(AgilentPSA, AgilentPSASim, driver_kw={"model": PSA_MODELS["E4440A"]})  # ждёт INP:COUP
+    assert drv.state.name == "CONNECTED"
+    status, msg = rec.last_status("input.coupling")
+    assert status is PStatus.ERROR and "не поддерживает" in msg
+    assert any(code == -113 for code, _ in rec.errors)            # причина видна в журнале ошибок
+    n = sum(h.upper().startswith("INP:COUP?") for h in sim.history)
+    drv.sync_all()
+    assert sum(h.upper().startswith("INP:COUP?") for h in sim.history) == n   # больше не спрашивается
+    assert rec.values["freq.center"] == pytest.approx(sim.c["center"])
+    drv.poll()
+    assert rec.values["trace"] is not None and drv.state.name == "CONNECTED"
 
 
 def test_input_trace_sweep_settings(sa):
     drv, sim, rec = sa
     for key, value, check in (("ref_offset", 10.0, lambda: sim.c["roff"] == 10.0),
                               ("preamp", True, lambda: sim.c["gain"] is True),
-                              ("input.coupling", "DC", lambda: sim.c["coup"] == "DC"),
                               ("sweep.type", "SWEPT", lambda: sim.c["swtype"] == "SWE"),
                               ("trace.mode", "MAXHOLD", lambda: sim.c["tmode"] == "MAXH")):
         assert setp(drv, rec, key, value) is PStatus.WRITTEN, key
@@ -184,3 +230,19 @@ def test_zero_span_trace_is_time(sa):
     assert setp(drv, rec, "freq.span", 100e6) is PStatus.WRITTEN
     drv.poll()
     assert rec.values["trace"].x_unit == "Hz"
+
+
+def test_front_panel_frequency_change_reaches_trace_and_window(sa):
+    """Частоты поменяли на самом приборе (передняя панель, Local): ось трассы и ключи - по прибору,
+    а не по кэшу драйвера (иначе трасса подписана старыми частотами до SYNC)."""
+    drv, sim, rec = sa
+    drv.poll()
+    assert rec.values["trace"].x[-1] == pytest.approx(44e9)
+    sim.c.update(center=1.1e9, span=400e6)              # не через драйвер
+    sim._couple()
+    drv.poll()                                          # развёртка уже идёт - её трасса ещё по прибору
+    drv.poll()
+    t = rec.values["trace"]
+    assert t.x[0] == pytest.approx(0.9e9) and t.x[-1] == pytest.approx(1.3e9)
+    assert rec.values["freq.center"] == pytest.approx(1.1e9) and rec.values["freq.span"] == pytest.approx(400e6)
+    assert t.peak()[0] == pytest.approx(1.0e9, abs=2e6)         # пик сигнала на своей частоте
