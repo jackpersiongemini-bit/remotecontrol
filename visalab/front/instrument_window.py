@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from PyQt6 import sip
 from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
                              QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
@@ -31,13 +32,15 @@ from ..core.params import ConnectionState, PStatus
 from ..core.units import si_format, si_parse
 from .models import ModelWindow, all_models, model_class
 from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
-from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
+from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
                      Window, WriteState, mark_growing)
 
 __all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay", "parse_power_list",
            "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "WINDOW_EVENTS", "window_for"]
 
+PRESET_SETTLE_S = 3.0      # после клика по пресету: столько ждать, пока прибор примет все значения
+COMPACT_PADDING_PX = 9     # кнопка у спинбокса: поля по бокам от подписи
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
 DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
@@ -289,6 +292,19 @@ class HScrollArea(QScrollArea):
         e.accept()
 
 
+def compact_button(b: QPushButton) -> QPushButton:
+    """Кнопка у спинбокса (PRST, RF ON, CW...): ширина по самой длинной подписи, а не столбец
+    (Алексей 2026-11-14: «почему кнопки занимают столько же, сколько спинбокс»)."""
+    b.ensurePolished()
+    font = QFont(b.font())
+    font.setBold(True)                        # выбранная - полужирная: ширина не прыгает
+    fm = QFontMetrics(font)
+    texts = list(getattr(b, "_names", ())) or [b.text()]
+    width = max(fm.horizontalAdvance(t) for t in texts) + 2 * COMPACT_PADDING_PX
+    b.setFixedWidth(max(width, UI_CONTROL_HEIGHT_PX + 12))
+    return b
+
+
 class LogView(QPlainTextEdit):
     """Журнал ошибок окна: обычно 10 строк, растёт вместе с окном."""
 
@@ -323,6 +339,9 @@ class InstrumentWindow(Window):
     CONNECTION_GROUP = "CONNECTION/INSTRUMENT"
     DEFAULT_KIND = ""
     PRESET_KEY = "PRESETS"
+    #: пресеты - значения прибора (SDG): горит тот, что совпадает с прибором (``preset_from_current``)
+    PRESET_TRACKS_VALUES = False
+    _preset_pending_until = 0.0
     PRESET_DEFAULTS: tuple = ()
     PRESET_ADD_TIP = "Add preset from current values"
 
@@ -403,6 +422,11 @@ class InstrumentWindow(Window):
         top = PanelTable(*self.top_lines)
         self.preset_panel = Panel(top)
         top.build()
+        for line in self.top_lines:                   # кнопки рядом со спинбоксом - по тексту, не шире него
+            if any(isinstance(w, PSpinBox) for w in line.widgets):
+                for w in line.widgets:
+                    if isinstance(w, QPushButton):
+                        compact_button(w)
 
         self.tabs = PTabBar()
         self.pages: list[PanelTable] = []
@@ -445,6 +469,15 @@ class InstrumentWindow(Window):
         names = {k: k.upper().replace(".", " ") for k in keys}
         names["instrument"] = "INSTRUMENT"
         self.tracker = WriteTracker(proxy, keys, names, self)
+        for w in self.bound_widgets():                # шаг спинбоксов (правый клик) - в ini
+            if isinstance(w, PSpinBox):
+                raw = settings.value(self._step_key(w.key), None)
+                try:
+                    if raw not in (None, ""):
+                        w.set_step(float(raw), emit=False)
+                except (TypeError, ValueError):
+                    pass
+                w.step_changed.connect(lambda step, k=w.key: self._save_step(k, step))
         self.tracker.changed.connect(self.error_indicator.set_items)
         self.tracker.changed.connect(lambda *_a: WINDOW_EVENTS.changed.emit(self.proxy))
         self.error_indicator.clicked.connect(self.show_errors)
@@ -711,6 +744,15 @@ class InstrumentWindow(Window):
             self._log("INSTRUMENT", message)
             self.tracker.note_error("instrument", message)
 
+    def _step_key(self, key: str) -> str:
+        return f"{self._prefix}/STEP/{key.upper()}"
+
+    def _save_step(self, key: str, step) -> None:
+        if step:
+            self.settings.setValue(self._step_key(key), float(step))
+        else:
+            self.settings.remove(self._step_key(key))
+
     def has_errors(self) -> bool:
         """Индикатор ошибок горит (до CLEAR в журнале) - плитка главного окна красная."""
         return self.error_indicator.state is WriteState.ERROR
@@ -843,7 +885,22 @@ class InstrumentWindow(Window):
         self.presets.touch(index)
         self.preset_scroll.ensureWidgetVisible(self.presets.buttons()[index], 0, 0)
         self.setFocus()                       # чтобы ← → сразу переключали пресеты
+        if self.PRESET_TRACKS_VALUES:         # пока значения пишутся - чип горит; потом - по прибору
+            self._preset_pending_until = time.monotonic() + PRESET_SETTLE_S
+            QTimer.singleShot(int(PRESET_SETTLE_S * 1000) + 50, self._sync_preset)
         self.apply_preset_values(preset)
+
+    def _sync_preset(self) -> None:
+        """Горит пресет, совпадающий со значениями прибора; поменяли ширину руками - не горит ни один
+        (Алексей 2026-11-14: «пресет горит, а я уже поменял ширину»)."""
+        if sip.isdeleted(self) or not self.PRESET_TRACKS_VALUES or not self.presets.data:
+            return
+        cur = self.preset_from_current()
+        i = self.presets.find(*cur) if cur is not None else -1
+        if i < 0 and time.monotonic() < self._preset_pending_until:
+            return                            # пресет ещё пишется: значения приходят по одному
+        if i != self.presets.checked_index():
+            self.presets.set_checked(i)
 
     # ------------------------------------------------------------ сохранение
     def _settings_key(self, key: str) -> str:
@@ -853,6 +910,8 @@ class InstrumentWindow(Window):
         if any(key in states for states in self._page_states):
             self._update_tabs()
         self.on_param(key, value)
+        if self.PRESET_TRACKS_VALUES:
+            self._sync_preset()
         if self._resetting:              # после *RST прибор отдаёт заводские значения - не сохранять
             return
         # то же значение не писать: ini переписывается целиком при каждом setValue, а приборы публикуют

@@ -125,8 +125,16 @@ class LNumber(QLineEdit):
     def value(self) -> float | None:
         return self._value
 
+    def set_unit(self, unit: str, minimum: float, maximum: float, scale: float = 1.0, si_unit: str = "") -> None:
+        """Другая единица поля (шкала TIME: dBm / mW)."""
+        self.unit, self.minimum, self.maximum, self.scale, self.si_unit = unit, minimum, maximum, scale, si_unit
+        self.unit_button.setText(unit)
+        self.resizeEvent(None)
+        self.show_value(self._value)
+
     def resizeEvent(self, e):  # noqa: N802 - Qt
-        super().resizeEvent(e)
+        if e is not None:
+            super().resizeEvent(e)
         b = self.unit_button
         b.ensurePolished()
         w = max(b.sizeHint().width(), 26)
@@ -393,6 +401,11 @@ class TracePlot(QWidget):
         super().__init__(parent)
         self.trace: Trace | None = None
         self.gate: tuple[float, float] | None = None
+        #: шкала Y (вкладка TIME, Алексей 2026-11-14): единица dBm / W; AUTO или верх (REF) и цена деления
+        self.unit = "dBm"
+        self.auto = True
+        self.ref: float | None = None
+        self.per_div: float | None = None
         self._mouse: QPointF | None = None
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
@@ -412,10 +425,44 @@ class TracePlot(QWidget):
         """X вертикальной метки (у графика калибровки - частота датчика)."""
         return None
 
-    def y_range(self) -> tuple[float, float]:
-        """Сверху - максимум трассы, округлённый вверх до 10 dB; шкала 10 dB / дел."""
-        top = math.ceil(max(self.trace.y) / 10.0) * 10.0 if self.trace else 0.0
+    def set_scale(self, unit: str = "dBm", auto: bool = True, ref: float | None = None,
+                  per_div: float | None = None) -> None:
+        """Шкала Y: ``unit`` dBm (лог.) или W (линейная); вручную - верх ``ref`` и ``per_div`` в этой единице."""
+        self.unit = "W" if unit == "W" else "dBm"
+        self.auto = bool(auto) or ref is None or not per_div
+        self.ref, self.per_div = ref, per_div
+        self.update()
+
+    def ys(self) -> list[float]:
+        """Значения трассы в единице шкалы (W - из dBm)."""
+        if self.unit == "W" and self.trace is not None and self.trace.y_unit == "dBm":
+            return [10.0 ** ((y - 30.0) / 10.0) for y in self.trace.y]
+        return list(self.trace.y) if self.trace is not None else []
+
+    def y_unit(self) -> str:
+        return "W" if self.unit == "W" and self.trace is not None and self.trace.y_unit == "dBm" else \
+            (self.trace.y_unit if self.trace is not None else "")
+
+    def auto_range(self) -> tuple[float, float]:
+        """AUTO: dBm - сверху максимум, округлённый вверх до 10 dB, 10 dB / дел; W - от 0 до максимума
+        с круглой ценой деления (1, 2, 5)."""
+        ys = self.ys()
+        if self.y_unit() == "W":
+            top = max(ys) if ys else 1e-3
+            raw = top / self.DIVS_Y if top > 0 else 1e-3
+            mag = 10.0 ** math.floor(math.log10(raw))
+            step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw * (1 - 1e-9))
+            return 0.0, step * self.DIVS_Y
+        top = math.ceil(max(ys) / 10.0) * 10.0 if ys else 0.0
         return top - self.DIVS_Y * self.DB_PER_DIV, top
+
+    def y_range(self) -> tuple[float, float]:
+        if not self.auto and self.ref is not None and self.per_div:
+            return self.ref - self.DIVS_Y * self.per_div, self.ref
+        return self.auto_range()
+
+    def _y_text(self, v: float, digits: int = 4) -> str:
+        return si_format(v, "W", digits) if self.y_unit() == "W" else f"{v:g} {self.y_unit()}"
 
     def _plot_rect(self) -> QRectF:
         return QRectF(self.rect()).adjusted(6, 6, -6, -20)
@@ -470,8 +517,9 @@ class TracePlot(QWidget):
                 p.setBrush(band)
                 p.drawRect(QRectF(g0, r.top(), g1 - g0, r.height()))
                 p.setBrush(Qt.BrushStyle.NoBrush)
-        path = QPainterPath(QPointF(px(t.x[0]), py(t.y[0])))
-        for x, y in zip(t.x[1:], t.y[1:]):
+        ys = self.ys()
+        path = QPainterPath(QPointF(px(t.x[0]), py(ys[0])))
+        for x, y in zip(t.x[1:], ys[1:]):
             path.lineTo(px(x), py(y))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
@@ -479,8 +527,10 @@ class TracePlot(QWidget):
         # подписи: верх шкалы и дБ/дел слева сверху, X по краям снизу
         xu, yu = t.x_unit, t.y_unit
         p.setPen(muted)
+        div = (hi - lo) / self.DIVS_Y
+        div_text = si_format(div, "W", 3) if self.y_unit() == "W" else f"{div:g} {'dB' if yu == 'dBm' else yu}"
         p.drawText(QRectF(r.left() + 3, r.top() + 1, r.width(), 14), Qt.AlignmentFlag.AlignLeft,
-                   f"{hi:g} {yu}  {(hi - lo) / self.DIVS_Y:g} dB/div")
+                   f"{self._y_text(hi)}  {div_text}/div{'' if self.auto else '  MAN'}")
         bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 14)
         p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, xu, 4))
         p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, xu, 3)}/div")
@@ -492,7 +542,7 @@ class TracePlot(QWidget):
         m = self._mouse
         if m is not None and r.contains(m):              # курсор: точка трассы под мышью
             i = min(range(len(t)), key=lambda k: abs(px(t.x[k]) - m.x()))
-            cx, cy = px(t.x[i]), py(t.y[i])
+            cx, cy = px(t.x[i]), py(ys[i])
             p.setPen(QPen(muted, 1, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(cx, r.top()), QPointF(cx, r.bottom()))
             p.setPen(Qt.PenStyle.NoPen)
@@ -500,7 +550,8 @@ class TracePlot(QWidget):
             p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
             p.setPen(QColor(UI_COLOR_TEXT))
             p.drawText(QRectF(r.left(), r.top() + 1, r.width() - 3, 14), Qt.AlignmentFlag.AlignRight,
-                       f"{si_format(t.x[i], xu, 4)}  {t.y[i]:.2f} {yu}")
+                       f"{si_format(t.x[i], xu, 4)}  " + (si_format(ys[i], "W", 4) if self.y_unit() == "W"
+                                                          else f"{ys[i]:.2f} {yu}"))
 
 
 class CalPlot(TracePlot):
@@ -610,6 +661,7 @@ class PowerMeterWindow(InstrumentWindow):
                     ("SLOP", "trig.slope", None),
                     ("AVG", "avg.state", None, ("avg.count", None),         # усреднение: вкл, число, авто
                      ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)]))),
+                    ("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
                     ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
 
@@ -668,12 +720,78 @@ class PowerMeterWindow(InstrumentWindow):
         self.page_specs.append(("CAL", ("offset.state",) if sup("offset.state") else (), PanelTable(*cal)))
 
         # TIME: режим временной области (график - в избранном, пока TRAC ON) и его настройки
+        # DET - на MAIN: во временном режиме датчик всегда NORMAL (Алексей 2026-11-14: «зачем DET в TIME»)
         time_ = add((("TRAC", "trace.state", None), ("TLEN", "trace.time", None), ("TOFS", "trace.offset", None),
-                     ("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
                      ("DLY", "trig.delay", None), ("GSTR", "gate.start", None), ("GLEN", "gate.length", None),
                      ("HOLD", "trig.holdoff", None), ("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
+        time_ += self._time_scale_lines()
         self.page_specs.append(("TIME", ("trace.state",) if sup("trace.state") else (),
                                 PanelTable(*time_)))
+
+    # ------------------------------------------------------------ шкала графика TIME (настройка окна)
+    def _time_scale_lines(self) -> list[PanelLine]:
+        """SCAL: AUTO / MAN и единица dBm / W; REF - верх шкалы, DIV - цена деления (ini TIME_*)."""
+        s, pre = self.settings, self._prefix
+        self.scale_auto = LToggle([("AUTO", True), ("MAN", False)], s.value(f"{pre}/TIME_AUTO", True, type=bool))
+        self.scale_auto.setToolTip("Y scale of the TIME graph: AUTO from the trace, MAN - REF and DIV below")
+        self.scale_unit = LToggle([("dBm", "dBm"), ("W", "W")], s.value(f"{pre}/TIME_UNIT", "dBm", type=str))
+        self.scale_unit.setToolTip("Y unit of the TIME graph: dBm (log) or W (linear)")
+        self.scale_ref = LNumber(None, "dBm", -200.0, 100.0)
+        self.scale_ref.setToolTip("Top of the TIME graph (REF); typing a value switches the scale to MAN")
+        self.scale_div = LNumber(None, "dB", 0.001, 100.0)
+        self.scale_div.setToolTip("Value of one of the 6 divisions; typing a value switches the scale to MAN")
+        self.scale_auto.changed.connect(lambda v: self._scale_changed("TIME_AUTO", bool(v)))
+        self.scale_unit.changed.connect(lambda v: self._scale_changed("TIME_UNIT", v))
+        self.scale_ref.changed.connect(lambda v: self._scale_typed("REF", v))
+        self.scale_div.changed.connect(lambda v: self._scale_typed("DIV", v))
+        self._apply_scale()
+        return [PanelLine("SCAL", self.scale_auto, self.scale_unit), PanelLine("REF", self.scale_ref),
+                PanelLine("DIV", self.scale_div)]
+
+    def _scale_values(self) -> tuple[str, float | None, float | None]:
+        unit = self.scale_unit.value
+        tag = "W" if unit == "W" else "DBM"
+        ref = self.settings.value(f"{self._prefix}/TIME_REF_{tag}", None)
+        div = self.settings.value(f"{self._prefix}/TIME_DIV_{tag}", None)
+        return unit, (float(ref) if ref not in (None, "") else None), (float(div) if div not in (None, "") else None)
+
+    def _apply_scale(self) -> None:
+        """Шкала - в график, поля REF / DIV - в единице шкалы (в AUTO показывают текущую шкалу)."""
+        unit, ref, div = self._scale_values()
+        if unit == "W":
+            self.scale_ref.set_unit("mW", 0.0, 1e3, scale=1e-3, si_unit="W")
+            self.scale_div.set_unit("mW", 1e-12, 1e3, scale=1e-3, si_unit="W")
+        else:
+            self.scale_ref.set_unit("dBm", -200.0, 100.0)
+            self.scale_div.set_unit("dB", 0.001, 100.0)
+        auto = self.scale_auto.value is not False
+        self.plot.set_scale(unit, auto, ref, div)
+        lo, hi = self.plot.y_range() if self.plot.trace is not None else (None, None)
+        shown_ref = ref if not auto and ref is not None else hi
+        shown_div = div if not auto and div else (None if hi is None else (hi - lo) / self.plot.DIVS_Y)
+        for w, v in ((self.scale_ref, shown_ref), (self.scale_div, shown_div)):
+            if v is None:
+                w.clear_value()
+            else:
+                w.set_value(v, emit=False)
+
+    def _scale_changed(self, name: str, value) -> None:
+        if self.settings.value(f"{self._prefix}/{name}") != value:
+            self.settings.setValue(f"{self._prefix}/{name}", value)
+        self._apply_scale()
+
+    def _scale_typed(self, what: str, value: float) -> None:
+        """Ввели REF или DIV - шкала ручная; второе значение берётся с текущей шкалы."""
+        tag = "W" if self.scale_unit.value == "W" else "DBM"
+        lo, hi = self.plot.y_range()
+        other = {"REF": ("DIV", (hi - lo) / self.plot.DIVS_Y), "DIV": ("REF", hi)}[what]
+        self.settings.setValue(f"{self._prefix}/TIME_{what}_{tag}", float(value))
+        if self.settings.value(f"{self._prefix}/TIME_{other[0]}_{tag}", None) in (None, ""):
+            self.settings.setValue(f"{self._prefix}/TIME_{other[0]}_{tag}", float(other[1]))
+        if self.scale_auto.value is not False:
+            self.scale_auto.set_value(False)      # -> _scale_changed -> _apply_scale
+        else:
+            self._apply_scale()
 
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
@@ -682,6 +800,8 @@ class PowerMeterWindow(InstrumentWindow):
     def on_param(self, key: str, value: Any) -> None:
         if key == "trace":
             self.plot.set_trace(value)
+            if self.scale_auto.value is not False:
+                self._apply_scale()               # в AUTO поля REF / DIV показывают текущую шкалу
         elif key == "trace.state":
             self.show_plot(value is True)
         elif key in ("gate.start", "gate.length"):

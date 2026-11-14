@@ -229,3 +229,33 @@ def test_time_plot_grows_with_window(qtbot, pm):
     win.resize(win.width(), win.height() + 100)
     qtbot.wait(20)
     assert win.cal_plot.height() > cal and win.plot.height() > h
+
+
+def test_time_scale_units_and_det_on_main(qtbot, pm):
+    """DET - на MAIN, не в TIME; шкала TIME: AUTO / MAN, dBm / W, REF и DIV (Алексей 2026-11-14)."""
+    proxy, win, settings = pm
+    names = lambda page: [ln.name for ln in win.pages[page].lines]          # noqa: E731
+    assert "DET" in names(0) and "DET" not in names(2)
+    assert names(2)[-3:] == ["SCAL", "REF", "DIV"]
+    proxy.set("trace.state", True)
+    _wait(qtbot, proxy, "trace.state", lambda v: v is True)
+    qtbot.waitUntil(lambda: win.plot.trace is not None, timeout=5000)
+    lo, hi = win.plot.y_range()                                            # импульс -10 dBm: верх -10, 10 dB/дел
+    assert win.plot.auto and hi == -10.0 and lo == -70.0
+    assert win.scale_ref.value == hi and win.scale_div.value == 10.0      # в AUTO поля - текущая шкала
+    win.scale_div.set_value(5.0)                                           # ввели DIV - шкала ручная
+    assert not win.plot.auto and win.plot.y_range() == (hi - 30.0, hi) and win.scale_auto.value is False
+    win.scale_ref.set_value(-5.0)
+    assert win.plot.y_range() == (-35.0, -5.0)
+    assert settings.value(f"{win._prefix}/TIME_REF_DBM", type=float) == -5.0
+    win.scale_unit.set_value("W")                                          # линейная шкала в ваттах
+    win.scale_auto.set_value(True)
+    assert win.plot.y_unit() == "W" and max(win.plot.ys()) == pytest.approx(1e-4, rel=1e-3)   # -10 dBm = 100 uW
+    lo, hi = win.plot.y_range()
+    assert lo == 0.0 and hi >= 1e-4 and win.scale_ref.unit == "mW"
+    win.plot.resize(400, 200)
+    win.plot.grab()
+    from visalab.front import PowerMeterWindow
+    win2 = PowerMeterWindow(proxy, settings)                               # из ini
+    qtbot.addWidget(win2)
+    assert win2.scale_unit.value == "W" and win2.scale_auto.value is True

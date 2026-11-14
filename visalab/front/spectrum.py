@@ -16,11 +16,13 @@ clear-write / max hold / min hold / view / blank, усреднение), TRIG (�
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 from PyQt6.QtCore import QSettings, Qt
 
 from ..coord import Instrument
+from ..core.units import si_format
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow, PresetGroup
 from .params import IndicatorButton, PLineEdit, PSButton, PanelLine, PanelTable
@@ -107,8 +109,35 @@ def _preset(name) -> tuple[str]:
     return (str(name),)
 
 
+_COMPACT_PREFIX = {"P": 1e-12, "N": 1e-9, "U": 1e-6, "R": 1.0, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+
+
+def parse_compact(text: str) -> float | None:
+    """Обратное к ``compact_si`` для частот: ``2G4`` -> 2.4e9, ``100M`` -> 1e8, ``1R5`` -> 1.5, ``0`` -> 0.
+    Регистр не важен (каталог PSA может отдать имена заглавными), поэтому M - мега."""
+    m = re.fullmatch(r"(\d+)([PNURKMGT]?)(\d*)", text.strip().upper())
+    if not m or (m.group(3) and not m.group(2)):
+        return None
+    whole, pre, frac = m.groups()
+    return float(f"{whole}.{frac}" if frac else whole) * _COMPACT_PREFIX.get(pre, 1.0)
+
+
+def state_label(name: str) -> str | None:
+    """Имя пресета ``2G4S100M`` -> «2.4 GHz» / «SPAN 100 MHz» (нулевая полоса - «ZERO SPAN»); чужое имя - None."""
+    center, sep, span = name.upper().partition("S")
+    c, sp = parse_compact(center), parse_compact(span) if sep else None
+    if c is None or sp is None:
+        return None
+    return f"{si_format(c, 'Hz', 6)}\n" + ("ZERO SPAN" if sp == 0 else f"SPAN {si_format(sp, 'Hz', 6)}")
+
+
 def _describe(preset: tuple) -> tuple[str, str]:
-    return preset[0], f"{preset[0]}\nstate in the analyzer memory"
+    """Чип: центр и полоса, расшифрованные из имени (Алексей 2026-11-14: «некрасивые маленькие пресеты»);
+    имя файла - третьей строкой и в подсказке."""
+    name = preset[0]
+    label = state_label(name)
+    text = f"{label}\n{name}" if label else name
+    return text, f"{name}\nstate in the analyzer memory" + (f"\n{label.replace(chr(10), ', ')}" if label else "")
 
 
 class StatePresets(PresetGroup):

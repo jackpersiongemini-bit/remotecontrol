@@ -106,3 +106,37 @@ def test_rf_launcher(qtbot, tmp_path, monkeypatch):
     made[0].reconnect_requested.emit("smf100a", "sim", "")
     assert len(made) == 2 and made[1].driver_choice.value == "smf100a"
     made[1].proxy.shutdown()
+
+
+def test_spinbox_auto_step_and_step_setting(qtbot, rf):
+    """AUTO: последняя показанная цифра, пока крутят - тот же разряд; правый клик - постоянный шаг (ini)."""
+    proxy, win, settings = rf
+    win.show()
+    qtbot.waitExposed(win)
+    proxy.set("rf.frequency", 1.28e9)
+    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(1.28e9))
+    spin = win.freq_spin
+    qtbot.waitUntil(lambda: spin.lineEdit().text() == "1.28" and spin.prefix == "G")
+    assert not spin.hasFocus() and spin.step_index() == 3        # подчёркнута «8»: шаг 0.01 GHz
+    spin.stepBy(1)
+    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(1.29e9))
+    spin.stepBy(1)                                                # 1.29 + 0.01 = «1.30», а не шаг 0.1
+    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(1.30e9))
+    qtbot.waitUntil(lambda: spin.lineEdit().text() == "1.30")
+    spin.stepBy(1)
+    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(1.31e9))
+    spin._release_step()                                          # мышь ушла: снова по последней цифре
+    assert spin.step_setting is None
+    assert spin.step_choices()[:3] == [1e3, 1e4, 1e5] and spin.step_label(1e6) == "1 MHz"
+    spin.set_step(1e6)                                            # меню: постоянный шаг 1 MHz
+    assert settings.value(f"{win._prefix}/STEP/RF.FREQUENCY", type=float) == 1e6
+    qtbot.waitUntil(lambda: spin.lineEdit().text() == "1.310")   # знаки - до шага
+    assert spin.step_index() == 4 and "STEP 1 MHz" in spin.toolTip()
+    spin.stepBy(-2)
+    _wait(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(1.308e9))
+    from visalab.front import RFGenWindow
+    win2 = RFGenWindow(proxy, settings)                           # из ini
+    qtbot.addWidget(win2)
+    assert win2.freq_spin.step_setting == 1e6
+    win2.freq_spin.set_step(None)                                 # AUTO - ключ убран
+    assert settings.value(f"{win2._prefix}/STEP/RF.FREQUENCY") is None

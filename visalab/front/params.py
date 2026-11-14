@@ -13,6 +13,7 @@ verified) окрашивает рамку и собирается ``WriteTracker
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from PyQt6.QtCore import QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
@@ -29,7 +30,7 @@ from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_
                     UI_CONTROL_HEIGHT_PX, render_qss, scrollbar_qss)
 from .window import WriteState
 
-__all__ = ["PLineEdit", "PSpinBox", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
+__all__ = ["PLineEdit", "PSpinBox", "StepLineEdit", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
            "WriteTracker"]
 
 _WSTATE = {PStatus.WRITING: "process", PStatus.ERROR: "error", PStatus.INVALID: "error",
@@ -233,15 +234,49 @@ class PLineEdit(QLineEdit, _Bound):
         return True
 
 
+class StepLineEdit(QLineEdit):
+    """Поле спинбокса: подчёркивает разряд, который меняют колесо и стрелки."""
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        spin = self.parent()
+        idx = spin.step_index() if isinstance(spin, PSpinBox) else -1
+        text = self.text()
+        if not 0 <= idx < len(text):
+            return
+        fm = self.fontMetrics()
+        cur = self.cursorPosition()
+        x0 = self.cursorRect().center().x()          # граница перед символом cur; от неё - к idx
+        left = x0 + fm.horizontalAdvance(text[cur:idx]) if idx >= cur else x0 - fm.horizontalAdvance(text[idx:cur])
+        width = fm.horizontalAdvance(text[idx])
+        y = self.cursorRect().center().y() + fm.ascent() // 2 + 2
+        p = QPainter(self)
+        pen = QPen(QColor(UI_COLOR_TEXT_MUTED if spin.step_setting is None else UI_COLOR_TEXT))
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.drawLine(QPointF(left + 0.5, y + 0.5), QPointF(left + width - 0.5, y + 0.5))
+
+
 class PSpinBox(QDoubleSpinBox, _Bound):
-    """Число со стрелками / колесом: шаг - разряд слева от курсора (как ручка прибора).
+    """Число со стрелками / колесом (как ручка прибора); меняется подчёркнутый разряд.
+
+    Шаг (Алексей 2026-11-14): AUTO - последняя показанная цифра («1.25 GHz» - 0.01 GHz; пока крутят,
+    шаг не меняется, «1.30» показывается с нулём); в поле с курсором - разряд слева от курсора. Правый
+    клик - меню шага: AUTO или постоянный (1 kHz, 10 kHz...), он же подчёркнут и показан с нужными
+    знаками. ``step_changed(шаг или None)`` - окно хранит выбор в ini.
 
     Единица - кнопка слева со списком префиксов (как у PLineEdit). Ввод с клавиатуры пишется
     по Enter / уходу фокуса, шаг стрелкой или колесом - сразу.
     """
 
+    step_changed = pyqtSignal(object)        # шаг в единицах параметра (Hz, dBm...) или None - AUTO
+
     def __init__(self, proxy: Instrument, key: str, prefixes: tuple[str, ...] | None = None, parent=None):
+        #: постоянный шаг в единицах параметра; None - AUTO (последняя цифра)
+        self.step_setting: float | None = None
+        self._step_lock: float | None = None    # AUTO: шаг (в единицах префикса), пока крутят колесо
         super().__init__(parent)
+        self.setLineEdit(StepLineEdit(self))
         self.unit = proxy.params[key].unit
         self.prefixes = prefixes or UNIT_PREFIXES.get(self.unit, ("",))
         self.prefix = "" if "" in self.prefixes else self.prefixes[0]
@@ -342,7 +377,14 @@ class PSpinBox(QDoubleSpinBox, _Bound):
     # -------------------------------------------------------- текст
     def textFromValue(self, v: float) -> str:  # noqa: N802 - Qt
         text = f"{v:.9f}".rstrip("0").rstrip(".")
-        return "0" if text in ("", "-0") else text
+        text = "0" if text in ("", "-0") else text
+        step = self._shown_step()
+        if step is not None and step < 1:            # знаков - не меньше, чем у шага: «1.30» при шаге 0.01
+            need = min(9, max(0, round(-math.log10(step))))
+            whole, _, frac = text.partition(".")
+            if len(frac) < need:
+                text = f"{whole}.{frac.ljust(need, '0')}"
+        return text
 
     def valueFromText(self, text: str) -> float:  # noqa: N802 - Qt
         try:
@@ -365,26 +407,124 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self.lineEdit().setModified(False)
 
     # -------------------------------------------------------- шаг и запись
+    @staticmethod
+    def last_digit(text: str) -> float:
+        """Вес последней цифры: «1.25» - 0.01, «40» - 1, «0» - 1."""
+        _whole, dot, frac = text.strip().partition(".")
+        return 10.0 ** -len(frac) if dot and frac else 1.0
+
+    def _shown_step(self) -> float | None:
+        """Шаг, под который показываются знаки (в единицах префикса): постоянный или AUTO, пока крутят."""
+        if self.step_setting:
+            return self.step_setting / self._factor()
+        return self._step_lock
+
     def _digit_step(self) -> float:
-        """Шаг = разряд слева от курсора; курсор не в поле - единица текущего префикса."""
+        """Шаг в единицах префикса: постоянный; в поле с курсором - разряд слева от курсора;
+        иначе - последняя показанная цифра (AUTO)."""
+        if self.step_setting:
+            return self.step_setting / self._factor()
         le = self.lineEdit()
+        text = le.text()
         if not self.hasFocus():
-            return 1.0
-        text, pos = le.text(), le.cursorPosition()
+            return self._step_lock or self.last_digit(text)
+        pos = le.cursorPosition()
         dot = text.find(".")
         dot = len(text) if dot < 0 else dot
         pos = max(pos, 1)
         exp = dot - pos if pos <= dot else dot - pos + 1
         return 10.0 ** exp
 
+    def step_index(self) -> int:
+        """Позиция подчёркнутой цифры в тексте (её меняет шаг) или -1."""
+        text = self.lineEdit().text()
+        if not text or not self.isEnabled():
+            return -1
+        step = self._digit_step()
+        if step <= 0:
+            return -1
+        exp = round(math.log10(step))
+        dot = text.find(".")
+        dot = len(text) if dot < 0 else dot
+        idx = dot - 1 - exp if exp >= 0 else dot - exp
+        return idx if 0 <= idx < len(text) and text[idx].isdigit() else -1
+
     def stepBy(self, steps: int) -> None:  # noqa: N802 - Qt
         le = self.lineEdit()
         from_end = len(le.text()) - le.cursorPosition()
+        step = self._digit_step()
+        if self.step_setting is None:
+            self._step_lock = step                # пока крутят - тот же разряд («1.29» + 0.01 = «1.30»)
         self.blockSignals(True)
-        self.setValue(self.value() + steps * self._digit_step())
+        self.setValue(self.value() + steps * step)
         self.blockSignals(False)
         le.setCursorPosition(max(len(le.text()) - from_end, 0))
         self.commit(force=True)
+
+    def _release_step(self) -> None:
+        """Кончили крутить (мышь ушла, фокус ушёл, печатают): AUTO снова по последней цифре."""
+        if self._step_lock is not None:
+            self._step_lock = None
+            if not (self.hasFocus() and self.lineEdit().isModified()):
+                self.show_value(self._value, force=True)
+        self.lineEdit().update()
+
+    def leaveEvent(self, e):  # noqa: N802 - Qt
+        super().leaveEvent(e)
+        if not self.hasFocus():
+            self._release_step()
+
+    def focusOutEvent(self, e):  # noqa: N802 - Qt
+        super().focusOutEvent(e)
+        self._release_step()
+
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        super().keyPressEvent(e)
+        self.lineEdit().update()                  # курсор сдвинулся - подчёркнут другой разряд
+
+    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
+        super().mouseReleaseEvent(e)
+        self.lineEdit().update()
+
+    # -------------------------------------------------------- настройка шага
+    def step_choices(self) -> list[float]:
+        """Постоянные шаги для меню (в единицах параметра): 1 / 10 / 100 каждого префикса."""
+        factors = sorted({SI_PREFIXES[p] if p else 1.0 for p in self.prefixes})
+        if len(factors) == 1:                     # без префиксов (dBm, %): от 0.001 до 10
+            return [factors[0] * m for m in (0.001, 0.01, 0.1, 1.0, 10.0)]
+        return [f * m for f in factors for m in (1.0, 10.0, 100.0)][:-2]
+
+    def step_label(self, step: float | None) -> str:
+        if step is None:
+            return "AUTO"
+        return si_format(step, self.unit, 4) if self.unit else f"{step:g}"
+
+    def set_step(self, step: float | None, emit: bool = True) -> None:
+        """Постоянный шаг (единицы параметра) или None - AUTO."""
+        step = float(step) if step else None
+        changed = step != self.step_setting
+        self.step_setting = step
+        self._step_lock = None
+        self.show_value(self._value, force=True)
+        self.lineEdit().update()
+        tip = self.toolTip().split("\nSTEP ")[0]
+        self.setToolTip(f"{tip}\nSTEP {self.step_label(step)}" if tip else f"STEP {self.step_label(step)}")
+        if changed and emit:
+            self.step_changed.emit(step)
+
+    def contextMenuEvent(self, e):  # noqa: N802 - Qt
+        """Правый клик - шаг колеса и стрелок."""
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        title = menu.addAction("STEP")
+        title.setEnabled(False)
+        for step in (None, *self.step_choices()):
+            act = menu.addAction(self.step_label(step) + ("  (last digit)" if step is None else ""))
+            act.setCheckable(True)
+            act.setChecked(step == self.step_setting or (step is None and self.step_setting is None))
+            act.triggered.connect(lambda _=False, st=step: self.set_step(st))
+        menu.popup(e.globalPos())
+        e.accept()
 
     def commit(self, force: bool = False) -> None:
         if not force and not self.lineEdit().isModified():
