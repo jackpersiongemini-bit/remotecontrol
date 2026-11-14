@@ -472,3 +472,50 @@ def test_generator_lost_during_acal_rf_off_when_it_reconnects(qtbot, lab):
     qtbot.waitUntil(lambda: gen.is_connected, timeout=5000)
     qtbot.waitUntil(lambda: sim.s["rf.output"] is False, timeout=5000)
     assert coord.pending_restore(gen) == []
+
+
+# ------------------------------------------------------------------ частота ваттметра за генератором, ВАЦ в CW
+def test_pm_frequency_follows_generator(qtbot, lab):
+    """Алексей 2026-11-14: меняю частоту генератора - на ваттметре она тоже должна меняться."""
+    gen, pm, coord = lab
+    _wait_value(qtbot, pm, "freq", lambda v: v == pytest.approx(5e9))       # уже за генератором
+    gen.set("rf.frequency", 3e9)
+    _wait_value(qtbot, pm, "freq", lambda v: v == pytest.approx(3e9))
+    assert coord.follow.source(pm) is gen
+    seen = []
+    coord.follow.changed.connect(seen.append)
+    coord.follow.set_enabled(pm, False)                                      # выключили - не следует
+    assert seen == [pm] and coord.follow.source(pm) is None
+    gen.set("rf.frequency", 4e9)
+    _wait_value(qtbot, gen, "rf.frequency", lambda v: v == pytest.approx(4e9))
+    qtbot.wait(200)
+    assert pm.value("freq") == pytest.approx(3e9)
+    coord.follow.set_enabled(pm, True)                                       # включили - сразу на частоту
+    _wait_value(qtbot, pm, "freq", lambda v: v == pytest.approx(4e9))
+
+
+def test_vna_in_cw_is_the_generator(qtbot):
+    """ВАЦ в режиме CW - генератор сигнала для сценариев и для слежения ваттметра."""
+    coord = Coordinator(ProxyLinks())
+    vna, pm = coord.attach(_proxy("pna")), coord.attach(_proxy("u2021xa"))
+    for p in (vna, pm):
+        _open(qtbot, p)
+    try:
+        assert coord.find_for("signal_generator") is None                   # не в CW - не генератор
+        with pytest.raises(ScenarioError, match="no signal generator"):
+            coord.start(Probe())
+        vna.set("freq.cw", 2.5e9)
+        _wait_value(qtbot, vna, "freq.cw", lambda v: v == pytest.approx(2.5e9))
+        vna.set("gen.state", True)
+        _wait_value(qtbot, vna, "gen.state", lambda v: v is True)
+        assert coord.find_for("signal_generator") is vna and coord.generators() == [vna]
+        _wait_value(qtbot, pm, "freq", lambda v: v == pytest.approx(2.5e9))  # ваттметр - на частоту CW
+        run = _finish(qtbot, coord.start(Probe()))                            # ключи генератора -> ключи ВАЦ
+        assert run.state == "done", run.error
+        assert run.devices["signal_generator"].name == "VNA"
+        assert run.result[0] == pytest.approx(2e9)
+        assert vna.value("source.power") == pytest.approx(-7.0)              # rf.power -> source.power
+        assert vna.value("freq.cw") == pytest.approx(2.5e9)                  # возврат: freq.cw как было
+    finally:
+        coord.stop_all(wait_ms=3000)
+        coord.close_all()

@@ -259,3 +259,26 @@ def test_time_scale_units_and_det_on_main(qtbot, pm):
     win2 = PowerMeterWindow(proxy, settings)                               # из ini
     qtbot.addWidget(win2)
     assert win2.scale_unit.value == "W" and win2.scale_auto.value is True
+
+
+def test_follow_button_shows_source(qtbot, tmp_path):
+    """FREQ на MAIN: кнопка слежения за генератором (вкл по умолчанию, ini), видно за кем."""
+    from visalab.coord import COORD
+    settings = QSettings(str(tmp_path / "f.ini"), QSettings.Format.IniFormat)
+    gen, pm = COORD.open_instrument("e8267d", "sim"), COORD.open_instrument("u2021xa", "sim")
+    try:
+        win = PowerMeterWindow(pm, settings)
+        qtbot.addWidget(win)
+        for p in (gen, pm):
+            with qtbot.waitSignal(p.sync_done, timeout=5000):
+                p.open()
+        freq_line = next(ln for ln in win.pages[0].lines if ln.name == "FREQ")
+        assert win.follow_button in freq_line.widgets and win.follow_button.isChecked()
+        gen.set("rf.frequency", 2.2e9)
+        _wait(qtbot, pm, "freq", lambda v: v == pytest.approx(2.2e9))
+        qtbot.waitUntil(lambda: win.follow_button.text().startswith("← GEN"), timeout=2000)
+        win.follow_button.setChecked(False)
+        assert settings.value(f"{win._prefix}/FREQ_FOLLOW", type=bool) is False
+        assert win.follow_button.text() == "FOLW" and not COORD.follow.enabled(pm)
+    finally:
+        COORD.close_all([gen, pm])

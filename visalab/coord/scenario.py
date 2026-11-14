@@ -317,17 +317,35 @@ class ActionStep(DeviceStep):
 
 
 # ===================================================================== прибор
+#: ВАЦ в режиме генератора (CW, ``gen.state``) - генератор сигнала для сценариев (Алексей 2026-11-14:
+#: «в CW режиме векторник должен восприниматься программой как генератор СВЧ сигнала»)
+VNA_AS_GENERATOR = {"rf.frequency": "freq.cw", "rf.power": "source.power", "rf.output": "rf.output"}
+
+
 class Device:
     """Прибор в сценарии: класс (профиль) и его ключи. Драйвер не виден.
 
     ``instrument`` - прибор координатора (тот же, что у окна); ``proxy`` - абстрактный прибор слоя 3 под
     ним: шаги сценария пишут в прибор через него, мимо арбитража (окну прибор в это время не отдаётся)."""
 
-    def __init__(self, instrument, name: str = ""):
+    def __init__(self, instrument, name: str = "", keys: dict[str, str] | None = None):
+        """``keys`` - прибор другого класса в роли нужного сценарию: {ключ сценария: ключ прибора}
+        (ВАЦ в режиме CW как генератор - ``VNA_AS_GENERATOR``)."""
         self.instrument = instrument
         self.proxy = instrument._proxy
         self.profile = profile_name(instrument)
         self.name = name or SHORT_NAMES.get(self.profile, "") or instrument.name
+        self.keys = dict(keys or {})
+
+    def k(self, key: str) -> str:
+        """Ключ прибора для ключа сценария."""
+        return self.keys.get(key, key)
+
+    def spec(self, key: str):
+        spec = self.proxy.params.get(self.k(key))
+        if spec is None:
+            raise ScenarioError(f"{self.name}: no {key}")
+        return spec
 
     # ----------------------------------------------------------- без обращения к прибору
     @property
@@ -335,11 +353,11 @@ class Device:
         return self.proxy.is_connected
 
     def supports(self, key: str) -> bool:
-        return self.proxy.supports(key)
+        return self.proxy.supports(self.k(key))
 
     def value(self, key: str, default: Any = None) -> Any:
         """Последнее известное значение (кэш окна)."""
-        return self.proxy.value(key, default)
+        return self.proxy.value(self.k(key), default)
 
     def require(self, *keys: str) -> None:
         missing = [k for k in keys if not self.supports(k)]
@@ -348,7 +366,7 @@ class Device:
 
     def check(self, key: str, value: Any) -> Any:
         """Значение, которое прибор примет (тип, диапазон модели), - иначе ScenarioError."""
-        spec = self.proxy.params.get(key)
+        spec = self.proxy.params.get(self.k(key))
         if spec is None:
             raise ScenarioError(f"{self.name}: no {key}")
         if spec.readonly or spec.kind is Kind.TRACE:
@@ -360,14 +378,14 @@ class Device:
 
     # ----------------------------------------------------------- шаги
     def set(self, key: str, value: Any, timeout_s: float | None = SET_TIMEOUT_S) -> SetStep:
-        return SetStep(self, key, value, timeout_s)
+        return SetStep(self, self.k(key), value, timeout_s)
 
     def measure(self, key: str, skip: int = 1, count: int = 1,
                 timeout_s: float | None = MEASURE_TIMEOUT_S) -> MeasureStep:
-        return MeasureStep(self, key, skip, count, timeout_s)
+        return MeasureStep(self, self.k(key), skip, count, timeout_s)
 
     def read(self, key: str, timeout_s: float | None = SET_TIMEOUT_S) -> ReadStep:
-        return ReadStep(self, key, timeout_s)
+        return ReadStep(self, self.k(key), timeout_s)
 
     def action(self, name: str, *args, timeout_s: float | None = ACTION_TIMEOUT_S) -> ActionStep:
         return ActionStep(self, name, args, timeout_s)
@@ -459,7 +477,7 @@ class Run(QObject):
     def defer_restore(self, dev: Device, key: str, value: Any) -> None:
         """С прибором нет связи: записать ``key = value``, когда он снова подключится (это сделает координатор
         после конца сценария - например, выключить выход, который сценарий включил)."""
-        self.deferred.append((dev.instrument, key, value))
+        self.deferred.append((dev.instrument, dev.k(key), value))
 
     # ----------------------------------------------------------- управление
     def start(self) -> None:

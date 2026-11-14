@@ -28,6 +28,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from PyQt6 import sip
 from PyQt6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
@@ -612,6 +613,8 @@ class PowerMeterWindow(InstrumentWindow):
         proxy.param_updated.connect(self._on_meas)
         COORD.links.changed.connect(self._relink)
         COORD.run_ended.connect(self._on_run_ended)
+        COORD.follow.changed.connect(self._show_follow)
+        COORD.follow.set_enabled(proxy, self.follow_button.isChecked())
         self._relink()
         self._refresh_readout()
 
@@ -663,6 +666,17 @@ class PowerMeterWindow(InstrumentWindow):
                      ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)]))),
                     ("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
                     ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
+        # FREQ следует за генератором / ВАЦ в CW (координатор); кнопка - вкл / выкл, видно за кем
+        self.follow_button = IndicatorButton("FOLW")
+        self.follow_button.setObjectName("choice")
+        self.follow_button.setCheckable(True)
+        self.follow_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.follow_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.follow_button.setChecked(s.value(f"{pre}/FREQ_FOLLOW", True, type=bool))
+        self.follow_button.toggled.connect(self._set_follow)
+        for ln in main:
+            if ln.name == "FREQ":
+                ln.add_widget(self.follow_button)
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
 
         # CAL: график поправки, выбор таблицы (CSV), автокалибровка, GAIN, DUTY, итог, датчик
@@ -993,6 +1007,23 @@ class PowerMeterWindow(InstrumentWindow):
                 p.set("offset.state", on)
 
     # ------------------------------------------------------------ связь с ГСС (скважность)
+    # ------------------------------------------------------------ частота за генератором
+    def _set_follow(self, on: bool) -> None:
+        if self.settings.value(f"{self._prefix}/FREQ_FOLLOW", True, type=bool) != bool(on):
+            self.settings.setValue(f"{self._prefix}/FREQ_FOLLOW", bool(on))
+        COORD.follow.set_enabled(self.proxy, on)
+
+    def _show_follow(self, pm=None) -> None:
+        if sip.isdeleted(self) or (pm is not None and pm is not self.proxy):
+            return
+        src = COORD.follow.source(self.proxy)
+        on = self.follow_button.isChecked()
+        name = COORD.display_name(src) if src is not None else ""
+        self.follow_button.setText(f"← {name}" if on and name else "FOLW")
+        self.follow_button.setToolTip(
+            ("FREQ follows " + (f"{name}: " if name else "the generator: ") if on else "FREQ does not follow: ")
+            + "a new generator frequency (GEN, or VNA in CW) is set on the sensor.\nClick - on / off")
+
     def _relink(self) -> None:
         sdg = COORD.find("function_generator") if self.duty_src.value in ("CH1", "CH2") else None
         if sdg is self._sdg:
