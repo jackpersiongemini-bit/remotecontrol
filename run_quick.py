@@ -20,8 +20,7 @@ from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
 from run_gui import DEVICES, _load_lab
-from visalab.core import InstrumentProxy
-from visalab.drivers import DRIVERS, MODELS, make_transport
+from visalab.coord import COORD
 from visalab.quick import WINDOWS, LabWindow
 
 HERE = Path(__file__).resolve().parent
@@ -78,10 +77,8 @@ def main(argv=None) -> int:
             address = lab[name]["address"]
             model_name = lab[name].get("model", model_name)
             delay = lab[name].get("delay")
-        driver_cls, _ = DRIVERS[kind]
-        proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency),
-                                model=MODELS[kind].get(model_name) if model_name else None,
-                                command_delay_s=None if delay is None else float(delay))
+        proxy = COORD.open_instrument(kind, address, model=model_name or None, delay=delay, backend=args.backend,
+                                      latency=args.latency)
         panels.append(WINDOWS[kind](proxy, title=_english(kind), settings=settings))
     win = LabWindow(panels, settings)
     win.show()

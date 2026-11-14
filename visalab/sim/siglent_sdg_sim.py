@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from ..core.scpi import parse_number
+from ..core.units import parse_number
 from .base import ESR_CME, ESR_EXE, SimError, SimInstrument
 
 WAVES = ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "ARB", "DC")

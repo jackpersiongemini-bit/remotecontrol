@@ -1,8 +1,9 @@
 """Контракт «чёрного ящика»: каждый драйвер соответствует профилю своего класса."""
 import pytest
 
-from visalab.core import Kind, Param, ProfileError, SimTransport
-from visalab.core.instrument import VISAInstrument
+from visalab.core import Kind, Param, ProfileError
+from visalab.transport import SimTransport
+from visalab.drivers.base import VISAInstrument
 from visalab.core.params import Action
 from visalab.drivers import DRIVERS
 from visalab.profiles import PROFILES, SIGNAL_GENERATOR

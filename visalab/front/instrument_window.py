@@ -7,8 +7,10 @@
 (выход - клик по вкладке).
 
 Конкретное окно (генератор импульсов, СВЧ генератор...) наследует ``InstrumentWindow`` и
-задаёт в ``build()`` виджеты, строки избранного и вкладки. Окно знает только InstrumentProxy
-и ключи профиля прибора.
+задаёт в ``build()`` виджеты, строки избранного и вкладки. Окно знает только координатор:
+прибор (``proxy`` - :class:`visalab.coord.Instrument`, его выдаёт ``COORD.open_instrument``), ключи профиля
+прибора и каталог драйверов для страницы подключения. Пока прибор ведёт сценарий координатора (ACAL),
+запись из окна в прибор не уходит - отказ виден как ошибка ключа и строка BUSY в журнале окна.
 """
 from __future__ import annotations
 
@@ -18,21 +20,21 @@ import re
 import time
 from typing import Any, Callable
 
-from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
                              QSizePolicy, QVBoxLayout, QWidget)
 
+from ..coord import COORD, Instrument
 from ..core.params import ConnectionState, PStatus
-from ..core.proxy import InstrumentProxy
-from ..drivers import DRIVERS
+from ..core.units import si_format, si_parse
 from .models import ModelWindow, all_models, model_class
 from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
                      Window, short_address)
 
-__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "parse_power_list",
-           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "LINKS", "ProxyLinks"]
+__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay", "parse_power_list",
+           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST"]
 
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
@@ -48,45 +50,20 @@ def parse_power_list(text: str) -> list[float]:
     return sorted(out)
 
 
-class ProxyLinks(QObject):
-    """Прокси открытых в этом процессе окон: окно может брать значения другого прибора
-    (ваттметр - скважность у ГСС) по имени профиля, не зная драйвера."""
-
-    changed = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self._proxies: list[InstrumentProxy] = []
-
-    def add(self, proxy: InstrumentProxy) -> None:
-        if proxy not in self._proxies:
-            self._proxies.append(proxy)
-            self.changed.emit()
-
-    def remove(self, proxy: InstrumentProxy) -> None:
-        if proxy in self._proxies:
-            self._proxies.remove(proxy)
-            try:
-                self.changed.emit()
-            except RuntimeError:                 # выход из программы: реестр уже удалён
-                pass
-
-    def find(self, profile: str) -> InstrumentProxy | None:
-        """Последний открытый прибор с этим профилем (``function_generator``...)."""
-        for proxy in reversed(self._proxies):
-            prof = getattr(getattr(proxy, "driver_cls", None), "PROFILE", None)
-            if prof is not None and prof.name == profile:
-                return proxy
-        return None
-
-
-#: общий для процесса реестр приборов окон
-LINKS = ProxyLinks()
 
 
 def saved_connection(settings: QSettings, group: str) -> dict[str, str]:
     """Сохранённые в окне драйвер / адрес / модель (пустые строки - не задано)."""
     return {k: str(settings.value(f"{group}/{k.upper()}", "") or "") for k in ("driver", "address", "model")}
+
+
+def saved_delay(settings: QSettings, group: str) -> float | None:
+    """Сохранённая на странице адреса пауза между командами, с (None - не задана: как у драйвера)."""
+    v = settings.value(f"{group}/DELAY", "")
+    try:
+        return None if v in (None, "") else max(0.0, float(v))
+    except (TypeError, ValueError):
+        return None
 
 
 def _same(a, b) -> bool:
@@ -186,7 +163,7 @@ class PresetGroup(PBGroup):
 class PowerSpin(PSpinBox):
     """Мощность: колесо / стрелки - разряд под курсором, а в режиме пресетов - соседнее значение списка."""
 
-    def __init__(self, proxy: InstrumentProxy, key: str, parent=None):
+    def __init__(self, proxy: Instrument, key: str, parent=None):
         super().__init__(proxy, key, parent=parent)
         self.preset_mode = False
         self.levels: list[float] = list(DEFAULT_POWER_LIST)
@@ -213,7 +190,7 @@ class PowerLevels(QWidget):
 
     COLUMNS = 4
 
-    def __init__(self, proxy: InstrumentProxy, key: str, levels, on_change: Callable | None = None, parent=None):
+    def __init__(self, proxy: Instrument, key: str, levels, on_change: Callable | None = None, parent=None):
         super().__init__(parent)
         self.proxy, self.key, self.on_change = proxy, key, on_change
         self._levels: list[float] = []
@@ -349,12 +326,13 @@ class InstrumentWindow(Window):
         return 2
 
     # ------------------------------------------------------------ сборка
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Instrument", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Instrument", parent=None):
         super().__init__(settings, parent)
         self.proxy = proxy
         self.setWindowTitle(title)
         self._prefix = re.sub(r"\W+", "_", proxy.address).strip("_").upper() or self.DEFAULT_KIND.upper()
         self._resetting = False
+        self._saved: dict[str, Any] = {}        # что уже записано в ini (ключ -> значение)
         self._expanded = False
         self._overlay: str | None = None        # вместо таблицы: "errors" / "connection"
         self.saved_widgets: list = []
@@ -446,9 +424,9 @@ class InstrumentWindow(Window):
         proxy.action_done.connect(self._on_action_done)
         proxy.param_updated.connect(self._on_param)
         proxy.comm_error.connect(self._on_comm_error)
+        proxy.reconnect_pending.connect(self._on_reconnect)
+        proxy.refused.connect(self._on_refused)
         self._on_state(proxy.state)
-        LINKS.add(proxy)
-        self.destroyed.connect(lambda *_a, p=proxy: LINKS.remove(p))
 
         self.address.setMinimumWidth(self.address.sizeHint().width())
         self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.minimumSize().width()))
@@ -679,16 +657,12 @@ class InstrumentWindow(Window):
 
     # ------------------------------------------------------------ подключение
     def _driver_kind(self) -> str:
-        for kind, (cls, _sim) in DRIVERS.items():
-            if cls is getattr(self.proxy, "driver_cls", None):
-                return kind
-        return self.DEFAULT_KIND
+        return self.proxy.kind or self.DEFAULT_KIND
 
     def _build_connection_page(self) -> QWidget:
         kind = self._driver_kind()
-        profile = DRIVERS[kind][0].PROFILE
         saved = saved_connection(self.settings, self.CONNECTION_GROUP)
-        drivers = [(k.upper(), k) for k, (cls, _s) in DRIVERS.items() if cls.PROFILE is profile]
+        drivers = [(k.upper(), k) for k in COORD.kinds(self.proxy.profile.name)]
         self.driver_choice = PChoice(drivers, kind)
         self.driver_choice.setToolTip("Driver (instrument family)")
         self.model_choice = PChoice([("AUTO", "")])
@@ -703,11 +677,20 @@ class InstrumentWindow(Window):
         self.address_edit.setPlaceholderText("192.168.0.5 / USB0::... / sim")
         self.address_edit.setToolTip("VISA address: IP, IP:port, full VISA string, or sim")
         self.address_edit.returnPressed.connect(self.apply_connection)
+        self.delay_edit = QLineEdit()
+        self.delay_edit.setObjectName("cfg")
+        self.delay_edit.setPlaceholderText("driver default")
+        self.delay_edit.setToolTip("Pause between commands to the instrument (e.g. 50m = 50 ms); "
+                                   "Enter applies at once, empty = driver default")
+        self.delay_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._show_delay()
+        self.delay_edit.returnPressed.connect(self.apply_delay)
         self.apply_button = self._tool("APPLY", "Save and reconnect with these settings", self.apply_connection)
         self.apply_button.setProperty("wide", True)
         table = PanelTable(PanelLine("DRV", self.driver_choice),
                            PanelLine("MDL", self.model_choice, self.new_model_button),
-                           PanelLine("ADDR", self.address_edit), PanelLine("", self.apply_button))
+                           PanelLine("ADDR", self.address_edit), PanelLine("DLY", self.delay_edit),
+                           PanelLine("", self.apply_button))
         table.lines[-1].line_layout.insertStretch(1)
         table.hide()
         return table
@@ -730,7 +713,29 @@ class InstrumentWindow(Window):
         """Клик по адресу: вместо таблицы - драйвер / модель / адрес (выход - вкладка или APPLY)."""
         self._show_overlay("connection")
 
+    def _show_delay(self) -> None:
+        saved = saved_delay(self.settings, self.CONNECTION_GROUP)
+        self.delay_edit.setText("" if saved is None else si_format(saved, "s", 4))
+
+    def apply_delay(self) -> bool:
+        """DLY: сохранить в ini и сразу применить к прибору. False - не число (поле возвращается)."""
+        text = self.delay_edit.text().strip()
+        if not text:
+            self.settings.remove(f"{self.CONNECTION_GROUP}/DELAY")
+            self.proxy.set_command_delay(COORD.default_delay(self._driver_kind()))
+            return True
+        try:
+            value = max(0.0, si_parse(text, "s"))
+        except ValueError:
+            self._show_delay()
+            return False
+        self.settings.setValue(f"{self.CONNECTION_GROUP}/DELAY", value)
+        self.proxy.set_command_delay(value)
+        self._show_delay()
+        return True
+
     def apply_connection(self) -> None:
+        self.apply_delay()
         driver = self.driver_choice.value or self._driver_kind()
         address = self.address_edit.text().strip() or "sim"
         model = self.model_choice.value or ""
@@ -767,7 +772,10 @@ class InstrumentWindow(Window):
         self.on_param(key, value)
         if self._resetting:              # после *RST прибор отдаёт заводские значения - не сохранять
             return
-        if value is not None and any(w.key == key for w in self.saved_widgets):
+        # то же значение не писать: ini переписывается целиком при каждом setValue, а приборы публикуют
+        # некоторые ключи постоянно (ВАЦ - ось трасс после каждой развёртки)
+        if value is not None and any(w.key == key for w in self.saved_widgets) and self._saved.get(key) != value:
+            self._saved[key] = value
             self.settings.setValue(self._settings_key(key), value)
 
     def on_param(self, key: str, value: Any) -> None:
@@ -787,8 +795,8 @@ class InstrumentWindow(Window):
 
     # ------------------------------------------------------------ кнопки
     def _toggle_connection(self) -> None:
-        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
-            self.proxy.close()
+        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or self.proxy.reconnecting:
+            self.proxy.close()          # в том числе - перестать переподключаться
         else:
             self.proxy.open()
 
@@ -806,8 +814,10 @@ class InstrumentWindow(Window):
     # ------------------------------------------------------------ события
     def _on_state(self, state: ConnectionState) -> None:
         status = {ConnectionState.CONNECTED: ON, ConnectionState.CONNECTING: "process",
-                  ConnectionState.ERROR: "error"}.get(state, OFF)
+                  ConnectionState.ERROR: "retry" if self.proxy.reconnecting else "error"}.get(state, OFF)
         self.on_button.set_status(status)
+        self.on_button.setToolTip("No connection: reconnecting by itself when the instrument answers. "
+                                  "Click - stop" if status == "retry" else "Connect / disconnect")
         on = state is ConnectionState.CONNECTED
         self.sync_button.setEnabled(on)
         self.init_button.setEnabled(on)
@@ -816,8 +826,19 @@ class InstrumentWindow(Window):
             self.sync_button.set_status("ok")
             self.init_button.set_status("ok")
 
+    def _on_reconnect(self, _seconds: float) -> None:
+        self._on_state(self.proxy.state)
+
     def _on_comm_error(self, msg: str) -> None:
         self._log("CONNECTION", msg)
+        self._release_buttons()
+
+    def _on_refused(self, msg: str) -> None:
+        """Прибор ведёт сценарий координатора: запрос окна не отправлен."""
+        self._log("BUSY", msg)
+        self._release_buttons()
+
+    def _release_buttons(self) -> None:
         self._resetting = False
         for b in (self.sync_button, self.init_button):
             if b.status() == "process":

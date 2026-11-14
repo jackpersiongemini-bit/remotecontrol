@@ -144,7 +144,7 @@ def test_gate_feeds_follow_trigger_source(pm):
 
 
 def test_float_block_roundtrip():
-    from visalab.core.transport import float_block, parse_float_block
+    from visalab.transport import float_block, parse_float_block
     vals = [-10.0, 1.5, -120.25]
     assert parse_float_block(float_block(vals).encode("latin-1")) == vals
 

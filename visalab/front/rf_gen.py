@@ -5,7 +5,7 @@
 чипы PRST на вкладке RF (клик ставит мощность, «+» - текущая, «−» - выбранная). Модуляция - на вкладках.
 Развёрнутый вид - вкладки RF / AM / FM / PM / PULS (индикатор - режим включён).
 
-Окно знает только InstrumentProxy и ключи профиля signal_generator.
+Окно знает только прибор координатора (Instrument) и ключи профиля signal_generator.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QPushButton
 
 from ..core.params import Kind
-from ..core.proxy import InstrumentProxy
+from ..coord import Instrument
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
 from .params import PLineEdit, PSButton, PSpinBox, PanelLine, PanelTable
@@ -33,7 +33,7 @@ def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
 
 
-def _auto(proxy: InstrumentProxy, key: str):
+def _auto(proxy: Instrument, key: str):
     spec = proxy.params[key]
     if spec.kind is Kind.BOOL:
         return PSButton(proxy, key, [("OFF", False), ("ON", True)])
@@ -62,7 +62,7 @@ class RFGenWindow(InstrumentWindow):
     DEFAULT_KIND = "e8267d"
     PRESET_KEY = None                                 # вместо пресетов FREQ/POW/MOD - пресеты мощности
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "RF generator", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "RF generator", parent=None):
         super().__init__(proxy, settings, title, parent)
         tools = getattr(self, "_pwr_tools", None)     # «+»/«−» - по ширине кнопок, у правого края
         if tools is not None:

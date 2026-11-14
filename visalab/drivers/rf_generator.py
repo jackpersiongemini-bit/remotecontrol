@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.instrument import VISAInstrument
+from .base import VISAInstrument
 from ..core.params import Action, Kind, Param
 from ..profiles import SIGNAL_GENERATOR
 

@@ -16,9 +16,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.instrument import VISAInstrument
+from .base import VISAInstrument
 from ..core.params import Action, Kind, Param, PStatus
-from ..core.scpi import parse_bool, parse_number
+from ..core.units import parse_bool, parse_number
 from ..profiles import FUNCTION_GENERATOR
 
 __all__ = ["SiglentSDG", "SDGModel", "SDG_MODELS", "parse_siglent_response"]

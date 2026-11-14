@@ -2,7 +2,9 @@
 import pytest
 from PyQt6.QtCore import QSettings
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach, l3
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import ItechIT6300, KeysightE8267D, KeysightU2021XA, RSSMF100A, SiglentSDG
 from visalab.quick import FuncGenWindow, PowerMeterWindow, PSUWindow, RFGenWindow, SpinField
 from visalab.sim import (ItechIT6300Sim, KeysightE8267DSim, KeysightU2021XASim, RSSMF100ASim,
@@ -15,7 +17,7 @@ def settings(tmp_path):
 
 
 def _open(qtbot, win_cls, drv, sim, settings):
-    proxy = InstrumentProxy(drv, SimTransport(sim))
+    proxy = attach(InstrumentProxy(drv, SimTransport(sim)))
     win = win_cls(proxy, settings=settings)
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):
@@ -126,7 +128,7 @@ def test_lab_window_holds_all_panels(qtbot, settings):
     panels = []
     for cls, drv, sim in ((RFGenWindow, KeysightE8267D, KeysightE8267DSim()), (PSUWindow, ItechIT6300, ItechIT6300Sim()),
                           (FuncGenWindow, SiglentSDG, SiglentSDGSim()), (PowerMeterWindow, KeysightU2021XA, KeysightU2021XASim())):
-        panels.append(cls(InstrumentProxy(drv, SimTransport(sim)), settings=settings))
+        panels.append(cls(attach(InstrumentProxy(drv, SimTransport(sim))), settings=settings))
     win = LabWindow(panels, settings)
     qtbot.addWidget(win)
     win.connect_all.click()
@@ -138,4 +140,4 @@ def test_lab_window_holds_all_panels(qtbot, settings):
     win.outputs_off.click()
     _wait_value(qtbot, rf, "rf.output", lambda v: v is False)
     win.close()
-    assert not any(p.proxy._thread.isRunning() for p in panels)
+    assert not any(l3(p.proxy)._thread.isRunning() for p in panels)

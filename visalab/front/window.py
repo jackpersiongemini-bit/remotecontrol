@@ -400,10 +400,12 @@ def short_address(address: str) -> str:
 class Switch(QAbstractButton):
     """Анимированный переключатель ON/OFF для заголовка окна (по WindowClass.py).
 
-    ``set_status``: ON / OFF / "process" (связь устанавливается) / "error".
+    ``set_status``: ON / OFF / "process" (связь устанавливается) / "error" / "retry" (включён, но связи
+    нет - прибор переподключается сам: ручка справа, цвет ошибки; клик - отключить).
     """
 
-    COLORS = {OFF: UI_COLOR_ERROR, ON: UI_COLOR_SUCCESS, "process": UI_COLOR_PROCESS, "error": UI_COLOR_ERROR}
+    COLORS = {OFF: UI_COLOR_ERROR, ON: UI_COLOR_SUCCESS, "process": UI_COLOR_PROCESS, "error": UI_COLOR_ERROR,
+              "retry": UI_COLOR_ERROR}
     HANDLE_COLOR = QColor(UI_COLOR_CONTROL)
     HANDLE_BORDER_COLOR = QColor(UI_COLOR_BORDER)
 
@@ -442,7 +444,7 @@ class Switch(QAbstractButton):
         """Состояние связи: ручка - включено/выключено, цвет дорожки - статус."""
         self._status = status
         self.blockSignals(True)
-        self.setChecked(status in (ON, "process"))
+        self.setChecked(status in (ON, "process", "retry"))
         self.blockSignals(False)
         self._animate_handle(self.isChecked())
         self.setCursor(Qt.CursorShape.WaitCursor if status == "process" else Qt.CursorShape.PointingHandCursor)

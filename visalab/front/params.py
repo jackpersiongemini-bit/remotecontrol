@@ -1,4 +1,4 @@
-"""Виджеты параметров в духе Parameter.py Алексея, но поверх InstrumentProxy.
+"""Виджеты параметров в духе Parameter.py Алексея, но поверх прибора координатора (Instrument).
 
 * ``PLineEdit`` - число с единицей (SI-префиксы при вводе и показе), запись по Enter/уходу фокуса;
 * ``PSpinBox``  - то же со стрелками: шаг - разряд под курсором (как ручка прибора);
@@ -22,8 +22,8 @@ from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFr
                              QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import SI_PREFIXES, si_format, si_parse
+from ..coord import Instrument
+from ..core.units import SI_PREFIXES, si_format, si_parse
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INDICATOR_FRAME, UI_COLOR_INVERT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_CONTROL_HEIGHT_PX, render_qss)
@@ -47,7 +47,7 @@ def _repolish(w: QWidget) -> None:
 class _Bound:
     """Привязка к ключу: значение, статус записи, доступность по состоянию связи."""
 
-    def bind(self, proxy: InstrumentProxy, key: str) -> None:
+    def bind(self, proxy: Instrument, key: str) -> None:
         self.proxy, self.key = proxy, key
         self.spec = proxy.params[key]
         self._value: Any = None
@@ -85,7 +85,7 @@ class PLineEdit(QLineEdit, _Bound):
     Пока единицу не выбрали вручную, префикс подбирается под значение.
     """
 
-    def __init__(self, proxy: InstrumentProxy, key: str, unit: str | None = None, digits: int = 6, parent=None):
+    def __init__(self, proxy: Instrument, key: str, unit: str | None = None, digits: int = 6, parent=None):
         super().__init__(parent)
         self.unit = unit if unit is not None else proxy.params[key].unit
         self.digits = digits
@@ -240,7 +240,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
     по Enter / уходу фокуса, шаг стрелкой или колесом - сразу.
     """
 
-    def __init__(self, proxy: InstrumentProxy, key: str, prefixes: tuple[str, ...] | None = None, parent=None):
+    def __init__(self, proxy: Instrument, key: str, prefixes: tuple[str, ...] | None = None, parent=None):
         super().__init__(parent)
         self.unit = proxy.params[key].unit
         self.prefixes = prefixes or UNIT_PREFIXES.get(self.unit, ("",))
@@ -409,7 +409,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
 class PNLabel(PLineEdit):
     """Число только для показа (DUTY)."""
 
-    def __init__(self, proxy: InstrumentProxy, key: str, unit: str | None = None, digits: int = 6, parent=None):
+    def __init__(self, proxy: Instrument, key: str, unit: str | None = None, digits: int = 6, parent=None):
         super().__init__(proxy, key, unit, digits, parent)
         self.setReadOnly(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -458,7 +458,7 @@ class PSButton(IndicatorButton, _Bound):
     def indicated(self) -> bool:
         return self.property("state") in ("true", "on")
 
-    def __init__(self, proxy: InstrumentProxy, key: str, states, parent=None):
+    def __init__(self, proxy: Instrument, key: str, states, parent=None):
         super().__init__(self.UNKNOWN, parent)
         pairs = list(states.items()) if isinstance(states, dict) else list(states)   # или [(подпись, значение)]
         if not pairs:
@@ -558,7 +558,7 @@ class PChoice(QPushButton):
 class PLabel(QLabel, _Bound):
     """Показ значения прибора (или просто текст, если ``proxy`` не задан)."""
 
-    def __init__(self, proxy: InstrumentProxy | None = None, key: str = "", unit: str | None = None,
+    def __init__(self, proxy: Instrument | None = None, key: str = "", unit: str | None = None,
                  digits: int = 6, text: str = "", parent=None):
         super().__init__(text, parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -890,7 +890,7 @@ class WriteTracker(QObject):
 
     changed = pyqtSignal(list, bool)          # [(name, WriteState, detail)], active
 
-    def __init__(self, proxy: InstrumentProxy, keys: list[str], names: dict[str, str] | None = None, parent=None):
+    def __init__(self, proxy: Instrument, keys: list[str], names: dict[str, str] | None = None, parent=None):
         super().__init__(parent)
         self.proxy = proxy
         self.keys = list(keys)

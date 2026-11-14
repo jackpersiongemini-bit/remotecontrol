@@ -11,22 +11,22 @@
 AMPL (опорный уровень и его смещение, масштаб, аттенюатор, детектор, предусилитель, связь входа),
 SWP (время, точки, тип развёртки, опора, непрерывно / одна развёртка), TRAC (режим трассы:
 clear-write / max hold / min hold / view / blank, усреднение), TRIG (источник, уровень, фронт, задержка).
-Окно знает только InstrumentProxy и ключи профиля spectrum_analyzer.
+Окно знает только прибор координатора (Instrument) и ключи профиля spectrum_analyzer.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from PyQt6.QtCore import QSettings, Qt
 
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format
+from ..coord import Instrument
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow, PresetGroup
 from .params import IndicatorButton, PLineEdit, PSButton, PanelLine, PanelTable
 from .power_meter import ActionButton
 
-__all__ = ["SpectrumWindow", "ZeroSpan", "StatePresets", "saved_connection"]
+__all__ = ["SpectrumWindow", "ZeroSpan", "StatePresets", "saved_connection", "compact_si"]
 
 CONNECTION_GROUP = "CONNECTION/SPECTRUM"
 AUTO = [("MAN", False), ("AUTO", True)]
@@ -50,6 +50,21 @@ PAGES = (
 NOT_SAVED = ("freq.start", "freq.stop")          # связаны с центром и обзором - после Init не восстанавливаем
 
 
+def compact_si(value: float, digits: int = 3) -> str:
+    """Число с SI-префиксом вместо точки: 2.4e9 -> ``2G4``, 1e9 -> ``1G``, 1.5e6 -> ``1M5``, 0 -> ``0``."""
+    if not value:
+        return "0"
+    power = max(-4, min(4, math.floor(math.log10(abs(value)) / 3)))
+    scaled = float(f"{abs(value) / 1000 ** power:.{digits}g}")
+    if scaled >= 1000 and power < 4:                       # 999.9M -> 1G
+        power, scaled = power + 1, scaled / 1000
+    whole, _, frac = f"{scaled:.{digits}g}".partition(".")
+    prefix = {-4: "P", -3: "N", -2: "U", -1: "M", 0: "", 1: "K", 2: "M", 3: "G", 4: "T"}[power]
+    if power == -1:
+        prefix = "m"                                       # милли - строчная (не путать с M)
+    return ("-" if value < 0 else "") + whole + ((prefix or "R") + frac if frac else prefix)
+
+
 def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
 
@@ -60,7 +75,7 @@ class ZeroSpan(IndicatorButton):
 
     DEFAULT_SPAN = 1e6
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, prefix: str, parent=None):
         super().__init__("ZERO", parent)
         self.proxy, self.settings, self._key = proxy, settings, f"{prefix}/LAST_SPAN"
         self.setObjectName("choice")
@@ -140,7 +155,7 @@ class SpectrumWindow(InstrumentWindow):
     PRESET_DEFAULTS = ()
     PRESET_ADD_TIP = "Save the current state in the analyzer memory"
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Spectrum analyzer", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Spectrum analyzer", parent=None):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
         proxy.action_done.connect(self._on_action)
@@ -205,15 +220,13 @@ class SpectrumWindow(InstrumentWindow):
             self.proxy.action("state_list")
 
     def state_name(self) -> str | None:
+        """Имя пресета из центра и полосы: ``2G4S100M`` = центр 2.4 GHz, полоса (S) 100 MHz; ``1GS0`` - нулевая
+        полоса. Только буквы и цифры, до 8 знаков: такие имена файлов принимает и PSA (DOS 8.3). Пресет с тем же
+        центром и полосой записывается поверх."""
         c, s = self.proxy.value("freq.center"), self.proxy.value("freq.span")
         if c is None or s is None:
             return None
-        text = lambda v: si_format(v, "Hz", 4).replace(" ", "").replace(".", "p")
-        base, name, n = f"{text(c)}_{text(s)}", None, 1
-        while name is None or name in self.presets.names():
-            name = base if n == 1 else f"{base}-{n}"
-            n += 1
-        return name
+        return f"{compact_si(c)}S{compact_si(s)}"
 
     def _add_preset(self) -> None:
         name = self.state_name()
@@ -230,6 +243,8 @@ class SpectrumWindow(InstrumentWindow):
         self.proxy.action("state_recall", preset[0])
 
     def _on_action(self, name: str, result) -> None:
+        if name == "state_save" and isinstance(result, str) and result:
+            self._select_after_list = result            # имя, под которым прибор записал состояние
         if name == "state_list" and isinstance(result, (list, tuple)):
             self.presets.set_names([str(n) for n in result], self._select_after_list)
             self._select_after_list = None

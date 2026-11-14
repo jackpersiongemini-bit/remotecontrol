@@ -7,7 +7,38 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from visalab.core import SimTransport  # noqa: E402
+from visalab.coord import COORD, LINKS  # noqa: E402
+from visalab.transport import SimTransport  # noqa: E402
+
+
+def attach(proxy):
+    """Абстрактный прибор (слой 3) -> прибор координатора, как его получает окно (в реестре COORD)."""
+    return COORD.attach(proxy)
+
+
+def l3(inst):
+    """Абстрактный прибор под прибором координатора (тестам: поток, драйвер, симулятор)."""
+    return getattr(inst, "_proxy", inst)
+
+
+def worker(inst):
+    """Драйвер прибора (живёт в потоке прибора)."""
+    return l3(inst)._worker
+
+
+def sim_of(inst):
+    """Симулятор под прибором."""
+    return worker(inst).transport.sim
+
+
+@pytest.fixture(autouse=True)
+def _own_registry_entries():
+    """Тест не оставляет своих приборов в реестре координатора процесса."""
+    before = LINKS.proxies()
+    yield
+    for inst in LINKS.proxies():
+        if inst not in before:
+            LINKS.remove(inst)
 
 
 class Recorder:

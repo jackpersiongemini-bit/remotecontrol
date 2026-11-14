@@ -23,8 +23,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication
 
-from visalab.core import InstrumentProxy
-from visalab.drivers import DRIVERS, MODELS, make_transport
+from visalab.coord import COORD
 from visalab.gui.window import InstrumentWindow
 
 #: ключ командной строки -> тип драйвера, заголовок окна, модель по умолчанию
@@ -66,7 +65,7 @@ def main(argv=None) -> int:
         ap.add_argument(f"--{name}", metavar="АДРЕС", help=f"{title}: VISA-адрес, IP (192.168.0.3 или 192.168.0.3:5025) или 'sim'")
     ap.add_argument("--model", action="append", default=[], metavar="ПРИБОР=МОДЕЛЬ",
                     help="модель (пределы проверки): " + "; ".join(
-                        f"{n}: {', '.join(sorted(MODELS[k]))}" for n, (k, _, _) in DEVICES.items()))
+                        f"{n}: {', '.join(sorted(COORD.models(k)))}" for n, (k, _, _) in DEVICES.items()))
     ap.add_argument("--sdg-model", help="то же, что --model sdg=МОДЕЛЬ")
     ap.add_argument("--psu-model", help="то же, что --model psu=МОДЕЛЬ")
     ap.add_argument("--delay", action="append", default=[], metavar="ПРИБОР=СЕК",
@@ -84,8 +83,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     if args.list:
-        import pyvisa
-        print("\n".join(pyvisa.ResourceManager(args.backend).list_resources()) or "ресурсов не найдено")
+        print("\n".join(COORD.list_resources(args.backend)) or "ресурсов не найдено")
         return 0
 
     models = _pairs(args.model, "model")
@@ -119,13 +117,11 @@ def main(argv=None) -> int:
     windows = []
     for i, (name, address) in enumerate(addresses.items()):
         kind, title, default_model = DEVICES[name]
-        driver_cls, _ = DRIVERS[kind]
         model_name = models.get(name, default_model)
-        if model_name is not None and model_name not in MODELS[kind]:
-            raise SystemExit(f"{name}: неизвестная модель {model_name!r}, есть {sorted(MODELS[kind])}")
-        proxy = InstrumentProxy(driver_cls, make_transport(kind, address, args.backend, args.latency),
-                                model=MODELS[kind].get(model_name) if model_name else None,
-                                command_delay_s=delays.get(name))
+        if model_name is not None and model_name not in COORD.models(kind):
+            raise SystemExit(f"{name}: неизвестная модель {model_name!r}, есть {sorted(COORD.models(kind))}")
+        proxy = COORD.open_instrument(kind, address, model=model_name or None, delay=delays.get(name),
+                                      backend=args.backend, latency=args.latency)
         win = InstrumentWindow(proxy, title)
         win.resize(1000, 720)
         win.move(40 + i * 60, 40 + i * 60)
@@ -133,7 +129,7 @@ def main(argv=None) -> int:
         if not args.no_connect:
             proxy.open()
         windows.append(win)
-    app.aboutToQuit.connect(lambda: [w.proxy.shutdown() for w in windows])
+    app.aboutToQuit.connect(lambda: COORD.close_all([w.proxy for w in windows]))
     return app.exec()
 
 

@@ -13,14 +13,18 @@ PTAV, клик - следующая) слева сверху, под ней за
 CAL - потери тракта на частоте датчика (линейная интерполяция по таблице), GAIN - усиление в
 тракте, DUTY - скважность импульсов (вручную или с ГСС, открытого в этом же процессе).
 
-Окно знает только InstrumentProxy и ключи профилей power_meter / function_generator.
+ACAL (вкладка CAL) - автокалибровка через координатор (``visalab.coord``, сценарий AutoCalibration):
+СВЧ генератор перебирает START..STOP по PTS точкам, ваттметр меряет без поправки, GAIN = средний
+коэффициент передачи тракта, таблица ``calibrations/ACAL_<start>-<stop>_<pts>.csv`` - неравномерность;
+после неё исправленное показание равно уровню генератора. Пока идёт ACAL, окно не пишет поправку в
+прибор, кнопка ▶ - стоп (■), в индикаторе вместо CAL - «ACAL n/N».
+
+Окно знает только координатор (прибор - Instrument) и ключи профилей power_meter / function_generator.
 """
 from __future__ import annotations
 
-import bisect
 import json
 import math
-import re
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +33,12 @@ from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
                              QVBoxLayout, QWidget)
 
+from ..coord import COORD, AutoCalibration, Instrument, ScenarioError, acal_file_name, interpolate, load_csv, save_csv
 from ..core.params import ConnectionState, Kind
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import SI_PREFIXES, si_format, si_parse
+from ..core.units import SI_PREFIXES, si_format, si_parse
 from ..core.trace import Trace
 from . import instrument_window as _iw
-from .instrument_window import LINKS, InstrumentWindow
+from .instrument_window import InstrumentWindow
 from .params import IndicatorButton, PChoice, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
                     UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
@@ -46,32 +50,19 @@ OFFSET_LIMIT = 100.0                    # CORR:GAIN2: ±100 dB
 SECONDARY = ("W", "PEAK", "PTAV")       # что показывает малое поле индикатора
 DUTY_SOURCES = (("OFF", "OFF"), ("MAN", "MAN"), ("SDG1", "CH1"), ("SDG2", "CH2"))
 CONFIRM_MS = 3000
+ACAL_TIP = ("Run auto calibration: the generator steps the frequency, the meter measures, GAIN and the table "
+            "are fitted (the generator level is the reference)")
 
 
 def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
 
 
-def interpolate(table: list[tuple[float, float]], freq: float | None) -> float:
-    """Поправка на частоте: линейно между точками, за краями - крайняя точка, пустая таблица - 0."""
-    if not table or freq is None:
-        return 0.0
-    pts = sorted(table)
-    xs = [f for f, _ in pts]
-    if freq <= xs[0]:
-        return pts[0][1]
-    if freq >= xs[-1]:
-        return pts[-1][1]
-    i = bisect.bisect_right(xs, freq)
-    (f0, d0), (f1, d1) = pts[i - 1], pts[i]
-    return d0 + (d1 - d0) * (freq - f0) / (f1 - f0) if f1 != f0 else d1
-
-
 def _dbm_to_w(dbm: float) -> float:
     return 10 ** ((dbm - 30.0) / 10.0)
 
 
-def _auto(proxy: InstrumentProxy, key: str):
+def _auto(proxy: Instrument, key: str):
     spec = proxy.params[key]
     if spec.kind is Kind.BOOL:
         return PSButton(proxy, key, [("OFF", False), ("ON", True)])
@@ -223,7 +214,7 @@ class LNumber(QLineEdit):
 class ActionButton(QPushButton):
     """Действие прибора. ``confirm`` - первый клик спрашивает SURE?, второй (за 3 с) выполняет."""
 
-    def __init__(self, proxy: InstrumentProxy, name: str, text: str, tip: str, confirm: bool = False, parent=None):
+    def __init__(self, proxy: Instrument, name: str, text: str, tip: str, confirm: bool = False, parent=None):
         super().__init__(text, parent)
         self.setObjectName("choice")
         self.proxy, self.name, self._text, self.confirm = proxy, name, text, confirm
@@ -237,6 +228,7 @@ class ActionButton(QPushButton):
         self.clicked.connect(self._click)
         proxy.action_done.connect(self._done)
         proxy.comm_error.connect(lambda _m: self._set_state(""))
+        proxy.refused.connect(lambda _m: self._set_state(""))          # прибор ведёт сценарий: не отправлено
         proxy.state_changed.connect(lambda _s: self.setEnabled(proxy.is_connected))
         self.setEnabled(proxy.is_connected)
 
@@ -384,8 +376,8 @@ class PowerReadout(QFrame):
         if self.trig_button.property("armed") != waiting:
             self.trig_button.setProperty("armed", waiting)
             _repolish(self.trig_button)
-        cal = v.get("cal")
-        self.cal_button.setText("CAL " + ("---" if cal is None else f"{cal:+.2f} dB"))
+        cal, acal = v.get("cal"), v.get("acal")
+        self.cal_button.setText(acal or "CAL " + ("---" if cal is None else f"{cal:+.2f} dB"))
 
 
 
@@ -544,25 +536,6 @@ class CalPlot(TracePlot):
         return lo, hi + 1.0
 
 
-def load_csv(path) -> list[tuple[float, float]]:
-    """Таблица калибровки: строки «частота_Hz, dB» (разделитель , ; или таб; заголовок и
-    строки не из двух чисел пропускаются)."""
-    points = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-        parts = [x for x in re.split(r"[,;\t ]+", line.strip()) if x]
-        if len(parts) < 2:
-            continue
-        try:
-            points.append((float(parts[0]), float(parts[1])))
-        except ValueError:
-            continue
-    return sorted(points)
-
-
-def save_csv(path, points) -> None:
-    Path(path).write_text("freq_hz,db\n" + "".join(f"{f:.10g},{d:.6g}\n" for f, d in points), encoding="utf-8")
-
-
 # ---------------------------------------------------------------- окно
 #: порядок восстановления: детектор (меняет запуск) -> запуск -> остальное -> непрерывный счёт
 RESTORE_RANK = {"detector": 0, "trig.source": 1, "trace.state": 3, "meas.continuous": 4}
@@ -573,16 +546,19 @@ class PowerMeterWindow(InstrumentWindow):
     DEFAULT_KIND = "u2021xa"
     PRESET_KEY = "PM_PRESETS"            # пресетов у ваттметра нет
 
-    #: ACAL ▶: (start Hz, stop Hz, точек) - выполнит слой сценариев, когда появится
+    #: ACAL ▶ нажата: (start Hz, stop Hz, точек); саму автокалибровку ведёт координатор (COORD)
     acal_requested = pyqtSignal(float, float, int)
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Power meter", parent=None):
-        self._sdg: InstrumentProxy | None = None
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Power meter", parent=None):
+        self._sdg: Instrument | None = None
+        self._acal = None                      # идущая автокалибровка (Run координатора)
+        self._acal_curve: list[tuple[float, float]] = []
         super().__init__(proxy, settings, title, parent)
         proxy.sync_done.connect(self.apply_correction)
         proxy.action_done.connect(lambda name, _r: name == "reset" and self.apply_correction())
         proxy.param_updated.connect(self._on_meas)
-        LINKS.changed.connect(self._relink)
+        COORD.links.changed.connect(self._relink)
+        COORD.run_ended.connect(self._on_run_ended)
         self._relink()
         self._refresh_readout()
 
@@ -655,8 +631,7 @@ class PowerMeterWindow(InstrumentWindow):
                 w.set_value(float(v), emit=False)
             w.changed.connect(lambda v, n=name: s.setValue(f"{pre}/{n}", v))
             w.setMinimumWidth(0)
-        self.acal_run = InstrumentWindow._tool("▶", "Run auto calibration: the generator steps the frequency, "
-                                               "the meter measures, GAIN and the table are fitted", self.run_acal)
+        self.acal_run = InstrumentWindow._tool("▶", ACAL_TIP, self.run_acal)
         self.gain_on = LToggle([("OFF", False), ("ON", True)], s.value(f"{pre}/GAIN_ON", False, type=bool))
         self.gain = LNumber(s.value(f"{pre}/GAIN", 0.0, type=float), "dB", -100.0, 100.0)
         self.gain.setToolTip("Gain in the path (subtracted)")
@@ -740,14 +715,66 @@ class PowerMeterWindow(InstrumentWindow):
         self._local_changed("CAL_FILE", name or "")
 
     def run_acal(self) -> None:
-        """Автокалибровка - пока только интерфейс: нужен слой сценариев (ГСС + ваттметр)."""
+        """▶: автокалибровка - сценарий координатора ACAL (ГСС перебирает частоты START..STOP, ваттметр
+        меряет, подбираются GAIN и таблица CSV). Во время неё та же кнопка (■) останавливает."""
+        if self._acal is not None:
+            self._acal.stop()
+            return
         start, stop, pts = self.acal_start.value, self.acal_stop.value, self.acal_points.value
         if None in (start, stop, pts) or stop <= start or pts < 2:
             self._log("ACAL", "set START < STOP and PTS >= 2")
             return
         self.acal_requested.emit(float(start), float(stop), int(pts))
-        self._log("ACAL", f"{si_format(start, 'Hz', 6)} - {si_format(stop, 'Hz', 6)}, {int(pts)} pts: "
-                          "not available yet (needs the measurement scenario layer)")
+        scenario = AutoCalibration(start, stop, int(pts), path=self.cal_dir / acal_file_name(start, stop, pts),
+                                   duty_db=self.correction_parts()["duty"])
+        try:
+            run = COORD.start(scenario, bind={"power_meter": self.proxy})
+        except ScenarioError as exc:
+            self._log("ACAL", str(exc))
+            return
+        self._acal = run
+        self._acal_curve = []
+        run.progress.connect(self._acal_progress)
+        run.point.connect(self._acal_point)
+        run.message.connect(lambda text: self._log("ACAL", text))
+        run.ended.connect(self._acal_ended)
+        self._acal_ui(True)
+
+    def _acal_ui(self, running: bool) -> None:
+        self.acal_run.setText("■" if running else "▶")
+        self.acal_run.setToolTip("Stop auto calibration (the instruments are returned as they were)"
+                                 if running else ACAL_TIP)
+        for w in (self.acal_start, self.acal_stop, self.acal_points, self.cal_choice):
+            w.setEnabled(not running)
+        self._refresh_readout()
+
+    def _acal_progress(self, done: int, total: int, _text: str) -> None:
+        self._refresh_readout()
+
+    def _acal_point(self, point: dict) -> None:
+        """Пока идёт ACAL, график показывает измеренную поправку тракта (уровень ГСС − показание)."""
+        self._acal_curve.append((point["freq"], point["level"] - point["power"]))
+        self.cal_plot.set_points(self._acal_curve)
+
+    def _acal_ended(self, run) -> None:
+        self._acal = None
+        self._acal_ui(False)
+        result = run.result if run.state == run.DONE else None
+        if result is not None and result.path is not None:
+            name = result.path.name
+            self.refresh_tables(select=name)            # новая таблица выбрана и на графике
+            self._local_changed("CAL_FILE", name)
+            self.gain.set_value(round(result.gain, 3))
+            self.gain_on.set_value(True)                # итог - строкой сценария в журнале (run.message)
+        else:
+            self.cal_plot.set_points(self.cal_points)  # график - снова выбранная таблица
+            self._log("ACAL", run.error or run.state)
+        self.apply_correction()
+
+    def _on_run_ended(self, run) -> None:
+        """Сценарий с этим ваттметром закончился - вернуть прибору поправку окна."""
+        if self.proxy in run.instruments():
+            self.apply_correction()
 
     def show_plot(self, on: bool) -> None:
         """Избранное: график (временная область) или индикатор."""
@@ -768,10 +795,12 @@ class PowerMeterWindow(InstrumentWindow):
 
     def _refresh_readout(self) -> None:
         v = self.proxy.value
+        run = self._acal
         self.readout.update_values(power=v("meas.power"), peak=v("meas.peak"), ptav=v("meas.ptav"),
                                    source=v("trig.source"), level=v("trig.level"),
                                    level_auto=v("trig.level_auto"), armed=v("meas.armed"),
-                                   cal=self.total_correction())
+                                   cal=self.total_correction(),
+                                   acal=f"ACAL {run.done}/{run.total}" if run is not None else None)
         self.readout.setEnabled(self.proxy.is_connected)
 
     def _on_state(self, state: ConnectionState) -> None:
@@ -830,8 +859,8 @@ class PowerMeterWindow(InstrumentWindow):
         total = round(self.total_correction(), 3)
         self._refresh_readout()
         p = self.proxy
-        if not p.is_connected or self._resetting:
-            return
+        if not p.is_connected or self._resetting or COORD.busy(p) is not None:
+            return                               # сценарий координатора ведёт прибор (ACAL: без поправки)
         if p.supports("offset"):
             cur = p.value("offset")
             if cur is None or abs(cur - total) > 5e-4:
@@ -843,7 +872,7 @@ class PowerMeterWindow(InstrumentWindow):
 
     # ------------------------------------------------------------ связь с ГСС (скважность)
     def _relink(self) -> None:
-        sdg = LINKS.find("function_generator") if self.duty_src.value in ("CH1", "CH2") else None
+        sdg = COORD.find("function_generator") if self.duty_src.value in ("CH1", "CH2") else None
         if sdg is self._sdg:
             return
         if self._sdg is not None:
@@ -861,10 +890,11 @@ class PowerMeterWindow(InstrumentWindow):
             self.apply_correction()
 
     def closeEvent(self, event):  # noqa: N802 - Qt
-        try:
-            LINKS.changed.disconnect(self._relink)
-        except TypeError:
-            pass
+        for signal, slot in ((COORD.links.changed, self._relink), (COORD.run_ended, self._on_run_ended)):
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
         if self._sdg is not None:
             try:
                 self._sdg.param_updated.disconnect(self._on_sdg_param)

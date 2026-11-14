@@ -1,7 +1,7 @@
 """Универсальное окно прибора, которое строится из описания параметров драйвера.
 
 ``section = "Вкладка/Группа"`` -> вкладка QTabWidget, внутри группы QGroupBox
-(до трёх в ряд). Окно общается с прибором только через InstrumentProxy (сигналы).
+(до трёх в ряд). Окно общается с прибором только через прибор координатора (Instrument, сигналы).
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QCheckBox, QDockWidget, QFormLayout, QGridLayout, Q
                              QWidget)
 
 from ..core.params import ConnectionState, Kind
-from ..core.proxy import InstrumentProxy
+from ..coord import Instrument
 from .widgets import STYLE, make_widget
 
 _LED = {
@@ -30,7 +30,7 @@ _LED = {
 class InstrumentWindow(QMainWindow):
     GROUP_COLUMNS = 3
 
-    def __init__(self, proxy: InstrumentProxy, title: str | None = None, parent=None):
+    def __init__(self, proxy: Instrument, title: str | None = None, parent=None):
         super().__init__(parent)
         self.proxy = proxy
         self.setWindowTitle(f"{title or proxy.name} — {proxy.address}")
@@ -45,11 +45,13 @@ class InstrumentWindow(QMainWindow):
         self._build_console()
 
         proxy.state_changed.connect(self._on_state)
+        proxy.reconnect_pending.connect(lambda _s: self._on_state(self.proxy.state))
         proxy.identified.connect(lambda idn: self.idn_label.setText(idn))
         proxy.instrument_error.connect(lambda c, m: self._log(f"ОШИБКА ПРИБОРА {c}: {m}", error=True))
         proxy.comm_error.connect(lambda m: self._log(f"ОШИБКА: {m}", error=True))
         proxy.scpi_log.connect(lambda d, t: self._log(f"{d} {t}"))
         proxy.raw_response.connect(lambda q, a: self._log(f"{q} → {a}"))
+        proxy.refused.connect(lambda m: self._log(f"НЕ ОТПРАВЛЕНО: {m}", error=True))
         proxy.param_status.connect(self._on_param_status)
         self._on_state(proxy.state)
 
@@ -143,7 +145,7 @@ class InstrumentWindow(QMainWindow):
 
     # ------------------------------------------------------------ обработчики
     def _toggle_connection(self) -> None:
-        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+        if self.proxy.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING) or self.proxy.reconnecting:
             self.proxy.close()
         else:
             self.proxy.open()
@@ -163,11 +165,13 @@ class InstrumentWindow(QMainWindow):
 
     def _on_state(self, state: ConnectionState) -> None:
         color, text = _LED[state]
+        if state is ConnectionState.ERROR and self.proxy.reconnecting:
+            text = "Нет связи, переподключение…"
         self.led.setStyleSheet(f"background: {color};")
         self.state_label.setText(text)
         connected = state is ConnectionState.CONNECTED
-        self.connect_btn.setText("Отключить" if state in (ConnectionState.CONNECTED,
-                                                           ConnectionState.CONNECTING) else "Подключить")
+        self.connect_btn.setText("Отключить" if state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
+                                 or self.proxy.reconnecting else "Подключить")
         self.tabs.setEnabled(connected)
         self.sync_btn.setEnabled(connected)
         for b in self.action_buttons:

@@ -629,3 +629,40 @@ def test_markers_of_selected_trace(make):
     assert not any(m["on"] for m in sim.meas["CH2_S21"]["marks"].values()) and actions[-1] == ("mark_aoff", [])
     assert setp(drv, rec, "mark.n", 11) is not PStatus.WRITTEN
     assert not rec.comm
+
+
+def test_serial_poll_not_supported_falls_back_to_stb_query(qapp):
+    """VI_ERROR_NSUP_OPER на read_stb (LAN): дальше статус через *STB?, без ошибки связи."""
+    from visalab.transport import SimTransport
+    from visalab.transport import TransportNotSupported
+    from visalab.drivers import DRIVERS
+    drv_cls, sim_cls = DRIVERS["pna"]
+
+    class NoPoll(SimTransport):
+        def read_stb(self):
+            raise TransportNotSupported("The given session or object reference does not support this operation")
+
+    t = NoPoll(sim_cls())
+    drv = drv_cls(t)
+    comm = []
+    drv.comm_error.connect(comm.append)
+    drv.open_connection()
+    drv._on_poll()
+    drv._on_poll()
+    assert not comm and t.supports_serial_poll is False
+    drv.close_connection()
+
+
+def test_stimulus_changed_on_the_pna_screen(vna):
+    """Стимул поменяли на экране PNA: ось трассы и ключи стимула - по прибору, без SYNC."""
+    drv, sim, rec = vna
+    drv.poll()
+    assert rec.values["trace"].x[-1] == pytest.approx(13.5e9)
+    sim.stim(1).update(start=1e9, stop=3e9, poin=201)          # не через драйвер
+    drv.poll()
+    drv.poll()
+    t = rec.values["trace"]
+    assert t.x[0] == pytest.approx(1e9) and t.x[-1] == pytest.approx(3e9)
+    assert rec.values["freq.start"] == pytest.approx(1e9) and rec.values["freq.stop"] == pytest.approx(3e9)
+    assert rec.values["freq.center"] == pytest.approx(2e9) and rec.values["freq.span"] == pytest.approx(2e9)
+    assert not rec.errors and not rec.comm

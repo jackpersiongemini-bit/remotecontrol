@@ -10,7 +10,8 @@ from __future__ import annotations
 from collections import deque
 from typing import Callable
 
-from ..core.scpi import match_header, parse_number, split_header, split_units
+from ..core.units import parse_number
+from ..transport.scpi import match_header, split_header, split_units
 
 __all__ = ["SimInstrument", "SimError"]
 

@@ -24,7 +24,7 @@ def gen(request, make):
 
 
 def test_same_keys_on_both_generators(qapp):
-    from visalab.core import SimTransport
+    from visalab.transport import SimTransport
     a = KeysightE8267D(SimTransport(KeysightE8267DSim()))
     b = RSSMF100A(SimTransport(RSSMF100ASim()))
     assert set(a.params) == set(b.params) and set(a.actions) == set(b.actions)

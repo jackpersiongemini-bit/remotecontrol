@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from .scpi import format_bool, format_number, parse_bool, parse_number
+from .units import format_bool, format_number, parse_bool, parse_number
 
 __all__ = ["PStatus", "Kind", "Param", "Action", "ConnectionState"]
 

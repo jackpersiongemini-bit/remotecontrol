@@ -2,7 +2,9 @@
 import pytest
 from PyQt6.QtCore import QPoint, QSettings, Qt
 
-from visalab.core import InstrumentProxy, SimTransport
+from conftest import attach
+from visalab.instruments import InstrumentProxy
+from visalab.transport import SimTransport
 from visalab.drivers import DRIVERS
 from visalab.front import PSUWindow
 from visalab.front.psu import SourceGrid
@@ -10,7 +12,7 @@ from visalab.front.psu import SourceGrid
 
 def _proxy():
     drv, sim_cls = DRIVERS["it6300"]
-    return InstrumentProxy(drv, SimTransport(sim_cls()))
+    return attach(InstrumentProxy(drv, SimTransport(sim_cls())))
 
 
 @pytest.fixture

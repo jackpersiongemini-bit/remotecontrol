@@ -42,6 +42,8 @@ TOKENS = {
     "UI_CONTROL_HEIGHT_PX": 28,
     "UI_COLUMN_WIDTH_PX": 84,
 }
+#: цвета трасс на графиках (первая - как текст, дальше - приглушённые, различимые на #222)
+UI_TRACE_COLORS = ("#f2f2f2", "#e3a21a", "#5aa9e6", "#4fbf6f", "#e0605f", "#b48ad8", "#9a9a9a", "#d8c36a")
 WINDOW_BAR_HEIGHT = TOKENS["UI_TITLE_BAR_ITEM_SIZE_PX"] + 14
 TITLE_BAR_BUTTON_LINE_WIDTH = 1.2
 

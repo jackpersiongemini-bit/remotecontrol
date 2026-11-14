@@ -1,12 +1,13 @@
-from .instrument import ESR_BITS, InstrumentError, VISAInstrument
+"""Общий словарь портов - не слой.
+
+То, на чём говорят все порты: типы значений и состояний (:mod:`.params`), контракт класса приборов
+(:mod:`.profile`, стандартные профили - :mod:`visalab.profiles`), трасса (:mod:`.trace`) и её запись
+в файлы (:mod:`.export`), числа и SI-префиксы (:mod:`.units`). Модули словаря не знают ни о приборах,
+ни о соединениях, поэтому ими пользуется любой слой (см. README, «Слои и порты»).
+"""
 from .params import Action, ConnectionState, Kind, Param, PStatus
 from .profile import ActionSlot, Profile, ProfileError, Slot
-from .proxy import InstrumentProxy
 from .trace import Trace
-from .transport import PyVisaTransport, SimTransport, Transport, TransportError, TransportTimeout
 
-__all__ = [
-    "VISAInstrument", "InstrumentProxy", "InstrumentError", "ESR_BITS",
-    "Param", "Action", "Trace", "Profile", "Slot", "ActionSlot", "ProfileError", "Kind", "PStatus", "ConnectionState",
-    "Transport", "PyVisaTransport", "SimTransport", "TransportError", "TransportTimeout",
-]
+__all__ = ["Param", "Action", "Trace", "Profile", "Slot", "ActionSlot", "ProfileError", "Kind", "PStatus",
+           "ConnectionState"]

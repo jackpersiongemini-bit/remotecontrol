@@ -19,7 +19,7 @@ OFF всех), STIM (стимул и развёртка), TRIG (запуск), P
 мощности чипами: клик ставит, «+» текущая, «−» выбранная), CAL (cal set'ы прибора чипами: клик применяет к каналу выбранного трейса, NONE снимает;
 стимул из cal set или свой, CORR, интерполяция; CALIBRATE открывает отдельное окно калибровки), SAVE (состояния в памяти прибора: чип -
 вызвать, + сохранить, − удалить; в ini только порядок чипов).
-Окно знает только InstrumentProxy и ключи профиля network_analyzer.
+Окно знает только прибор координатора (Instrument) и ключи профиля network_analyzer.
 """
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushBu
 
 from ..core.export import write_touchstone, write_traces_csv
 from ..core.params import Kind
-from ..core.proxy import InstrumentProxy
-from ..core.scpi import si_format
+from ..coord import Instrument
+from ..core.units import si_format
 from . import instrument_window as _iw
 from .instrument_window import (PRESET_GAP, HScrollArea, InstrumentWindow, PowerSpin, PresetGroup,
                                 parse_power_list)
@@ -78,7 +78,7 @@ def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
 
 
-def _auto(proxy: InstrumentProxy, key: str):
+def _auto(proxy: Instrument, key: str):
     spec = proxy.params[key]
     if spec.kind is Kind.BOOL:
         return PSButton(proxy, key, AUTO if key.endswith("_auto") else ONOFF)
@@ -90,7 +90,7 @@ def _auto(proxy: InstrumentProxy, key: str):
 class MathButton(IndicatorButton):
     """Математика с памятью у всех читаемых измерений; показывает первое читаемое. Индикатор - не DATA."""
 
-    def __init__(self, proxy: InstrumentProxy, parent=None):
+    def __init__(self, proxy: Instrument, parent=None):
         super().__init__("DATA", parent)
         self.proxy = proxy
         self.setObjectName("choice")
@@ -143,7 +143,7 @@ class CWButton(IndicatorButton):
     """CW - режим генератора (``gen.state``): канал CH в CW, остальные каналы стоят; повторный клик
     возвращает настройки канала, как были до включения (это делает драйвер)."""
 
-    def __init__(self, proxy: InstrumentProxy, parent=None):
+    def __init__(self, proxy: Instrument, parent=None):
         super().__init__("CW", parent)
         self.proxy = proxy
         self.setObjectName("choice")
@@ -258,7 +258,7 @@ class TraceEditor(QWidget):
     Слоты не видны: READ сам занимает свободный (до 16 читаемых). В режиме генератора трейсы
     других каналов недоступны."""
 
-    def __init__(self, proxy: InstrumentProxy, parent=None):
+    def __init__(self, proxy: Instrument, parent=None):
         super().__init__(parent)
         self.proxy = proxy
         self.table: list[tuple[int, str, str, str, str]] = []
@@ -462,7 +462,7 @@ class MarkerPanel(QWidget):
 
     MARKS = 10
 
-    def __init__(self, proxy: InstrumentProxy, trace_row=None, parent=None):
+    def __init__(self, proxy: Instrument, trace_row=None, parent=None):
         super().__init__(parent)
         self.proxy, self.trace_row = proxy, trace_row
         self.table: dict[int, tuple[float, float | None]] = {}
@@ -517,7 +517,7 @@ class CalSets(QWidget):
 
     NONE = "NONE"
 
-    def __init__(self, proxy: InstrumentProxy, parent=None):
+    def __init__(self, proxy: Instrument, parent=None):
         super().__init__(parent)
         self.proxy = proxy
         self.names: list[str] = []
@@ -625,7 +625,7 @@ class CalWizard(QWidget):
 
     OFF = "OFF"
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, prefix: str, parent=None):
         super().__init__(parent)
         self.proxy, self.settings, self.prefix = proxy, settings, prefix
         self.conns: list[str] = []
@@ -847,7 +847,7 @@ class CalWindow(Window):
     """Отдельное окно калибровки (guided) канала выбранного трейса: P1 / P2, START / ABORT, шаги, NAME + SAVE.
     Закрытие окна посреди калибровки её прерывает (развёртки продолжаются)."""
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, prefix: str, parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, prefix: str, parent=None):
         super().__init__(settings, parent)
         self.proxy = proxy
         wz = self.wizard = CalWizard(proxy, settings, prefix)
@@ -909,7 +909,7 @@ class VNAWindow(InstrumentWindow):
     PRESET_DEFAULTS = ()
     PRESET_ADD_TIP = "Save the current state in the analyzer memory"
 
-    def __init__(self, proxy: InstrumentProxy, settings: QSettings, title: str = "Network analyzer", parent=None):
+    def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Network analyzer", parent=None):
         self._select_after_list: str | None = None
         super().__init__(proxy, settings, title, parent)
         # столбики «+»/«−» (TRC, SAVE) - по ширине кнопок, у правого края (вкладки задают ширину столбца)

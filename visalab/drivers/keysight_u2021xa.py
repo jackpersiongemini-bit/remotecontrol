@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.instrument import VISAInstrument
+from .base import VISAInstrument
 from ..core.params import Action, Kind, Param
 from ..core.trace import Trace
 from ..profiles import POWER_METER
@@ -283,6 +283,11 @@ class KeysightU2021XA(VISAInstrument):
         meta = {"trigger": self._values.get("trig.source"), "delay": self._values.get("trig.delay"),
                 "gate": (self._values.get("gate.start"), self._values.get("gate.length"))}
         return Trace.linear(start, start + length, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
+
+    def after_poll_timeout(self) -> None:
+        """Чтение результата прервал таймаут (обмен уже восстановлен): взвести измерение снова."""
+        if self._continuous and not self._armed and not (self._free_run and not self._tracing):
+            self._arm()
 
     def poll(self) -> None:
         if self._free_run and self._continuous and not self._tracing:
