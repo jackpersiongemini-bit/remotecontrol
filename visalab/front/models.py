@@ -164,6 +164,7 @@ class ModelWindow(Window):
         lay.setSpacing(8)
         lay.addWidget(table)
         lay.addWidget(buttons)
+        lay.addStretch()                           # окно растянули - строки и кнопки остаются сверху
         panel = Panel(body)
         table.build(UI_COLUMN_WIDTH_PX * 2)
         outer = QVBoxLayout(self)
@@ -171,7 +172,8 @@ class ModelWindow(Window):
         outer.addWidget(panel)
         self.setMinimumWidth(max(self.titleBar.sizeHint().width(), outer.minimumSize().width()))
         self.recall_size(QSize(self.minimumWidth(), 0))
-        self.setFixedHeight(outer.sizeHint().height())
+        outer.activate()
+        self.fit_to(outer)                         # по содержимому; растянуть можно
 
     @staticmethod
     def _button(text, tip, slot) -> QPushButton:

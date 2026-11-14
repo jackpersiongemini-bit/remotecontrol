@@ -13,7 +13,8 @@
 * ВАЦ - развёртки идут всегда, поэтому тоже по уровню: хоть один S21 / S12 выше ``vna_thru_db``
   (есть передача - что-то стоит между портами) или S11 / S22 ниже ``vna_refl_db`` (порт нагружен,
   а не открыт). Модуль берётся из комплексных данных слота или из формата MLOG / LIN_MAG / SWR /
-  POLAR / SMITH; PHASE, GDELAY... без комплексных данных уровень не дают. rf.output = False - не измеряет.
+  POLAR / SMITH. Трейс без модуля (PHASE, GDELAY...) по уровню не судится - пока идут развёртки, ВАЦ
+  с таким трейсом измеряет (Алексей: «трейс на фазе - и ничего не происходит»). rf.output = False - не измеряет.
 
 Для анализатора и ваттметра координатор ищет источник: включённый генератор на частоте пика
 (для ваттметра - на частоте датчика ``freq``; если включён один генератор - он) и считает
@@ -38,8 +39,10 @@ __all__ = ["ActivityMonitor", "Activity", "Source", "Thresholds", "RECEIVERS", "
            "spectrum_peak", "match_source", "vna_signal", "slot_magnitude_db", "magnitude_db", "short_name"]
 
 RECEIVERS = ("network_analyzer", "power_meter", "spectrum_analyzer")
+#: короткие имена классов приборов - плитки главного окна и заголовки окон (Алексей 2026-11-14: генератор
+#: импульсов - PULSE, не SDG)
 SHORT_NAMES = {"network_analyzer": "VNA", "power_meter": "PM", "spectrum_analyzer": "SA",
-               "signal_generator": "GEN", "function_generator": "SDG", "power_supply": "PSU"}
+               "signal_generator": "GEN", "function_generator": "PULSE", "power_supply": "PSU"}
 #: сколько последних показаний ваттметра хранится (точки на графике)
 HISTORY = 2000
 _SOURCE_KEYS = frozenset(("rf.output", "rf.frequency", "rf.power", "gen.state", "freq.cw", "source.power"))
@@ -162,6 +165,8 @@ class ActivityMonitor(QObject):
         self._sa: dict[Any, tuple[bool, float, float, float]] = {}
         self._measuring: dict[Any, bool] = {}
         self.history: dict[Any, deque] = {}
+        #: ваттметр -> {частота датчика, Hz: (время, dBm)} - последнее показание с сигналом на каждой частоте
+        self.pm_points: dict[Any, dict[float, tuple[float, float]]] = {}
         links.changed.connect(self._sync_roster)
         self._timer = QTimer(self)
         self._timer.setInterval(500)
@@ -204,7 +209,7 @@ class ActivityMonitor(QObject):
         current = self.proxies()
         for p in [p for p in self._conns if p not in current]:
             self._drop(p)
-            for d in (self._last_signal, self._updated, self._sa, self._measuring, self.history):
+            for d in (self._last_signal, self._updated, self._sa, self._measuring, self.history, self.pm_points):
                 d.pop(p, None)
         for p in current:
             if p in self._conns:
@@ -246,6 +251,12 @@ class ActivityMonitor(QObject):
             self._updated[proxy] = now
             if v >= self.th.pm_floor_dbm:
                 self._last_signal[proxy] = now
+                f = _num(proxy.value("freq"))
+                if f is not None:
+                    points = self.pm_points.setdefault(proxy, {})
+                    points[float(round(f))] = (now, v)
+                    while len(points) > HISTORY:          # самые старые частоты - вон
+                        del points[min(points, key=lambda k: points[k][0])]
             self._emit(proxy)
         elif prof == "power_meter" and key == "trace" and isinstance(value, Trace):
             self._updated[proxy] = now
@@ -266,18 +277,26 @@ class ActivityMonitor(QObject):
             self._emit(proxy)
 
     def vna_has_signal(self, proxy) -> bool:
-        """Хоть один включённый слот показывает по уровню, что на портах что-то есть."""
+        """Хоть один включённый слот показывает по уровню, что на портах что-то есть. Слот, у которого
+        модуля нет (фаза, групповая задержка...), по уровню не судится: он сам - «измеряет»."""
         for n in range(1, 17):
             if not proxy.value(f"m{n}.enabled"):
                 continue
+            mag = sp = None
+            seen = False
             for key in (f"m{n}.sdata", f"m{n}.trace"):
                 tr = proxy.value(key)
-                mag = slot_magnitude_db(tr) if isinstance(tr, Trace) and len(tr) else None
+                if not isinstance(tr, Trace) or not len(tr):
+                    continue
+                seen = True
+                mag = slot_magnitude_db(tr)
                 if mag is not None:
                     sp = (tr.meta or {}).get("sparam") or proxy.value(f"m{n}.sparam")
-                    if vna_signal(sp, mag, self.th.vna_thru_db, self.th.vna_refl_db):
-                        return True
                     break
+            if mag is not None and vna_signal(sp, mag, self.th.vna_thru_db, self.th.vna_refl_db):
+                return True
+            if mag is None and seen:                 # фаза / задержка: данные идут - значит, измеряет
+                return True
         return False
 
     def _emit(self, proxy) -> None:
@@ -360,6 +379,15 @@ class ActivityMonitor(QObject):
 
     def _tol(self, freq: float | None, step: float) -> float:
         return max(self.th.freq_tol_hz, self.th.freq_tol_rel * abs(freq or 0.0), 2 * step)
+
+    def pm_table(self, proxy) -> list[tuple[float, float, float]]:
+        """Таблица ваттметра: [(частота Hz, dBm, время показания)] по возрастанию частоты - на каждой
+        частоте датчика последнее показание с сигналом (не ниже ``pm_floor_dbm``)."""
+        return sorted((f, v, t) for f, (t, v) in self.pm_points.get(proxy, {}).items())
+
+    def clear_pm_table(self, proxy) -> None:
+        self.pm_points.pop(proxy, None)
+        self.changed.emit(proxy)
 
     def vna_traces(self, proxy) -> list[tuple[str, Trace]]:
         """Трейсы включённых слотов ВАЦ: [(«1·S21 MLOG», трасса)]."""

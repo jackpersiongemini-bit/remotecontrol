@@ -262,7 +262,15 @@ def test_connection_page_from_address(qtbot, opened, settings):
     _sim, _proxy, win = opened
     win.show()
     qtbot.waitExposed(win)
-    win.address.clicked.emit()
+    from PyQt6.QtCore import Qt
+    bar = win.titleBar.hBoxLayout                            # переключатель, рядом ошибки, ..., имя прибора
+    order = [bar.itemAt(i).widget() for i in range(bar.count()) if bar.itemAt(i).widget() is not None]
+    assert order[:5] == [win.on_button, win.error_indicator, win.sync_button, win.init_button, win.address]
+    assert win.address.text().startswith("PULSE") and win.proxy.address in win.address.toolTip()
+    assert win.on_button.height() < win.sync_button.height()      # переключатель ниже кнопок
+    qtbot.mouseClick(win.address, Qt.MouseButton.LeftButton)      # один клик - ничего
+    assert not win.connection_page.isVisible()
+    qtbot.mouseDClick(win.address, Qt.MouseButton.LeftButton)     # двойной - настройки подключения
     assert win._expanded and win.connection_page.isVisible()
     assert not win.error_page.isVisible() and not any(p.isVisible() for p in win.pages)
     assert win.driver_choice.value == "sdg"
@@ -435,3 +443,36 @@ def test_rejected_eqphase_is_logged_once_and_not_as_period(qtbot, settings):
     assert text.count("[EQPHASE]") == 1 and "INSTRUMENT" in text
     assert win.tracker.names.get("ch1.period", "ch1.period") not in text
     proxy.shutdown()
+
+
+def test_window_stretches_and_remembers_height(qtbot, opened, settings):
+    """Окна растягиваются (Алексей 2026-11-14); растянутая высота вида запоминается, журнал растёт с окном."""
+    _sim, _proxy, win = opened
+    win.show()
+    qtbot.waitExposed(win)
+    win.set_expanded(True)
+    win.set_page(0)
+    qtbot.wait(20)
+    fit = win.height()
+    assert win.minimumHeight() == fit and win.maximumHeight() > 10 * fit     # сжать нельзя, растянуть - да
+    panel = win.parameter_panel.height()
+    win.resize(win.width(), fit + 150)                                          # растянули руками
+    qtbot.wait(20)
+    assert win.view_heights == {"tab0": fit + 150} and win.parameter_panel.height() == panel + 150
+    win.set_page(1)                                                             # другая вкладка - по содержимому
+    qtbot.wait(20)
+    assert win.height() == win._layout.sizeHint().height()
+    win.set_page(0)                                                             # эта - как растянули
+    qtbot.wait(20)
+    assert win.height() == fit + 150
+    win.resize(win.width(), fit)                                                # сжали до содержимого - забыта
+    assert "tab0" not in win.view_heights
+    win.show_errors()                                                           # журнал растёт вместе с окном
+    qtbot.wait(20)
+    log = win.error_log.height()
+    win.resize(win.width(), win.height() + 200)
+    qtbot.wait(20)
+    assert win.error_log.height() == log + 200 and win.view_heights["errors"] == win.height()
+    win.close()
+    import json
+    assert json.loads(settings.value(f"WINDOW_HEIGHTS/{type(win).__module__}.{type(win).__qualname__}")) == win.view_heights

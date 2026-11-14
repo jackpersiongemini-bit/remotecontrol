@@ -207,3 +207,25 @@ def test_pm_launcher_with_sdg(qtbot, tmp_path, monkeypatch):
     assert [type(w).__name__ for w in made] == ["PowerMeterWindow", "PulseGenWindow"]
     for w in made:
         w.proxy.shutdown()
+
+
+def test_time_plot_grows_with_window(qtbot, pm):
+    proxy, win, _s = pm
+    win.show()
+    qtbot.waitExposed(win)
+    proxy.set("trace.state", True)
+    _wait(qtbot, proxy, "trace.state", lambda v: v is True)
+    qtbot.waitUntil(lambda: not win.plot.isHidden(), timeout=5000)
+    qtbot.wait(20)
+    assert win.minimumHeight() <= win.height() < win.maximumHeight()      # окно растягивается
+    h = win.plot.height()
+    win.resize(win.width(), win.height() + 120)
+    qtbot.wait(20)
+    assert win.plot.height() == h + 120                         # лишняя высота - графику
+    win.set_expanded(True)
+    win.set_page(1)                                             # CAL: два графика делят высоту
+    qtbot.wait(20)
+    cal = win.cal_plot.height()
+    win.resize(win.width(), win.height() + 100)
+    qtbot.wait(20)
+    assert win.cal_plot.height() > cal and win.plot.height() > h

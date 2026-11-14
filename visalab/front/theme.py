@@ -39,6 +39,8 @@ TOKENS = {
     "UI_TITLE_BAR_ITEM_SIZE_PX": 26,
     "UI_TITLE_BAR_WIDE_ITEM_SIZE_PX": 52,
     "UI_SWITCH_MARGIN_PX": 3,
+    "UI_SWITCH_WIDTH_PX": 38,              # переключатель связи в заголовке: ниже кнопок (Алексей 2026-11-14)
+    "UI_SWITCH_HEIGHT_PX": 18,
     "UI_CONTROL_HEIGHT_PX": 28,
     "UI_COLUMN_WIDTH_PX": 84,
     "UI_SCROLLBAR_WIDTH_PX": 8,            # полоса прокрутки: дорожка без фона, ручка - тонкая скруглённая

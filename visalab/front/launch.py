@@ -92,9 +92,13 @@ def _quit(opened: list[dict]) -> None:
 
 
 def remember_windows(opened: list[dict], settings: QSettings) -> None:
-    """Запомнить, какие окна приборов открыты (вызывать ДО выхода: quit сам закрывает окна)."""
+    """Запомнить, какие окна приборов открыты, и их размеры (вызывать ДО выхода: quit закрывает окна
+    без closeEvent - размеры иначе не сохранились бы)."""
     for cur in opened:
-        settings.setValue(f"WINDOWS/{cur['lab_key']}/VISIBLE", bool(cur["win"].isVisible()))
+        key, visible = f"WINDOWS/{cur['lab_key']}/VISIBLE", bool(cur["win"].isVisible())
+        if settings.value(key, None, type=bool) != visible or settings.value(key) is None:
+            settings.setValue(key, visible)
+        cur["win"].save_size()
     settings.sync()
 
 

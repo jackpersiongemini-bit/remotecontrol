@@ -171,11 +171,14 @@ def test_main_window_tile_shows_retry(qtbot, gen, tmp_path):
     qtbot.addWidget(win)
     with qtbot.waitSignal(proxy.sync_done, timeout=5000):
         proxy.open()
-    _power_off(sim, tr)
-    qtbot.waitUntil(lambda: win.tiles[inst].text().endswith("RETRY"), timeout=5000)
+    tile = win.tiles[inst]
+    assert not tile.error
+    _power_off(sim, tr)                                 # связь потеряна: плитка красная, в подсказке - почему
+    qtbot.waitUntil(lambda: tile.error and "reconnecting" in tile.toolTip(), timeout=5000)
+    assert tile.text() == "GEN"                         # на плитке только имя (Алексей 2026-11-14)
     _power_on(sim, tr)
     qtbot.waitUntil(lambda: proxy.is_connected, timeout=5000)
-    qtbot.waitUntil(lambda: not win.tiles[inst].text().endswith("RETRY"), timeout=5000)
+    qtbot.waitUntil(lambda: not tile.error, timeout=5000)
 
 
 # ------------------------------------------------------------------ проверка доступности узла LAN
