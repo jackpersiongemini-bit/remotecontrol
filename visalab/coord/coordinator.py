@@ -30,6 +30,7 @@ from PyQt6.QtCore import QCoreApplication, QEventLoop, QObject, pyqtSignal
 from .. import instruments as _instruments
 from ..core.params import ConnectionState
 from ..profiles import PROFILES
+from .activity import short_name
 from .instrument import Instrument
 from .registry import LINKS, ProxyLinks
 from .scenario import Device, Run, Scenario, ScenarioError
@@ -121,6 +122,11 @@ class Coordinator(QObject):
     def proxies(self) -> list[Instrument]:
         """Приборы процесса в порядке открытия."""
         return self.links.proxies()
+
+    def display_name(self, inst) -> str:
+        """Что это за прибор, коротко: VNA, SA, PM, GEN, PULSE, PSU; второй того же класса - GEN2.
+        Так прибор подписан на плитке главного окна и в заголовке своего окна."""
+        return short_name(inst, self.links.proxies())
 
     # ------------------------------------------------------------ сценарии
     def runs(self) -> list[Run]:

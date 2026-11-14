@@ -42,6 +42,7 @@ from .instrument_window import InstrumentWindow
 from .params import IndicatorButton, PChoice, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
                     UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
+from .window import mark_growing
 
 __all__ = ["PowerMeterWindow", "PowerReadout", "TracePlot", "CalPlot", "load_csv", "save_csv", "saved_connection", "interpolate"]
 
@@ -395,6 +396,7 @@ class TracePlot(QWidget):
         self._mouse: QPointF | None = None
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
+        mark_growing(self)                        # растянули окно - график выше
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def set_trace(self, trace: Trace | None) -> None:

@@ -1,7 +1,8 @@
 """Общее окно прибора в стиле PulseGen.py Алексея.
 
-Заголовок: связь (ползунок), Sync, Init (*RST + восстановление сохранённого), адрес (клик -
-настройки подключения), индикатор ошибок (клик - журнал), развернуть / свернуть.
+Заголовок: связь (ползунок), индикатор ошибок (клик - журнал), Sync, Init (*RST + восстановление
+сохранённого), что это за прибор - VNA, PM... (двойной клик - настройки подключения), развернуть / свернуть.
+Высота окна - по содержимому; окно можно растянуть, графики и журнал растут вместе с ним.
 Ниже - «избранное» (выходы, пресеты, главные поля) и сворачиваемые вкладки с таблицами
 параметров. На месте таблицы могут открываться журнал ошибок и настройки подключения
 (выход - клик по вкладке).
@@ -20,9 +21,10 @@ import re
 import time
 from typing import Any, Callable
 
-from PyQt6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
-                             QSizePolicy, QVBoxLayout, QWidget)
+from PyQt6 import sip
+from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+                             QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
 from ..coord import COORD, Instrument
 from ..core.params import ConnectionState, PStatus
@@ -31,10 +33,10 @@ from .models import ModelWindow, all_models, model_class
 from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
-                     Window, short_address)
+                     Window, WriteState, mark_growing)
 
 __all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay", "parse_power_list",
-           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST"]
+           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "WINDOW_EVENTS", "window_for"]
 
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
@@ -287,6 +289,31 @@ class HScrollArea(QScrollArea):
         e.accept()
 
 
+class LogView(QPlainTextEdit):
+    """Журнал ошибок окна: обычно 10 строк, растёт вместе с окном."""
+
+    def sizeHint(self):  # noqa: N802 - Qt
+        return QSize(UI_COLUMN_WIDTH_PX * 4, 10 * self.fontMetrics().lineSpacing() + 12)
+
+
+class WindowEvents(QObject):
+    """Окна приборов процесса: ``changed(прибор)`` - окно создано, показано, скрыто или у него изменились
+    ошибки (плитки главного окна: «окно открыто» и «ошибка»)."""
+
+    changed = pyqtSignal(object)
+
+
+WINDOW_EVENTS = WindowEvents()
+
+
+def window_for(proxy) -> "InstrumentWindow | None":
+    """Окно прибора в этом процессе (может быть скрыто) или None."""
+    for w in QApplication.topLevelWidgets():
+        if isinstance(w, InstrumentWindow) and not sip.isdeleted(w) and w.proxy is proxy:
+            return w
+    return None
+
+
 class InstrumentWindow(Window):
     """База окна прибора. Наследник задаёт атрибуты класса и ``build()``."""
 
@@ -351,14 +378,17 @@ class InstrumentWindow(Window):
         self.init_button = CustomInitButton()
         self.init_button.setToolTip("Reset (*RST) and restore saved values")
         self.init_button.clicked.connect(self._init)
-        self.address = AddressLabel(short_address(proxy.address))
-        self.address.setToolTip(proxy.address)
+        # вместо адреса - что это за прибор (VNA, PM...), адрес - в подсказке (Алексей 2026-11-14)
+        self.address = AddressLabel(COORD.display_name(proxy))
+        self._update_name()
         self.error_indicator = ErrorIndicator()
-        # ход записи виден по цвету рамки самого поля; в заголовке остаётся только индикатор ошибок
-        for i, w in enumerate((self.on_button, self.sync_button, self.init_button, self.address,
-                               self.error_indicator)):
+        # ход записи виден по цвету рамки самого поля; в заголовке остаётся только индикатор ошибок -
+        # рядом с переключателем связи (Алексей)
+        for i, w in enumerate((self.on_button, self.error_indicator, self.sync_button, self.init_button,
+                               self.address)):
             bar.insert_widget(w, i)
-        bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает адрес
+        bar.hBoxLayout.setAlignment(self.on_button, Qt.AlignmentFlag.AlignVCenter)   # он ниже кнопок
+        bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает имя прибора
         self.expand_button = CustomExpandButton()
         self.expand_button.setToolTip("Show / hide all parameters")
         self.expand_button.clicked.connect(lambda: self.set_expanded(not self.expand_button.expanded))
@@ -407,17 +437,19 @@ class InstrumentWindow(Window):
         lay.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
         lay.setSpacing(8)
         lay.addWidget(self.preset_panel)
-        lay.addWidget(self.parameter_panel)
-        lay.addStretch()
+        lay.addWidget(self.parameter_panel, 1)    # растянули окно - панель растёт (график в ней - вместе с ней)
         self._layout = lay
 
         # ---------------------------------------------------------- состояние
         keys = list(dict.fromkeys(w.key for w in self.bound_widgets()))
         names = {k: k.upper().replace(".", " ") for k in keys}
+        names["instrument"] = "INSTRUMENT"
         self.tracker = WriteTracker(proxy, keys, names, self)
         self.tracker.changed.connect(self.error_indicator.set_items)
+        self.tracker.changed.connect(lambda *_a: WINDOW_EVENTS.changed.emit(self.proxy))
         self.error_indicator.clicked.connect(self.show_errors)
-        self.address.clicked.connect(self.show_connection)
+        self.address.double_clicked.connect(self.show_connection)
+        COORD.links.changed.connect(self._update_name)       # второй прибор того же класса - GEN2
         proxy.param_status.connect(self._log_status)
         proxy.instrument_error.connect(self._log_instrument_error)
         proxy.state_changed.connect(self._on_state)
@@ -436,6 +468,7 @@ class InstrumentWindow(Window):
         self.set_page(settings.value(f"{self._prefix}/TAB", 0, type=int), fit=False)
         self.set_expanded(settings.value(f"{self._prefix}/EXPANDED", False, type=bool))
         self._update_tabs()
+        WINDOW_EVENTS.changed.emit(proxy)
 
     def bound_widgets(self) -> list:
         """Все виджеты, привязанные к ключам (для журнала ошибок)."""
@@ -523,6 +556,11 @@ class InstrumentWindow(Window):
     def showEvent(self, e):  # noqa: N802 - Qt
         super().showEvent(e)
         self._fit_height()                # до показа раскладки считаются неточно
+        WINDOW_EVENTS.changed.emit(self.proxy)
+
+    def hideEvent(self, e):  # noqa: N802 - Qt
+        super().hideEvent(e)
+        WINDOW_EVENTS.changed.emit(self.proxy)
 
     def _show_pages(self) -> None:
         overlay = self._overlay if self._expanded else None
@@ -557,15 +595,32 @@ class InstrumentWindow(Window):
         self._show_pages()
         self._fit_height()
 
+    def view_key(self) -> str:
+        """Вид окна для запомненной высоты: свёрнуто, вкладка, журнал, подключение."""
+        if not getattr(self, "_expanded", False):
+            return "collapsed"
+        return getattr(self, "_overlay", None) or f"tab{self.tabs.currentIndex()}"
+
+    def _grows(self, panel: QWidget) -> bool:
+        return any(w.property("grows") and w.isVisibleTo(self) for w in panel.findChildren(QWidget))
+
     def _fit_height(self, again: bool = True) -> None:
-        """Высота окна - по содержимому (вложенные раскладки пересчитываются не сразу)."""
-        QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
-        for w in self.findChildren(QWidget):          # вложенные раскладки хранят старые размеры
-            if w.layout() is not None:
-                w.layout().invalidate()
-        self._layout.invalidate()
-        self._layout.activate()
-        self.setFixedHeight(self._layout.sizeHint().height())
+        """Высота окна - по содержимому (вложенные раскладки пересчитываются не сразу). Окно можно
+        растянуть: лишняя высота - графику / журналу, а если их нет - панели параметров."""
+        with self.fitting():
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
+            for w in self.findChildren(QWidget):          # вложенные раскладки хранят старые размеры
+                if w.layout() is not None:
+                    w.layout().invalidate()
+            # лишняя высота: панелям с графиком / журналом (в избранном - TRAC ON), обеим - по их высоте
+            # (Qt выравнивает размеры по stretch); нет графиков - панели параметров
+            top, params = self._grows(self.preset_panel), self._grows(self.parameter_panel)
+            self._layout.setStretchFactor(self.preset_panel, self.preset_panel.sizeHint().height() if top else 0)
+            self._layout.setStretchFactor(self.parameter_panel,
+                                          self.parameter_panel.sizeHint().height() if params else int(not top))
+            self._layout.invalidate()
+            self._layout.activate()
+            self.fit_to(self._layout, top or params)
         if again:
             QTimer.singleShot(0, self._fit_height_again)   # связанный метод: не сработает после удаления окна
 
@@ -629,12 +684,13 @@ class InstrumentWindow(Window):
         self.clear_button.setProperty("wide", True)
         head.addWidget(self.clear_button)
         lay.addLayout(head)
-        self.error_log = QPlainTextEdit()
+        self.error_log = LogView()
         self.error_log.setObjectName("errorLog")
         self.error_log.setReadOnly(True)
         self.error_log.setPlaceholderText("No errors")
         self.error_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.error_log.setFixedHeight(10 * self.error_log.fontMetrics().lineSpacing() + 12)
+        self.error_log.setMinimumHeight(6 * self.error_log.fontMetrics().lineSpacing() + 12)
+        mark_growing(self.error_log)              # 10 строк; растянули окно - журнал выше
         lay.addWidget(self.error_log)
         page.hide()
         return page
@@ -648,11 +704,24 @@ class InstrumentWindow(Window):
             self._log(self.tracker.names.get(key, key), message)
 
     def _log_instrument_error(self, _code: int, message: str) -> None:
-        """Ошибка прибора не по ключу окна (EQPHASE, опрос, команда из консоли). Ошибку записи ключа
-        («... [ch1.period]») журнал уже показал строкой этого ключа - второй раз не писать."""
+        """Ошибка прибора не по ключу окна (EQPHASE, опрос, команда из консоли): в журнал и в индикатор
+        ошибок. Ошибку записи ключа («... [ch1.period]») журнал уже показал строкой этого ключа."""
         context = message[message.rfind("[") + 1:-1] if message.endswith("]") and "[" in message else ""
         if context not in self.tracker.keys:
             self._log("INSTRUMENT", message)
+            self.tracker.note_error("instrument", message)
+
+    def has_errors(self) -> bool:
+        """Индикатор ошибок горит (до CLEAR в журнале) - плитка главного окна красная."""
+        return self.error_indicator.state is WriteState.ERROR
+
+    def _update_name(self) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.proxy):
+            return
+        name = COORD.display_name(self.proxy)
+        self.address.setText(name)
+        self.address.setToolTip(f"{name}: {self.proxy.name}\n{self.proxy.address}\n"
+                                "Double-click - driver, model, address")
 
     def show_errors(self) -> None:
         """Клик по индикатору ошибок: вместо таблицы - журнал (выход - вкладка или CLEAR)."""

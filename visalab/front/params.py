@@ -911,6 +911,15 @@ class Panel(QFrame):
         Panel QPushButton#tool[wide="true"] { min-width: ${UI_COLUMN_WIDTH_PX}px; max-width: ${UI_COLUMN_WIDTH_PX}px; }
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }
+        Panel QPushButton#chip[wstate="error"] { color: $UI_COLOR_ERROR; }
+        Panel QTableWidget#pmTable, Panel QTableWidget#pmTable QWidget { background-color: $UI_COLOR_BACKGROUND; }
+        Panel QTableWidget#pmTable { color: $UI_COLOR_TEXT_MUTED; padding: 2px 4px; }
+        Panel QTableWidget#pmTable::item { border: none; padding: 0 8px; }
+        Panel QTableWidget#pmTable QHeaderView::section {
+            background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_BORDER_LIGHT; border: none;
+            border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 3px 8px; font-weight: normal;
+        }
+        Panel QTableWidget#pmTable QTableCornerButton::section { background: transparent; border: none; }
     """) + scrollbar_qss("Panel ")
 
     def __init__(self, table: QWidget, column_width: int | None = None, parent=None):
@@ -962,6 +971,10 @@ class WriteTracker(QObject):
         elif state is ConnectionState.DISCONNECTED:
             self._state.clear()
         self.emit()
+
+    def note_error(self, key: str, detail: str) -> None:
+        """Ошибка не по ключу окна (ошибка прибора из опроса, EQPHASE): индикатор горит до CLEAR."""
+        self._set(key, WriteState.ERROR, detail)
 
     def clear_errors(self) -> None:
         """CLEAR в журнале: ошибки сброшены, индикатор гаснет до следующей."""

@@ -874,13 +874,14 @@ class CalWindow(Window):
 
     def fit_height(self, again: bool = True) -> None:
         """Высота - по содержимому (шаги появились / исчезли); раскладки пересчитываются не сразу."""
-        QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
-        for w in self.findChildren(QWidget):
-            if w.layout() is not None:
-                w.layout().invalidate()
-        self._outer.invalidate()
-        self._outer.activate()
-        self.setFixedHeight(self._outer.sizeHint().height())
+        with self.fitting():
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
+            for w in self.findChildren(QWidget):
+                if w.layout() is not None:
+                    w.layout().invalidate()
+            self._outer.invalidate()
+            self._outer.activate()
+            self.fit_to(self._outer)               # по содержимому; растянуть можно
         if again:
             QTimer.singleShot(0, self._fit_again)
 

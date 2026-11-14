@@ -3,6 +3,7 @@ import math
 
 import pytest
 from PyQt6.QtCore import QSettings
+from PyQt6.QtGui import QKeySequence
 
 from conftest import sim_of, worker
 from visalab.coord import ActivityMonitor, Instrument, ProxyLinks, Thresholds
@@ -118,6 +119,28 @@ def test_monitor_finds_who_measures_and_the_source(qtbot, lab):
     b = mon.activity(pm)
     assert b.source is not None and b.source.name == "GEN" and b.path_db == pytest.approx(-10.0, abs=0.5)
     assert len(mon.history[pm]) > 0
+    # таблица ваттметра: частота датчика -> последнее показание с сигналом
+    rows = mon.pm_table(pm)
+    assert len(rows) == 1 and rows[0][0] == pytest.approx(pm.value("freq")) and rows[0][1] == pytest.approx(b.level, abs=0.5)
+    mon.clear_pm_table(pm)
+    assert mon.pm_table(pm) == []
+
+
+def test_monitor_vna_phase_trace_counts_as_measuring(qtbot, lab):
+    """Трейс на фазе: модуля нет, по уровню не судится - пока идут развёртки, ВАЦ измеряет."""
+    links, px, _bench = lab
+    vna = px["pna"]
+    _sim(vna).dut = None                               # порты открыты: по модулю (MLOG) не измеряет
+    mon = ActivityMonitor(links, Thresholds(hold_s=0.5))
+    fmt = lambda: (vna.value("m1.trace").meta or {}).get("format") if isinstance(vna.value("m1.trace"), Trace) else None  # noqa: E731
+    qtbot.waitUntil(lambda: fmt() == "MLOG", timeout=10000)
+    qtbot.wait(800)
+    mon.tick()
+    assert not _measuring(mon, vna)
+    vna.set("m1.format", "PHASE")
+    qtbot.waitUntil(lambda: fmt() == "PHASE", timeout=10000)
+    qtbot.waitUntil(lambda: _measuring(mon, vna), timeout=5000)
+    assert mon.activity(vna).measuring
 
 
 def test_monitor_vna_idle_with_open_ports(qtbot, lab):
@@ -137,7 +160,7 @@ def test_main_window_shows_only_measuring(qtbot, lab, tmp_path):
     win = MainWindow(settings, ActivityMonitor(links))
     qtbot.addWidget(win)
     win.show()
-    assert [t.text().split("\n")[0] for t in win.tiles.values()] == ["VNA", "SA", "PM", "GEN"]
+    assert [t.text() for t in win.tiles.values()] == ["VNA", "SA", "PM", "GEN"]     # только что это, без IDLE
     qtbot.waitUntil(lambda: [p.title.text() for p in win.visible_panels()] == ["VNA"], timeout=10000)
     vna_panel = win.panels[px["pna"]]
     assert vna_panel.plots[0].traces and vna_panel.plots[0].traces[0][0].startswith("1·S11")
@@ -147,9 +170,14 @@ def test_main_window_shows_only_measuring(qtbot, lab, tmp_path):
     qtbot.waitUntil(lambda: gen.value("rf.output") is True and gen.value("rf.power") == -5.0, timeout=5000)
     bench.step()
     qtbot.waitUntil(lambda: len(win.visible_panels()) == 3, timeout=10000)
-    assert win.tiles[gen].indicated() and win.tiles[px["e4446a"]].indicated()
+    assert [t.text() for t in win.tiles.values()] == ["VNA", "SA", "PM", "GEN"]
+    assert not any(t.indicated() or t.error for t in win.tiles.values())   # окон приборов нет, ошибок нет
     assert "← GEN" in win.panels[px["e4446a"]].source.text()
-    assert win.panels[px["u2021xa"]].plots[0].points
+    pm = px["u2021xa"]
+    panel = win.panels[pm]                                # ваттметр: таблица частота / мощность, не график
+    qtbot.waitUntil(lambda: bool(panel.power_table.rows), timeout=5000)
+    assert panel.power_table.isVisibleTo(panel) and not any(p.isVisibleTo(panel) for p in panel.plots)
+    assert panel.power_table.rows[0][0] == pytest.approx(pm.value("freq")) and panel.power_table.item(0, 1).text().endswith("dBm")
     win.all_button.setChecked(False)
     assert settings.value("MAIN/SHOW_ALL", type=bool) is False
 
@@ -241,6 +269,56 @@ def test_open_instrument_picks_the_instrument_window_not_helpers(qtbot, tmp_path
     assert vna.isVisible() and not helper.isVisible()
     win.monitor.stop()
     proxy.shutdown()
+
+
+def test_tiles_show_open_window_and_error(qtbot, tmp_path):
+    """Плитка: имя прибора; индикатор - окно открыто; красная - ошибка в окне прибора (до CLEAR)."""
+    from visalab.front import PulseGenWindow
+    settings = QSettings(str(tmp_path / "t.ini"), QSettings.Format.IniFormat)
+    links = ProxyLinks()
+    proxy = _proxy("sdg")
+    links.add(proxy)
+    win = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win)
+    tile = win.tiles[proxy]
+    assert tile.text() == "PULSE" and not tile.window_open and not tile.error
+    sdg = PulseGenWindow(proxy, settings)
+    qtbot.addWidget(sdg)
+    assert not tile.window_open                         # окно есть, но скрыто
+    sdg.show()
+    qtbot.waitUntil(lambda: tile.window_open, timeout=2000)
+    assert tile.indicated()
+    sdg.tracker.note_error("instrument", "-113 Undefined header [EQPHASE]")
+    assert tile.error and "Undefined header" in tile.toolTip() and tile.property("wstate") == "error"
+    sdg.clear_button.click()                            # CLEAR в журнале - ошибка снята
+    assert not tile.error
+    sdg.close()
+    assert not tile.window_open
+    tile.click()                                        # клик - показать окно
+    assert sdg.isVisible() and tile.window_open
+    win.monitor.stop()
+    proxy.shutdown()
+
+
+def test_main_window_full_screen(qtbot, tmp_path):
+    from PyQt6.QtCore import Qt
+    settings = QSettings(str(tmp_path / "f.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(settings, ActivityMonitor(ProxyLinks()))
+    qtbot.addWidget(win)
+    win.show_window()
+    assert win.isVisible() and not win.isFullScreen()
+    assert win.titleBar.hBoxLayout.indexOf(win.full_button) == win.titleBar.hBoxLayout.indexOf(win.titleBar.minimized_button) - 1
+    win.full_button.click()
+    assert win.isFullScreen() and win.full_button.full and settings.value("MAIN/FULL_SCREEN", type=bool)
+    win.toggle_full_screen()                            # то же, что F11
+    assert not win.isFullScreen() and not win.full_button.full
+    assert win._full_key.key().toString() == QKeySequence(Qt.Key.Key_F11).toString()
+    win.set_full_screen(True)
+    win.close()
+    win2 = MainWindow(settings, ActivityMonitor(ProxyLinks()))   # как при выходе - во весь экран
+    qtbot.addWidget(win2)
+    win2.show_window()
+    assert win2.isFullScreen() and win2.full_button.full
 
 
 def test_delay_on_address_page(qtbot, tmp_path):

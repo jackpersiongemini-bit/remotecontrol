@@ -1,36 +1,41 @@
-"""Главное окно: что сейчас измеряется.
+"""Главное окно: какие приборы открыты и что сейчас измеряется.
 
-Сверху - плитки всех открытых приборов (класс и коротко состояние; индикатор - прибор измеряет
-или источник включён; клик - окно прибора). Ниже - панели живых данных приёмников, которые
-сейчас измеряют (решает координатор, ``visalab.coord.ActivityMonitor``):
+Сверху - плитки приборов: что это (VNA, SA, PM, GEN, PULSE, PSU), индикатор - окно прибора открыто,
+красная плитка - у прибора ошибка (горит, пока её не сбросили CLEAR в журнале окна); клик - окно прибора
+(Алексей 2026-11-14: «не что работает, а что открыто и у чего ошибка»). Ниже - панели живых данных
+приёмников, которые сейчас измеряют (решает координатор, ``visalab.coord.ActivityMonitor``):
 
 * ВАЦ - трейсы включённых измерений (по графику на каждую единицу: dB, deg, s...);
-* ваттметр - показания точками за последнюю минуту (или трасса во времени, если включена);
+* ваттметр - таблица: частота датчика и мощность в этой точке (последнее показание с сигналом на каждой
+  частоте); во временном режиме (TRAC ON) - трасса во времени;
 * анализатор спектра - трасса, пик, шумовая дорожка.
 
 У панели - источник сигнала, если координатор его нашёл: «← GEN 1 GHz  PATH −10.0 dB».
 Пока идёт сценарий координатора (ACAL...), в полосе плиток - его фишка «ACAL 12/101» (клик - окно прибора).
 ALL - показывать и приёмники, которые сейчас ничего не измеряют. Вкладки: LIVE - живые данные,
-SET - пороги «измеряет / не измеряет» (сохраняются в ini, группа MAIN/THRESHOLDS). Окно знает только ключи профилей.
+SET - пороги «измеряет / не измеряет» (сохраняются в ini, группа MAIN/THRESHOLDS). Полный экран - кнопка в
+заголовке или F11. Окно знает только ключи профилей.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
-from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6 import sip
+from PyQt6.QtCore import QRectF, QSettings, QSize, Qt
+from PyQt6.QtGui import QColor, QFont, QKeySequence, QPainter, QPen, QShortcut
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                             QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
 from ..core.units import si_format, si_parse
 from ..core.trace import Trace
+from .instrument_window import WINDOW_EVENTS, window_for
 from .live_plot import LivePlot
-from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar
-from .theme import WINDOW_BAR_HEIGHT
-from .window import Window, short_address
+from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
+from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED,
+                    WINDOW_BAR_HEIGHT)
+from .window import CustomFullButton, Window, short_address
 
-__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip"]
-
-#: сколько секунд показаний ваттметра на графике
-PM_WINDOW_S = 60.0
+__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable"]
 
 #: страница SET: (подпись, поле Thresholds, единица, множитель показа, подсказка)
 SETTINGS = (
@@ -73,31 +78,112 @@ def _dbm(v: float | None) -> str:
     return "" if v is None else f"{v:.2f} dBm"
 
 
-def _output_on(proxy) -> bool:
-    """Какой-нибудь выход прибора включён (ГСС, источник питания...)."""
-    return any(proxy.value(k) is True for k in proxy.params if k.endswith(".output") or k == "output")
+def _num(v) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
 class InstrumentTile(IndicatorButton):
-    """Плитка прибора: класс сверху, состояние снизу; индикатор - измеряет / выход включён."""
+    """Плитка прибора: что это (VNA, PM...); индикатор - окно прибора открыто, красная - у прибора ошибка."""
 
     def __init__(self, proxy, parent=None):
         super().__init__(parent)
         self.proxy = proxy
         self.setObjectName("chip")
+        self.setProperty("tile", True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"{proxy.name} {proxy.address}\nClick - open the instrument window")
-        self.active = False
+        self.window_open = False
+        self.error = False
         self.setMinimumWidth(72)
 
     def indicated(self) -> bool:
-        return self.active
+        return self.window_open
 
-    def show_state(self, name: str, line: str, active: bool) -> None:
-        self.setText(f"{name}\n{line}")
-        self.active = active
+    def show_state(self, name: str, window_open: bool, error: bool, tip: str = "") -> None:
+        if self.text() != name:
+            self.setText(name)
+        if error != self.error:
+            self.setProperty("wstate", "error" if error else "")
+            _repolish(self)
+        self.window_open, self.error = bool(window_open), bool(error)
+        if tip:
+            self.setToolTip(tip)
         self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        QPushButton.paintEvent(self, e)
+        p = QPainter(self)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        if self.window_open:                  # окно открыто - индикатор (при ошибке - красная полоса)
+            paint_indicator(p, rect, UI_COLOR_ERROR if self.error else UI_COLOR_TEXT_MUTED)
+        if self.error:                        # ошибка - красная рамка поверх
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(QPen(QColor(UI_COLOR_ERROR), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect.adjusted(0.25, 0.25, -0.25, -0.25), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+
+
+class PowerTable(QTableWidget):
+    """Ваттметр в главном окне: частота датчика и мощность в этой точке (последнее показание с сигналом);
+    строка текущей частоты датчика выделена (Алексей 2026-11-14: вместо графика показаний во времени)."""
+
+    EMPTY = "NO POINTS YET: each sensor frequency gets a row\nwith the last reading that had a signal"
+    ALIGN = (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    def __init__(self, parent=None):
+        super().__init__(0, 2, parent)
+        self.setObjectName("pmTable")
+        self.setHorizontalHeaderLabels(["FREQ", "POWER"])
+        self.verticalHeader().hide()
+        self.verticalHeader().setDefaultSectionSize(20)
+        self.setShowGrid(False)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        hh = self.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hh.setHighlightSections(False)
+        for col, align in enumerate(self.ALIGN):                # частота - слева, мощность - справа
+            self.horizontalHeaderItem(col).setTextAlignment(align)
+        self.setMinimumHeight(170)
+        self.rows: list[tuple[float, float, float]] = []
+        self.current: float | None = None
+
+    def set_rows(self, rows, current: float | None = None) -> None:
+        """rows: [(Hz, dBm, время)] по частоте; ``current`` - частота датчика (строка выделена, видна)."""
+        rows = list(rows)
+        moved = current != self.current or len(rows) != len(self.rows)
+        self.rows, self.current = rows, current
+        self.setRowCount(len(rows))
+        bold = QFont(self.font())
+        bold.setBold(True)
+        cur_row = -1
+        for i, (f, v, _t) in enumerate(rows):
+            is_cur = current is not None and abs(f - current) < 0.5
+            if is_cur:
+                cur_row = i
+            for col, text in enumerate((si_format(f, "Hz", 9), f"{v:.2f} dBm")):
+                item = self.item(i, col)
+                if item is None:
+                    item = QTableWidgetItem()
+                    item.setTextAlignment(self.ALIGN[col])
+                    self.setItem(i, col, item)
+                if item.text() != text:
+                    item.setText(text)
+                item.setFont(bold if is_cur else self.font())
+                item.setForeground(QColor(UI_COLOR_TEXT if is_cur else UI_COLOR_TEXT_MUTED))
+        if moved and cur_row >= 0:
+            self.scrollToItem(self.item(cur_row, 0), QAbstractItemView.ScrollHint.EnsureVisible)
+        self.viewport().update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        if not self.rows:
+            p = QPainter(self.viewport())
+            p.setPen(QColor(UI_COLOR_BORDER_LIGHT))
+            p.drawText(QRectF(self.viewport().rect()), Qt.AlignmentFlag.AlignCenter, self.EMPTY)
 
 
 class ScenarioChip(IndicatorButton):
@@ -149,16 +235,28 @@ class LivePanel(Panel):
         self.source.setObjectName("source")
         self.level = QLabel()
         self.level.setObjectName("heading")
+        self.clear_button = QPushButton("CLEAR")
+        self.clear_button.setObjectName("chip")
+        self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_button.setToolTip("Clear the frequency / power table")
+        self.clear_button.clicked.connect(lambda: self.monitor.clear_pm_table(self.proxy))
+        self.clear_button.hide()
         head.addWidget(self.title)
         head.addWidget(self.address)
         head.addStretch()
         head.addWidget(self.source)
         head.addWidget(self.level)
+        head.addWidget(self.clear_button)
         lay.addLayout(head)
         self.plots_box = QVBoxLayout()
         self.plots_box.setSpacing(6)
         lay.addLayout(self.plots_box)
         self.plots: list[LivePlot] = []
+        self.power_table: PowerTable | None = None      # не ``table``: так Panel зовёт своё содержимое
+        if self.profile == "power_meter":
+            self.power_table = PowerTable()
+            lay.addWidget(self.power_table)
         super().__init__(body, parent=parent)
         self.address.setStyleSheet("color: #8a8a8a;")
         self.source.setStyleSheet("color: #8a8a8a;")
@@ -220,18 +318,18 @@ class LivePanel(Panel):
             self.level.setText(f"{_dbm(a.level)}{where}" if a.measuring else f"NOISE {_dbm(a.floor)}")
 
     def _refresh_pm(self, a: Activity) -> None:
-        plot = self._plot(0)
-        self._use_plots(1)
+        """Временной режим (TRAC ON) - трасса во времени; иначе - таблица частота / мощность."""
         tr = self.proxy.value("trace")
-        if self.proxy.value("trace.state") is True and isinstance(tr, Trace):
+        timed = self.proxy.value("trace.state") is True and isinstance(tr, Trace)
+        if timed:
+            plot = self._plot(0)
             plot.x_range = None
             plot.set_traces([("", tr)])
-        else:
-            now = self.monitor.clock()
-            pts = [(t - now, v) for t, v in self.monitor.history.get(self.proxy, ()) if now - t <= PM_WINDOW_S]
-            plot.x_range = (-PM_WINDOW_S, 0.0)
-            plot.set_traces([("", Trace(tuple(t for t, _ in pts), tuple(v for _, v in pts), "s", "dBm"))]
-                            if pts else [], points=True)
+        self._use_plots(1 if timed else 0)
+        self.power_table.setVisible(not timed)
+        self.clear_button.setVisible(not timed)
+        if not timed:
+            self.power_table.set_rows(self.monitor.pm_table(self.proxy), _num(self.proxy.value("freq")))
         if a.connected:
             self.level.setText(_dbm(a.level) or "NO DATA")
 
@@ -253,6 +351,14 @@ class MainWindow(Window):
         self.before_quit: list = []
         self.tiles: dict[object, InstrumentTile] = {}
         self.panels: dict[object, LivePanel] = {}
+
+        # во весь экран: кнопка в заголовке и F11 (Алексей 2026-11-14)
+        self.full_button = CustomFullButton()
+        self.full_button.setToolTip("Full screen (F11)")
+        self.full_button.clicked.connect(self.toggle_full_screen)
+        self.titleBar.insert_control_widget(self.full_button)
+        self._full_key = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
+        self._full_key.activated.connect(self.toggle_full_screen)
 
         strip = QWidget()
         self.strip_layout = QHBoxLayout(strip)
@@ -330,13 +436,10 @@ class MainWindow(Window):
 
         self.monitor.roster_changed.connect(self._rebuild)
         self.monitor.changed.connect(self._on_changed)
+        WINDOW_EVENTS.changed.connect(self._update_tile)    # окно прибора открыли / закрыли, ошибка
         for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):
             sig.connect(self._on_runs)
         self._on_runs()
-        self._timer = QTimer(self)                  # время на графике ваттметра идёт и без новых точек
-        self._timer.setInterval(1000)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
         self.setMinimumWidth(560)
         self.recall_size(QSize(720, 420))
         self._rebuild()
@@ -364,35 +467,38 @@ class MainWindow(Window):
 
     # ------------------------------------------------------------ обновление
     def _on_changed(self, proxy) -> None:
-        tile = self.tiles.get(proxy)
-        if tile is None:
+        self._update_tile(proxy)
+        panel = self.panels.get(proxy)
+        if panel is not None:
+            panel.refresh(self.monitor.activity(proxy))
+            self._update_visibility()
+
+    def _update_tile(self, proxy) -> None:
+        """Плитка: имя прибора; индикатор - его окно открыто; красная - ошибка: индикатор ошибок окна горит
+        (до CLEAR в журнале), связь не установилась или потеряна."""
+        if sip.isdeleted(self):
             return
-        prof = profile_name(proxy)
+        tile = self.tiles.get(proxy)
+        if tile is None or sip.isdeleted(tile):
+            return
         name = self.monitor.name(proxy)
-        connected = proxy.state is ConnectionState.CONNECTED
-        off = "RETRY" if getattr(proxy, "reconnecting", False) else "OFF"     # связь потеряна, переподключается
-        if prof in ("network_analyzer", "spectrum_analyzer", "power_meter"):
-            a = self.monitor.activity(proxy)
-            if not connected:
-                line = off
-            elif not a.measuring:
-                line = "IDLE"
-            elif prof == "network_analyzer":
-                line = "SWEEP"
-            else:
-                line = f"{a.level:.1f} dBm" if a.level is not None else "MEAS"
-            tile.show_state(name, line, a.measuring)
-            panel = self.panels.get(proxy)
-            if panel is not None:
-                panel.refresh(a)
-                self._update_visibility()
-        elif prof == "signal_generator":
-            on = connected and proxy.value("rf.output") is True
-            line = si_format(proxy.value("rf.frequency"), "Hz", 4) if on else ("RF OFF" if connected else off)
-            tile.show_state(name, line, on)
+        w = window_for(proxy)
+        window_open = w is not None and w.isVisible()
+        lost = proxy.state is ConnectionState.ERROR or bool(getattr(proxy, "reconnecting", False))
+        errors = w is not None and w.has_errors()
+        if proxy.state is ConnectionState.CONNECTED:
+            link = "connected"
+        elif lost:
+            link = "no connection, reconnecting" if getattr(proxy, "reconnecting", False) else "connection error"
+        elif proxy.state is ConnectionState.CONNECTING:
+            link = "connecting"
         else:
-            on = connected and _output_on(proxy)
-            tile.show_state(name, ("OUT ON" if on else "ON") if connected else off, on)
+            link = "off"
+        tip = [f"{name}: {proxy.name}", short_address(proxy.address), link]
+        if errors:
+            tip.append(w.error_indicator.toolTip())
+        tip.append(("Window is open" if window_open else "Window is closed") + ". Click - show the window")
+        tile.show_state(name, window_open, errors or lost, "\n".join(tip))
 
     def _on_runs(self, *_args) -> None:
         self.scenario_chip.show_runs(self.coord.runs())
@@ -401,11 +507,6 @@ class MainWindow(Window):
         runs = self.coord.runs()
         if runs and runs[0].devices:
             self.open_instrument(list(runs[0].devices.values())[-1].instrument)
-
-    def _tick(self) -> None:
-        for p, panel in self.panels.items():
-            if panel.isVisible() and panel.profile == "power_meter":
-                panel.refresh(self.monitor.activity(p))
 
     def set_page(self, index: int) -> None:
         """0 - LIVE (живые данные), 1 - SET (пороги)."""
@@ -445,18 +546,38 @@ class MainWindow(Window):
     def visible_panels(self) -> list[LivePanel]:
         return [panel for panel in self.panels.values() if panel.isVisibleTo(self.live_page)]
 
+    # ------------------------------------------------------------ во весь экран
+    def show_window(self) -> None:
+        """Показать как при выходе: во весь экран или обычным окном (ini MAIN/FULL_SCREEN)."""
+        if self.settings.value(f"{self.SETTINGS_GROUP}/FULL_SCREEN", False, type=bool):
+            self.set_full_screen(True)
+        else:
+            self.show()
+
+    def set_full_screen(self, on: bool) -> None:
+        if on:
+            self.showFullScreen()
+        else:
+            self.showNormal()
+        self.full_button.set_full(on)
+        self.full_button.setToolTip("Exit full screen (F11)" if on else "Full screen (F11)")
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/FULL_SCREEN", bool(on))
+
+    def toggle_full_screen(self) -> None:
+        self.set_full_screen(not self.isFullScreen())
+
     # ------------------------------------------------------------ окна приборов
     def open_instrument(self, proxy) -> None:
-        """Показать окно прибора (окна открыты в этом же процессе, возможно скрыты)."""
-        from .instrument_window import InstrumentWindow       # не вспомогательные окна (TraceEditor, CAL...)
-        for w in QApplication.topLevelWidgets():
-            if isinstance(w, InstrumentWindow) and w.proxy is proxy:
-                if w.isMinimized():
-                    w.showNormal()
-                w.show()
-                w.raise_()
-                w.activateWindow()
-                return
+        """Показать окно прибора (окна открыты в этом же процессе, возможно скрыты); не вспомогательные
+        окна (TraceEditor, CAL...)."""
+        w = window_for(proxy)
+        if w is None:
+            return
+        if w.isMinimized():
+            w.showNormal()
+        w.show()
+        w.raise_()
+        w.activateWindow()
 
     def closeEvent(self, event):  # noqa: N802 - Qt
         if self.quit_on_close:
@@ -465,10 +586,13 @@ class MainWindow(Window):
         super().closeEvent(event)
         if self.quit_on_close:
             self.monitor.stop()
+            try:
+                WINDOW_EVENTS.changed.disconnect(self._update_tile)
+            except TypeError:
+                pass
             for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):
                 try:
                     sig.disconnect(self._on_runs)
                 except TypeError:
                     pass
             QApplication.quit()
-

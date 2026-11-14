@@ -5,22 +5,36 @@
 """
 from __future__ import annotations
 
+import json
 import textwrap
+from contextlib import contextmanager
 from enum import Enum
 
 from PyQt6.QtCore import QEasingCurve, QLineF, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QAbstractButton, QLabel, QPushButton, QWidget
+from PyQt6.QtWidgets import QAbstractButton, QLabel, QPushButton, QSizePolicy, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
 
 from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_CONTROL, UI_COLOR_ERROR,
-                    UI_COLOR_PANEL, UI_SWITCH_MARGIN_PX, UI_TITLE_BAR_WIDE_ITEM_SIZE_PX,
+                    UI_COLOR_PANEL, UI_SWITCH_HEIGHT_PX, UI_SWITCH_MARGIN_PX, UI_SWITCH_WIDTH_PX,
                     UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss, scrollbar_qss)
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
-           "CustomExpandButton", "CustomLockButton", "Switch",
-           "CustomOnButton", "CustomSyncButton", "CustomInitButton"]
+           "CustomExpandButton", "CustomFullButton", "CustomLockButton", "Switch",
+           "CustomOnButton", "CustomSyncButton", "CustomInitButton", "mark_growing", "QWIDGETSIZE_MAX"]
+
+QWIDGETSIZE_MAX = (1 << 24) - 1
+
+
+def mark_growing(widget: QWidget) -> QWidget:
+    """Виджет растёт по высоте вместе с окном (график, журнал): окно с ним можно растянуть ниже его
+    обычного размера и выше - лишняя высота достаётся ему (``Window.fit_to``)."""
+    pol = widget.sizePolicy()
+    pol.setVerticalPolicy(QSizePolicy.Policy.Expanding)
+    widget.setSizePolicy(pol)
+    widget.setProperty("grows", True)
+    return widget
 
 
 class WriteState(Enum):
@@ -84,6 +98,9 @@ class WindowBar(TitleBar):
         """Перед «свернуть»/«закрыть» (после растяжки)."""
         self.hBoxLayout.insertWidget(self.hBoxLayout.indexOf(self.minimized_button), widget)
 
+    def canDrag(self, pos):  # noqa: N802 - qframelesswindow
+        return not self.window().isFullScreen() and super().canDrag(pos)     # во весь экран окно не таскается
+
 
 class Window(FramelessWindow):
     STYLE_SHEET = render_qss("""
@@ -96,7 +113,19 @@ class Window(FramelessWindow):
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self._size_key = f"WINDOW_SIZE/{type(self).__module__}.{type(self).__qualname__}"
+        name = f"{type(self).__module__}.{type(self).__qualname__}"
+        self._size_key = f"WINDOW_SIZE/{name}"
+        self._heights_key = f"WINDOW_HEIGHTS/{name}"
+        #: вид окна (``view_key``) -> высота, до которой его растянули руками (ini, при закрытии / выходе)
+        try:
+            saved = json.loads(settings.value(self._heights_key, "", type=str) or "{}")
+            self.view_heights = {str(k): int(v) for k, v in saved.items()} if isinstance(saved, dict) else {}
+        except (TypeError, ValueError):
+            self.view_heights = {}
+        self._saved_heights = dict(self.view_heights)
+        self._fit_target: int | None = None          # высота, которую ставит fit_to (остальное - руками)
+        self._fit_hint, self._fit_grows = 0, False
+        self._fitting = 0
         self.setStyleSheet(self.STYLE_SHEET)
         self.setTitleBar(WindowBar(self))
         self.titleBar.raise_()
@@ -106,7 +135,62 @@ class Window(FramelessWindow):
         self.resize(self.settings.value(self._size_key, default, type=QSize))
 
     def save_size(self) -> None:
-        self.settings.setValue(self._size_key, self.size())
+        """Размер и растянутые высоты видов - в ini (только если изменились: QSettings переписывает файл)."""
+        size = self.size()
+        if self.isFullScreen() or self.isMaximized():      # обычный размер, а не размер экрана
+            size = self.normalGeometry().size()
+            if not size.isValid() or size.isEmpty():
+                return
+        if self.settings.value(self._size_key, None, type=QSize) != size:
+            self.settings.setValue(self._size_key, size)
+        if self.view_heights != self._saved_heights:
+            self.settings.setValue(self._heights_key, json.dumps(self.view_heights, sort_keys=True))
+            self._saved_heights = dict(self.view_heights)
+
+    # ------------------------------------------------------------ высота по содержимому
+    def view_key(self) -> str:
+        """Что сейчас показано (вкладка, журнал...): у каждого вида своя растянутая высота."""
+        return "main"
+
+    @contextmanager
+    def fitting(self):
+        """Высоту меняет программа (раскладка, ``fit_to``), а не пользователь - не запоминать."""
+        self._fitting += 1
+        try:
+            yield
+        finally:
+            self._fitting -= 1
+
+    def fit_to(self, layout, grows: bool = False) -> None:
+        """Высота окна - по содержимому ``layout``; растянуть можно всегда (Алексей 2026-11-14: «окна должны
+        растягиваться»). ``grows`` - в виде есть график / журнал (``mark_growing``): окно можно и сжать до
+        их минимума. Растянутая руками высота запоминается для вида и возвращается, когда он снова открыт."""
+        hint = layout.sizeHint().height()
+        minimum = layout.minimumSize().height() if grows else hint
+        saved = self.view_heights.get(self.view_key())
+        want = max(saved, minimum) if saved else hint
+        with self.fitting():                           # setMinimumHeight сам меняет высоту окна
+            self._fit_hint, self._fit_grows = hint, grows
+            self.setMinimumHeight(minimum)
+            self.setMaximumHeight(QWIDGETSIZE_MAX)
+            if self.isMaximized() or self.isFullScreen():
+                return
+            self._fit_target = want
+            if self.height() != want:
+                self.resize(self.width(), want)
+
+    def resizeEvent(self, e):  # noqa: N802 - Qt
+        super().resizeEvent(e)
+        h = e.size().height()
+        if (self._fit_target is not None and not self._fitting and self.isVisible() and e.oldSize().height() > 0
+                and h != e.oldSize().height() and h != self._fit_target
+                and not (self.isMaximized() or self.isFullScreen())):
+            key = self.view_key()                      # растянули руками - запомнить для этого вида
+            if not self._fit_grows and h <= self._fit_hint:
+                self.view_heights.pop(key, None)       # сжали до содержимого - снова по содержимому
+            else:
+                self.view_heights[key] = h
+            self._fit_target = h
 
     def closeEvent(self, event):  # noqa: N802 - Qt
         self.save_size()
@@ -174,18 +258,21 @@ class StatusIndicator(WriteIndicator):
 
 
 class AddressLabel(QLabel):
-    """Адрес прибора в заголовке; клик открывает настройки подключения."""
+    """Что за прибор (VNA, PM...) в заголовке, адрес - в подсказке; двойной клик открывает настройки
+    подключения (Алексей 2026-11-14: по одному клику открывались случайно)."""
 
-    clicked = pyqtSignal()
+    double_clicked = pyqtSignal()
 
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
-        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(e)
+    def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.double_clicked.emit()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
 
 
 # ------------------------------------------------------- кнопки-иконки
@@ -328,6 +415,32 @@ class CustomCloseButton(IconButtonBase):
         p.drawLine(m, self.height() - m, self.width() - m, m)
 
 
+class CustomFullButton(IconButtonBase):
+    """Во весь экран: уголки наружу; в полноэкранном режиме (``full``) - уголки внутрь."""
+
+    full = False
+
+    def set_full(self, on: bool) -> None:
+        self.full = bool(on)
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy, a, c = self.width() / 2, self.height() / 2, 5.0, 3.0
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                if self.full:                     # уголок внутри квадрата, концы - наружу
+                    x, y = cx + sx * (a - c), cy + sy * (a - c)
+                    p.drawLine(QLineF(x, y, x + sx * c, y))
+                    p.drawLine(QLineF(x, y, x, y + sy * c))
+                else:                             # уголок в вершине квадрата, концы - внутрь
+                    x, y = cx + sx * a, cy + sy * a
+                    p.drawLine(QLineF(x, y, x - sx * c, y))
+                    p.drawLine(QLineF(x, y, x, y - sy * c))
+
+
 class CustomInitButton(IconButtonBase):
     def paintEvent(self, e):  # noqa: N802 - Qt
         super().paintEvent(e)
@@ -426,7 +539,7 @@ class Switch(QAbstractButton):
         self.toggled.connect(self._animate_handle)
 
     def sizeHint(self):  # noqa: N802 - Qt
-        return QSize(int(UI_TITLE_BAR_WIDE_ITEM_SIZE_PX * 0.9), int(UI_TITLE_BAR_ITEM_SIZE_PX * 0.9))
+        return QSize(UI_SWITCH_WIDTH_PX, UI_SWITCH_HEIGHT_PX)
 
     def minimumSizeHint(self):  # noqa: N802 - Qt
         return self.sizeHint()
