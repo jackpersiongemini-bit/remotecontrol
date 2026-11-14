@@ -323,3 +323,115 @@ def test_create_model_window(qtbot, opened, settings):
     qtbot.addWidget(mw2)
     mw2.fields[0].widget.setText("SDG2042X")                  # встроенное имя не перезаписать
     assert not mw2.save() and "built-in" in mw2.status.text()
+
+
+# ---------------------------------------------------------------- вкладки и полосы прокрутки
+def _wheel(widget, dy=0, dx=0) -> bool:
+    from PyQt6.QtCore import QPoint, QPointF, Qt
+    from PyQt6.QtGui import QWheelEvent
+    from PyQt6.QtWidgets import QApplication
+    ev = QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(0, 0), QPoint(dx, dy), Qt.MouseButton.NoButton,
+                     Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+    QApplication.sendEvent(widget, ev)
+    return ev.isAccepted()
+
+
+def _mouse_button(widget, button) -> None:
+    from PyQt6.QtCore import QEvent, QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+    from PyQt6.QtWidgets import QApplication
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(10, 10), QPointF(10, 10), button, button,
+                     Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(widget, ev)
+
+
+def _arrows(tabs):
+    from PyQt6.QtWidgets import QToolButton
+    return [b for b in tabs.findChildren(QToolButton) if b.isVisible()]
+
+
+def test_tabs_scroll_by_wheel_and_mouse_buttons_without_arrows(qtbot):
+    """Алексей 2026-11-14: вкладки не помещаются - стрелок нет, полоса листается колесом (и наклоном
+    колеса) и кнопками мыши назад/вперёд; выбранная вкладка при этом не меняется."""
+    from PyQt6.QtCore import Qt
+    from visalab.front.params import PTabBar
+    tabs = PTabBar()
+    for t in ("MAIN", "STIM", "CH", "TRACE", "MKR", "MEM", "MATH", "CAL", "SAVE", "SYS"):
+        tabs.addTab(t)
+    qtbot.addWidget(tabs)
+    tabs.setFixedWidth(260)
+    tabs.show()
+    qtbot.waitExposed(tabs)
+    assert tabs.tabRect(tabs.count() - 1).right() > tabs.width()           # не помещаются
+    assert not _arrows(tabs) and tabs.tabRect(0).x() == 0
+    assert _wheel(tabs, dy=-120)                                          # колесо на себя - вправо
+    x1 = tabs.tabRect(0).x()
+    assert x1 < 0 and tabs.currentIndex() == 0
+    assert _wheel(tabs, dy=-60) and tabs.tabRect(0).x() == x1             # полшага сенсорного колеса копится
+    assert _wheel(tabs, dy=-60) and tabs.tabRect(0).x() < x1
+    _wheel(tabs, dy=120 * 5)                                              # от себя - к началу
+    assert tabs.tabRect(0).x() == 0
+    _wheel(tabs, dx=-120)                                                 # наклон колеса вправо
+    assert tabs.tabRect(0).x() < 0
+    _mouse_button(tabs, Qt.MouseButton.BackButton)
+    assert tabs.tabRect(0).x() == 0
+    for _ in range(20):
+        _mouse_button(tabs, Qt.MouseButton.ForwardButton)
+    assert tabs.tabRect(tabs.count() - 1).right() <= tabs.width()         # дошли до последней
+    assert tabs.currentIndex() == 0 and not _arrows(tabs)
+    tabs.setFixedWidth(200)                                               # новая раскладка - стрелки снова скрыты
+    qtbot.waitUntil(lambda: tabs.width() == 200)
+    assert not _arrows(tabs)
+    tabs.setCurrentIndex(9)                                               # выбор вкладки по-прежнему её показывает
+    assert tabs.tabRect(9).right() <= tabs.width()
+
+
+def test_wheel_over_tabs_that_fit_goes_to_window(qtbot):
+    from visalab.front.params import PTabBar
+    tabs = PTabBar()
+    for t in ("MAIN", "MOD"):
+        tabs.addTab(t)
+    qtbot.addWidget(tabs)
+    tabs.setFixedWidth(400)
+    tabs.show()
+    qtbot.waitExposed(tabs)
+    assert not _wheel(tabs, dy=-120) and tabs.currentIndex() == 0 and tabs.tabRect(0).x() == 0
+
+
+def test_error_log_scroll_bars_use_theme(qtbot, opened):
+    """Полосы журнала ошибок - по теме (тонкие, без стрелок, ручка цвета рамки), а не стандартные Qt."""
+    from PyQt6.QtWidgets import QPlainTextEdit
+    from visalab.front.theme import UI_COLOR_INDICATOR_FRAME, UI_SCROLLBAR_WIDTH_PX
+    _sim, _proxy, win = opened
+    win.show()
+    qtbot.waitExposed(win)
+    win.show_errors()
+    win.error_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    for i in range(40):
+        win._log("CH1 PERIOD", f"line {i} " + "x" * 80)
+    vbar, hbar = win.error_log.verticalScrollBar(), win.error_log.horizontalScrollBar()
+    qtbot.waitUntil(lambda: vbar.isVisible() and hbar.isVisible())
+    assert vbar.width() == UI_SCROLLBAR_WIDTH_PX and hbar.height() == UI_SCROLLBAR_WIDTH_PX
+    vbar.setValue(0)
+    img = vbar.grab().toImage()
+    middle = {img.pixelColor(img.width() // 2, y).name() for y in range(img.height())}
+    assert UI_COLOR_INDICATOR_FRAME in middle                             # ручка в цветах темы
+
+
+def test_rejected_eqphase_is_logged_once_and_not_as_period(qtbot, settings):
+    """Прибор не знает EQPHASE: в журнале - строка прибора про EQPHASE, период ошибкой не помечен."""
+    sim = SiglentSDGSim(eqphase=False)
+    proxy = attach(InstrumentProxy(SiglentSDG, SimTransport(sim)))
+    win = PulseGenWindow(proxy, settings)
+    qtbot.addWidget(win)
+    with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+        proxy.open()
+    win.channels[0]["period"].set_value(2e-3)
+    _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(2e-3))
+    qtbot.waitUntil(lambda: "[EQPHASE]" in win.error_log.toPlainText())
+    win.channels[0]["period"].set_value(3e-3)
+    _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(3e-3))
+    text = win.error_log.toPlainText()
+    assert text.count("[EQPHASE]") == 1 and "INSTRUMENT" in text
+    assert win.tracker.names.get("ch1.period", "ch1.period") not in text
+    proxy.shutdown()

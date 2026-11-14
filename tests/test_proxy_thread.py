@@ -1,6 +1,8 @@
 """Интеграция: прокси в GUI-потоке, прибор в своём QThread, только сигналы."""
 import time
 
+import pytest
+
 from PyQt6.QtCore import QThread
 
 from visalab.core import ConnectionState, PStatus
@@ -76,6 +78,9 @@ def test_command_delay_spaces_out_commands(make):
     assert min(gaps) >= 0.029
 
 
+@pytest.mark.real_pacing
 def test_sdg_has_default_delay():
     from visalab.drivers import ItechIT6300 as P, SiglentSDG as D
-    assert D.COMMAND_DELAY_S == 0.05 and P.COMMAND_DELAY_S == 0.0
+    from visalab.drivers import default_delay
+    assert D.COMMAND_DELAY_S == 0.15 and P.COMMAND_DELAY_S == 0.0      # как COMMAND_DELAY_SECONDS в PulseGen.py
+    assert default_delay("sdg") == 0.15

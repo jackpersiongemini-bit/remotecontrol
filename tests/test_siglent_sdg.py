@@ -163,3 +163,102 @@ def test_pulse_period_delay_and_eqphase(sdg):
     assert sim.eqphase_count == n
     drv.run_action("align_phase", ())
     assert sim.eqphase_count == n + 1
+
+
+class _LossySim(SiglentSDGSim):
+    """Прибор теряет первую запись периода (команда пришла, а значение прежнее, ошибки нет)."""
+    lose = 1
+
+    def _bswv_set(self, args, g):
+        if self.lose and "PERI" in args.upper():
+            self.lose -= 1
+            return None
+        return super()._bswv_set(args, g)
+
+
+def test_eqphase_goes_after_confirmed_write(sdg):
+    """Как PulseGen.py: запись -> проверка ошибок -> обратное чтение -> только потом EQPHASE."""
+    drv, sim, rec = sdg
+    drv.set_param("ch1.wave", "PULSE"); flush(drv)
+    start = len(sim.history)
+    drv.set_param("ch1.period", 0.4); flush(drv)
+    seq = sim.history[start:]
+    write = next(i for i, u in enumerate(seq) if u.startswith("C1:BSWV PERI"))
+    readback = next(i for i, u in enumerate(seq) if u == "C1:BSWV?" and i > write)
+    eq = seq.index("EQPHASE")
+    assert write < readback < eq and seq[eq + 1] == "*ESR?"            # у EQPHASE своя проверка ошибок
+    assert rec.last_status("ch1.period")[0] is PStatus.WRITTEN
+
+
+def test_rejected_eqphase_is_not_a_period_error(make):
+    """Прибор не знает EQPHASE: ошибка - у EQPHASE (один раз), период записан; после
+    переподключения EQPHASE пробуется снова."""
+    drv, sim, rec = make(SiglentSDG, SiglentSDGSim, sim=SiglentSDGSim(eqphase=False),
+                         driver_kw={"model": SDG_MODELS["SDG2042X"]})
+    drv.set_param("ch1.wave", "PULSE"); flush(drv)
+    assert rec.last_status("ch1.wave")[0] is PStatus.WRITTEN
+    assert any("[EQPHASE]" in m for _, m in rec.errors)
+    assert not any("[ch1." in m for _, m in rec.errors)
+    assert any("EQPHASE" in m and "не принимает" in m for _, m in rec.errors)
+    errors = len(rec.errors)
+    drv.set_param("ch1.period", 0.4); flush(drv)
+    drv.set_param("ch1.width", 1e-4); flush(drv)
+    assert rec.last_status("ch1.period")[0] is PStatus.WRITTEN
+    assert rec.last_status("ch1.width")[0] is PStatus.WRITTEN
+    assert sim.history.count("EQPHASE") == 1 and len(rec.errors) == errors
+    drv.close_connection()
+    drv.open_connection()
+    drv.set_param("ch1.period", 0.5); flush(drv)
+    assert sim.history.count("EQPHASE") == 2
+    assert rec.last_status("ch1.period")[0] is PStatus.WRITTEN
+
+
+def test_lost_write_is_sent_again(make):
+    drv, sim, rec = make(SiglentSDG, _LossySim, driver_kw={"model": SDG_MODELS["SDG2042X"]})
+    drv.set_param("ch1.period", 0.4); flush(drv)
+    assert sum(u.startswith("C1:BSWV PERI") for u in sim.history) == 2     # потерянная запись - ещё раз
+    assert rec.values["ch1.period"] == pytest.approx(0.4)
+    assert rec.last_status("ch1.period")[0] is PStatus.WRITTEN and not rec.errors
+
+
+def test_failed_or_coerced_write_is_not_repeated(sdg):
+    drv, sim, rec = sdg
+    drv.set_param("ch1.load", "50"); flush(drv)
+    drv.set_param("ch1.amplitude", 15.0); flush(drv)                       # 50 Ом: прибор ограничит до 10 В
+    assert sum(u.startswith("C1:BSWV AMP") for u in sim.history) == 1
+    assert rec.last_status("ch1.amplitude")[0] is PStatus.COERCED
+    drv.set_param("ch1.wave", "NOISE"); flush(drv)
+    drv.set_param("ch1.sweep_state", True); flush(drv)                     # ошибка прибора - не повторять
+    assert sum(u.startswith("C1:SWWV STATE") for u in sim.history) == 1
+    assert rec.last_status("ch1.sweep_state")[0] is PStatus.ERROR
+
+
+@pytest.mark.real_pacing
+def test_default_pause_before_every_exchange(make):
+    """150 мс от конца прошлого обмена до каждой команды, запроса и опроса статуса (serial poll)."""
+    import time
+    drv, sim, rec = make(SiglentSDG, SiglentSDGSim, driver_kw={"model": SDG_MODELS["SDG2042X"]})
+    assert drv.command_delay_s == pytest.approx(0.15)
+    t = drv.transport
+    spans, depth = [], [0]
+
+    def timed(fn):
+        def call(*a, **kw):                 # query транспорта сам зовёт write - считать только внешний вызов
+            depth[0] += 1
+            t0 = time.monotonic()
+            try:
+                return fn(*a, **kw)
+            finally:
+                depth[0] -= 1
+                if not depth[0]:
+                    spans.append((t0, time.monotonic(), fn.__name__))
+        return call
+
+    for name in ("write", "query", "read_stb"):
+        setattr(t, name, timed(getattr(t, name)))
+    drv.set_param("ch1.period", 2e-3); flush(drv)
+    drv._on_poll()
+    names = [n for *_, n in spans]
+    assert "read_stb" in names and "write" in names and "query" in names
+    gaps = [b[0] - a[1] for a, b in zip(spans, spans[1:])]
+    assert min(gaps) >= 0.149, list(zip(names[1:], gaps))

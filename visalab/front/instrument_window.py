@@ -419,6 +419,7 @@ class InstrumentWindow(Window):
         self.error_indicator.clicked.connect(self.show_errors)
         self.address.clicked.connect(self.show_connection)
         proxy.param_status.connect(self._log_status)
+        proxy.instrument_error.connect(self._log_instrument_error)
         proxy.state_changed.connect(self._on_state)
         proxy.sync_done.connect(self._on_sync_done)
         proxy.action_done.connect(self._on_action_done)
@@ -646,6 +647,13 @@ class InstrumentWindow(Window):
         if key in self.tracker.keys and status in (PStatus.ERROR, PStatus.INVALID):
             self._log(self.tracker.names.get(key, key), message)
 
+    def _log_instrument_error(self, _code: int, message: str) -> None:
+        """Ошибка прибора не по ключу окна (EQPHASE, опрос, команда из консоли). Ошибку записи ключа
+        («... [ch1.period]») журнал уже показал строкой этого ключа - второй раз не писать."""
+        context = message[message.rfind("[") + 1:-1] if message.endswith("]") and "[" in message else ""
+        if context not in self.tracker.keys:
+            self._log("INSTRUMENT", message)
+
     def show_errors(self) -> None:
         """Клик по индикатору ошибок: вместо таблицы - журнал (выход - вкладка или CLEAR)."""
         self._show_overlay("errors")
@@ -716,6 +724,12 @@ class InstrumentWindow(Window):
     def _show_delay(self) -> None:
         saved = saved_delay(self.settings, self.CONNECTION_GROUP)
         self.delay_edit.setText("" if saved is None else si_format(saved, "s", 4))
+        # пустое поле - пауза драйвера: показать какая (у SDG 150 мс), чтобы старое значение в ini было видно
+        try:
+            default = COORD.default_delay(self._driver_kind())
+        except KeyError:                  # драйвер не из каталога - подсказка без числа
+            default = 0.0
+        self.delay_edit.setPlaceholderText(f"default {si_format(default, 's', 4)}" if default else "driver default")
 
     def apply_delay(self) -> bool:
         """DLY: сохранить в ini и сразу применить к прибору. False - не число (поле возвращается)."""

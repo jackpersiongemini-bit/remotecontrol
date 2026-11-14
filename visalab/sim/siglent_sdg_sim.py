@@ -38,12 +38,14 @@ class SiglentSDGSim(SimInstrument):
     CMR_SUPPORTED = False
     ECHO_COMMON_HEADER = True    # "*ESR 0", "*OPC 1" - как в мануале
 
-    def __init__(self, idn: str | None = None, max_freq: float | None = None):
+    def __init__(self, idn: str | None = None, max_freq: float | None = None, eqphase: bool = True):
+        """``eqphase=False`` - модель, которая EQPHASE не знает (в мануале 2016 его нет): команда -> CME."""
         if idn:
             self.IDN = idn
         if max_freq:
             self.MAX_FREQ = max_freq
         self.cmr = 0
+        self.has_eqphase = eqphase
         super().__init__()
 
     # Siglent не имеет SYST:ERR? - ошибки только в ESR (и CMR)
@@ -77,7 +79,8 @@ class SiglentSDGSim(SimInstrument):
         self.on("C#:SWWV", self._swwv_set, self._swwv_get)
         self.on("C#:BTWV", self._btwv_set, self._btwv_get)
         self.on("PACP", self._pacp)
-        self.on("EQPHASE", lambda a, g: setattr(self, "eqphase_count", getattr(self, "eqphase_count", 0) + 1))
+        if self.has_eqphase:
+            self.on("EQPHASE", lambda a, g: setattr(self, "eqphase_count", getattr(self, "eqphase_count", 0) + 1))
         if self.CMR_SUPPORTED:
             self.on("CMR", get=self._cmr_get)
 

@@ -69,7 +69,7 @@ def main(argv=None) -> int:
     ap.add_argument("--sdg-model", help="то же, что --model sdg=МОДЕЛЬ")
     ap.add_argument("--psu-model", help="то же, что --model psu=МОДЕЛЬ")
     ap.add_argument("--delay", action="append", default=[], metavar="ПРИБОР=СЕК",
-                    help="пауза между командами прибору (по умолчанию: sdg 0.05, остальные 0)")
+                    help="пауза между командами прибору (по умолчанию: sdg 0.15, остальные 0)")
     ap.add_argument("--sdg-delay", type=float, help="то же, что --delay sdg=СЕК")
     ap.add_argument("--psu-delay", type=float, help="то же, что --delay psu=СЕК")
     ap.add_argument("--lab", default=str(Path(__file__).with_name("lab.json")),
