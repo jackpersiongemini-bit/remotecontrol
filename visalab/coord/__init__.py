@@ -10,6 +10,7 @@ UI <> координатор <> абстрактные приборы (проф�
   пока прибор ведёт сценарий, запросы окна, которые меняют прибор, в него не уходят;
 * ``LINKS`` - реестр приборов процесса (его ведёт ``COORD``);
 * ``ActivityMonitor`` - кто что сейчас измеряет (главное окно);
+* ``COORD.follow`` (``FrequencyFollow``) - частота ваттметров следует за генератором / ВАЦ в CW;
 * ``calibration`` - таблицы поправки по частоте (CSV) и подбор GAIN.
 
 Выходной порт слоя - порт абстрактных приборов (:mod:`visalab.instruments`).
@@ -17,12 +18,13 @@ UI <> координатор <> абстрактные приборы (проф�
 from .activity import Activity, ActivityMonitor, Source, Thresholds
 from .calibration import fit_gain_table, interpolate, load_csv, save_csv
 from .coordinator import COORD, Coordinator
+from .follow import FrequencyFollow, source_frequency
 from .instrument import Instrument
 from .registry import LINKS, ProxyLinks, profile_name
 from .scenario import Device, Run, Scenario, ScenarioError, Stopped
 from .scenarios import AcalResult, AutoCalibration, FrequencySweep, acal_file_name, frequency_points
 
-__all__ = ["COORD", "Coordinator", "Instrument", "LINKS", "ProxyLinks", "profile_name", "ActivityMonitor", "Activity",
+__all__ = ["COORD", "Coordinator", "FrequencyFollow", "source_frequency", "Instrument", "LINKS", "ProxyLinks", "profile_name", "ActivityMonitor", "Activity",
            "Source", "Thresholds", "Scenario", "Run", "Device", "ScenarioError", "Stopped",
            "FrequencySweep", "AutoCalibration", "AcalResult", "acal_file_name", "frequency_points",
            "load_csv", "save_csv", "interpolate", "fit_gain_table"]

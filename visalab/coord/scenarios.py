@@ -141,7 +141,7 @@ class FrequencySweep(Scenario):
             actual = dev.value(key)
             if actual is None or expected is None:
                 continue
-            if not dev.proxy.params[key].same(expected, actual):
+            if not dev.spec(key).same(expected, actual):
                 raise ScenarioError(f"{dev.name} {key} changed during {self.NAME}: "
                                     f"{si_format(actual, 'Hz', 6)} instead of {si_format(expected, 'Hz', 6)}")
 
@@ -167,7 +167,7 @@ class FrequencySweep(Scenario):
     def change(self, saved: list, dev: Device, key: str, value):
         """Поставить значение на время сценария (если оно другое) и запомнить, что вернуть."""
         old = dev.value(key)
-        spec = dev.proxy.params[key]
+        spec = dev.spec(key)
         if old is not None and spec.same(spec.validate(value), old):
             return
         saved.append((dev, key, old))

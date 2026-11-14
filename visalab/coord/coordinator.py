@@ -31,9 +31,10 @@ from .. import instruments as _instruments
 from ..core.params import ConnectionState
 from ..profiles import PROFILES
 from .activity import short_name
+from .follow import FrequencyFollow
 from .instrument import Instrument
-from .registry import LINKS, ProxyLinks
-from .scenario import Device, Run, Scenario, ScenarioError
+from .registry import LINKS, ProxyLinks, profile_name
+from .scenario import VNA_AS_GENERATOR, Device, Run, Scenario, ScenarioError
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +54,8 @@ class Coordinator(QObject):
         self.links = links
         self._runs: list[Run] = []
         self._deferred: dict = {}           # прибор -> ([(ключ, значение, сценарий)], слот state_changed)
+        #: частота ваттметров следует за генератором / ВАЦ в CW (``follow.set_enabled(ваттметр, вкл)``)
+        self.follow = FrequencyFollow(self)
 
     # ------------------------------------------------------------ каталог драйверов (транзитом из слоя 3)
     @staticmethod
@@ -119,6 +122,30 @@ class Coordinator(QObject):
         """Последний открытый прибор класса (``signal_generator``...) или None."""
         return self.links.find(profile)
 
+    def generators(self) -> list[Instrument]:
+        """Источники СВЧ: генераторы сигнала и ВАЦ в режиме генератора (CW, ``gen.state``), в порядке открытия."""
+        return [p for p in self.links.proxies() if profile_name(p) == "signal_generator"
+                or (profile_name(p) == "network_analyzer" and p.value("gen.state") is True)]
+
+    def find_for(self, profile: str) -> Instrument | None:
+        """Прибор для роли сценария. Генератор: ВАЦ в CW тоже генератор; если источников несколько -
+        тот, у которого включён выход ВЧ (если такой один), иначе последний открытый генератор сигнала."""
+        if profile != "signal_generator":
+            return self.find(profile)
+        gens = self.generators()
+        on = [g for g in gens if g.value("rf.output") is True]
+        if len(on) == 1:
+            return on[0]
+        real = [g for g in gens if profile_name(g) == "signal_generator"]
+        return (real or gens or [None])[-1]
+
+    @staticmethod
+    def role_keys(inst, profile: str) -> dict[str, str]:
+        """Ключи прибора в чужой роли: ВАЦ как генератор - ``VNA_AS_GENERATOR``; своя роль - {}."""
+        if profile == "signal_generator" and profile_name(inst) == "network_analyzer":
+            return dict(VNA_AS_GENERATOR)
+        return {}
+
     def proxies(self) -> list[Instrument]:
         """Приборы процесса в порядке открытия."""
         return self.links.proxies()
@@ -144,11 +171,14 @@ class Coordinator(QObject):
         профиля. Нет прибора, не подключён, занят другим сценарием - ScenarioError (ничего не начато)."""
         devices: dict[str, Device] = {}
         for profile in scenario.needs:
-            inst = (bind or {}).get(profile) or self.find(profile)
+            inst = (bind or {}).get(profile) or self.find_for(profile)
             title = PROFILES[profile].title if profile in PROFILES else profile
             if inst is None:
                 raise ScenarioError(f"{scenario.NAME}: no {profile.replace('_', ' ')} open ({title})")
-            dev = Device(inst)
+            keys = self.role_keys(inst, profile)
+            if keys and inst.value("gen.state") is not True:
+                raise ScenarioError(f"{scenario.NAME}: {self.display_name(inst)} is not in CW (generator mode)")
+            dev = Device(inst, keys=keys)
             if not inst.is_connected:
                 raise ScenarioError(f"{scenario.NAME}: {dev.name} ({inst.name}) is not connected")
             other = self.busy(inst)
