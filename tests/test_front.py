@@ -82,6 +82,22 @@ def test_preset_add_apply_and_eqphase(qtbot, opened):
     assert win.presets.find(2e-3, 50e-6) < 0
 
 
+def test_preset_highlight_follows_instrument(qtbot, opened):
+    """Горит пресет, равный значениям прибора; поменяли ширину - не горит (Алексей 2026-11-14)."""
+    _sim, proxy, win = opened
+    idx = win.presets.find(400e-3, 30e-6, "PULSE")
+    assert idx >= 0
+    win._apply_preset(idx)
+    _wait(qtbot, proxy, "ch1.width", lambda v: v == pytest.approx(30e-6))
+    qtbot.waitUntil(lambda: win.presets.checked_index() == idx, timeout=5000)
+    win._preset_pending_until = 0.0                          # пресет записан
+    win.channels[0]["width"].set_value(40e-6)                 # руками - другая ширина
+    _wait(qtbot, proxy, "ch1.width", lambda v: v == pytest.approx(40e-6))
+    qtbot.waitUntil(lambda: win.presets.checked_index() == -1, timeout=5000)
+    win.channels[0]["width"].set_value(30e-6)                 # вернули - снова горит
+    qtbot.waitUntil(lambda: win.presets.checked_index() == idx, timeout=5000)
+
+
 def test_init_restores_saved_values(qtbot, opened, settings):
     sim, proxy, win = opened
     win.channels[1]["delay"].set_value(1e-6)

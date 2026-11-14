@@ -118,6 +118,7 @@ class PulseGenWindow(InstrumentWindow):
     PRESET_KEY = "PULSE_PRESETS"
     PRESET_DEFAULTS = PULSE_PRESETS
     PRESET_ADD_TIP = "Add preset from CH1 TYPE / PERI / WID"
+    PRESET_TRACKS_VALUES = True             # горит пресет, равный CH1 TYPE / PERI / WID прибора
 
     def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Pulse generator", parent=None):
         super().__init__(proxy, settings, title, parent)
