@@ -344,6 +344,9 @@ class InstrumentWindow(Window):
     _preset_pending_until = 0.0
     PRESET_DEFAULTS: tuple = ()
     PRESET_ADD_TIP = "Add preset from current values"
+    #: подсказка строки пресетов
+    PRESET_HELP = ("Presets: click a chip - apply it to the instrument. The chip that matches the instrument "
+                   "now is selected. + saves the current values, − removes the selected chip.")
 
     # ------------------------------------------------------------ точки расширения
     def build(self) -> None:  # pragma: no cover - абстрактный
@@ -524,6 +527,7 @@ class InstrumentWindow(Window):
         tl.addWidget(self.remove_button)
         line = PanelLine(name, self.preset_scroll, tools)
         line.line_layout.setAlignment(line._name, Qt.AlignmentFlag.AlignTop)
+        line.set_help(self.PRESET_HELP)
         return line
 
     def power_levels_line(self, key: str, name: str = "PRST") -> PanelLine:
@@ -538,7 +542,8 @@ class InstrumentWindow(Window):
         tl.addWidget(self._tool("+", "Add the current power to the presets", pl.add_current, half))
         tl.addWidget(self._tool("−", "Remove the selected power preset", pl.remove_selected, half))
         tl.addStretch(1)
-        return PanelLine(name, pl, tools)
+        return PanelLine(name, pl, tools).set_help(
+            "Power presets: click a level - set the power. + adds the current power, − removes the selected level.")
 
     def _load_levels(self) -> list[float]:
         raw = self.settings.value(f"{self._prefix}/POWER_LIST", "")
@@ -711,6 +716,8 @@ class InstrumentWindow(Window):
         head = QHBoxLayout()
         title = QLabel("ERRORS")
         title.setObjectName("lineName")
+        title.setToolTip("Errors of this window: failed writes, instrument errors, lost connection. "
+                         "The red indicator in the title bar stays on until CLEAR.")
         head.addWidget(title)
         head.addStretch()
         self.clear_button = self._tool("CLEAR", "Clear the error log and return to parameters", self.clear_errors)
