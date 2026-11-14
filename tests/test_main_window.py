@@ -252,6 +252,10 @@ def test_delay_on_address_page(qtbot, tmp_path):
     qtbot.addWidget(win)
     names = [ln.name for ln in win.connection_page.lines]
     assert names[:4] == ["DRV", "MDL", "ADDR", "DLY"]
+    from visalab.core.units import si_format
+    from visalab.drivers import default_delay
+    assert win.delay_edit.text() == ""                                  # пустое - пауза драйвера, и видно какая
+    assert win.delay_edit.placeholderText() == f"default {si_format(default_delay('sdg'), 's', 4)}"
     win.delay_edit.setText("120m")
     assert win.apply_delay()
     assert saved_delay(settings, win.CONNECTION_GROUP) == pytest.approx(0.12) and win.delay_edit.text() == "120 ms"

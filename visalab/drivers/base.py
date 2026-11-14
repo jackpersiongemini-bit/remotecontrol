@@ -100,9 +100,12 @@ class VISAInstrument(QObject):
     MAX_POLL_FAILURES: int = 3
     #: проверять ошибки прибора сразу после каждой записи пользователя
     CHECK_AFTER_WRITE: bool = True
-    #: минимальная пауза между обращениями к прибору, с (между любыми write/query).
-    #: Пауза выдерживается в потоке прибора, GUI при этом не блокируется.
+    #: минимальная пауза между обращениями к прибору, с (между любыми write/query и опросом статуса),
+    #: от конца предыдущего обмена. Пауза выдерживается в потоке прибора, GUI при этом не блокируется.
     COMMAND_DELAY_S: float = 0.0
+    #: сколько раз отправлять запись, если обратное чтение показало прежнее значение без ошибки
+    #: (прибор команду потерял). 1 - не повторять.
+    WRITE_ATTEMPTS: int = 1
     #: команда SCPI очереди ошибок (None - у прибора её нет)
     ERROR_QUERY: str | None = "SYST:ERR?"
     #: автоподключение после обрыва связи / неудачного подключения: паузы перед попытками, с
@@ -665,11 +668,22 @@ class VISAInstrument(QObject):
             self._read_keys([key])  # вернуть GUI фактическое значение
             return
         self.param_status.emit(key, PStatus.WRITING, "")
-        self.write_param(spec, value)
-        errors = self._check_errors(context=key) if self.CHECK_AFTER_WRITE else []
-        self._read_failed.discard(key)
-        self._read_keys([key, *spec.also_read])      # обратное чтение
-        actual = self._values.get(key)
+        attempts = max(1, int(self.WRITE_ATTEMPTS))
+        for attempt in range(1, attempts + 1):
+            before = self._values.get(key)
+            self.write_param(spec, value)
+            errors = self._check_errors(context=key) if self.CHECK_AFTER_WRITE else []
+            self._read_failed.discard(key)
+            self._read_keys([key, *spec.also_read])      # обратное чтение
+            actual = self._values.get(key)
+            # прибор ответил прежним значением и ошибки не было - команда потерялась: отправить ещё раз
+            lost = (attempt < attempts and not errors and key not in self._no_answer
+                    and key not in self._read_failed and before is not None
+                    and not spec.same(value, actual) and spec.same(before, actual))
+            if not lost:
+                break
+            log.warning("%s: %s = %s не применилось (прибор показывает %s), повтор %d/%d",
+                        self.transport.address, key, value, actual, attempt + 1, attempts)
         if errors:
             self.param_status.emit(key, PStatus.ERROR, "; ".join(m for _, m in errors))
         elif key in self._no_answer:                 # не читается у модели: подтвердить нечем
@@ -679,8 +693,14 @@ class VISAInstrument(QObject):
             pass
         elif spec.same(value, actual):
             self.param_status.emit(key, PStatus.WRITTEN, "")
+            self.after_write(spec, actual)
         else:
             self.param_status.emit(key, PStatus.COERCED, f"запрошено {value}, установлено {actual}")
+            self.after_write(spec, actual)
+
+    def after_write(self, spec: Param, value: Any) -> None:
+        """Хук: значение записано и подтверждено обратным чтением (WRITTEN или COERCED), ``value`` -
+        что теперь в приборе. Например, SDG выравнивает здесь фазы каналов (EQPHASE)."""
 
     def read_esr(self) -> int:
         """*ESR? (регистр при чтении сбрасывается). Бит OPC запоминается в ``opc_latched``,
@@ -730,11 +750,16 @@ class VISAInstrument(QObject):
 
     def _read_status_byte(self) -> int:
         if self.transport.supports_serial_poll:
+            # serial poll - тоже обращение к прибору: та же пауза, что перед командой (медленный SDG
+            # путается, если опрос статуса приходит сразу за записью)
+            self._pace()
             try:
                 return self.transport.read_stb()
             except TransportNotSupported:          # VI_ERROR_NSUP_OPER: дальше статус через *STB?
                 log.warning("%s: serial poll не поддерживается, статус через *STB?", self.transport.address)
                 self.transport.supports_serial_poll = False
+            finally:
+                self._last_io = time.monotonic()
         return self.query_int("*STB?")
 
     @pyqtSlot()

@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,8 @@ from .base import VISAInstrument
 from ..core.params import Action, Kind, Param, PStatus
 from ..core.units import parse_bool, parse_number
 from ..profiles import FUNCTION_GENERATOR
+
+log = logging.getLogger(__name__)
 
 __all__ = ["SiglentSDG", "SDGModel", "SDG_MODELS", "parse_siglent_response"]
 
@@ -102,9 +105,13 @@ class SiglentSDG(VISAInstrument):
     NAME = "Siglent SDG"
     PROFILE = FUNCTION_GENERATOR
     STRIP_RESPONSE_HEADER = True   # "*ESR 1", "C1:SYNC OFF"
-    #: SDG по USB может терять команды, идущие подряд без паузы. 50 мс - стартовое
-    #: значение, подбирается на приборе (run_gui.py --sdg-delay).
-    COMMAND_DELAY_S = 0.05
+    #: SDG теряет и путает команды, идущие подряд без паузы, и подвисает (Алексей, 2026-11-14: «ошибка
+    #: команды» на периоде, потом таймауты). 150 мс от конца прошлого обмена - как в его PulseGen.py, где
+    #: SDG работает. Пауза - перед каждой командой, запросом и опросом статуса; меняется в окне (DLY).
+    COMMAND_DELAY_S = 0.15
+    #: запись проверяется обратным чтением; прибор показал прежнее значение без ошибки - команда
+    #: потерялась, отправить ещё раз (PulseGen.py: WRITE_ATTEMPTS = 3)
+    WRITE_ATTEMPTS = 3
     ERROR_QUERY = None           # SYST:ERR? в этом мануале нет
 
     # (ключ-суффикс, подпись, тип, единица, код в BSWV, extra)
@@ -122,7 +129,7 @@ class SiglentSDG(VISAInstrument):
         ("width", "Длительность имп.", Kind.FLOAT, "s", "WIDTH", {"minimum": 0.0}),
         ("delay", "Задержка имп.", Kind.FLOAT, "s", "DLY", {}),
     )
-    #: после изменения этих полей BSWV выравнивать фазы каналов (EQPHASE), как в PulseGen
+    #: после подтверждённой записи этих полей BSWV выравнивать фазы каналов (EQPHASE), как в PulseGen.py
     PHASE_FIELDS = ("WVTP", "PERI", "FRQ", "WIDTH", "DUTY", "DLY")
     AUTO_EQPHASE = True
     _SWWV = (
@@ -144,6 +151,8 @@ class SiglentSDG(VISAInstrument):
     def __init__(self, transport, model: SDGModel | None = None, parent=None,
                  command_delay_s: float | None = None):
         self.model = model or DEFAULT_MODEL
+        #: EQPHASE принимается прибором; False - модель его не знает, до переподключения не отправлять
+        self._eqphase = True
         super().__init__(transport, parent, command_delay_s)
 
     @property
@@ -240,9 +249,26 @@ class SiglentSDG(VISAInstrument):
         else:
             cmd = spec.write.format(value=spec.to_scpi(value))
         self.write(cmd)
-        if (self.AUTO_EQPHASE and self.model.channels >= 2 and spec.group and spec.group.endswith(":BSWV")
-                and spec.meta.get("code") in self.PHASE_FIELDS):
-            self.write("EQPHASE")
+
+    def on_connected(self) -> None:
+        super().on_connected()
+        self._eqphase = True          # после переподключения - снова пробовать (прибор могли сменить)
+
+    def after_write(self, spec: Param, value: Any) -> None:
+        """EQPHASE - только после того, как прибор подтвердил запись поля, влияющего на фазу (как
+        PulseGen.py), и со своей проверкой ошибок: ошибка EQPHASE не выдаётся за ошибку периода.
+        Модель, которая EQPHASE не знает (в мануале 2016 его нет), получает его один раз."""
+        if not (self.AUTO_EQPHASE and self._eqphase and self.model.channels >= 2 and spec.group
+                and spec.group.endswith(":BSWV") and spec.meta.get("code") in self.PHASE_FIELDS):
+            return
+        self.write("EQPHASE")
+        errors = self._check_errors(context="EQPHASE")
+        if any(code == -5 or -199 <= code <= -100 or code > 0 for code, _ in errors):  # CME, -1xx, CMR?
+            self._eqphase = False
+            log.warning("%s: прибор не принимает EQPHASE - автоматическое выравнивание фаз выключено",
+                        self.transport.address)
+            self.instrument_error.emit(0, "EQPHASE прибор не принимает: фазы каналов больше не выравниваются "
+                                          "сами (кнопка выравнивания осталась)")
 
     def read_param_raw(self, spec: Param) -> Any:
         # SYNC: "C1:SYNC ON" (на части моделей "C1:SYNC ON,TYPE,CH1")

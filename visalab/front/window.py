@@ -16,7 +16,7 @@ from qframelesswindow import FramelessWindow, TitleBar
 from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_CONTROL, UI_COLOR_ERROR,
                     UI_COLOR_PANEL, UI_SWITCH_MARGIN_PX, UI_TITLE_BAR_WIDE_ITEM_SIZE_PX,
                     UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
-                    UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss)
+                    UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss, scrollbar_qss)
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
            "CustomExpandButton", "CustomLockButton", "Switch",
@@ -91,7 +91,7 @@ class Window(FramelessWindow):
                   font-size: ${UI_FONT_SIZE_PT}pt; color: $UI_COLOR_TEXT; }
         QToolTip { padding: 3px 6px; color: $UI_COLOR_TEXT; background-color: $UI_COLOR_PANEL;
                    border: 1px solid $UI_COLOR_BORDER; border-radius: ${UI_BORDER_RADIUS_PX}px; }
-    """)
+    """) + scrollbar_qss()
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)

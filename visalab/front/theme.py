@@ -41,6 +41,7 @@ TOKENS = {
     "UI_SWITCH_MARGIN_PX": 3,
     "UI_CONTROL_HEIGHT_PX": 28,
     "UI_COLUMN_WIDTH_PX": 84,
+    "UI_SCROLLBAR_WIDTH_PX": 8,            # полоса прокрутки: дорожка без фона, ручка - тонкая скруглённая
 }
 #: цвета трасс на графиках (первая - как текст, дальше - приглушённые, различимые на #222)
 UI_TRACE_COLORS = ("#f2f2f2", "#e3a21a", "#5aa9e6", "#4fbf6f", "#e0605f", "#b48ad8", "#9a9a9a", "#d8c36a")
@@ -52,3 +53,40 @@ globals().update(TOKENS)
 
 def render_qss(template: str) -> str:
     return Template(template).safe_substitute({k: str(v) for k, v in TOKENS.items()})
+
+
+#: правила полос прокрутки; ``$UI_...`` подставит render_qss
+_SCROLLBAR_RULES = (
+    ("QScrollBar:vertical", "background: transparent; border: none; border-radius: 0; margin: 0; padding: 0;"
+                            " width: ${UI_SCROLLBAR_WIDTH_PX}px;"),
+    ("QScrollBar:horizontal", "background: transparent; border: none; border-radius: 0; margin: 0; padding: 0;"
+                              " height: ${UI_SCROLLBAR_WIDTH_PX}px;"),
+    ("QScrollBar::handle:vertical", "background: $UI_COLOR_INDICATOR_FRAME; border: none; margin: 1px;"
+                                    " border-radius: ${SCROLLBAR_HANDLE_RADIUS_PX}px; min-height: 24px;"),
+    ("QScrollBar::handle:horizontal", "background: $UI_COLOR_INDICATOR_FRAME; border: none; margin: 1px;"
+                                      " border-radius: ${SCROLLBAR_HANDLE_RADIUS_PX}px; min-width: 24px;"),
+    ("QScrollBar::handle:hover", "background: $UI_COLOR_BORDER_LIGHT;"),
+    ("QScrollBar::handle:pressed", "background: $UI_COLOR_INVERT;"),
+    ("QScrollBar::add-line, QScrollBar::sub-line", "width: 0; height: 0; border: none; background: none;"),
+    ("QScrollBar::up-arrow, QScrollBar::down-arrow, QScrollBar::left-arrow, QScrollBar::right-arrow",
+     "width: 0; height: 0; border: none; background: none;"),
+    ("QScrollBar::add-page, QScrollBar::sub-page", "background: none;"),
+    ("QAbstractScrollArea::corner", "background: transparent; border: none;"),
+)
+
+
+def scrollbar_qss(scope: str = "") -> str:
+    """Полосы прокрутки в цветах темы (Алексей 2026-11-14: стандартные полосы Qt «стиль не настроен»):
+    без стрелок, дорожка прозрачная, ручка цвета рамки, светлее при наведении и нажатии.
+
+    ``scope`` - префикс каждого селектора («Panel »). Таблица стилей ближайшего предка сильнее
+    дальней при любой специфичности, поэтому окно и панель (её общее «Panel QWidget» перекрасило бы
+    полосу в фон панели) добавляют эти правила каждый к себе.
+    """
+    radius = (TOKENS["UI_SCROLLBAR_WIDTH_PX"] - 2) // 2
+    lines = []
+    for selector, body in _SCROLLBAR_RULES:
+        scoped = ", ".join(scope + part.strip() for part in selector.split(","))
+        lines.append(f"{scoped} {{ {body} }}")
+    return Template("\n".join(lines)).safe_substitute(
+        {**{k: str(v) for k, v in TOKENS.items()}, "SCROLLBAR_HANDLE_RADIUS_PX": str(radius)})

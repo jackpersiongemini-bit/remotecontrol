@@ -31,6 +31,19 @@ def sim_of(inst):
     return worker(inst).transport.sim
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "real_pacing: драйвер с настоящей паузой между обращениями (SDG - 150 мс)")
+
+
+@pytest.fixture(autouse=True)
+def _sim_pacing(request, monkeypatch):
+    """Симулятору не нужна пауза живого SDG (150 мс): остальные тесты идут с прежними 50 мс, иначе набор
+    втрое дольше. Саму паузу по умолчанию и её соблюдение проверяют тесты с меткой real_pacing."""
+    if request.node.get_closest_marker("real_pacing") is None:
+        from visalab.drivers import SiglentSDG
+        monkeypatch.setattr(SiglentSDG, "COMMAND_DELAY_S", 0.05)
+
+
 @pytest.fixture(autouse=True)
 def _own_registry_entries():
     """Тест не оставляет своих приборов в реестре координатора процесса."""

@@ -18,7 +18,7 @@ from typing import Any
 from PyQt6.QtCore import QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QMenu, QPushButton, QTabBar, QVBoxLayout,
+                             QLineEdit, QMenu, QPushButton, QTabBar, QToolButton, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
@@ -26,7 +26,7 @@ from ..coord import Instrument
 from ..core.units import SI_PREFIXES, si_format, si_parse
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INDICATOR_FRAME, UI_COLOR_INVERT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
-                    UI_CONTROL_HEIGHT_PX, render_qss)
+                    UI_CONTROL_HEIGHT_PX, render_qss, scrollbar_qss)
 from .window import WriteState
 
 __all__ = ["PLineEdit", "PSpinBox", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
@@ -649,7 +649,8 @@ class PTabBar(QTabBar):
     """Вкладки (QTabBar) в стиле панели: выбранная - фон поля, отмеченная ``set_on`` - инверсия.
 
     QSS не умеет красить отдельные вкладки по своему признаку, поэтому вкладки рисуются здесь.
-    Колесо мыши и клавиши переключают вкладки (поведение QTabBar).
+    Вкладки не помещаются - полоса прокручивается колесом мыши (и наклоном колеса) или кнопками мыши
+    «назад» / «вперёд»; стрелок нет (Алексей). Выбранная вкладка при прокрутке не меняется.
     """
 
     def __init__(self, parent=None):
@@ -657,6 +658,7 @@ class PTabBar(QTabBar):
         self.setExpanding(True)
         self.setDrawBase(False)
         self.setDocumentMode(True)
+        # прокрутку полосы делает сам QTabBar (его кнопки-стрелки), сами стрелки скрыты: tabLayoutChange
         self.setUsesScrollButtons(True)
         self.setElideMode(Qt.TextElideMode.ElideNone)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -664,7 +666,47 @@ class PTabBar(QTabBar):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._on: set[int] = set()
         self._hover = -1
+        self._wheel = 0                   # накопленный поворот колеса (сенсорные колёса дают доли шага)
         self.show_selection = True        # False - полоса только как индикаторы (свёрнутое окно)
+
+    # ------------------------------------------------------------ прокрутка без стрелок
+    def tabLayoutChange(self) -> None:  # noqa: N802 - Qt
+        super().tabLayoutChange()
+        for b in self.findChildren(QToolButton):     # QTabBar показывает стрелки при каждой раскладке
+            b.hide()
+
+    def scroll_tabs(self, steps: int) -> bool:
+        """Сдвинуть полосу на ``steps`` вкладок (минус - влево). False - сдвигать некуда."""
+        name = "ScrollLeftButton" if steps < 0 else "ScrollRightButton"
+        button = self.findChild(QToolButton, name)
+        moved = False
+        for _ in range(abs(steps)):
+            if button is None or not button.isEnabled():
+                break
+            button.click()                # QTabBar сдвигает полосу к следующей скрытой вкладке
+            moved = True
+        return moved
+
+    def wheelEvent(self, e):  # noqa: N802 - Qt
+        d = e.angleDelta()
+        self._wheel += d.x() if abs(d.x()) > abs(d.y()) else d.y()
+        steps = int(self._wheel / 120)    # шаг колеса - 120 (1/8 градуса)
+        if not steps:
+            e.accept()
+            return
+        self._wheel -= steps * 120
+        if self.scroll_tabs(-steps):      # от себя / влево - к началу полосы
+            e.accept()
+        else:
+            self._wheel = 0
+            e.ignore()                    # полоса и так видна целиком - колесо достаётся окну
+
+    def mousePressEvent(self, e):  # noqa: N802 - Qt
+        if e.button() in (Qt.MouseButton.BackButton, Qt.MouseButton.ForwardButton):
+            self.scroll_tabs(-1 if e.button() == Qt.MouseButton.BackButton else 1)
+            e.accept()
+            return
+        super().mousePressEvent(e)
 
     def set_on(self, index: int, on: bool) -> None:
         if on != (index in self._on):
@@ -855,7 +897,6 @@ class Panel(QFrame):
         QMenu#psmenu::item:checked { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         QMenu#psmenu::indicator { width: 0; }
         Panel PTabBar { background: transparent; }
-        Panel PTabBar QToolButton { background-color: $UI_COLOR_BACKGROUND; border: none; }
         Panel QPushButton#unit {
             background-color: transparent; border: none; padding: 0 4px; min-height: 0;
             color: $UI_COLOR_BORDER_LIGHT; font-weight: normal;
@@ -870,7 +911,7 @@ class Panel(QFrame):
         Panel QPushButton#tool[wide="true"] { min-width: ${UI_COLUMN_WIDTH_PX}px; max-width: ${UI_COLUMN_WIDTH_PX}px; }
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }
-    """)
+    """) + scrollbar_qss("Panel ")
 
     def __init__(self, table: QWidget, column_width: int | None = None, parent=None):
         """``table`` - PanelTable (будет выровнена) или любой виджет со своими таблицами."""
