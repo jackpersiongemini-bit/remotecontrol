@@ -16,10 +16,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from PyQt6.QtCore import QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QMenu, QPushButton, QTabBar, QToolButton, QVBoxLayout,
+                             QLineEdit, QMenu, QPushButton, QTabBar, QToolButton, QToolTip, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
@@ -28,6 +28,7 @@ from ..core.units import SI_PREFIXES, si_format, si_parse
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INDICATOR_FRAME, UI_COLOR_INVERT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_CONTROL_HEIGHT_PX, render_qss, scrollbar_qss)
+from .help import param_help
 from .window import WriteState
 
 __all__ = ["PLineEdit", "PSpinBox", "StepLineEdit", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
@@ -48,14 +49,44 @@ def _repolish(w: QWidget) -> None:
 class _Bound:
     """Привязка к ключу: значение, статус записи, доступность по состоянию связи."""
 
+    #: как менять значение (``help.HOW``): spin / edit / button / menu / label
+    HOW = ""
+
     def bind(self, proxy: Instrument, key: str) -> None:
         self.proxy, self.key = proxy, key
         self.spec = proxy.params[key]
         self._value: Any = None
+        self._status_message = ""
         proxy.subscribe(key, self._on_value, self._on_status)
-        proxy.state_changed.connect(lambda _s: self._update_enabled())
-        self.setToolTip(key)
+        proxy.state_changed.connect(lambda _s: (self._update_enabled(), self.refresh_tip()))
+        self.refresh_tip()
         self._update_enabled()
+
+    def how(self) -> str:
+        return self.HOW
+
+    def help_text(self) -> str:
+        """Подсказка: что это и как работает (``help.param_help``), без ошибки записи. Текст, который
+        окно задало через ``setToolTip``, заменяет общее описание ключа (диапазон и ключ остаются)."""
+        return param_help(self.proxy, self.key, self.how(), text=getattr(self, "_custom_tip", ""),
+                          extra=self.help_extra())
+
+    def help_extra(self) -> str:
+        return ""
+
+    def refresh_tip(self) -> None:
+        if not hasattr(self, "key"):
+            return
+        msg = getattr(self, "_status_message", "")
+        QWidget.setToolTip(self, self.help_text() + (f"\n{msg}" if msg else ""))
+
+    def set_custom_tip(self, text: str) -> None:
+        """``setToolTip`` поля прибора: своё описание вместо общего."""
+        self._custom_tip = text or ""
+        if hasattr(self, "key"):
+            self.refresh_tip()
+        else:
+            QWidget.setToolTip(self, text)
 
     def _update_enabled(self) -> None:
         self.setEnabled(self.proxy.is_connected and self._value is not None)
@@ -68,7 +99,8 @@ class _Bound:
     def _on_status(self, status: PStatus, message: str) -> None:
         self.setProperty("wstate", _WSTATE.get(status, ""))
         _repolish(self)
-        self.setToolTip(self.key + (f"\n{message}" if message else ""))
+        self._status_message = message
+        self.refresh_tip()
 
     def show_value(self, value: Any) -> None:  # pragma: no cover
         raise NotImplementedError
@@ -86,6 +118,9 @@ class PLineEdit(QLineEdit, _Bound):
     Пока единицу не выбрали вручную, префикс подбирается под значение.
     """
 
+    setToolTip = _Bound.set_custom_tip
+    HOW = "edit"
+
     def __init__(self, proxy: Instrument, key: str, unit: str | None = None, digits: int = 6, parent=None):
         super().__init__(parent)
         self.unit = unit if unit is not None else proxy.params[key].unit
@@ -102,8 +137,10 @@ class PLineEdit(QLineEdit, _Bound):
             if len(self.prefixes) > 1:
                 b.setCursor(Qt.CursorShape.PointingHandCursor)
                 b.clicked.connect(self._unit_menu)
+                b.setToolTip(f"Unit: click to choose the prefix ({', '.join(p + self.unit for p in self.prefixes)})")
             else:
                 b.setProperty("static", True)
+                b.setToolTip(f"Unit: {self.unit}")
             self.unit_button = b
         self.bind(proxy, key)
         self.editingFinished.connect(self.change_value)
@@ -269,6 +306,9 @@ class PSpinBox(QDoubleSpinBox, _Bound):
     по Enter / уходу фокуса, шаг стрелкой или колесом - сразу.
     """
 
+    setToolTip = _Bound.set_custom_tip
+    HOW = "spin"
+
     step_changed = pyqtSignal(object)        # шаг в единицах параметра (Hz, dBm...) или None - AUTO
 
     def __init__(self, proxy: Instrument, key: str, prefixes: tuple[str, ...] | None = None, parent=None):
@@ -296,8 +336,10 @@ class PSpinBox(QDoubleSpinBox, _Bound):
             if len(self.prefixes) > 1:
                 b.setCursor(Qt.CursorShape.PointingHandCursor)
                 b.clicked.connect(self._unit_menu)
+                b.setToolTip(f"Unit: click to choose the prefix ({', '.join(p + self.unit for p in self.prefixes)})")
             else:
                 b.setProperty("static", True)
+                b.setToolTip(f"Unit: {self.unit}")
             self.unit_button = b
         self.bind(proxy, key)
         self.editingFinished.connect(self.commit)
@@ -499,6 +541,10 @@ class PSpinBox(QDoubleSpinBox, _Bound):
             return "AUTO"
         return si_format(step, self.unit, 4) if self.unit else f"{step:g}"
 
+    def help_extra(self) -> str:
+        step = self.step_label(self.step_setting)
+        return f"STEP {step}" + (" (the last shown digit)" if self.step_setting is None else "")
+
     def set_step(self, step: float | None, emit: bool = True) -> None:
         """Постоянный шаг (единицы параметра) или None - AUTO."""
         step = float(step) if step else None
@@ -507,8 +553,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self._step_lock = None
         self.show_value(self._value, force=True)
         self.lineEdit().update()
-        tip = self.toolTip().split("\nSTEP ")[0]
-        self.setToolTip(f"{tip}\nSTEP {self.step_label(step)}" if tip else f"STEP {self.step_label(step)}")
+        self.refresh_tip()
         if changed and emit:
             self.step_changed.emit(step)
 
@@ -548,6 +593,8 @@ class PSpinBox(QDoubleSpinBox, _Bound):
 
 class PNLabel(PLineEdit):
     """Число только для показа (DUTY)."""
+
+    HOW = "label"
 
     def __init__(self, proxy: Instrument, key: str, unit: str | None = None, digits: int = 6, parent=None):
         super().__init__(proxy, key, unit, digits, parent)
@@ -593,7 +640,11 @@ class PSButton(IndicatorButton, _Bound):
     Подпись показывает только значение прибора (``NKNW`` - пока не известно).
     """
 
+    setToolTip = _Bound.set_custom_tip
     UNKNOWN = "NKNW"
+
+    def how(self) -> str:
+        return "menu" if len(self._data) > 2 else "button"
 
     def indicated(self) -> bool:
         return self.property("state") in ("true", "on")
@@ -697,6 +748,9 @@ class PChoice(QPushButton):
 
 class PLabel(QLabel, _Bound):
     """Показ значения прибора (или просто текст, если ``proxy`` не задан)."""
+
+    setToolTip = _Bound.set_custom_tip
+    HOW = "label"
 
     def __init__(self, proxy: Instrument | None = None, key: str = "", unit: str | None = None,
                  digits: int = 6, text: str = "", parent=None):
@@ -900,15 +954,44 @@ class PTabBar(QTabBar):
             p.setPen(Qt.PenStyle.NoPen)
 
 
+class _LineName(QLabel):
+    """Подпись строки. Подсказка - своя (``PanelLine.set_help``) или первого поля строки, у которого
+    она есть: наводят на имя параметра, а объясняет его поле (что это, диапазон, ключ)."""
+
+    def __init__(self, text: str, line: "PanelLine"):
+        super().__init__(text)
+        self._line = line
+
+    def tip(self) -> str:
+        if self.toolTip():
+            return self.toolTip()
+        for w in self._line.widgets:
+            text = w.help_text() if isinstance(w, _Bound) and hasattr(w, "key") else w.toolTip()
+            if text:
+                return text
+        return ""
+
+    def event(self, e):  # noqa: D401 - Qt
+        if e.type() == QEvent.Type.ToolTip and not self.toolTip():
+            text = self.tip()
+            if text:
+                QToolTip.showText(e.globalPos(), text, self)
+            else:
+                QToolTip.hideText()
+                e.ignore()
+            return True
+        return super().event(e)
+
+
 class PanelLine(QWidget):
     """Строка панели: подпись слева, дальше виджеты (по одному на столбец)."""
 
     def __init__(self, name: str, *widgets: QWidget, parent=None):
         super().__init__(parent)
-        self._name = QLabel(name)
+        self.widgets: list[QWidget] = []
+        self._name = _LineName(name, self)
         self._name.setObjectName("lineName")
         self._name.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.widgets: list[QWidget] = []
         self.line_layout = QHBoxLayout(self)
         self.line_layout.setContentsMargins(0, 0, 0, 0)
         self.line_layout.setSpacing(6)
@@ -923,6 +1006,15 @@ class PanelLine(QWidget):
     @property
     def name(self) -> str:
         return self._name.text()
+
+    def set_help(self, text: str) -> "PanelLine":
+        """Своя подсказка подписи (для строк без поля прибора)."""
+        self._name.setToolTip(text)
+        return self
+
+    def help(self) -> str:
+        """Подсказка подписи строки (своя или первого поля)."""
+        return self._name.tip()
 
     def set_label_width(self, width: int) -> None:
         self._name.setFixedWidth(width)

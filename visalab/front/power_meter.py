@@ -119,6 +119,7 @@ class LNumber(QLineEdit):
         self.unit_button.setObjectName("unit")
         self.unit_button.setProperty("static", True)
         self.unit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.unit_button.setToolTip(f"Unit: {unit}" if unit else "")
         self.editingFinished.connect(self._commit)
         self.show_value(self._value)
 
@@ -130,6 +131,7 @@ class LNumber(QLineEdit):
         """Другая единица поля (шкала TIME: dBm / mW)."""
         self.unit, self.minimum, self.maximum, self.scale, self.si_unit = unit, minimum, maximum, scale, si_unit
         self.unit_button.setText(unit)
+        self.unit_button.setToolTip(f"Unit: {unit}" if unit else "")
         self.resizeEvent(None)
         self.show_value(self._value)
 
@@ -699,8 +701,12 @@ class PowerMeterWindow(InstrumentWindow):
                 w.set_value(float(v), emit=False)
             w.changed.connect(lambda v, n=name: s.setValue(f"{pre}/{n}", v))
             w.setMinimumWidth(0)
+        self.acal_start.setToolTip("ACAL start frequency (the generator starts here)")
+        self.acal_stop.setToolTip("ACAL stop frequency")
+        self.acal_points.setToolTip("ACAL number of frequency points from START to STOP")
         self.acal_run = InstrumentWindow._tool("▶", ACAL_TIP, self.run_acal)
         self.gain_on = LToggle([("OFF", False), ("ON", True)], s.value(f"{pre}/GAIN_ON", False, type=bool))
+        self.gain_on.setToolTip("GAIN on / off: subtract the path gain from the reading")
         self.gain = LNumber(s.value(f"{pre}/GAIN", 0.0, type=float), "dB", -100.0, 100.0)
         self.gain.setToolTip("Gain in the path (subtracted)")
         self.duty_src = LToggle(DUTY_SOURCES, s.value(f"{pre}/DUTY_SRC", "OFF", type=str))

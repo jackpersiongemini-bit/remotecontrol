@@ -183,6 +183,8 @@ class SpectrumWindow(InstrumentWindow):
     PRESET_KEY = "SA_PRESETS"
     PRESET_DEFAULTS = ()
     PRESET_ADD_TIP = "Save the current state in the analyzer memory"
+    PRESET_HELP = ("States saved in the analyzer memory: click a chip - recall it. + saves the current state, "
+                   "− deletes the selected one from the analyzer.")
 
     def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Spectrum analyzer", parent=None):
         self._select_after_list: str | None = None

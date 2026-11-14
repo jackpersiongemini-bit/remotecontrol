@@ -451,6 +451,7 @@ class _MarkChip(IndicatorButton):
         self.setCheckable(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"Marker {n}: click - select it. The bar - the marker is on.")
 
     def indicated(self) -> bool:
         return not self.isChecked() and self.n in self.owner.table
@@ -909,6 +910,8 @@ class VNAWindow(InstrumentWindow):
     PRESET_KEY = "VNA_STATES"
     PRESET_DEFAULTS = ()
     PRESET_ADD_TIP = "Save the current state in the analyzer memory"
+    PRESET_HELP = ("States saved on the analyzer disk (folder in the VNA line): click a chip - recall it. "
+                   "+ saves the current state, − deletes the selected one from the analyzer.")
 
     def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Network analyzer", parent=None):
         self._select_after_list: str | None = None
@@ -940,7 +943,9 @@ class VNAWindow(InstrumentWindow):
             for text, tip, slot in (("+", "New S21 trace on the channel of the selected one", te.create),
                                     ("−", "Delete the selected trace from the analyzer", te.delete)):
                 tl.addWidget(self._tool(text, tip, slot, half))
-            top.append(PanelLine("TRC", te.scroll, tools))
+            top.append(PanelLine("TRC", te.scroll, tools).set_help(
+                "Traces (measurements) on the analyzer: click a chip - select it, the lines below set it up. "
+                "The bar - the trace is read after every sweep. + new trace, − delete the selected one."))
         if "mem_store" in proxy.actions:
             mem = [ActionButton(proxy, "mem_store", "CAPTURE", "Copy data to memory for every measurement being read")]
         else:
@@ -1032,7 +1037,9 @@ class VNAWindow(InstrumentWindow):
                 tl.addWidget(cs.delete_button)
             tl.addStretch(1)
             self._cal_tools = tools
-            cal = [PanelLine("CSET", cs, tools)]
+            cal = [PanelLine("CSET", cs, tools).set_help(
+                "Cal sets on the analyzer: click one - apply it to the channel. ↻ re-reads the list, "
+                "− deletes the cal set of this channel.")]
             for name, key, choices, tip in (
                     ("STIM", "cal.stim", [("CAL", True), ("KEEP", False)],
                      "Applying a cal set: CAL - take its stimulus too (start, stop, points, IFBW, power),\n"
@@ -1108,7 +1115,10 @@ class VNAWindow(InstrumentWindow):
             rl.addWidget(mx, 4)
             rl.addWidget(mp.value, 3)
             mp.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            mark = [PanelLine("MKR", mp), PanelLine("STAT", row)]
+            mark = [PanelLine("MKR", mp).set_help("Markers 1..10 of the selected trace: click a number - select it. "
+                                                  "The bar - the marker is on."),
+                    PanelLine("STAT", row).set_help("Selected marker: on / off, position, value at the marker "
+                                                    "(read after every sweep).")]
             search = [ActionButton(proxy, a, t, tip) for a, t, tip in
                       (("mark_peak", "MAX", "Selected marker to the maximum"),
                        ("mark_min", "MIN", "Selected marker to the minimum")) if a in proxy.actions]

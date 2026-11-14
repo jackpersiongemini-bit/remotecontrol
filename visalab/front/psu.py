@@ -293,6 +293,7 @@ class RuleRow(PanelLine):
         self.edit.setPlaceholderText("IF CH2.I < 5m THEN CH1 OFF AND BLOCK ELSE UNBLOCK")
         self.toggle = LToggle([("ON", True), ("OFF", False)], on)
         self.toggle.setFixedWidth(48)
+        self.toggle.setToolTip("Rule on / off: OFF keeps the rule but does not check it")
         self.delete = QPushButton("×")
         self.delete.setObjectName("choice")
         self.delete.setFixedWidth(28)
