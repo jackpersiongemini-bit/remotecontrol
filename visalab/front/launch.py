@@ -14,7 +14,7 @@ from pathlib import Path
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
-from ..applog import close_logging, default_log_path, setup_logging
+from ..applog import close_logging, default_ini_path, default_log_path, setup_logging
 from ..coord import COORD
 from .instrument_window import saved_connection, saved_delay
 from .models import all_models
@@ -58,12 +58,13 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None 
     ap.add_argument("--address", metavar="ADDR")
     ap.add_argument("--sim", action="store_true")
     ap.add_argument("--lab", default=str(ROOT / "lab.json"))
-    ap.add_argument("--ini", default=str(ROOT / "visalab_front.ini"))
+    ap.add_argument("--ini", default=str(default_ini_path()))
     ap.add_argument("--backend", default="")
     ap.add_argument("--latency", type=float, default=0.005, help="задержка симулятора, с")
     ap.add_argument("--no-connect", action="store_true")
     ap.add_argument("--log", metavar="FILE", help="журнал программы (по умолчанию logs/visalab.log рядом с ini)")
     args, _rest = ap.parse_known_args(argv)
+    Path(args.ini).parent.mkdir(parents=True, exist_ok=True)
     log_file = setup_logging(args.log or default_log_path(args.ini))
 
     sys.excepthook = _log_exception
