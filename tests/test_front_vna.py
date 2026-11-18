@@ -98,6 +98,23 @@ def test_cw_generator_and_correction(qtbot, vna):
     assert all(b.isEnabled() for b in win.trace_editor.chips.buttons())
 
 
+def test_cw_generator_port_button(qtbot, vna):
+    proxy, win, _s, sim = vna
+    assert win.port_button.text() == "P1"
+    win.power_spin.set_value(-8.0)
+    _wait(qtbot, lambda: sim.c["pow"] == pytest.approx(-8.0))
+    win.cw_button.click()
+    _wait(qtbot, lambda: proxy.value("gen.state") is True and sim.c["pow_mode1"] == "ON")
+    win.port_button.click()
+    _wait(qtbot, lambda: proxy.value("gen.port") == 2 and sim.c["pow_mode2"] == "ON")
+    assert win.port_button.text() == "P2" and sim.c["pow_mode1"] == "OFF"
+    win.power_spin.set_value(2.0)
+    _wait(qtbot, lambda: sim.c["pow2"] == pytest.approx(2.0))
+    assert sim.c["pow"] == pytest.approx(-8.0)
+    win.cw_button.click()
+    _wait(qtbot, lambda: proxy.value("gen.state") is False and sim.c["pow_mode2"] == "AUTO")
+
+
 def _chips(te):
     return [b.text() for b in te.chips.buttons()]
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 
 from PyQt6 import sip
-from PyQt6.QtCore import QMimeData, QPoint, QRectF, QSettings, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QMimeData, QPoint, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QShortcut
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                              QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
@@ -42,6 +42,7 @@ __all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTa
 
 TILE_MIN_HEIGHT = 38
 PLOT_MIN_HEIGHT = 240
+UI_REFRESH_MS = 60
 LAYOUT_MODES = ("1 COL", "2 COL", "ROW")
 _PANEL_MIME = "application/x-visalab-livepanel"
 
@@ -107,15 +108,18 @@ class InstrumentTile(IndicatorButton):
         return self.window_open
 
     def show_state(self, name: str, window_open: bool, error: bool, tip: str = "") -> None:
+        window_open, error = bool(window_open), bool(error)
+        changed = (self.text() != name) or (window_open != self.window_open) or (error != self.error)
         if self.text() != name:
             self.setText(name)
         if error != self.error:
             self.setProperty("wstate", "error" if error else "")
             _repolish(self)
-        self.window_open, self.error = bool(window_open), bool(error)
-        if tip:
+        self.window_open, self.error = window_open, error
+        if tip and self.toolTip() != tip:
             self.setToolTip(tip)
-        self.update()
+        if changed:
+            self.update()
 
     def paintEvent(self, e):  # noqa: N802 - Qt
         QPushButton.paintEvent(self, e)
@@ -157,33 +161,62 @@ class PowerTable(QTableWidget):
         self.setMinimumHeight(PLOT_MIN_HEIGHT)
         self.rows: list[tuple[float, float, float]] = []
         self.current: float | None = None
+        self._cur_row = -1
+        self._normal_font = QFont(self.font())
+        self._bold_font = QFont(self.font())
+        self._bold_font.setBold(True)
+        self._cur_color = QColor(UI_COLOR_TEXT)
+        self._muted_color = QColor(UI_COLOR_TEXT_MUTED)
+
+    def _style_row(self, row: int, is_cur: bool) -> None:
+        font = self._bold_font if is_cur else self._normal_font
+        color = self._cur_color if is_cur else self._muted_color
+        for col in (0, 1):
+            item = self.item(row, col)
+            if item is not None:
+                item.setFont(font)
+                item.setForeground(color)
 
     def set_rows(self, rows, current: float | None = None) -> None:
         """rows: [(Hz, dBm, время)] по частоте; ``current`` - частота датчика (строка выделена, видна)."""
         rows = list(rows)
-        moved = current != self.current or len(rows) != len(self.rows)
+        if rows == self.rows and current == self.current:
+            return
+        old_len, old_cur = len(self.rows), self._cur_row
+        moved = current != self.current or len(rows) != old_len
         self.rows, self.current = rows, current
-        self.setRowCount(len(rows))
-        bold = QFont(self.font())
-        bold.setBold(True)
+        if len(rows) != old_len:
+            self.setRowCount(len(rows))
         cur_row = -1
+        changed = len(rows) != old_len
         for i, (f, v, _t) in enumerate(rows):
             is_cur = current is not None and abs(f - current) < 0.5
             if is_cur:
                 cur_row = i
+            created = False
             for col, text in enumerate((si_format(f, "Hz", 9), f"{v:.2f} dBm")):
                 item = self.item(i, col)
                 if item is None:
                     item = QTableWidgetItem()
                     item.setTextAlignment(self.ALIGN[col])
                     self.setItem(i, col, item)
+                    created = True
                 if item.text() != text:
                     item.setText(text)
-                item.setFont(bold if is_cur else self.font())
-                item.setForeground(QColor(UI_COLOR_TEXT if is_cur else UI_COLOR_TEXT_MUTED))
+                    changed = True
+            if created:
+                self._style_row(i, is_cur)
+        if cur_row != old_cur:
+            if 0 <= old_cur < len(rows):
+                self._style_row(old_cur, False)
+            if 0 <= cur_row < len(rows):
+                self._style_row(cur_row, True)
+            changed = True
+        self._cur_row = cur_row
         if moved and cur_row >= 0:
             self.scrollToItem(self.item(cur_row, 0), QAbstractItemView.ScrollHint.EnsureVisible)
-        self.viewport().update()
+        if changed:
+            self.viewport().update()
 
     def paintEvent(self, e):  # noqa: N802 - Qt
         super().paintEvent(e)
@@ -359,7 +392,10 @@ class LivePanel(Panel):
             path = f"  PATH {a.path_db:+.1f} dB" if a.path_db is not None else ""
             self.source.setText(f"← {a.source.name} {si_format(a.source.freq, 'Hz', 6)}{path}")
         elif self.profile == "network_analyzer" and self.proxy.value("gen.state") is True:
-            self.source.setText(f"CW {si_format(self.proxy.value('freq.cw'), 'Hz', 6)}")
+            port = self.proxy.value("gen.port")
+            pt = f" P{port}" if port in (1, 2) else ""
+            rf_off = " (RF OFF)" if self.proxy.value("rf.output") is False else ""
+            self.source.setText(f"CW{pt} {si_format(self.proxy.value('freq.cw'), 'Hz', 6)}{rf_off}")
         else:
             self.source.setText("")
 
@@ -429,6 +465,13 @@ class MainWindow(Window):
         self._root_splitter: QSplitter | None = None
         self._splitters: list[tuple[str, QSplitter]] = []
         self._arranged_sig: tuple | None = None
+        self._visible_proxies: set = set()
+        self._dirty_panels: set = set()
+        self._dirty_vis = False
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(UI_REFRESH_MS)
+        self._refresh_timer.timeout.connect(self._flush_panels)
         self.panel_order: list[str] = self._load_list(f"{self.SETTINGS_GROUP}/PANEL_ORDER")
         self.hidden_panels: set[str] = set(self._load_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS"))
         saved_mode = str(settings.value(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", LAYOUT_MODES[0]) or LAYOUT_MODES[0])
@@ -599,15 +642,39 @@ class MainWindow(Window):
                 if panel.panel_key not in self.panel_order:
                     self.panel_order.append(panel.panel_key)
         for p in proxies:
-            self._on_changed(p)
+            self._update_tile(p)
+            panel = self.panels.get(p)
+            if panel is not None:
+                panel.refresh(self.monitor.activity(p))
+        self._dirty_panels.clear()
+        self._dirty_vis = False
         self._update_visibility()
 
     # ------------------------------------------------------------ обновление
     def _on_changed(self, proxy) -> None:
         self._update_tile(proxy)
         panel = self.panels.get(proxy)
-        if panel is not None:
-            panel.refresh(self.monitor.activity(proxy))
+        if panel is None:
+            return
+        self._dirty_panels.add(proxy)
+        if (proxy in self._visible_proxies) != self._should_show(proxy):
+            self._dirty_vis = True
+            self._flush_panels()
+        elif not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
+    def _flush_panels(self) -> None:
+        if sip.isdeleted(self):
+            return
+        dirty = list(self._dirty_panels)
+        self._dirty_panels.clear()
+        need_vis = self._dirty_vis
+        self._dirty_vis = False
+        for proxy in dirty:
+            panel = self.panels.get(proxy)
+            if panel is not None and not sip.isdeleted(panel):
+                panel.refresh(self.monitor.activity(proxy))
+        if need_vis:
             self._update_visibility()
 
     def _update_tile(self, proxy) -> None:
@@ -785,6 +852,7 @@ class MainWindow(Window):
         ordered = self._ordered_receivers()
         self._update_restore_chips(ordered)
         visible = [p for p in ordered if self._should_show(p)]
+        self._visible_proxies = set(visible)
         sig = (self.layout_mode, tuple(self._panel_key(p) for p in visible))
         if sig != self._arranged_sig:
             self._save_splitters()
@@ -875,6 +943,8 @@ class MainWindow(Window):
         w.activateWindow()
 
     def closeEvent(self, event):  # noqa: N802 - Qt
+        self._refresh_timer.stop()
+        self._dirty_panels.clear()
         self._save_splitters()
         if self.quit_on_close:
             for fn in self.before_quit:

@@ -156,7 +156,7 @@ class _Slot:
 class KeysightPNA(VISAInstrument):
     NAME = "Keysight PNA-L N5231A"
     PROFILE = NETWORK_ANALYZER
-    POLL_INTERVAL_MS = 100
+    POLL_INTERVAL_MS = 200
     TIMEOUT_MS = 10000            # трасса 32001 точка в ASCII
 
     def __init__(self, transport, model: PNAModel | None = None, parent=None,
@@ -176,8 +176,9 @@ class KeysightPNA(VISAInstrument):
         self._armed_channels: list[int] = [1]
         self.meas_name = ""
         self._stim_ch = 1
-        #: режим генератора: (канал, снимок GEN_KEYS, {канал: SWE:MODE до включения})
-        self._gen: tuple[int, dict[str, Any], dict[int, str]] | None = None
+        self._gen_port = 1
+        #: режим генератора: (канал, снимок GEN_KEYS, {канал: SWE:MODE}, {pow_coup, pow_modes, pow_levels, trig_source})
+        self._gen: tuple[int, dict[str, Any], dict[int, str], dict[str, Any]] | None = None
         self._sel: tuple[int, str] | None = None                # trace.sel: (канал, имя измерения)
         super().__init__(transport, parent, command_delay_s)
 
@@ -241,7 +242,9 @@ class KeysightPNA(VISAInstrument):
             Param("smooth.aper", "Апертура сглаживания", F, "%", section=sc, query="<scale>", write="<scale>",
                   minimum=1.0, maximum=25.0, tolerance=1e-3),
             Param("gen.state", "Режим генератора", B, section=st, query="<virtual>", write="<virtual>",
-                  also_read=(*STIM_KEYS, "rf.output", "gen.channel", "stim.channel")),
+                  also_read=(*STIM_KEYS, "rf.output", "gen.channel", "gen.port", "stim.channel", "trig.source")),
+            Param("gen.port", "Порт генератора", I, section=st, query="<virtual>", write="<virtual>",
+                  minimum=1, maximum=2, also_read=("source.power",)),
             Param("gen.channel", "Канал генератора", I, section=st, query="<virtual>"),
             Param("meas.complex", "Комплексные данные", B, section=rs, query="<virtual>", write="<virtual>"),
             Param("meas.armed", "Идёт развёртка", B, section=sw, query="<virtual>"),
@@ -345,6 +348,7 @@ class KeysightPNA(VISAInstrument):
         self._armed = False
         self._cal = None
         self._stim_ch = 1
+        self._gen_port = 1
         self._gen = None                      # после *RST / вызова состояния возвращать нечего
         self._sweep = {}
         self.write("FORM:DATA ASCII,0")
@@ -425,6 +429,15 @@ class KeysightPNA(VISAInstrument):
             return
         if spec.key == "gen.state":
             self._set_gen(bool(value))
+            return
+        if spec.key == "gen.port":
+            port = int(value)
+            self._gen_port = port
+            if self._gen is not None:
+                c = self._gen[0]
+                other = 2 if port == 1 else 1
+                self.write(f"SOUR{c}:POW{other}:MODE OFF")
+                self.write(f"SOUR{c}:POW{port}:MODE ON")
             return
         if spec.key == "cal.stim":
             self._cal_stim = bool(value)
@@ -517,6 +530,8 @@ class KeysightPNA(VISAInstrument):
             return self._stim_ch
         if key == "gen.state":
             return self._gen is not None
+        if key == "gen.port":
+            return self._gen_port
         if key == "cal.stim":
             return self._cal_stim
         if key == "cal.busy":
@@ -631,10 +646,16 @@ class KeysightPNA(VISAInstrument):
     def _stim_spec(self, spec: Param, channel: int | None = None) -> Param:
         """Ключ стимула -> команды для канала ``channel`` (по умолчанию ``stim.channel``)."""
         c = self._stim_ch if channel is None else channel
-        if spec.key not in STIM_KEYS or c == 1:
+        if spec.key not in STIM_KEYS:
             return spec
-        sub = lambda t: t and t.replace("SENS1:", f"SENS{c}:").replace("SOUR1:", f"SOUR{c}:")
-        return replace(spec, query=sub(spec.query), write=sub(spec.write))
+        q, w = spec.query, spec.write
+        if c != 1:
+            q = q and q.replace("SENS1:", f"SENS{c}:").replace("SOUR1:", f"SOUR{c}:")
+            w = w and w.replace("SENS1:", f"SENS{c}:").replace("SOUR1:", f"SOUR{c}:")
+        if spec.key == "source.power" and self._gen is not None and self._gen_port != 1:
+            q = q and q.replace(":POW1?", f":POW{self._gen_port}?")
+            w = w and w.replace(":POW1 ", f":POW{self._gen_port} ")
+        return replace(spec, query=q, write=w)
 
     # ------------------------------------------------------- маркеры трейса trace.sel
     def _mark_cmd(self, n: int | None = None) -> str:
@@ -683,14 +704,29 @@ class KeysightPNA(VISAInstrument):
         try:
             if on:
                 c = self._stim_ch
+                port = self._gen_port
+                other = 2 if port == 1 else 1
                 snap = {k: super(KeysightPNA, self).read_param_raw(self._stim_spec(self._params[k], c))
                         for k in GEN_KEYS}
                 modes = {ch: self.query(f"SENS{ch}:SWE:MODE?").strip().upper() for ch in self._channels()}
-                self._gen = (c, snap, modes)
+                extra = {
+                    "pow_coup": self.query(f"SOUR{c}:POW:COUP?").strip(),
+                    "pow_modes": {p: self.query(f"SOUR{c}:POW{p}:MODE?").strip().upper() for p in (1, 2)},
+                    "pow_levels": {p: parse_number(self.query(f"SOUR{c}:POW{p}?")) for p in (1, 2)},
+                    "trig_source": self._params["trig.source"].from_scpi(self.query("TRIG:SOUR?")),
+                }
+                self._gen = (c, snap, modes, extra)
                 for ch, mode in modes.items():               # остальные каналы стоят (в т.ч. бывшие CONT)
                     if ch != c and mode != "HOLD":
                         self.write(f"SENS{ch}:SWE:MODE HOLD")
+                if extra["trig_source"] != "IMM":
+                    self.write("TRIG:SOUR IMM")
+                if snap.get("cal.state"):                    # без 2-портовой коррекции - источник не скачет по портам
+                    self.write(f"SENS{c}:CORR:STAT 0")
                 self.write(f"SENS{c}:SWE:TYPE CW")
+                self.write(f"SOUR{c}:POW:COUP 0")
+                self.write(f"SOUR{c}:POW{other}:MODE OFF")
+                self.write(f"SOUR{c}:POW{port}:MODE ON")
             else:
                 gen, self._gen = self._gen, None
                 self._gen_restore(*gen)
@@ -702,9 +738,10 @@ class KeysightPNA(VISAInstrument):
             elif was_armed:
                 self._start_sweep()
 
-    def _gen_restore(self, channel: int, snap: dict[str, Any], modes: dict[int, str]) -> None:
-        """Вернуть настройки канала и режимы развёртки всех каналов, запомненные при включении генератора
-        (ошибка одной настройки не мешает остальным)."""
+    def _gen_restore(self, channel: int, snap: dict[str, Any], modes: dict[int, str],
+                     extra: dict[str, Any] | None = None) -> None:
+        """Вернуть настройки канала, режимы источников/триггера и развёрток каналов, запомненные при
+        включении генератора (ошибка одной настройки не мешает остальным)."""
         first: Exception | None = None
         for k in GEN_KEYS:
             v = snap.get(k)
@@ -714,6 +751,29 @@ class KeysightPNA(VISAInstrument):
                 super().write_param(self._stim_spec(self._params[k], channel), v)
             except Exception as e:  # noqa: BLE001
                 first = first or e
+        if extra:
+            pow_levels = extra.get("pow_levels") or {}
+            if 2 in pow_levels:
+                try:
+                    self.write(f"SOUR{channel}:POW2 {pow_levels[2]}")
+                except Exception as e:  # noqa: BLE001
+                    first = first or e
+            if "pow_coup" in extra:
+                try:
+                    self.write(f"SOUR{channel}:POW:COUP {extra['pow_coup']}")
+                except Exception as e:  # noqa: BLE001
+                    first = first or e
+            for p, pm in (extra.get("pow_modes") or {}).items():
+                try:
+                    self.write(f"SOUR{channel}:POW{p}:MODE {pm}")
+                except Exception as e:  # noqa: BLE001
+                    first = first or e
+            if "trig_source" in extra:
+                try:
+                    ts = self._params["trig.source"].to_scpi(extra["trig_source"])
+                    self.write(f"TRIG:SOUR {ts}")
+                except Exception as e:  # noqa: BLE001
+                    first = first or e
         existing = set(self._channels())
         for ch, mode in modes.items():
             if ch not in existing:                           # канал удалили в режиме генератора

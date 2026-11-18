@@ -975,7 +975,13 @@ class VNAWindow(InstrumentWindow):
             self.cw_button = CWButton(proxy)
             self.cw_spin = PSpinBox(proxy, "freq.cw", ("k", "M", "G"))
             self.widgets["freq.cw"] = self.cw_spin
-            top.append(PanelLine("CW", self.cw_button, self.cw_spin))
+            cw_ws: list[QWidget] = [self.cw_button]
+            if sup("gen.port"):
+                self.port_button = PSButton(proxy, "gen.port", [("P1", 1), ("P2", 2)])
+                self.widgets["gen.port"] = self.port_button
+                cw_ws.append(self.port_button)
+            cw_ws.append(self.cw_spin)
+            top.append(PanelLine("CW", *cw_ws))
         self.top_lines = top
         self.saved_widgets += [self.power_spin, *(w for k, w in self.widgets.items() if k not in NOT_SAVED)]
 

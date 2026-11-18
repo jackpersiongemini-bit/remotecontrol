@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import QWidget
 
 from ..core.units import si_format
@@ -35,6 +35,47 @@ def nice_range(lo: float, hi: float, divs: int) -> tuple[float, float, float]:
             if bottom + step * divs >= hi and bottom <= lo:
                 return bottom, bottom + step * divs, step
     return lo, hi, (hi - lo) / divs
+
+
+def _decimate_polyline(pts: list[tuple[float, float]], left: float, width: float) -> list[tuple[float, float]]:
+    """Сжать длинную трассу до min/max-огибающей по пиксельным столбцам."""
+    cols = max(1, int(width) // 2)
+    if cols < 16 or len(pts) <= 2 * cols:
+        return pts
+    out: list[tuple[float, float]] = []
+    cur_col: int | None = None
+    first_x = min_y = max_y = 0.0
+    min_first = True
+    for x, y in pts:
+        col = int((x - left) * 0.5)
+        if col != cur_col:
+            if cur_col is not None:
+                _emit_col(out, first_x, min_y, max_y, min_first)
+            cur_col = col
+            first_x = x
+            min_y = max_y = y
+            min_first = True
+        else:
+            if y < min_y:
+                min_y = y
+                min_first = False
+            if y > max_y:
+                max_y = y
+                min_first = True
+    if cur_col is not None:
+        _emit_col(out, first_x, min_y, max_y, min_first)
+    return out
+
+
+def _emit_col(out: list[tuple[float, float]], x: float, min_y: float, max_y: float, min_first: bool) -> None:
+    if min_y == max_y:
+        out.append((x, min_y))
+    elif min_first:
+        out.append((x, min_y))
+        out.append((x, max_y))
+    else:
+        out.append((x, max_y))
+        out.append((x, min_y))
 
 
 class LivePlot(QWidget):
@@ -89,7 +130,11 @@ class LivePlot(QWidget):
         return QRectF(self.rect()).adjusted(6, 20, -6, -20)
 
     def paintEvent(self, e):  # noqa: N802 - Qt
+        if self.width() <= 0 or self.height() <= 0:
+            return
         p = QPainter(self)
+        if not p.isActive():
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(UI_COLOR_BACKGROUND))
@@ -129,13 +174,11 @@ class LivePlot(QWidget):
         for i, (_name, t) in enumerate(self.traces):
             color = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
             pts = [(px(x), py(y)) for x, y in zip(t.x, t.y) if math.isfinite(y)]
-            if len(pts) > 1:
-                path = QPainterPath(QPointF(*pts[0]))
-                for xy in pts[1:]:
-                    path.lineTo(*xy)
+            draw_pts = pts if self.points else _decimate_polyline(pts, r.left(), r.width())
+            if len(draw_pts) > 1:
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.setPen(QPen(color, 1.0 if self.points else 1.2))
-                p.drawPath(path)
+                p.drawPolyline(QPolygonF([QPointF(x, y) for x, y in draw_pts]))
             if self.points or len(pts) == 1:
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(color)

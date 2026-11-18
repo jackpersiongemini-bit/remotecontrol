@@ -234,9 +234,9 @@ HELP: dict[str, dict[str, str]] = {
                       "data read from the analyzer.",
         "smooth.state": "Trace smoothing on / off (changes the data read).",
         "smooth.aper": "Smoothing aperture in % of the span.",
-        "gen.state": "Generator mode: the channel goes to CW at freq CW and the other channels stop "
-                     "sweeping. The VNA then counts as a signal generator (power meter FOLW, scenarios). "
-                     "OFF returns the channel settings as they were.",
+        "gen.state": "Generator mode: the channel goes to CW at freq CW and the selected port stays continuously "
+                     "on without retrace blanking while other channels stop sweeping. OFF restores the channel.",
+        "gen.port": "Output port used in generator mode (Port 1 or Port 2).",
         "gen.channel": "Channel used in generator mode (empty - generator mode off).",
         "bw.if": "IF bandwidth: narrower - lower noise, slower sweep.",
         "source.power": "Source power at the port.",

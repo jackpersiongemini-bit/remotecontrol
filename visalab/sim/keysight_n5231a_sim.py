@@ -30,7 +30,8 @@ class KeysightPNASim(SimInstrument):
     F_MIN, F_MAX = 300e3, 13.5e9
 
     def reset(self) -> None:
-        self.c = {"start": 10e6, "stop": 13.5e9, "poin": 201, "bwid": 35e3, "pow": -5.0, "outp": True,
+        self.c = {"start": 10e6, "stop": 13.5e9, "poin": 201, "bwid": 35e3, "pow": -5.0, "pow2": -5.0,
+                  "pow_coup": True, "pow_mode1": "AUTO", "pow_mode2": "AUTO", "outp": True,
                   "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN",
                   "form": "ASC", "type": "LIN", "cw": 1e9, "cset": "", "interp": True}
         self.meas = {"CH1_S11_1": {"s": "S11", "fmt": "MLOG", "ch": 1}}
@@ -89,6 +90,7 @@ class KeysightPNASim(SimInstrument):
             return self.c
         if ch not in self.other:
             st = {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9, "bwid": 35e3, "pow": -5.0,
+                  "pow2": -5.0, "pow_coup": True, "pow_mode1": "AUTO", "pow_mode2": "AUTO",
                   "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN",
                   "cset": "", "interp": True}
             self._auto_time(st)
@@ -277,8 +279,9 @@ class KeysightPNASim(SimInstrument):
         self.on(g + "DESCription", get=self._guid_desc)
         self.on(g + "ACQuire", self._guid_acq)
         self.on(g + "SAVE:CSET", self._guid_save)
-        self.on("SOURce#:POWer#[:LEVel][:IMMediate][:AMPLitude]", self._n("pow", -90, 20),
-                self._gs("pow"))
+        self.on("SOURce#:POWer:COUPle", self._pow_coup_set, self._gb("pow_coup"))
+        self.on("SOURce#:POWer#:MODE", self._pow_mode_set, self._pow_mode_get)
+        self.on("SOURce#:POWer#[:LEVel][:IMMediate][:AMPLitude]", self._pow_set, self._pow_get)
         self.on("OUTPut[:STATe]", self._b("outp"), self._gb("outp"))
         self.on("ABORt", lambda a, g: setattr(self, "sweeping", False))
         self.on("TRIGger[:SEQuence]:SOURce", self._tenum("sour", {"IMM": "IMM", "IMMEDIATE": "IMM", "EXT": "EXT",
@@ -329,6 +332,46 @@ class KeysightPNASim(SimInstrument):
             st[k] = self.boolean(a)
             self._auto_time(st)
         return fn
+
+    def _pow_coup_set(self, a, g):
+        st = self.stim(self._ch(g))
+        st["pow_coup"] = self.boolean(a)
+
+    def _pow_port(self, g) -> int:
+        p = int(g[1]) if len(g) > 1 and g[1] else 1
+        if p not in (1, 2):
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        return p
+
+    def _pow_set(self, a, g):
+        v = self.num(a, -90, 20)
+        st = self.stim(self._ch(g))
+        p = self._pow_port(g)
+        if p == 1:
+            st["pow"] = v
+            if st["pow_coup"]:
+                st["pow2"] = v
+        else:
+            st["pow2"] = v
+            if st["pow_coup"]:
+                st["pow"] = v
+
+    def _pow_get(self, a, g):
+        st = self.stim(self._ch(g))
+        p = self._pow_port(g)
+        v = st["pow"] if p == 1 else st["pow2"]
+        return f"{v:+.11E}"
+
+    def _pow_mode_set(self, a, g):
+        tok = a.strip().upper()
+        if tok not in ("AUTO", "ON", "OFF"):
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        st = self.stim(self._ch(g))
+        st[f"pow_mode{self._pow_port(g)}"] = tok
+
+    def _pow_mode_get(self, a, g):
+        st = self.stim(self._ch(g))
+        return st[f"pow_mode{self._pow_port(g)}"]
 
     def _n(self, k, lo, hi, integer=False, auto=None):
         def fn(a, g):
