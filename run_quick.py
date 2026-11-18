@@ -20,6 +20,7 @@ from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
 from run_gui import DEVICES, _load_lab
+from visalab.applog import default_ini_path
 from visalab.coord import COORD
 from visalab.quick import WINDOWS, LabWindow
 
@@ -48,7 +49,7 @@ def main(argv=None) -> int:
     ap.add_argument("--pm", metavar="ADDR", help="датчик мощности U2021XA")
     ap.add_argument("--sim", action="store_true", help="все приборы на симуляторах")
     ap.add_argument("--lab", default=str(HERE / "lab.json"))
-    ap.add_argument("--ini", default=str(HERE / "visalab_quick.ini"))
+    ap.add_argument("--ini", default=str(default_ini_path("visalab_quick.ini")))
     ap.add_argument("--backend", default="")
     ap.add_argument("--latency", type=float, default=0.005, help="задержка симулятора, с")
     ap.add_argument("--no-connect", action="store_true")

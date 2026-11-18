@@ -167,16 +167,18 @@ def test_other_channels(make):
     t1, t2 = rec.values["m1.trace"], rec.values["m2.trace"]
     assert len(t2) == 51 and t2.x[0] == pytest.approx(2e9) and t2.x[-1] == pytest.approx(4e9)     # ось канала 2
     assert t2.meta["channel"] == 2 and t2.name == "S21" and len(t1) == 201 and t1.meta["channel"] == 1
-    assert "SENS2:SWE:MODE SING" in sim.history and "CALC2:PAR:SEL 'CH2_S21'" in sim.history
+    assert "SENS2:SWE:MODE SING" not in sim.history and "CALC2:PAR:SEL 'CH2_S21'" in sim.history
+    assert sim.stim(2)["mode"] == "CONT"
     assert len(rec.values["m2.sdata"]) == 51 and not rec.errors and not rec.comm
     # формат и S-параметр меняются у измерения своего канала
     assert setp(drv, rec, "m2.format", "PHASE") is PStatus.WRITTEN and sim.meas["CH2_S21"]["fmt"] == "PHAS"
     assert sim.meas["CH2_S11"]["fmt"] == "PHAS" and sim.meas["CH1_S11_1"]["fmt"] == "MLOG"
-    # выключили m1: канал 1 больше не разворачивается
+    # выключили m1: канал 1 больше не читается, но прибору не шлются SING/HOLD
     assert setp(drv, rec, "m1.enabled", False) is PStatus.WRITTEN
     del sim.history[:]
     drv.poll()
-    assert "SENS1:SWE:MODE SING" not in sim.history and "SENS2:SWE:MODE SING" in sim.history
+    assert not any("SWE:MODE SING" in c for c in sim.history)
+    assert rec.values["m1.trace"] is None and rec.values["m2.trace"] is not None
     # meas_all берёт измерения всех каналов
     drv.run_action("meas_all")
     drv.poll()
@@ -382,7 +384,8 @@ def test_generator_mode_stops_other_channels_and_restores(make):
     assert setp(drv, rec, "stim.channel", 1) is PStatus.ERROR            # канал закреплён
     del sim.history[:]
     drv.poll()
-    assert "SENS1:SWE:MODE SING" not in sim.history and "SENS2:SWE:MODE SING" in sim.history
+    assert sim.stim(1)["mode"] == "HOLD" and sim.stim(2)["mode"] == "CONT"
+    assert "SENS1:SWE:MODE SING" not in sim.history and "SENS2:SWE:MODE SING" not in sim.history
     assert rec.values["m1.trace"] is None and rec.values["m2.trace"].x_unit == "s"   # канал 1 стоит
     # выключили - всё как было, частота CW осталась
     assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
@@ -394,7 +397,8 @@ def test_generator_mode_stops_other_channels_and_restores(make):
     assert rec.values["gen.channel"] is None and rec.values["stim.channel"] == 2
     del sim.history[:]
     drv.poll()
-    assert "SENS1:SWE:MODE SING" in sim.history and rec.values["m1.trace"] is not None
+    assert sim.stim(1)["mode"] == "CONT" and rec.values["m1.trace"] is not None
+    assert "SENS1:SWE:MODE SING" not in sim.history
     assert not rec.comm
 
 
@@ -666,3 +670,44 @@ def test_stimulus_changed_on_the_pna_screen(vna):
     assert rec.values["freq.start"] == pytest.approx(1e9) and rec.values["freq.stop"] == pytest.approx(3e9)
     assert rec.values["freq.center"] == pytest.approx(2e9) and rec.values["freq.span"] == pytest.approx(2e9)
     assert not rec.errors and not rec.comm
+
+
+def test_continuous_mode_never_sends_sing_and_keeps_cont_on_disconnect(make):
+    """В непрерывном режиме CONT не посылаются SING/HOLD при опросе, настройке и отключении."""
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
+    assert rec.values["meas.continuous"] is True and sim.c["mode"] == "CONT"
+    setp(drv, rec, "freq.start", 1e9)
+    setp(drv, rec, "format", "PHASE")
+    drv.poll()
+    drv.poll()
+    assert rec.values["m1.trace"] is not None
+    assert not any("SWE:MODE SING" in c or "SWE:MODE HOLD" in c for c in sim.history)
+    drv.close_connection()
+    assert sim.c["mode"] == "CONT"
+
+
+def test_single_and_abort_use_sing_only_on_request(make):
+    sim = KeysightPNASim()
+    sim.c["mode"] = "HOLD"                                  # прибор уже в HOLD при подключении
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert rec.values["meas.continuous"] is False and rec.values["meas.armed"] is False
+    sim.hold_sweeps = True
+    drv.run_action("single")
+    assert "SENS1:SWE:MODE SING" in sim.history and rec.values["meas.armed"] is True
+    sim.finish_sweep()
+    drv.poll()
+    assert rec.values["meas.armed"] is False and rec.values["m1.trace"] is not None
+    assert sim.c["mode"] == "HOLD"                          # после single снова ждёт в HOLD
+    # включили CONT -> перешёл в CONT; abort -> HOLD
+    assert setp(drv, rec, "meas.continuous", True) is PStatus.WRITTEN
+    assert sim.c["mode"] == "CONT" and rec.values["meas.armed"] is True
+    drv.run_action("abort")
+    assert sim.c["mode"] == "HOLD" and rec.values["meas.continuous"] is False and rec.values["meas.armed"] is False
+
+
+def test_app_data_dir_uses_appdata_when_set(monkeypatch, tmp_path):
+    from visalab.applog import app_data_dir, default_ini_path, default_log_path
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    assert app_data_dir() == tmp_path / "visalab"
+    assert default_ini_path() == tmp_path / "visalab" / "visalab_front.ini"
+    assert default_log_path(default_ini_path()) == tmp_path / "visalab" / "logs" / "visalab.log"

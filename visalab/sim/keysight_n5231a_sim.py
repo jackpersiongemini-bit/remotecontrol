@@ -41,9 +41,13 @@ class KeysightPNASim(SimInstrument):
         self.trig = {"sour": "IMM", "scop": "ALL", "slop": "POS", "type": "EDGE", "del": 0.0}
         self.trig_count = 0                              # триггеров в текущей развёртке (режим POINT)
         self.windows: dict[int, dict[int, str]] = {1: {1: "CH1_S11_1"}}     # окно -> {номер трейса: измерение}
-        self.sweeping = False
+        self.sweeping = True
         self.opc_pending = False
         self.sweeps_done = 0
+        self.oper_ptr = 0
+        self.oper_ntr = 0
+        self.oper_even = 0
+        self.oper_cond = 16
         if not hasattr(self, "dirs"):                    # папки и файлы переживают *RST
             self.dirs: dict[str, dict[str, tuple]] = {DEFAULT_DIR: {}, DEFAULT_DIR + "\\Lab": {}}
             self.cdir = DEFAULT_DIR
@@ -158,17 +162,27 @@ class KeysightPNASim(SimInstrument):
             return [v.real for v in vals]
         return [v.imag for v in vals]
 
+    def _has_cont(self) -> bool:
+        return any(st["mode"] == "CONT" for st in (self.c, *self.other.values()))
+
     def finish_sweep(self) -> None:
         if not self.sweeping:
             return
         self.sweeping = False
         self.sweeps_done += 1
+        self.oper_cond &= ~16
+        if self.oper_ntr & 16:
+            self.oper_even |= 16
         for st in (self.c, *self.other.values()):       # однократные развёртки закончились
             if st["mode"] == "SING":
                 st["mode"] = "HOLD"
         if self.opc_pending:
             self.opc_pending = False
             self.esr |= ESR_OPC
+        if self._has_cont():                             # непрерывный режим - сразу ждём следующую развёртку
+            self.sweeping = True
+            self.trig_count = 0
+            self.oper_cond |= 16
 
     # ------------------------------------------------------------ команды
     def _register_common(self) -> None:
@@ -280,6 +294,12 @@ class KeysightPNASim(SimInstrument):
         self.on("TRIGger[:SEQuence]:DELay", self._trig_delay, lambda a, g: f"{self.trig['del']:+.11E}")
         self.on("SENSe#:SWEep:TRIGger:MODE", self._tmode_set, lambda a, g: self.stim(self._ch(g))["tmode"])
         self.on("INITiate#[:IMMediate]", lambda a, g: self.trigger())
+        self.on("STATus:OPERation:PTRansition", lambda a, g: setattr(self, "oper_ptr", int(self.num(a, 0, 65535))),
+                lambda a, g: str(self.oper_ptr))
+        self.on("STATus:OPERation:NTRansition", lambda a, g: setattr(self, "oper_ntr", int(self.num(a, 0, 65535))),
+                lambda a, g: str(self.oper_ntr))
+        self.on("STATus:OPERation:CONDition", get=lambda a, g: str(self.oper_cond))
+        self.on("STATus:OPERation[:EVENt]", get=self._oper_even_get)
 
     def _err(self, a, g):
         code, msg = self.errors.popleft() if self.errors else (0, "No error")
@@ -437,19 +457,32 @@ class KeysightPNASim(SimInstrument):
         data = self.fdata(name) if kind == "FDATA" else self.sdata(name)
         return ",".join(f"{v:+.10E}" for v in data)
 
+    def _oper_even_get(self, a, g) -> str:
+        val = self.oper_even
+        self.oper_even = 0
+        if self._has_cont() and self.trig["sour"] == "IMM" and not self.hold_sweeps:
+            if not self.sweeping:
+                self.sweeping = True
+                self.oper_cond |= 16
+            self.finish_sweep()
+        return str(val)
+
     def _mode_set(self, a, g):
         t = a.strip().upper()
         mode = {"HOLD": "HOLD", "CONT": "CONT", "CONTINUOUS": "CONT", "SING": "SING", "SINGLE": "SING"}.get(t)
         if mode is None:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
         self.stim(self._ch(g))["mode"] = mode
-        if mode == "SING":
+        if mode in ("SING", "CONT"):
             self.sweeping = True
             self.trig_count = 0
+            self.oper_cond |= 16
             if not self.hold_sweeps and self.trig["sour"] == "IMM":     # EXT / MAN - ждать триггера
                 self.finish_sweep()
         elif mode == "HOLD":
-            self.sweeping = False
+            self.sweeping = self._has_cont()
+            if not self.sweeping:
+                self.oper_cond &= ~16
 
     # ------------------------------------------------------------ запуск
     def _tenum(self, key, table):
@@ -458,6 +491,8 @@ class KeysightPNASim(SimInstrument):
             if t not in table:
                 raise SimError(-224, "Illegal parameter value", ESR_EXE)
             self.trig[key] = table[t]
+            if key == "sour" and self.trig["sour"] == "IMM" and self.sweeping and not self.hold_sweeps:
+                self.finish_sweep()
         return fn
 
     def _trig_delay(self, a, g):

@@ -22,7 +22,7 @@ from pathlib import Path
 from PyQt6.QtCore import QCoreApplication, QSettings
 
 from run_main import WINDOWS
-from visalab.applog import FORMAT, close_logging, default_log_path, setup_logging
+from visalab.applog import FORMAT, close_logging, default_ini_path, default_log_path, setup_logging
 from visalab.check import format_report, run_check
 from visalab.coord import COORD
 from visalab.front.launch import ROOT, connection_for
@@ -51,7 +51,7 @@ def main(argv=None) -> int:
     ap.add_argument("only", nargs="*", metavar="ПРИБОР", help=f"записи lab.json: {', '.join(WINDOWS)}")
     ap.add_argument("--sim", action="store_true", help="симуляторы вместо приборов")
     ap.add_argument("--lab", default=str(ROOT / "lab.json"))
-    ap.add_argument("--ini", default=str(ROOT / "visalab_front.ini"))
+    ap.add_argument("--ini", default=str(default_ini_path()))
     ap.add_argument("--backend", default="", help="библиотека VISA для pyvisa (\"\" - системная, @py - pyvisa-py)")
     ap.add_argument("--poll", type=float, default=5.0, help="сколько опрашивать после чтения всех параметров, с")
     ap.add_argument("--timeout", type=float, default=60.0, help="сколько ждать подключения и чтения, с")

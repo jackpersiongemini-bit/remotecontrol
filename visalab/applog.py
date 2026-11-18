@@ -15,16 +15,38 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import platform
 import sys
 import time
 from pathlib import Path
 
-__all__ = ["setup_logging", "close_logging", "default_log_path", "Throttle", "FORMAT"]
+__all__ = ["setup_logging", "close_logging", "app_data_dir", "default_ini_path", "default_log_path",
+           "Throttle", "FORMAT", "APP_NAME"]
 
+APP_NAME = "visalab"
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 MAX_BYTES = 2_000_000
 BACKUPS = 5
+
+
+def app_data_dir(app_name: str = APP_NAME) -> Path:
+    """Папка данных программы: ``%APPDATA%/visalab`` на Windows, Application Support на macOS, XDG на Linux."""
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / app_name
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / app_name
+    if sys.platform.startswith("win"):
+        return Path.home() / "AppData" / "Roaming" / app_name
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / app_name
+
+
+def default_ini_path(filename: str = "visalab_front.ini", app_name: str = APP_NAME) -> Path:
+    """Файл настроек в папке данных программы (``%APPDATA%/visalab/visalab_front.ini``)."""
+    return app_data_dir(app_name) / filename
 
 
 def default_log_path(ini: str | Path) -> Path:

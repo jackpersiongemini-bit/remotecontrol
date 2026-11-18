@@ -82,6 +82,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -140,6 +141,8 @@ SLOT_KEYS = ("channel", "name", "enabled", "sparam", "format", "math")
 MATH = ("NORM", "DIV", "SUBT", "ADD", "MULT")
 STATE_EXT = ".csa"
 _STATE_NAME = re.compile(r"[A-Za-z0-9_\-]{1,32}")
+#: бит 4 регистра STATus:OPERation (Measuring / Sweeping: переход 1 -> 0 по NTR = развёртка завершена)
+OPER_SWEEP_BIT = 16
 
 
 @dataclass
@@ -161,6 +164,8 @@ class KeysightPNA(VISAInstrument):
         self.model = model or PNA_MODELS["N5231A"]
         self._continuous = True
         self._armed = False
+        self._oper_seen = False
+        self._last_cont_read = 0.0
         self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
         self._mark_n = 1
         self._cal_stim = True                  # cal set применяется вместе со своим стимулом
@@ -355,10 +360,16 @@ class KeysightPNA(VISAInstrument):
         for slot, name in zip(self._slots, cat):               # по умолчанию - канал 1 по порядку, читаем только m1
             slot.name = name
         self._slots[0].enabled = True
+        self._setup_oper_sync()
+        mode = self.query(f"SENS{self._stim_ch}:SWE:MODE?").strip().upper()
+        self._continuous = mode.startswith("CONT")
+        self._armed = self._continuous
+        self._oper_seen = False
+        self._last_cont_read = time.monotonic()
 
     def on_disconnecting(self) -> None:
         self._cal = None
-        if self._armed:
+        if self._armed and not self._continuous:
             self._abort()
         if self._gen is not None:             # не оставлять прибор в режиме генератора
             gen, self._gen = self._gen, None
@@ -400,9 +411,14 @@ class KeysightPNA(VISAInstrument):
 
     def write_param(self, spec: Param, value: Any) -> None:
         if spec.key == "meas.continuous":
-            self._continuous = bool(value)
-            if self._continuous and not self._armed:
-                self._start_sweep()
+            on = bool(value)
+            self._continuous = on
+            if on:
+                self._ensure_continuous()
+                self._clear_oper_events()
+                self._last_cont_read = time.monotonic()
+            else:
+                self._abort()
             return
         if spec.key == "meas.complex":
             self._complex = bool(value)
@@ -447,14 +463,20 @@ class KeysightPNA(VISAInstrument):
             return
         spec = self._stim_spec(spec)
         was_armed = self._armed
-        self._abort()
+        if not self._continuous:
+            self._abort()
         try:
             if spec.key == "cal.set":
                 self._cal_apply(str(value or "").strip())
             elif not self._write_slot(spec, value):
                 super().write_param(spec, value)
         finally:                                  # отказ записи не должен останавливать развёртки
-            if was_armed or self._continuous:
+            if self._continuous:
+                if self._cal is None:
+                    self._ensure_continuous()
+                    self._clear_oper_events()
+                    self._last_cont_read = time.monotonic()
+            elif was_armed:
                 self._start_sweep()
 
     def _write_slot(self, spec: Param, value: Any) -> bool:
@@ -558,14 +580,40 @@ class KeysightPNA(VISAInstrument):
 
     def _sync_all(self) -> None:
         super()._sync_all()
-        if self._continuous and not self._armed:
-            self._start_sweep()
+        if self._continuous:
+            self._ensure_continuous()
+            self._clear_oper_events()
+            self._last_cont_read = time.monotonic()
 
     # ------------------------------------------------------- развёртки
     def _set_armed(self, armed: bool) -> None:
         if armed != self._armed or "meas.armed" not in self._values:
             self._armed = armed
             self._publish("meas.armed", armed)
+
+    def _setup_oper_sync(self) -> None:
+        """Настроить фиксацию окончания развёртки в STAT:OPER:EVEN (переход бита Measuring 1 -> 0)."""
+        self.write("STAT:OPER:PTR 0")
+        self.write(f"STAT:OPER:NTR {OPER_SWEEP_BIT}")
+        self._clear_oper_events()
+
+    def _clear_oper_events(self) -> None:
+        try:
+            self.query("STAT:OPER:EVEN?")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ensure_continuous(self) -> None:
+        """Держать активные каналы в нативном CONT (не переводить в CONT те, что уже в CONT)."""
+        if self._cal is not None:
+            return
+        channels = self._active_channels()
+        self._armed_channels = channels
+        for c in channels:
+            mode = self.query(f"SENS{c}:SWE:MODE?").strip().upper()
+            if not mode.startswith("CONT"):
+                self.write(f"SENS{c}:SWE:MODE CONT")
+        self._set_armed(True)
 
     def _start_sweep(self) -> None:
         if self._cal is not None:                  # калибровка: стандарты меряет cal_measure
@@ -647,7 +695,11 @@ class KeysightPNA(VISAInstrument):
                 gen, self._gen = self._gen, None
                 self._gen_restore(*gen)
         finally:
-            if was_armed or self._continuous:
+            if self._continuous:
+                self._ensure_continuous()
+                self._clear_oper_events()
+                self._last_cont_read = time.monotonic()
+            elif was_armed:
                 self._start_sweep()
 
     def _gen_restore(self, channel: int, snap: dict[str, Any], modes: dict[int, str]) -> None:
@@ -743,21 +795,38 @@ class KeysightPNA(VISAInstrument):
 
     def after_poll_timeout(self) -> None:
         """Чтение трассы прервал таймаут (обмен уже восстановлен): развёртки не должны остановиться."""
-        if self._continuous and not self._armed:
+        if self._continuous:
+            self._ensure_continuous()
+        elif self._armed:
             self._start_sweep()
 
+    def _cont_fallback_s(self) -> float:
+        swt = float(self._values.get("sweep.time") or 0.1)
+        return max(1.5, 2.5 * swt)
+
     def poll(self) -> None:
-        if self._cal is not None and self._cal["busy"] is not None:
-            if self.opc_done("калибровка"):
+        if self._cal is not None:
+            if self._cal["busy"] is not None and self.opc_done("калибровка"):
                 self._cal["done"].add(self._cal["busy"])
                 self._cal["busy"] = None
                 self._publish("cal.busy", False)
             return
+        if self._continuous:
+            even = int(parse_number(self.query("STAT:OPER:EVEN?")))
+            if even & OPER_SWEEP_BIT:
+                self._oper_seen = True
+                self._last_cont_read = time.monotonic()
+                self._read_trace()
+                return
+            trig = self._values.get("trig.source", "IMM")
+            if (not self._oper_seen and trig == "IMM"
+                    and time.monotonic() - self._last_cont_read >= self._cont_fallback_s()):
+                self._last_cont_read = time.monotonic()
+                self._read_trace()
+            return
         if self._armed and self.opc_done("развёртка"):
             self._set_armed(False)
             self._read_trace()
-            if self._continuous:
-                self._start_sweep()
 
     def run_custom_action(self, name: str, args: tuple) -> Any:
         if name == "single":
@@ -767,8 +836,11 @@ class KeysightPNA(VISAInstrument):
             self._start_sweep()
             return None
         if name == "abort":
+            self._continuous = False
+            self._publish("meas.continuous", False)
             self._abort()
-            self.write("SENS1:SWE:MODE HOLD")
+            for c in self._active_channels():
+                self.write(f"SENS{c}:SWE:MODE HOLD")
             return None
         if name == "autoscale":
             cmd = self._scale_cmd("scale.div")
@@ -778,17 +850,19 @@ class KeysightPNA(VISAInstrument):
             self._read_keys(SCALE_KEYS)
             return None
         if name == "trigger":
-            if not self._armed:                          # нечего запускать: взвести одну развёртку
+            if not self._armed and not self._continuous:  # нечего запускать: взвести одну развёртку
                 self._start_sweep()
             scope = self._values.get("trig.scope")
-            for c in ([self._armed_channels[0]] if scope == "ALL" else self._armed_channels):
+            channels = self._active_channels()
+            for c in ([channels[0]] if scope == "ALL" else channels):
                 self.write(f"INIT{c}:IMM")
             return None
         if name == "meas_catalog":
             return [(c, n, sp) for c in self._channels() for n, sp in self._catalog(c).items()]
         if name in ("meas_all", "meas_none"):
             was_armed = self._armed
-            self._abort()
+            if not self._continuous:
+                self._abort()
             try:
                 if name == "meas_all":
                     entries = [(c, n) for c in self._channels() for n in self._catalog(c)][:MEAS_SLOTS]
@@ -800,7 +874,11 @@ class KeysightPNA(VISAInstrument):
                 self._read_keys([f"m{n}.{w}" for n in range(1, MEAS_SLOTS + 1)
                                  for w in SLOT_KEYS])
             finally:
-                if was_armed or self._continuous:
+                if self._continuous:
+                    self._ensure_continuous()
+                    self._clear_oper_events()
+                    self._last_cont_read = time.monotonic()
+                elif was_armed:
                     self._start_sweep()
             return None
         if name in ("mark_peak", "mark_min"):
@@ -828,13 +906,18 @@ class KeysightPNA(VISAInstrument):
             return self._meas_table()
         if name in ("meas_config", "meas_create", "meas_delete", "meas_move"):
             was_armed = self._armed
-            self._abort()
+            if not self._continuous:
+                self._abort()
             try:
                 getattr(self, f"_{name}")(*args)
                 self._check_errors(context=name)
                 self._read_keys([f"m{n}.{w}" for n in range(1, MEAS_SLOTS + 1) for w in SLOT_KEYS])
             finally:
-                if was_armed or self._continuous:
+                if self._continuous:
+                    self._ensure_continuous()
+                    self._clear_oper_events()
+                    self._last_cont_read = time.monotonic()
+                elif was_armed:
                     self._start_sweep()
             return self._meas_table()
         if name == "mem_store":
@@ -919,7 +1002,11 @@ class KeysightPNA(VISAInstrument):
             reply = self.query(f'CALC{c}:DATA:SNP:PORT? "{",".join(map(str, plist))}"')
             self._check_errors(context="snp_read")
         finally:
-            if was_armed or self._continuous:
+            if self._continuous:
+                self._ensure_continuous()
+                self._clear_oper_events()
+                self._last_cont_read = time.monotonic()
+            elif was_armed:
                 self._start_sweep()
         vals = [parse_number(t) for t in reply.split(",") if t.strip()]
         n, rest = divmod(len(vals), 1 + 2 * len(names))
@@ -1041,7 +1128,9 @@ class KeysightPNA(VISAInstrument):
         if c == self._stim_ch:
             self._read_keys(STIM_KEYS)
         if self._continuous:
-            self._start_sweep()
+            self._ensure_continuous()
+            self._clear_oper_events()
+            self._last_cont_read = time.monotonic()
 
     # ------------------------------------------------- состояния в памяти прибора
     def _state_dirs(self) -> tuple[str, list[str]]:
@@ -1069,22 +1158,20 @@ class KeysightPNA(VISAInstrument):
             self._check_errors(context=name)
             return
         was_armed = self._armed
-        self._abort()
         if name == "state_save":
             try:
                 self.write(f"MMEM:STOR {file}")
                 self._check_errors(context=name)
             finally:
-                if was_armed or self._continuous:
+                if not self._continuous and was_armed:
                     self._start_sweep()
             return
+        self._abort()
         self.write(f"MMEM:LOAD {file}")                          # state_recall
         self._check_errors(context=name)
         self.query("*OPC?")
         self.on_connected()                                      # измерения и каналы могли смениться
-        self._sync_all()                                         # перечитать всё; непрерывная - запустится
-        if was_armed and not self._armed:
-            self._start_sweep()
+        self._sync_all()                                         # перечитать всё; режим - как в файле состояния
 
     # ------------------------------------------------- таблица измерений (окно)
     def _meas_table(self) -> list[tuple[int, str, str, str, str]]:
