@@ -18,11 +18,14 @@ SET - пороги «измеряет / не измеряет» (сохраня�
 """
 from __future__ import annotations
 
+import json
+
 from PyQt6 import sip
-from PyQt6.QtCore import QRectF, QSettings, QSize, Qt
-from PyQt6.QtGui import QColor, QFont, QKeySequence, QPainter, QPen, QShortcut
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                             QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtCore import QMimeData, QPoint, QRectF, QSettings, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QShortcut
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                             QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
+                             QVBoxLayout, QWidget)
 
 from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
@@ -31,19 +34,22 @@ from ..core.trace import Trace
 from .instrument_window import WINDOW_EVENTS, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
-from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED,
-                    WINDOW_BAR_HEIGHT)
+from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR, UI_COLOR_TEXT,
+                    UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
 from .window import CustomFullButton, Window, mark_growing, short_address
 
-__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable"]
+__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES"]
+
+TILE_MIN_HEIGHT = 38
+PLOT_MIN_HEIGHT = 240
+LAYOUT_MODES = ("1 COL", "2 COL", "ROW")
+_PANEL_MIME = "application/x-visalab-livepanel"
 
 #: страница SET: (подпись, поле Thresholds, единица, множитель показа, подсказка)
 SETTINGS = (
-    ("SA MARG", "sa_margin_db", "dB", 1.0, "Spectrum analyzer measures when its peak is this much above the noise floor"),
-    ("PM FLR", "pm_floor_dbm", "dBm", 1.0, "Power meter measures when its reading is not below this level"),
-    ("VNA THRU", "vna_thru_db", "dB", 1.0, "VNA measures when any S21 / S12 rises above this level (something between the ports)"),
-    ("VNA REFL", "vna_refl_db", "dB", 1.0, "VNA measures when any S11 / S22 drops below this level (port is loaded, not open)"),
-    ("HOLD", "hold_s", "s", 1.0, "Keep showing an instrument this long after its signal is gone"),
+    ("SA MARG", "sa_margin_db", "dB", 1.0, "Spectrum analyzer shows peak marker and source when peak is this much above the noise floor"),
+    ("PM FLR", "pm_floor_dbm", "dBm", 1.0, "Power meter matches a signal source when its reading is not below this level"),
+    ("HOLD", "hold_s", "s", 1.0, "Keep showing an instrument this long after it stops outputting data"),
     ("FTOL", "freq_tol_hz", "Hz", 1.0, "Frequency match with a generator: at least this close"),
     ("FREL", "freq_tol_rel", "%", 100.0, "Frequency match with a generator: or this close relative to the frequency"),
 )
@@ -95,6 +101,7 @@ class InstrumentTile(IndicatorButton):
         self.window_open = False
         self.error = False
         self.setMinimumWidth(72)
+        self.setMinimumHeight(TILE_MIN_HEIGHT)
 
     def indicated(self) -> bool:
         return self.window_open
@@ -147,7 +154,7 @@ class PowerTable(QTableWidget):
         hh.setHighlightSections(False)
         for col, align in enumerate(self.ALIGN):                # частота - слева, мощность - справа
             self.horizontalHeaderItem(col).setTextAlignment(align)
-        self.setMinimumHeight(170)
+        self.setMinimumHeight(PLOT_MIN_HEIGHT)
         self.rows: list[tuple[float, float, float]] = []
         self.current: float | None = None
 
@@ -192,9 +199,11 @@ class ScenarioChip(IndicatorButton):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("chip")
+        self.setProperty("tile", True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMinimumWidth(72)
+        self.setMinimumHeight(TILE_MIN_HEIGHT)
         self.runs: list = []
 
     def indicated(self) -> bool:
@@ -216,18 +225,24 @@ class ScenarioChip(IndicatorButton):
 
 
 class LivePanel(Panel):
-    """Живые данные одного приёмника."""
+    """Живые данные одного приёмника: можно переставлять (кнопками / перетаскиванием) и закрывать."""
+
+    move_requested = pyqtSignal(object, int)
+    swap_requested = pyqtSignal(str, str)
+    close_requested = pyqtSignal(object)
 
     def __init__(self, proxy, monitor: ActivityMonitor, parent=None):
         self.proxy = proxy
         self.monitor = monitor
         self.profile = profile_name(proxy)
+        self.panel_key = f"{monitor.name(proxy)}:{proxy.address}"
+        self._drag_pos: QPoint | None = None
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
         head = QHBoxLayout()
-        head.setSpacing(8)
+        head.setSpacing(6)
         self.title = QLabel()
         self.title.setObjectName("heading")
         self.address = QLabel(short_address(proxy.address))
@@ -242,12 +257,21 @@ class LivePanel(Panel):
         self.clear_button.setToolTip("Clear the frequency / power table")
         self.clear_button.clicked.connect(lambda: self.monitor.clear_pm_table(self.proxy))
         self.clear_button.hide()
+        self.move_prev_button = self._tool_btn("◀", "Move measurement panel earlier",
+                                               lambda: self.move_requested.emit(self.proxy, -1))
+        self.move_next_button = self._tool_btn("▶", "Move measurement panel later",
+                                               lambda: self.move_requested.emit(self.proxy, 1))
+        self.close_button = self._tool_btn("×", "Hide this measurement panel",
+                                           lambda: self.close_requested.emit(self.proxy))
         head.addWidget(self.title)
         head.addWidget(self.address)
         head.addStretch()
         head.addWidget(self.source)
         head.addWidget(self.level)
         head.addWidget(self.clear_button)
+        head.addWidget(self.move_prev_button)
+        head.addWidget(self.move_next_button)
+        head.addWidget(self.close_button)
         lay.addLayout(head)
         self.plots_box = QVBoxLayout()
         self.plots_box.setSpacing(6)
@@ -258,12 +282,61 @@ class LivePanel(Panel):
             self.power_table = PowerTable()
             lay.addWidget(self.power_table, 1)
         super().__init__(body, parent=parent)
+        self.setAcceptDrops(True)
         self.address.setStyleSheet("color: #8a8a8a;")
         self.source.setStyleSheet("color: #8a8a8a;")
 
+    @staticmethod
+    def _tool_btn(text: str, tip: str, slot) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName("tool")
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setToolTip(tip)
+        b.clicked.connect(slot)
+        return b
+
+    def mousePressEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 40:
+            self._drag_pos = e.position().toPoint()
+        else:
+            self._drag_pos = None
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):  # noqa: N802 - Qt
+        if (self._drag_pos is not None and (e.buttons() & Qt.MouseButton.LeftButton)
+                and (e.position().toPoint() - self._drag_pos).manhattanLength() >= QApplication.startDragDistance()):
+            self._drag_pos = None
+            mime = QMimeData()
+            mime.setData(_PANEL_MIME, self.panel_key.encode("utf-8"))
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            drag.exec(Qt.DropAction.MoveAction)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
+        self._drag_pos = None
+        super().mouseReleaseEvent(e)
+
+    def dragEnterEvent(self, e):  # noqa: N802 - Qt
+        if e.mimeData().hasFormat(_PANEL_MIME):
+            e.acceptProposedAction()
+            return
+        super().dragEnterEvent(e)
+
+    def dropEvent(self, e):  # noqa: N802 - Qt
+        if e.mimeData().hasFormat(_PANEL_MIME):
+            src = bytes(e.mimeData().data(_PANEL_MIME)).decode("utf-8")
+            if src and src != self.panel_key:
+                self.swap_requested.emit(src, self.panel_key)
+            e.acceptProposedAction()
+            return
+        super().dropEvent(e)
+
     def _plot(self, i: int) -> LivePlot:
         while len(self.plots) <= i:
-            p = mark_growing(LivePlot(min_height=170))
+            p = mark_growing(LivePlot(min_height=PLOT_MIN_HEIGHT))
             self.plots.append(p)
             self.plots_box.addWidget(p)
         return self.plots[i]
@@ -308,14 +381,15 @@ class LivePanel(Panel):
         plot = self._plot(0)
         self._use_plots(1)
         plot.set_traces([("", tr)] if isinstance(tr, Trace) else [])
-        if a.measuring and a.level is not None and isinstance(tr, Trace):
+        present = bool(a.signal)
+        if present and a.level is not None and isinstance(tr, Trace):
             x, _y = tr.peak()
             plot.set_marker(x, a.level)
         else:
             plot.set_marker(None)
         if a.connected and a.level is not None:
-            where = f" @ {si_format(a.freq, 'Hz', 6)}" if a.freq is not None and a.measuring else ""
-            self.level.setText(f"{_dbm(a.level)}{where}" if a.measuring else f"NOISE {_dbm(a.floor)}")
+            where = f" @ {si_format(a.freq, 'Hz', 6)}" if a.freq is not None and present else ""
+            self.level.setText(f"{_dbm(a.level)}{where}" if present else f"NOISE {_dbm(a.floor)}")
 
     def _refresh_pm(self, a: Activity) -> None:
         """Временной режим (TRAC ON) - трасса во времени; иначе - таблица частота / мощность."""
@@ -351,12 +425,20 @@ class MainWindow(Window):
         self.before_quit: list = []
         self.tiles: dict[object, InstrumentTile] = {}
         self.panels: dict[object, LivePanel] = {}
+        self.restore_chips: dict[str, QPushButton] = {}
+        self._root_splitter: QSplitter | None = None
+        self._splitters: list[tuple[str, QSplitter]] = []
+        self._arranged_sig: tuple | None = None
+        self.panel_order: list[str] = self._load_list(f"{self.SETTINGS_GROUP}/PANEL_ORDER")
+        self.hidden_panels: set[str] = set(self._load_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS"))
+        saved_mode = str(settings.value(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", LAYOUT_MODES[0]) or LAYOUT_MODES[0])
+        self.layout_mode = saved_mode if saved_mode in LAYOUT_MODES else LAYOUT_MODES[0]
 
-        # во весь экран: кнопка в заголовке и F11 (Алексей 2026-11-14)
+        # во весь экран: кнопка в заголовке правее «свернуть» и F11
         self.full_button = CustomFullButton()
         self.full_button.setToolTip("Full screen (F11)")
         self.full_button.clicked.connect(self.toggle_full_screen)
-        self.titleBar.insert_control_widget(self.full_button)
+        self.titleBar.insert_control_widget(self.full_button, after_minimize=True)
         self._full_key = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
         self._full_key.activated.connect(self.toggle_full_screen)
 
@@ -364,21 +446,37 @@ class MainWindow(Window):
         self.strip_layout = QHBoxLayout(strip)
         self.strip_layout.setContentsMargins(0, 0, 0, 0)
         self.strip_layout.setSpacing(4)
+        self.restore_layout = QHBoxLayout()
+        self.restore_layout.setContentsMargins(0, 0, 0, 0)
+        self.restore_layout.setSpacing(4)
+        self.layout_button = QPushButton(self.layout_mode)
+        self.layout_button.setObjectName("chip")
+        self.layout_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.layout_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.layout_button.setMinimumHeight(28)
+        self.layout_button.setToolTip("Measurement panel layout: 1 COL (stack), 2 COL (grid), ROW (side by side). Click to switch")
+        self.layout_button.clicked.connect(self._cycle_layout_mode)
         self.all_button = QPushButton("ALL")
         self.all_button.setObjectName("chip")
         self.all_button.setCheckable(True)
         self.all_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.all_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.all_button.setToolTip("Show all receivers, also those that measure nothing now")
+        self.all_button.setMinimumHeight(28)
+        self.all_button.setToolTip("Show all receivers, also those without data now")
         self.all_button.setChecked(settings.value(f"{self.SETTINGS_GROUP}/SHOW_ALL", False, type=bool))
         self.all_button.toggled.connect(self._on_all)
         self.scenario_chip = ScenarioChip()
         self.scenario_chip.clicked.connect(self._open_scenario)
         self.scenario_chip.hide()
         self.strip_layout.addStretch()
+        self.strip_layout.addLayout(self.restore_layout)
         self.strip_layout.addWidget(self.scenario_chip)
+        self.strip_layout.addWidget(self.layout_button)
         self.strip_layout.addWidget(self.all_button)
         self.strip_panel = Panel(strip)
+        self.strip_panel.setStyleSheet(
+            Panel.STYLE_SHEET + f'\nPanel QPushButton#chip[tile="true"] {{ min-height: {TILE_MIN_HEIGHT}px; }}'
+        )
         self.strip_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         self.fields: dict[str, SettingField] = {}
@@ -409,16 +507,31 @@ class MainWindow(Window):
         live = QVBoxLayout(self.live_page)
         live.setContentsMargins(0, 0, 0, 0)
         live.setSpacing(8)
-        self.live_layout = QVBoxLayout()
-        self.live_layout.setSpacing(8)
-        live.addLayout(self.live_layout, 1)
+        self._live_host = QWidget()
+        self._live_host.setObjectName("liveHost")
+        self.live_layout = QVBoxLayout(self._live_host)
+        self.live_layout.setContentsMargins(0, 0, 0, 0)
+        self.live_layout.setSpacing(0)
+        self.live_scroll = QScrollArea()
+        self.live_scroll.setWidgetResizable(True)
+        self.live_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.live_scroll.setWidget(self._live_host)
+        self.live_scroll.setStyleSheet(render_qss("""
+            QScrollArea, QWidget#liveHost { background: $UI_COLOR_BACKGROUND; border: none; }
+            QSplitter { background: $UI_COLOR_BACKGROUND; }
+            QSplitter::handle { background: transparent; }
+            QSplitter::handle:vertical { height: 8px; }
+            QSplitter::handle:horizontal { width: 8px; }
+            QSplitter::handle:hover { background: $UI_COLOR_BORDER_LIGHT; border-radius: 2px; }
+        """))
+        live.addWidget(self.live_scroll, 1)
         live.addWidget(self.idle)
 
         # вкладки: LIVE - что измеряется, SET - пороги (как вкладки в окнах приборов)
         self.tabs = PTabBar()
         for title in self.TABS:
             self.tabs.addTab(title)
-        self.tabs.setTabToolTip(1, "Thresholds: when an instrument counts as measuring")
+        self.tabs.setTabToolTip(1, "Thresholds: signal detection and source matching")
         self.tabs_panel = Panel(self.tabs)
         self.tabs_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
@@ -440,16 +553,35 @@ class MainWindow(Window):
             sig.connect(self._on_runs)
         self._on_runs()
         self.setMinimumWidth(560)
-        self.recall_size(QSize(720, 420))
+        self.recall_size(QSize(860, 760))
         self._rebuild()
 
     # ------------------------------------------------------------ состав
+    def _load_list(self, key: str) -> list[str]:
+        raw = self.settings.value(key, "", type=str)
+        try:
+            items = json.loads(raw) if raw else []
+            return [str(x) for x in items] if isinstance(items, list) else []
+        except (TypeError, ValueError):
+            return []
+
+    def _save_list(self, key: str, items) -> None:
+        self.settings.setValue(key, json.dumps(list(items)))
+
+    def _panel_key(self, proxy) -> str:
+        panel = self.panels.get(proxy)
+        if panel is not None:
+            return panel.panel_key
+        return f"{self.monitor.name(proxy)}:{proxy.address}"
+
     def _rebuild(self) -> None:
         proxies = self.monitor.proxies()
         for p in [p for p in self.tiles if p not in proxies]:
             self.tiles.pop(p).deleteLater()
         for p in [p for p in self.panels if p not in proxies]:
-            self.panels.pop(p).deleteLater()
+            panel = self.panels.pop(p)
+            panel.setParent(None)
+            panel.deleteLater()
         for i, p in enumerate(proxies):
             if p not in self.tiles:
                 tile = InstrumentTile(p)
@@ -458,8 +590,14 @@ class MainWindow(Window):
             self.strip_layout.insertWidget(i, self.tiles[p])
         for p in self.monitor.receivers():
             if p not in self.panels:
-                self.panels[p] = LivePanel(p, self.monitor)
-                self.live_layout.addWidget(self.panels[p], 1)
+                panel = LivePanel(p, self.monitor)
+                panel.move_requested.connect(self.move_panel)
+                panel.swap_requested.connect(self.swap_panels)
+                panel.close_requested.connect(self.hide_panel)
+                panel.hide()
+                self.panels[p] = panel
+                if panel.panel_key not in self.panel_order:
+                    self.panel_order.append(panel.panel_key)
         for p in proxies:
             self._on_changed(p)
         self._update_visibility()
@@ -532,18 +670,176 @@ class MainWindow(Window):
         self.settings.setValue(f"{self.SETTINGS_GROUP}/SHOW_ALL", bool(on))
         self._update_visibility()
 
+    def _cycle_layout_mode(self) -> None:
+        nxt = LAYOUT_MODES[(LAYOUT_MODES.index(self.layout_mode) + 1) % len(LAYOUT_MODES)]
+        self.set_layout_mode(nxt)
+
+    def set_layout_mode(self, mode: str) -> None:
+        if mode not in LAYOUT_MODES or mode == self.layout_mode:
+            return
+        self._save_splitters()
+        self.layout_mode = mode
+        self.layout_button.setText(mode)
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", mode)
+        self._arranged_sig = None
+        self._update_visibility()
+
+    def hide_panel(self, proxy) -> None:
+        """Закрыть (скрыть) панель измерения; вернуть можно чипом «+ ИМЯ» сверху."""
+        key = self._panel_key(proxy)
+        if key not in self.hidden_panels:
+            self.hidden_panels.add(key)
+            self._save_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS", sorted(self.hidden_panels))
+            self._update_visibility()
+
+    def show_panel(self, key: str) -> None:
+        if key in self.hidden_panels:
+            self.hidden_panels.discard(key)
+            self._save_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS", sorted(self.hidden_panels))
+            self._update_visibility()
+
+    def move_panel(self, proxy, delta: int) -> None:
+        """Сдвинуть панель в порядке показа среди видимых панелей."""
+        ordered = self._ordered_receivers()
+        vis = [p for p in ordered if self._should_show(p)]
+        if proxy not in vis:
+            return
+        i = vis.index(proxy)
+        j = i + (-1 if delta < 0 else 1)
+        if not 0 <= j < len(vis):
+            return
+        self.swap_panels(self._panel_key(vis[i]), self._panel_key(vis[j]))
+
+    def swap_panels(self, src_key: str, dst_key: str) -> None:
+        if src_key == dst_key:
+            return
+        for k in (src_key, dst_key):
+            if k not in self.panel_order:
+                self.panel_order.append(k)
+        i, j = self.panel_order.index(src_key), self.panel_order.index(dst_key)
+        self.panel_order[i], self.panel_order[j] = self.panel_order[j], self.panel_order[i]
+        self._save_list(f"{self.SETTINGS_GROUP}/PANEL_ORDER", self.panel_order)
+        self._arranged_sig = None
+        self._update_visibility()
+
+    def _ordered_receivers(self) -> list:
+        rank = {k: i for i, k in enumerate(self.panel_order)}
+        receivers = list(self.panels)
+        return sorted(receivers, key=lambda p: (rank.get(self._panel_key(p), len(rank)), receivers.index(p)))
+
+    def _is_eligible(self, proxy) -> bool:
+        return self.all_button.isChecked() or self.monitor.activity(proxy).measuring
+
+    def _should_show(self, proxy) -> bool:
+        return self._is_eligible(proxy) and self._panel_key(proxy) not in self.hidden_panels
+
+    def _splitter_key(self, tag: str) -> str:
+        return f"{self.SETTINGS_GROUP}/SPLITTER_SIZES/{self.layout_mode}/{tag}"
+
+    def _save_splitters(self) -> None:
+        for tag, sp in self._splitters:
+            if not sip.isdeleted(sp):
+                sizes = sp.sizes()
+                if any(sizes):
+                    self.settings.setValue(self._splitter_key(tag), json.dumps(sizes))
+
+    def _restore_splitter(self, tag: str, sp: QSplitter) -> None:
+        raw = self.settings.value(self._splitter_key(tag), "", type=str)
+        try:
+            sizes = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            sizes = []
+        if isinstance(sizes, list) and len(sizes) == sp.count() and all(isinstance(x, int) and x > 0 for x in sizes):
+            sp.setSizes(sizes)
+        else:
+            sp.setSizes([1000] * sp.count())
+
+    def _make_splitter(self, orientation: Qt.Orientation, tag: str) -> QSplitter:
+        sp = QSplitter(orientation)
+        sp.setChildrenCollapsible(False)
+        sp.setHandleWidth(8)
+        sp.splitterMoved.connect(lambda _p, _i: self._save_splitters())
+        self._splitters.append((tag, sp))
+        return sp
+
+    def _update_restore_chips(self, ordered: list) -> None:
+        wanted = {self._panel_key(p): self.monitor.name(p)
+                  for p in ordered if self._is_eligible(p) and self._panel_key(p) in self.hidden_panels}
+        for key in [k for k in self.restore_chips if k not in wanted]:
+            btn = self.restore_chips.pop(key)
+            self.restore_layout.removeWidget(btn)
+            btn.deleteLater()
+        for key, name in wanted.items():
+            if key not in self.restore_chips:
+                b = QPushButton(f"+ {name}")
+                b.setObjectName("chip")
+                b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setMinimumHeight(28)
+                b.setToolTip(f"Show {name} measurement panel")
+                b.clicked.connect(lambda _=False, k=key: self.show_panel(k))
+                self.restore_chips[key] = b
+                self.restore_layout.addWidget(b)
+
     def _update_visibility(self) -> None:
-        show_all = self.all_button.isChecked()
-        shown = 0
-        for p, panel in self.panels.items():
-            vis = show_all or self.monitor.activity(p).measuring
-            if panel.isVisibleTo(self.live_page) != vis:
-                panel.setVisible(vis)
-            shown += vis
-        self.idle.setVisible(shown == 0)
+        ordered = self._ordered_receivers()
+        self._update_restore_chips(ordered)
+        visible = [p for p in ordered if self._should_show(p)]
+        sig = (self.layout_mode, tuple(self._panel_key(p) for p in visible))
+        if sig != self._arranged_sig:
+            self._save_splitters()
+            self._arranged_sig = sig
+            for panel in self.panels.values():
+                panel.setParent(self._live_host)
+                panel.hide()
+            if self._root_splitter is not None:
+                self.live_layout.removeWidget(self._root_splitter)
+                self._root_splitter.deleteLater()
+                self._root_splitter = None
+            self._splitters.clear()
+            if visible:
+                if self.layout_mode == "ROW":
+                    root = self._make_splitter(Qt.Orientation.Horizontal, "root")
+                    for i, p in enumerate(visible):
+                        root.addWidget(self.panels[p])
+                        root.setStretchFactor(i, 1)
+                        self.panels[p].show()
+                    self._restore_splitter("root", root)
+                elif self.layout_mode == "2 COL" and len(visible) > 1:
+                    root = self._make_splitter(Qt.Orientation.Vertical, "root")
+                    for r, i in enumerate(range(0, len(visible), 2)):
+                        chunk = visible[i:i + 2]
+                        if len(chunk) == 2:
+                            row_sp = self._make_splitter(Qt.Orientation.Horizontal, f"row{r}")
+                            for c, p in enumerate(chunk):
+                                row_sp.addWidget(self.panels[p])
+                                row_sp.setStretchFactor(c, 1)
+                                self.panels[p].show()
+                            self._restore_splitter(f"row{r}", row_sp)
+                            root.addWidget(row_sp)
+                        else:
+                            root.addWidget(self.panels[chunk[0]])
+                            self.panels[chunk[0]].show()
+                        root.setStretchFactor(r, 1)
+                    self._restore_splitter("root", root)
+                else:
+                    root = self._make_splitter(Qt.Orientation.Vertical, "root")
+                    for i, p in enumerate(visible):
+                        root.addWidget(self.panels[p])
+                        root.setStretchFactor(i, 1)
+                        self.panels[p].show()
+                    self._restore_splitter("root", root)
+                self._root_splitter = root
+                self.live_layout.addWidget(root, 1)
+        for i, p in enumerate(visible):
+            panel = self.panels[p]
+            panel.move_prev_button.setEnabled(i > 0)
+            panel.move_next_button.setEnabled(i < len(visible) - 1)
+        self.live_scroll.setVisible(bool(visible))
+        self.idle.setVisible(not visible)
 
     def visible_panels(self) -> list[LivePanel]:
-        return [panel for panel in self.panels.values() if panel.isVisibleTo(self.live_page)]
+        return [self.panels[p] for p in self._ordered_receivers() if self._should_show(p)]
 
     # ------------------------------------------------------------ во весь экран
     def show_window(self) -> None:
@@ -579,6 +875,7 @@ class MainWindow(Window):
         w.activateWindow()
 
     def closeEvent(self, event):  # noqa: N802 - Qt
+        self._save_splitters()
         if self.quit_on_close:
             for fn in self.before_quit:
                 fn()

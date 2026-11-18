@@ -74,6 +74,7 @@ class Activity:
     name: str
     connected: bool = False
     measuring: bool = False
+    signal: bool = False
     level: float | None = None       # dBm: пик спектра / показание ваттметра
     freq: float | None = None        # Hz: частота пика / частота датчика
     floor: float | None = None       # шумовая дорожка анализатора, dBm
@@ -160,6 +161,7 @@ class ActivityMonitor(QObject):
         self.th = thresholds or Thresholds()
         self.clock = clock
         self._conns: dict[Any, list] = {}
+        self._last_data: dict[Any, float] = {}
         self._last_signal: dict[Any, float] = {}
         self._updated: dict[Any, float] = {}
         self._sa: dict[Any, tuple[bool, float, float, float]] = {}
@@ -209,7 +211,8 @@ class ActivityMonitor(QObject):
         current = self.proxies()
         for p in [p for p in self._conns if p not in current]:
             self._drop(p)
-            for d in (self._last_signal, self._updated, self._sa, self._measuring, self.history, self.pm_points):
+            for d in (self._last_data, self._last_signal, self._updated, self._sa, self._measuring,
+                      self.history, self.pm_points):
                 d.pop(p, None)
         for p in current:
             if p in self._conns:
@@ -230,6 +233,7 @@ class ActivityMonitor(QObject):
     # ------------------------------------------------------------ события приборов
     def _on_state(self, proxy, state) -> None:
         if state is not ConnectionState.CONNECTED:
+            self._last_data.pop(proxy, None)
             self._last_signal.pop(proxy, None)
             self._sa.pop(proxy, None)
         self._emit(proxy)
@@ -249,29 +253,38 @@ class ActivityMonitor(QObject):
                 return
             self.history[proxy].append((now, v))
             self._updated[proxy] = now
+            self._last_data[proxy] = now
             if v >= self.th.pm_floor_dbm:
                 self._last_signal[proxy] = now
-                f = _num(proxy.value("freq"))
-                if f is not None:
-                    points = self.pm_points.setdefault(proxy, {})
-                    points[float(round(f))] = (now, v)
-                    while len(points) > HISTORY:          # самые старые частоты - вон
-                        del points[min(points, key=lambda k: points[k][0])]
+            f = _num(proxy.value("freq"))
+            if f is not None:
+                points = self.pm_points.setdefault(proxy, {})
+                points[float(round(f))] = (now, v)
+                while len(points) > HISTORY:          # самые старые частоты - вон
+                    del points[min(points, key=lambda k: points[k][0])]
             self._emit(proxy)
-        elif prof == "power_meter" and key == "trace" and isinstance(value, Trace):
+        elif prof == "power_meter" and key == "trace" and isinstance(value, Trace) and len(value) > 0:
             self._updated[proxy] = now
+            self._last_data[proxy] = now
             self._emit(proxy)
         elif prof == "spectrum_analyzer" and key == "trace" and isinstance(value, Trace) and len(value) > 1:
             self._sa[proxy] = spectrum_peak(value, self.th.sa_margin_db)
             self._updated[proxy] = now
+            self._last_data[proxy] = now
             if self._sa[proxy][0]:
                 self._last_signal[proxy] = now
             self._emit(proxy)
         elif prof == "network_analyzer" and key == "trace":
             self._updated[proxy] = now                # ``trace`` публикуется последним в развёртке
+            if self.vna_traces(proxy):
+                self._last_data[proxy] = now
+            else:
+                self._last_data.pop(proxy, None)
             if proxy.value("rf.output") is not False and self.vna_has_signal(proxy):
                 self._last_signal[proxy] = now
             self._emit(proxy)                         # одна перерисовка на развёртку
+        elif prof == "network_analyzer" and key.startswith("m") and key.endswith(".enabled"):
+            self._emit(proxy)
         elif prof == "network_analyzer" and key == "rf.output" and value is False:
             self._last_signal.pop(proxy, None)
             self._emit(proxy)
@@ -314,10 +327,18 @@ class ActivityMonitor(QObject):
                 self._sa[p] = spectrum_peak(tr, self.th.sa_margin_db)
                 if self._sa[p][0]:
                     self._last_signal[p] = self.clock()
-            elif prof == "network_analyzer" and p.value("rf.output") is not False and self.vna_has_signal(p):
-                self._last_signal[p] = self.clock()
-            elif prof == "power_meter" and self.history.get(p) and self.history[p][-1][1] >= self.th.pm_floor_dbm:
-                self._last_signal[p] = self.history[p][-1][0]
+                else:
+                    self._last_signal.pop(p, None)
+            elif prof == "network_analyzer":
+                if p.value("rf.output") is not False and self.vna_has_signal(p):
+                    self._last_signal[p] = self.clock()
+                else:
+                    self._last_signal.pop(p, None)
+            elif prof == "power_meter" and self.history.get(p):
+                if self.history[p][-1][1] >= self.th.pm_floor_dbm:
+                    self._last_signal[p] = self.history[p][-1][0]
+                else:
+                    self._last_signal.pop(p, None)
             self._emit(p)
 
     def tick(self) -> None:
@@ -328,6 +349,18 @@ class ActivityMonitor(QObject):
 
     # ------------------------------------------------------------ результат
     def _is_measuring(self, proxy) -> bool:
+        """Прибор подключён и выдаёт данные (за последние ``hold_s`` секунд)."""
+        if proxy.state is not ConnectionState.CONNECTED:
+            return False
+        t = self._last_data.get(proxy)
+        if t is None or self.clock() - t >= self.th.hold_s:
+            return False
+        if profile_name(proxy) == "network_analyzer":
+            return bool(self.vna_traces(proxy))
+        return True
+
+    def _has_signal(self, proxy) -> bool:
+        """Есть ли сигнал выше порога (для маркера пика и подбора источника)."""
         t = self._last_signal.get(proxy)
         return proxy.state is ConnectionState.CONNECTED and t is not None and self.clock() - t < self.th.hold_s
 
@@ -351,7 +384,8 @@ class ActivityMonitor(QObject):
     def activity(self, proxy) -> Activity:
         prof = profile_name(proxy)
         a = Activity(proxy, prof, self.name(proxy), connected=proxy.state is ConnectionState.CONNECTED,
-                     measuring=self._is_measuring(proxy), updated=self._updated.get(proxy))
+                     measuring=self._is_measuring(proxy), signal=self._has_signal(proxy),
+                     updated=self._updated.get(proxy))
         sources = self.sources(exclude=proxy)
         if prof == "spectrum_analyzer" and proxy in self._sa:
             present, x, peak, floor = self._sa[proxy]
@@ -369,7 +403,7 @@ class ActivityMonitor(QObject):
             if hist:
                 a.level = hist[-1][1]
             a.freq = _num(proxy.value("freq"))
-            if a.measuring:
+            if a.measuring and a.signal:
                 a.source = match_source(a.freq, sources, self._tol(a.freq, 0.0))
                 if a.source is None and len(sources) == 1:     # датчик широкополосный: единственный источник
                     a.source = sources[0]

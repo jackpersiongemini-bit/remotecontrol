@@ -102,56 +102,39 @@ def test_monitor_finds_who_measures_and_the_source(qtbot, lab):
     mon = ActivityMonitor(links)
     assert [mon.name(p) for p in mon.receivers()] == ["VNA", "SA", "PM"]
     vna, sa, pm, gen = px["pna"], px["e4446a"], px["u2021xa"], px["e8267d"]
-    # ВАЦ: DUT (фильтр) на портах -> по уровню S11 измеряет
-    qtbot.waitUntil(lambda: _measuring(mon, vna), timeout=10000)
-    # генератор выключен: анализатор видит только шум, ваттметр ниже порога
-    qtbot.waitUntil(lambda: mon.activity(sa).level is not None, timeout=10000)
-    assert not _measuring(mon, sa) and not _measuring(mon, pm)
+    # Приборы подключены и выдают данные -> все три отображаются даже без сигнала от генератора
+    qtbot.waitUntil(lambda: _measuring(mon, vna) and _measuring(mon, sa) and _measuring(mon, pm), timeout=10000)
+    assert not mon.activity(sa).signal and not mon.activity(pm).signal
+    assert mon.activity(sa).source is None and mon.activity(pm).source is None
     gen.set("rf.frequency", 1e9)
     gen.set("rf.power", -5.0)
     gen.set("rf.output", True)
     qtbot.waitUntil(lambda: gen.value("rf.output") is True and gen.value("rf.power") == -5.0, timeout=5000)
     bench.step()
-    qtbot.waitUntil(lambda: _measuring(mon, sa) and _measuring(mon, pm), timeout=10000)
+    qtbot.waitUntil(lambda: mon.activity(sa).signal and mon.activity(pm).signal, timeout=10000)
     a = mon.activity(sa)
     assert a.source is not None and a.source.name == "GEN" and a.freq == pytest.approx(1e9, rel=1e-3)
     assert a.path_db == pytest.approx(-10.0, abs=1.0)
     b = mon.activity(pm)
     assert b.source is not None and b.source.name == "GEN" and b.path_db == pytest.approx(-10.0, abs=0.5)
     assert len(mon.history[pm]) > 0
-    # таблица ваттметра: частота датчика -> последнее показание с сигналом
+    # таблица ваттметра: частота датчика -> последнее показание
     rows = mon.pm_table(pm)
     assert len(rows) == 1 and rows[0][0] == pytest.approx(pm.value("freq")) and rows[0][1] == pytest.approx(b.level, abs=0.5)
     mon.clear_pm_table(pm)
     assert mon.pm_table(pm) == []
 
 
-def test_monitor_vna_phase_trace_counts_as_measuring(qtbot, lab):
-    """Трейс на фазе: модуля нет, по уровню не судится - пока идут развёртки, ВАЦ измеряет."""
+def test_monitor_shows_data_even_with_open_ports_and_hides_when_stopped(qtbot, lab):
+    """Любой приёмник, выдающий данные (даже без сигнала / открытые порты), отображается; без данных - пропадает."""
     links, px, _bench = lab
     vna = px["pna"]
-    _sim(vna).dut = None                               # порты открыты: по модулю (MLOG) не измеряет
+    _sim(vna).dut = None                               # порты открыты, но трасса идёт
     mon = ActivityMonitor(links, Thresholds(hold_s=0.5))
-    fmt = lambda: (vna.value("m1.trace").meta or {}).get("format") if isinstance(vna.value("m1.trace"), Trace) else None  # noqa: E731
-    qtbot.waitUntil(lambda: fmt() == "MLOG", timeout=10000)
-    qtbot.wait(800)
-    mon.tick()
-    assert not _measuring(mon, vna)
-    vna.set("m1.format", "PHASE")
-    qtbot.waitUntil(lambda: fmt() == "PHASE", timeout=10000)
-    qtbot.waitUntil(lambda: _measuring(mon, vna), timeout=5000)
-    assert mon.activity(vna).measuring
-
-
-def test_monitor_vna_idle_with_open_ports(qtbot, lab):
-    links, px, _bench = lab
-    vna = px["pna"]
-    _sim(vna).dut = None                               # развёртки идут, но на портах ничего
-    mon = ActivityMonitor(links, Thresholds(hold_s=0.5))
-    qtbot.waitUntil(lambda: mon._updated.get(vna) is not None, timeout=10000)
-    qtbot.wait(800)
-    mon.tick()
-    assert not _measuring(mon, vna)
+    qtbot.waitUntil(lambda: _measuring(mon, vna), timeout=10000)
+    assert not mon.activity(vna).signal
+    vna.action("meas_none")                            # все слоты выключены -> данных нет
+    qtbot.waitUntil(lambda: not _measuring(mon, vna), timeout=5000)
 
 
 def test_main_window_shows_only_measuring(qtbot, lab, tmp_path):
@@ -161,20 +144,24 @@ def test_main_window_shows_only_measuring(qtbot, lab, tmp_path):
     qtbot.addWidget(win)
     win.show()
     assert [t.text() for t in win.tiles.values()] == ["VNA", "SA", "PM", "GEN"]     # только что это, без IDLE
-    qtbot.waitUntil(lambda: [p.title.text() for p in win.visible_panels()] == ["VNA"], timeout=10000)
+    assert all(t.height() >= 38 for t in win.tiles.values())
+    qtbot.waitUntil(lambda: len(win.visible_panels()) == 3, timeout=10000)
     vna_panel = win.panels[px["pna"]]
     assert vna_panel.plots[0].traces and vna_panel.plots[0].traces[0][0].startswith("1·S11")
+    assert vna_panel.plots[0].minimumHeight() >= 240
+    # генератор выключен: SA показывает шум (NOISE ...), без фальшивого источника
+    assert win.panels[px["e4446a"]].level.text().startswith("NOISE")
     gen = px["e8267d"]
     gen.set("rf.power", -5.0)
     gen.set("rf.output", True)
     qtbot.waitUntil(lambda: gen.value("rf.output") is True and gen.value("rf.power") == -5.0, timeout=5000)
     bench.step()
-    qtbot.waitUntil(lambda: len(win.visible_panels()) == 3, timeout=10000)
+    qtbot.waitUntil(lambda: "← GEN" in win.panels[px["e4446a"]].source.text(), timeout=10000)
     assert [t.text() for t in win.tiles.values()] == ["VNA", "SA", "PM", "GEN"]
     assert not any(t.indicated() or t.error for t in win.tiles.values())   # окон приборов нет, ошибок нет
-    assert "← GEN" in win.panels[px["e4446a"]].source.text()
     pm = px["u2021xa"]
     panel = win.panels[pm]                                # ваттметр: таблица частота / мощность, не график
+    assert panel.power_table.minimumHeight() >= 240
     qtbot.waitUntil(lambda: bool(panel.power_table.rows), timeout=5000)
     assert panel.power_table.isVisibleTo(panel) and not any(p.isVisibleTo(panel) for p in panel.plots)
     assert panel.power_table.rows[0][0] == pytest.approx(pm.value("freq")) and panel.power_table.item(0, 1).text().endswith("dBm")
@@ -224,7 +211,7 @@ def test_run_main_launcher(qtbot, tmp_path, monkeypatch):
 
 def test_thresholds_in_main_window_settings(qtbot, lab, tmp_path):
     links, px, _bench = lab
-    vna = px["pna"]
+    pm = px["u2021xa"]
     settings = QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat)
     win = MainWindow(settings, ActivityMonitor(links, Thresholds(hold_s=0.5)))
     qtbot.addWidget(win)
@@ -233,22 +220,22 @@ def test_thresholds_in_main_window_settings(qtbot, lab, tmp_path):
     assert win.live_page.isVisible() and not win.settings_panel.isVisible()
     win.tabs.setCurrentIndex(1)                         # SET - настройки вместо живых данных
     assert win.settings_panel.isVisible() and not win.live_page.isVisible()
-    assert settings.value("MAIN/TAB", type=int) == 1 and set(win.fields) >= {"vna_thru_db", "vna_refl_db", "pm_floor_dbm"}
-    qtbot.waitUntil(lambda: win.monitor.activity(vna).measuring, timeout=10000)
-    f = win.fields["vna_refl_db"]                       # фильтр в S11 ~ -34 dB: порог ниже - не измеряет
-    f.setText("-60")
+    assert settings.value("MAIN/TAB", type=int) == 1 and set(win.fields) >= {"sa_margin_db", "pm_floor_dbm", "hold_s"}
+    qtbot.waitUntil(lambda: win.monitor.activity(pm).measuring, timeout=10000)
+    f = win.fields["pm_floor_dbm"]
+    f.setText("-40")
     f.editingFinished.emit()
-    assert win.monitor.th.vna_refl_db == -60.0 and settings.value("MAIN/THRESHOLDS/vna_refl_db", type=float) == -60.0
-    qtbot.waitUntil(lambda: not win.monitor.activity(vna).measuring, timeout=5000)
+    assert win.monitor.th.pm_floor_dbm == -40.0 and settings.value("MAIN/THRESHOLDS/pm_floor_dbm", type=float) == -40.0
+    assert win.monitor.activity(pm).measuring           # порог не скрывает выдаваемые данные
     f.setText("junk")
     f.editingFinished.emit()
-    assert f.text() == "-60 dB"
+    assert f.text() == "-40 dBm"
     win.fields["freq_tol_rel"].setText("0.5")           # в процентах
     win.fields["freq_tol_rel"].editingFinished.emit()
     assert win.monitor.th.freq_tol_rel == pytest.approx(0.005)
     win2 = MainWindow(settings, ActivityMonitor(links))   # из ini
     qtbot.addWidget(win2)
-    assert win2.tabs.currentIndex() == 1 and win2.monitor.th.vna_refl_db == -60.0 and win2.fields["vna_refl_db"].text() == "-60 dB"
+    assert win2.tabs.currentIndex() == 1 and win2.monitor.th.pm_floor_dbm == -40.0 and win2.fields["pm_floor_dbm"].text() == "-40 dBm"
 
 
 def test_open_instrument_picks_the_instrument_window_not_helpers(qtbot, tmp_path):
@@ -307,7 +294,8 @@ def test_main_window_full_screen(qtbot, tmp_path):
     qtbot.addWidget(win)
     win.show_window()
     assert win.isVisible() and not win.isFullScreen()
-    assert win.titleBar.hBoxLayout.indexOf(win.full_button) == win.titleBar.hBoxLayout.indexOf(win.titleBar.minimized_button) - 1
+    assert win.titleBar.hBoxLayout.indexOf(win.full_button) == win.titleBar.hBoxLayout.indexOf(win.titleBar.minimized_button) + 1
+    assert win.titleBar.hBoxLayout.indexOf(win.full_button) < win.titleBar.hBoxLayout.indexOf(win.titleBar.close_button)
     win.full_button.click()
     assert win.isFullScreen() and win.full_button.full and settings.value("MAIN/FULL_SCREEN", type=bool)
     win.toggle_full_screen()                            # то же, что F11
@@ -399,3 +387,40 @@ def test_main_window_widgets_grow_with_window(qtbot, lab, tmp_path):
     qtbot.wait(100)
     field = win.fields["hold_s"] if "hold_s" in win.fields else next(iter(win.fields.values()))
     assert field.width() > 600
+
+
+def test_main_window_panel_close_reorder_and_layout(qtbot, lab, tmp_path):
+    """Панели измерений можно закрывать (и возвращать чипом), переставлять и раскладывать по сетке."""
+    links, px, _bench = lab
+    settings = QSettings(str(tmp_path / "layout.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win)
+    win.show()
+    win.all_button.setChecked(True)
+    assert [p.title.text() for p in win.visible_panels()] == ["VNA", "SA", "PM"]
+
+    # перестановка: VNA -> вправо
+    win.panels[px["pna"]].move_next_button.click()
+    assert [p.title.text() for p in win.visible_panels()] == ["SA", "VNA", "PM"]
+
+    # смена раскладки: 1 COL -> 2 COL -> ROW
+    assert win.layout_button.text() == "1 COL"
+    win.layout_button.click()
+    assert win.layout_mode == "2 COL" and win.layout_button.text() == "2 COL"
+    win.layout_button.click()
+    assert win.layout_mode == "ROW" and win.layout_button.text() == "ROW"
+
+    # закрыть SA -> появляется чип возврата "+ SA"
+    win.panels[px["e4446a"]].close_button.click()
+    assert [p.title.text() for p in win.visible_panels()] == ["VNA", "PM"]
+    restore_sa = [b for b in win.restore_chips.values() if b.text() == "+ SA"]
+    assert len(restore_sa) == 1
+
+    # перезапуск: порядок, раскладка и скрытая панель восстановились из ini
+    win2 = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win2)
+    win2.show()
+    assert win2.layout_mode == "ROW"
+    assert [p.title.text() for p in win2.visible_panels()] == ["VNA", "PM"]
+    win2.restore_chips[win2._panel_key(px["e4446a"])].click()
+    assert [p.title.text() for p in win2.visible_panels()] == ["SA", "VNA", "PM"]

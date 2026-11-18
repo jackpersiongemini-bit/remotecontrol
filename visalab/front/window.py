@@ -94,9 +94,10 @@ class WindowBar(TitleBar):
     def insert_widget(self, widget, index: int = 0) -> None:
         self.hBoxLayout.insertWidget(index, widget)
 
-    def insert_control_widget(self, widget) -> None:
-        """Перед «свернуть»/«закрыть» (после растяжки)."""
-        self.hBoxLayout.insertWidget(self.hBoxLayout.indexOf(self.minimized_button), widget)
+    def insert_control_widget(self, widget, after_minimize: bool = False) -> None:
+        """Перед «свернуть»/«закрыть» (или правее «свернуть», перед «закрыть»)."""
+        anchor = self.close_button if after_minimize else self.minimized_button
+        self.hBoxLayout.insertWidget(self.hBoxLayout.indexOf(anchor), widget)
 
     def canDrag(self, pos):  # noqa: N802 - qframelesswindow
         return not self.window().isFullScreen() and super().canDrag(pos)     # во весь экран окно не таскается

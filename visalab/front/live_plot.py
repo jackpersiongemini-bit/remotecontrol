@@ -40,7 +40,7 @@ def nice_range(lo: float, hi: float, divs: int) -> tuple[float, float, float]:
 class LivePlot(QWidget):
     DIVS_X, DIVS_Y = 10, 6
 
-    def __init__(self, parent=None, min_height: int = 170):
+    def __init__(self, parent=None, min_height: int = 240):
         super().__init__(parent)
         self.traces: list[tuple[str, Trace]] = []
         self.points = False
