@@ -33,7 +33,7 @@ from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED,
                     WINDOW_BAR_HEIGHT)
-from .window import CustomFullButton, Window, short_address
+from .window import CustomFullButton, Window, mark_growing, short_address
 
 __all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable"]
 
@@ -251,19 +251,19 @@ class LivePanel(Panel):
         lay.addLayout(head)
         self.plots_box = QVBoxLayout()
         self.plots_box.setSpacing(6)
-        lay.addLayout(self.plots_box)
+        lay.addLayout(self.plots_box, 1)
         self.plots: list[LivePlot] = []
         self.power_table: PowerTable | None = None      # не ``table``: так Panel зовёт своё содержимое
         if self.profile == "power_meter":
             self.power_table = PowerTable()
-            lay.addWidget(self.power_table)
+            lay.addWidget(self.power_table, 1)
         super().__init__(body, parent=parent)
         self.address.setStyleSheet("color: #8a8a8a;")
         self.source.setStyleSheet("color: #8a8a8a;")
 
     def _plot(self, i: int) -> LivePlot:
         while len(self.plots) <= i:
-            p = LivePlot(min_height=170)
+            p = mark_growing(LivePlot(min_height=170))
             self.plots.append(p)
             self.plots_box.addWidget(p)
         return self.plots[i]
@@ -392,12 +392,11 @@ class MainWindow(Window):
                     pass
             f = SettingField(unit, scale)
             f.setToolTip(tip)
-            f.setFixedWidth(130)
+            f.setMinimumWidth(130)                  # поле тянется с окном, как в окнах приборов
             f.show_value(getattr(self.monitor.th, name))
             f.editingFinished.connect(lambda n=name: self._apply_setting(n))
             self.fields[name] = f
             line = PanelLine(label, f)
-            line.line_layout.addStretch()
             line.setToolTip(tip)
             lines.append(line)
         self.settings_panel = Panel(PanelTable(*lines))
@@ -412,7 +411,7 @@ class MainWindow(Window):
         live.setSpacing(8)
         self.live_layout = QVBoxLayout()
         self.live_layout.setSpacing(8)
-        live.addLayout(self.live_layout)
+        live.addLayout(self.live_layout, 1)
         live.addWidget(self.idle)
 
         # вкладки: LIVE - что измеряется, SET - пороги (как вкладки в окнах приборов)
@@ -428,9 +427,9 @@ class MainWindow(Window):
         lay.setSpacing(8)
         lay.addWidget(self.strip_panel)
         lay.addWidget(self.tabs_panel)
-        lay.addWidget(self.live_page)
+        lay.addWidget(self.live_page, 1)            # растянули окно - графики растут (Алексей 2026-11-18)
         lay.addWidget(self.settings_panel)
-        lay.addStretch()
+        lay.addStretch(0)                            # SET: поля сверху, пустое место снизу
         self.tabs.currentChanged.connect(self.set_page)
         self.set_page(settings.value(f"{self.SETTINGS_GROUP}/TAB", 0, type=int))
 
@@ -460,7 +459,7 @@ class MainWindow(Window):
         for p in self.monitor.receivers():
             if p not in self.panels:
                 self.panels[p] = LivePanel(p, self.monitor)
-                self.live_layout.addWidget(self.panels[p])
+                self.live_layout.addWidget(self.panels[p], 1)
         for p in proxies:
             self._on_changed(p)
         self._update_visibility()

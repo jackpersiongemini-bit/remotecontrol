@@ -375,3 +375,27 @@ def test_windows_restored_as_at_exit(qtbot, tmp_path, monkeypatch):
     assert s.value("WINDOWS/e8267d/VISIBLE", type=bool) is True and s.value("WINDOWS/pna/VISIBLE", type=bool) is True
     for p in wins:
         p.shutdown()
+
+
+def test_main_window_widgets_grow_with_window(qtbot, lab, tmp_path):
+    """Алексей 2026-11-18: растянули главное окно - графики, таблица ваттметра и поля SET растут вместе с ним."""
+    links, _px, _bench = lab
+    settings = QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win)
+    win.show()
+    win.all_button.setChecked(True)
+    qtbot.waitUntil(lambda: len(win.visible_panels()) == 3, timeout=10000)
+    win.resize(720, 900)
+    qtbot.wait(100)
+    plots = [p for panel in win.visible_panels() for p in panel.plots if p.isVisible()]
+    table = next(panel.power_table for panel in win.visible_panels() if panel.power_table is not None)
+    before = [p.height() for p in plots], table.height(), [p.width() for p in plots]
+    win.resize(1120, 1300)
+    qtbot.waitUntil(lambda: all(p.height() > h + 60 for p, h in zip(plots, before[0])), timeout=2000)
+    assert table.height() > before[1] + 60
+    assert all(p.width() > w + 300 for p, w in zip(plots, before[2]))
+    win.tabs.setCurrentIndex(1)
+    qtbot.wait(100)
+    field = win.fields["hold_s"] if "hold_s" in win.fields else next(iter(win.fields.values()))
+    assert field.width() > 600
