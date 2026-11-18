@@ -424,3 +424,10 @@ def test_main_window_panel_close_reorder_and_layout(qtbot, lab, tmp_path):
     assert [p.title.text() for p in win2.visible_panels()] == ["VNA", "PM"]
     win2.restore_chips[win2._panel_key(px["e4446a"])].click()
     assert [p.title.text() for p in win2.visible_panels()] == ["SA", "VNA", "PM"]
+
+    # В CW режиме с портом P2 панель VNA показывает CW P2 и частоту
+    vna = px["pna"]
+    vna.set("freq.cw", 2.4e9)
+    vna.set("gen.port", 2)
+    vna.set("gen.state", True)
+    qtbot.waitUntil(lambda: "CW P2" in win2.panels[vna].source.text(), timeout=5000)

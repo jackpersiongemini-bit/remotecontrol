@@ -426,6 +426,30 @@ def test_generator_mode_keeps_sweep_modes_of_other_channels(make):
     assert not rec.comm
 
 
+def test_generator_port_routing_and_continuous_source(vna):
+    drv, sim, rec = vna
+    sim.c["cset"] = "CAL_FULL"
+    assert setp(drv, rec, "cal.state", True) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.source", "EXT") is PStatus.WRITTEN
+    assert setp(drv, rec, "source.power", -12.0) is PStatus.WRITTEN
+    assert rec.values["gen.port"] == 1
+    assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN
+    assert sim.c["type"] == "CW" and sim.c["corr"] is False and sim.trig["sour"] == "IMM"
+    assert sim.c["pow_coup"] is False
+    assert sim.c["pow_mode1"] == "ON" and sim.c["pow_mode2"] == "OFF"
+    # переключение на порт 2: источник держится на порту 2, мощность читается/пишется для порта 2
+    assert setp(drv, rec, "gen.port", 2) is PStatus.WRITTEN
+    assert sim.c["pow_mode1"] == "OFF" and sim.c["pow_mode2"] == "ON"
+    assert setp(drv, rec, "source.power", 3.0) is PStatus.WRITTEN
+    assert sim.c["pow2"] == pytest.approx(3.0) and sim.c["pow"] == pytest.approx(-12.0)
+    # выход из генератора: возвращает триггер, калибровку, связь мощностей и режимы источников
+    assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
+    assert sim.c["type"] == "LIN" and sim.c["corr"] is True and sim.trig["sour"] == "EXT"
+    assert sim.c["pow_coup"] is True and sim.c["pow_mode1"] == "AUTO" and sim.c["pow_mode2"] == "AUTO"
+    assert sim.c["pow"] == pytest.approx(-12.0) and sim.c["pow2"] == pytest.approx(-12.0)
+    assert not rec.comm
+
+
 def test_trigger_settings_external_and_manual(make):
     sim = KeysightPNASim()
     sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)

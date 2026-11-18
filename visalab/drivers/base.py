@@ -764,7 +764,7 @@ class VISAInstrument(QObject):
 
     @pyqtSlot()
     def _on_poll(self) -> None:
-        if self._state is not ConnectionState.CONNECTED:
+        if self._state is not ConnectionState.CONNECTED or self._pending:
             return
         self._quiet = not self.log_polling
         try:

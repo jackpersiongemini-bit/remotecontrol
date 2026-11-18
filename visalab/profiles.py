@@ -297,6 +297,7 @@ NETWORK_ANALYZER = Profile(
         Slot("smooth.aper", F, "%", doc="апертура сглаживания, % обзора"),
         Slot("gen.state", B, doc="режим генератора: канал stim.channel в CW, остальные каналы не развёртываются; "
                                   "выключение возвращает настройки канала, как были до включения"),
+        Slot("gen.port", I, doc="выходной порт в режиме генератора (1 или 2)"),
         Slot("gen.channel", I, readonly=True, doc="канал режима генератора (None - выключен)"),
         Slot("bw.if", F, "Hz", required=True, doc="полоса ПЧ"),
         Slot("source.power", F, "dBm", required=True),
