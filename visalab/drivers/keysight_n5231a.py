@@ -389,9 +389,8 @@ class KeysightPNA(VISAInstrument):
         self._scale_read_supported = True
         self._scale_skip = set()
         self._setup_oper_sync()
-        mode = self.query(f"SENS{self._stim_ch}:SWE:MODE?").strip().upper()
-        self._continuous = mode.startswith("CONT")
-        self._armed = self._continuous
+        self._continuous = True
+        self._ensure_continuous()
         self._oper_seen = False
         self._last_cont_read = time.monotonic()
 
@@ -753,10 +752,16 @@ class KeysightPNA(VISAInstrument):
             self._oper_supported = False
 
     def _clear_oper_events(self) -> None:
+        if not self._oper_supported:
+            return
         try:
             self.query("STAT:OPER:EVEN?")
+        except TransportTimeout:
+            self._try_resync()
+            self._drain_scale_errors()
+            self._oper_supported = False
         except Exception:  # noqa: BLE001
-            pass
+            self._oper_supported = False
 
     def _ensure_continuous(self) -> None:
         """Держать активные каналы в нативном CONT (не переводить в CONT те, что уже в CONT)."""
@@ -1138,7 +1143,7 @@ class KeysightPNA(VISAInstrument):
 
     def _cont_fallback_s(self) -> float:
         swt = float(self._values.get("sweep.time") or 0.1)
-        return min(max(0.4, swt), 2.0)
+        return min(max(0.3, swt), 1.0)
 
     def poll(self) -> None:
         if self._cal is not None:
@@ -1154,16 +1159,19 @@ class KeysightPNA(VISAInstrument):
                 except ValueError:
                     self._oper_supported = False
                     even = 0
+                except TransportTimeout:
+                    if not self._try_resync():
+                        raise
+                    self._drain_scale_errors()
+                    self._oper_supported = False
+                    even = 0
                 if even & OPER_SWEEP_BIT:
                     self._oper_seen = True
                     self._last_cont_read = time.monotonic()
                     self._read_trace()
                     return
-            trig = self._values.get("trig.source") or "IMM"
             fallback_s = self._cont_fallback_s()
-            if self._oper_seen:
-                fallback_s = max(1.0, fallback_s)
-            if trig == "IMM" and time.monotonic() - self._last_cont_read >= fallback_s:
+            if time.monotonic() - self._last_cont_read >= fallback_s:
                 self._last_cont_read = time.monotonic()
                 self._read_trace()
             return

@@ -712,9 +712,11 @@ def test_continuous_mode_never_sends_sing_and_keeps_cont_on_disconnect(make):
 
 def test_single_and_abort_use_sing_only_on_request(make):
     sim = KeysightPNASim()
-    sim.c["mode"] = "HOLD"                                  # прибор уже в HOLD при подключении
+    sim.c["mode"] = "HOLD"                                  # прибор был в HOLD -> при подключении запускается CONT
     drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert rec.values["meas.continuous"] is False and rec.values["meas.armed"] is False
+    assert sim.c["mode"] == "CONT" and rec.values["meas.continuous"] is True and rec.values["meas.armed"] is True
+    drv.run_action("abort")
+    assert sim.c["mode"] == "HOLD" and rec.values["meas.continuous"] is False and rec.values["meas.armed"] is False
     sim.hold_sweeps = True
     drv.run_action("single")
     assert "SENS1:SWE:MODE SING" in sim.history and rec.values["meas.armed"] is True

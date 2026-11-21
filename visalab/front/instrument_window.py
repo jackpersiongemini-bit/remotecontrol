@@ -230,6 +230,7 @@ class PowerSpin(PSpinBox):
             target = self.spec.validate(target)
         except ValueError:
             return
+        self._value = target
         self.show_value(target, force=True)
         self.set_value(target)
 

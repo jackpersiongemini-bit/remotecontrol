@@ -667,6 +667,7 @@ class MainWindow(Window):
         self._splitters: list[tuple[str, QSplitter]] = []
         self._arranged_sig: tuple | None = None
         self._visible_proxies: set = set()
+        self._measuring_proxies: set = set()
         self._dirty_panels: set = set()
         self._dirty_vis = False
         self._refresh_timer = QTimer(self)
@@ -875,7 +876,12 @@ class MainWindow(Window):
             self._update_tile(p)
             panel = self.panels.get(p)
             if panel is not None:
-                panel.refresh(self.monitor.activity(p))
+                act = self.monitor.activity(p)
+                if act.measuring:
+                    self._measuring_proxies.add(p)
+                else:
+                    self._measuring_proxies.discard(p)
+                panel.refresh(act)
         self._dirty_panels.clear()
         self._dirty_vis = False
         self._rebuild_display_settings()
@@ -890,8 +896,11 @@ class MainWindow(Window):
         if panel is None:
             return
         self._dirty_panels.add(proxy)
-        if (proxy in self._visible_proxies) != self._should_show(proxy):
-            self._dirty_vis = True
+        vis_changed = (proxy in self._visible_proxies) != self._should_show(proxy)
+        meas_changed = (proxy in self._measuring_proxies) != self.monitor.activity(proxy).measuring
+        if vis_changed or meas_changed:
+            if vis_changed:
+                self._dirty_vis = True
             self._flush_panels()
         elif not self._refresh_timer.isActive():
             self._refresh_timer.start()
@@ -906,7 +915,12 @@ class MainWindow(Window):
         for proxy in dirty:
             panel = self.panels.get(proxy)
             if panel is not None and not sip.isdeleted(panel):
-                panel.refresh(self.monitor.activity(proxy))
+                act = self.monitor.activity(proxy)
+                if act.measuring:
+                    self._measuring_proxies.add(proxy)
+                else:
+                    self._measuring_proxies.discard(proxy)
+                panel.refresh(act)
         if need_vis:
             self._update_visibility()
 
@@ -1222,10 +1236,10 @@ class MainWindow(Window):
     def _is_eligible(self, proxy) -> bool:
         if self.all_button.isChecked():
             return True
-        if not self.monitor.activity(proxy).measuring:
-            return False
         rule = self._display_rule(proxy)
         if rule["by_level"]:
+            if not self.monitor.activity(proxy).measuring:
+                return False
             lvl = self._receiver_level(proxy)
             return lvl is not None and lvl >= rule["level"]
         return True

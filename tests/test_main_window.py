@@ -145,7 +145,11 @@ def test_main_window_shows_only_measuring(qtbot, lab, tmp_path):
     win.show()
     assert [t.text() for t in win.tiles.values()] == ["VNA", "SA", "PM", "GEN"]     # только что это, без IDLE
     assert all(t.height() >= 38 for t in win.tiles.values())
-    qtbot.waitUntil(lambda: len(win.visible_panels()) == 3, timeout=10000)
+    qtbot.waitUntil(
+        lambda: len(win.visible_panels()) == 3
+        and all(win.monitor.activity(px[k]).measuring for k in ("pna", "e4446a", "u2021xa")),
+        timeout=10000,
+    )
     vna_panel = win.panels[px["pna"]]
     assert vna_panel.plots[0].traces and vna_panel.plots[0].traces[0][0].startswith("1·S11")
     assert vna_panel.plots[0].minimumHeight() >= 240
@@ -758,3 +762,16 @@ def test_vna_panel_stays_visible_in_hold_and_with_non_m1_slot(qtbot, lab, tmp_pa
     assert mon.activity(vna).measuring is True
     assert panel in win.visible_panels()
     assert panel.plots[0].traces and "S21" in panel.plots[0].traces[0][0]
+
+    # Даже когда данных нет (meas_none) и ALL выключен, панель с галочкой только на Show всё равно показывается
+    win.all_button.setChecked(False)
+    vna.action("meas_none")
+    qtbot.waitUntil(lambda: mon.activity(vna).measuring is False, timeout=5000)
+    assert panel in win.visible_panels()
+
+    # А если поставить ещё и галочку Above level - без данных панель скрывается
+    vna_key = win._panel_key(vna)
+    win.set_panel_by_level(vna_key, True)
+    assert panel not in win.visible_panels()
+    win.set_panel_by_level(vna_key, False)
+    assert panel in win.visible_panels()
