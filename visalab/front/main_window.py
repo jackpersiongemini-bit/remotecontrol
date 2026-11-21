@@ -22,8 +22,8 @@ import json
 import math
 
 from PyQt6 import sip
-from PyQt6.QtCore import QMimeData, QPoint, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QShortcut
+from PyQt6.QtCore import QMimeData, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel,
                              QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
@@ -36,13 +36,15 @@ from .instrument_window import WINDOW_EVENTS, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
 from .power_meter import pm_time_scale
-from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
-                    UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
-from .window import CustomFullButton, Window, mark_growing, short_address
+from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
+                    UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, UI_TITLE_BAR_ITEM_SIZE_PX,
+                    WINDOW_BAR_HEIGHT, render_qss)
+from .window import CustomFullButton, Window, WindowBar, mark_growing, short_address
 
-__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES", "PM_UNITS"]
+__all__ = ["MainWindow", "SincEmblem", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable",
+           "LAYOUT_MODES", "PM_UNITS"]
 
-TILE_MIN_HEIGHT = 38
+TILE_MIN_HEIGHT = UI_TITLE_BAR_ITEM_SIZE_PX
 PLOT_MIN_HEIGHT = 240
 UI_REFRESH_MS = 60
 LAYOUT_MODES = ("1 COL", "2 COL", "ROW")
@@ -114,6 +116,118 @@ def _vna_scale(tr: Trace) -> tuple[float, float, float] | None:
     return (lo, hi, pdiv)
 
 
+class SincEmblem(QWidget):
+    """Пульсирующая эмблема sinc(x) = sin(πx)/(πx) в левой части заголовка главного окна."""
+
+    WIDTH = 48
+    HEIGHT = UI_TITLE_BAR_ITEM_SIZE_PX
+    TICK_MS = 33
+    PERIOD_S = 2.4
+    _SAMPLES = 64
+    _X_MAX = 3.5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("sincEmblem")
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.setToolTip("VISALAB")
+        self._phase = 0.0
+        self._xs = [(-self._X_MAX + 2.0 * self._X_MAX * i / (self._SAMPLES - 1)) for i in range(self._SAMPLES)]
+        self._ys = [1.0 if abs(x) < 1e-9 else math.sin(math.pi * x) / (math.pi * x) for x in self._xs]
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.TICK_MS)
+        self._timer.timeout.connect(self._step)
+
+    @property
+    def pulse(self) -> float:
+        """Текущая фаза пульсации в диапазоне [0, 1]."""
+        return 0.5 - 0.5 * math.cos(self._phase)
+
+    def _step(self) -> None:
+        self._phase = (self._phase + 2.0 * math.pi * (self.TICK_MS / 1000.0) / self.PERIOD_S) % (2.0 * math.pi)
+        self.update()
+
+    def showEvent(self, e):  # noqa: N802 - Qt
+        super().showEvent(e)
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, e):  # noqa: N802 - Qt
+        self._timer.stop()
+        super().hideEvent(e)
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pulse = self.pulse
+
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        border = QColor(UI_COLOR_BORDER)
+        border = border.lighter(int(100 + 28 * pulse))
+        p.setBrush(QColor(UI_COLOR_BACKGROUND))
+        p.setPen(QPen(border, 1.0))
+        p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+
+        pad_x, pad_top, pad_bot = 5.0, 4.0, 4.0
+        plot_w = self.width() - 2.0 * pad_x
+        plot_h = self.height() - pad_top - pad_bot
+        # sinc(x) лежит в [-0.217, 1.0]: ось 0 - примерно на 76% высоты области
+        y_zero = pad_top + plot_h * 0.78
+        y_scale = (y_zero - pad_top) * (0.70 + 0.30 * pulse)
+
+        # Тонкая базовая ось нуля
+        p.setPen(QPen(QColor(UI_COLOR_BORDER), 0.75))
+        p.drawLine(QPointF(pad_x, y_zero), QPointF(self.width() - pad_x, y_zero))
+
+        pts = [
+            QPointF(pad_x + plot_w * i / (self._SAMPLES - 1), y_zero - y * y_scale)
+            for i, y in enumerate(self._ys)
+        ]
+        curve = QPainterPath(pts[0])
+        for pt in pts[1:]:
+            curve.lineTo(pt)
+
+        # Мягкое заполнение под кривой
+        fill_path = QPainterPath(curve)
+        fill_path.lineTo(QPointF(pts[-1].x(), y_zero))
+        fill_path.lineTo(QPointF(pts[0].x(), y_zero))
+        fill_path.closeSubpath()
+        fill_color = QColor(UI_COLOR_TEXT)
+        fill_color.setAlpha(int(12 + 28 * pulse))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill_color)
+        p.drawPath(fill_path)
+
+        # Пульсирующее свечение вдоль sinc-кривой
+        glow = QColor(UI_COLOR_TEXT)
+        glow.setAlpha(int(18 + 52 * pulse))
+        glow_pen = QPen(glow, 3.6)
+        glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        glow_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(glow_pen)
+        p.drawPath(curve)
+
+        # Основная чёткая линия кривой
+        fg = QColor(UI_COLOR_TEXT)
+        fg.setAlpha(int(185 + 70 * pulse))
+        fg_pen = QPen(fg, 1.45)
+        fg_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        fg_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(fg_pen)
+        p.drawPath(curve)
+
+        # Пульсирующая точка в главном максимуме (x = 0)
+        peak = QPointF(pad_x + plot_w * 0.5, y_zero - y_scale)
+        dot_r = 1.15 + 0.55 * pulse
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(UI_COLOR_TEXT))
+        p.drawEllipse(peak, dot_r, dot_r)
+
+
 class InstrumentTile(IndicatorButton):
     """Плитка прибора: что это (VNA, PM...); индикатор - окно прибора открыто, красная - у прибора ошибка."""
 
@@ -126,8 +240,8 @@ class InstrumentTile(IndicatorButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.window_open = False
         self.error = False
-        self.setMinimumWidth(72)
-        self.setMinimumHeight(TILE_MIN_HEIGHT)
+        self.setMinimumWidth(54)
+        self.setFixedHeight(TILE_MIN_HEIGHT)
 
     def indicated(self) -> bool:
         return self.window_open
@@ -359,8 +473,8 @@ class ScenarioChip(IndicatorButton):
         self.setProperty("tile", True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumWidth(72)
-        self.setMinimumHeight(TILE_MIN_HEIGHT)
+        self.setMinimumWidth(68)
+        self.setFixedHeight(TILE_MIN_HEIGHT)
         self.runs: list = []
 
     def indicated(self) -> bool:
@@ -373,7 +487,7 @@ class ScenarioChip(IndicatorButton):
             return
         run = self.runs[0]
         more = f" +{len(self.runs) - 1}" if len(self.runs) > 1 else ""
-        self.setText(f"{run.name}{more}\n{run.done}/{run.total}" if run.total else f"{run.name}{more}\nRUN")
+        self.setText(f"{run.name}{more} {run.done}/{run.total}" if run.total else f"{run.name}{more} RUN")
         who = " + ".join(d.name for d in run.devices.values())
         self.setToolTip("\n".join(f"{r.name}: {' + '.join(d.name for d in r.devices.values())}"
                                   + (f"  {r.done}/{r.total} {r.text}" if r.total else "") for r in self.runs)
@@ -679,6 +793,46 @@ class MainWindow(Window):
         saved_mode = str(settings.value(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", LAYOUT_MODES[0]) or LAYOUT_MODES[0])
         self.layout_mode = saved_mode if saved_mode in LAYOUT_MODES else LAYOUT_MODES[0]
 
+        # Заголовок окна: эмблема sinc слева, кнопки приборов (VNA, SA, PM...) вместо надписи LAB,
+        # справа - фишка активного сценария и системные кнопки (_ / ⛶ / ×)
+        self.titleBar.title_label.hide()
+        _tile_qss = render_qss("""
+            QWidget#tilesHost { background: transparent; border: none; }
+            InstrumentTile, ScenarioChip {
+                background-color: $UI_COLOR_BACKGROUND;
+                color: $UI_COLOR_TEXT_MUTED;
+                border: ${UI_BORDER_WIDTH_PX}px solid #3c3c3c;
+                border-radius: ${UI_BORDER_RADIUS_PX}px;
+                font-family: $UI_MONOSPACE_FONT_FAMILY;
+                font-size: ${UI_FONT_SIZE_PT}pt;
+                padding: 0 10px;
+            }
+            InstrumentTile:hover, ScenarioChip:hover {
+                background-color: $UI_COLOR_INVERT_HOVER;
+                color: $UI_COLOR_TEXT_INVERSE;
+                border-color: $UI_COLOR_INVERT_HOVER;
+                font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+            }
+            InstrumentTile[wstate="error"] {
+                color: $UI_COLOR_ERROR;
+            }
+        """)
+        self.titleBar.setStyleSheet(WindowBar.STYLE_SHEET + "\n" + _tile_qss)
+        self.emblem = SincEmblem(self.titleBar)
+        self._tiles_host = QWidget(self.titleBar)
+        self._tiles_host.setObjectName("tilesHost")
+        self._tiles_host.setStyleSheet(_tile_qss)
+        self.tiles_layout = QHBoxLayout(self._tiles_host)
+        self.tiles_layout.setContentsMargins(0, 0, 0, 0)
+        self.tiles_layout.setSpacing(4)
+        self.titleBar.insert_widget(self.emblem, 0)
+        self.titleBar.insert_widget(self._tiles_host, 1)
+
+        self.scenario_chip = ScenarioChip(self.titleBar)
+        self.scenario_chip.clicked.connect(self._open_scenario)
+        self.scenario_chip.hide()
+        self.titleBar.insert_control_widget(self.scenario_chip)
+
         # во весь экран: кнопка в заголовке правее «свернуть» и F11
         self.full_button = CustomFullButton()
         self.full_button.setToolTip("Full screen (F11)")
@@ -687,10 +841,6 @@ class MainWindow(Window):
         self._full_key = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
         self._full_key.activated.connect(self.toggle_full_screen)
 
-        strip = QWidget()
-        self.strip_layout = QHBoxLayout(strip)
-        self.strip_layout.setContentsMargins(0, 0, 0, 0)
-        self.strip_layout.setSpacing(4)
         self.restore_layout = QHBoxLayout()
         self.restore_layout.setContentsMargins(0, 0, 0, 0)
         self.restore_layout.setSpacing(4)
@@ -710,19 +860,6 @@ class MainWindow(Window):
         self.all_button.setToolTip("Show all receivers, also those without data now")
         self.all_button.setChecked(settings.value(f"{self.SETTINGS_GROUP}/SHOW_ALL", False, type=bool))
         self.all_button.toggled.connect(self._on_all)
-        self.scenario_chip = ScenarioChip()
-        self.scenario_chip.clicked.connect(self._open_scenario)
-        self.scenario_chip.hide()
-        self.strip_layout.addStretch()
-        self.strip_layout.addLayout(self.restore_layout)
-        self.strip_layout.addWidget(self.scenario_chip)
-        self.strip_layout.addWidget(self.layout_button)
-        self.strip_layout.addWidget(self.all_button)
-        self.strip_panel = Panel(strip)
-        self.strip_panel.setStyleSheet(
-            Panel.STYLE_SHEET + f'\nPanel QPushButton#chip[tile="true"] {{ min-height: {TILE_MIN_HEIGHT}px; }}'
-        )
-        self.strip_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         self.fields: dict[str, SettingField] = {}
         by_name: dict[str, PanelLine] = {}
@@ -798,18 +935,25 @@ class MainWindow(Window):
         live.addWidget(self.live_scroll, 1)
         live.addWidget(self.idle)
 
-        # вкладки: LIVE - что измеряется, SET - пороги (как вкладки в окнах приборов)
+        # вкладки: LIVE - что измеряется, SET - пороги; справа - восстановление панелей, раскладка, ALL
         self.tabs = PTabBar()
         for title in self.TABS:
             self.tabs.addTab(title)
         self.tabs.setTabToolTip(1, "Thresholds and displayed graphs settings")
-        self.tabs_panel = Panel(self.tabs)
+        tabs_bar = QWidget()
+        tabs_lay = QHBoxLayout(tabs_bar)
+        tabs_lay.setContentsMargins(0, 0, 0, 0)
+        tabs_lay.setSpacing(6)
+        tabs_lay.addWidget(self.tabs, 1)
+        tabs_lay.addLayout(self.restore_layout)
+        tabs_lay.addWidget(self.layout_button)
+        tabs_lay.addWidget(self.all_button)
+        self.tabs_panel = Panel(tabs_bar)
         self.tabs_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
         lay.setSpacing(8)
-        lay.addWidget(self.strip_panel)
         lay.addWidget(self.tabs_panel)
         lay.addWidget(self.live_page, 1)            # растянули окно - графики растут (Алексей 2026-11-18)
         lay.addWidget(self.settings_panel)
@@ -858,10 +1002,10 @@ class MainWindow(Window):
             panel.deleteLater()
         for i, p in enumerate(proxies):
             if p not in self.tiles:
-                tile = InstrumentTile(p)
+                tile = InstrumentTile(p, self._tiles_host)
                 tile.clicked.connect(lambda _=False, p=p: self.open_instrument(p))
                 self.tiles[p] = tile
-            self.strip_layout.insertWidget(i, self.tiles[p])
+            self.tiles_layout.insertWidget(i, self.tiles[p])
         for p in self.monitor.receivers():
             if p not in self.panels:
                 panel = LivePanel(p, self.monitor, settings=self.settings)
@@ -1391,6 +1535,7 @@ class MainWindow(Window):
 
     def cleanup(self) -> None:
         self._refresh_timer.stop()
+        self.emblem.stop()
         self._dirty_panels.clear()
         self.monitor.stop()
         try:

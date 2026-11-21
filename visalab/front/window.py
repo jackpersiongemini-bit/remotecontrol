@@ -110,7 +110,14 @@ class WindowBar(TitleBar):
         self.hBoxLayout.insertWidget(self.hBoxLayout.indexOf(anchor), widget)
 
     def canDrag(self, pos):  # noqa: N802 - qframelesswindow
-        return not self.window().isFullScreen() and super().canDrag(pos)     # во весь экран окно не таскается
+        if self.window().isFullScreen():
+            return False
+        child = self.childAt(pos)
+        while child is not None and child is not self:
+            if isinstance(child, QAbstractButton):
+                return False
+            child = child.parentWidget()
+        return super().canDrag(pos)     # во весь экран и по кнопкам окно не таскается
 
 
 class Window(FramelessWindow):
