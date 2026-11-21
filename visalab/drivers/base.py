@@ -142,10 +142,12 @@ class VISAInstrument(QObject):
         return int(getattr(self.transport, "timeout_ms", 2000) or 2000)
 
     def __init__(self, transport: Transport, parent: QObject | None = None,
-                 command_delay_s: float | None = None):
+                 command_delay_s: float | None = None, read_pause_s: float | None = None):
         super().__init__(parent)
         self.transport = transport
         self.command_delay_s = self.COMMAND_DELAY_S if command_delay_s is None else float(command_delay_s)
+        default_pause = max(0.05, self.POLL_INTERVAL_MS / 1000.0)
+        self.read_pause_s = default_pause if read_pause_s is None else max(0.05, float(read_pause_s))
         self._last_io = 0.0
         self._params: dict[str, Param] = {p.key: p for p in self.build_params()}
         self._actions: dict[str, Action] = {a.name: a for a in self.build_actions()}
@@ -168,7 +170,8 @@ class VISAInstrument(QObject):
         self._resyncing = False
         self._stopping = False         # кооперативный флаг остановки потока (устанавливает InstrumentProxy)
         self._timer = QTimer(self)     # переедет в поток вместе с self
-        self._timer.setInterval(self.POLL_INTERVAL_MS)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self._effective_poll_ms())
         self._timer.timeout.connect(self._on_poll)
         # автоподключение
         self.auto_reconnect = True
@@ -293,6 +296,27 @@ class VISAInstrument(QObject):
             self.select_channel(spec.channel)
         return spec.from_scpi(self.query(spec.query))
 
+    def is_triggered_mode(self) -> bool:
+        """True, если прибор ждёт внешний/уровневый/ручной запуск или однократное измерение:
+        в этом режиме пауза непрерывного чтения не замедляет ожидание сигнала окончания."""
+        return False
+
+    def _effective_poll_ms(self) -> int:
+        user_ms = max(50, int(round(self.read_pause_s * 1000)))
+        if self.is_triggered_mode():
+            return max(50, min(int(self.POLL_INTERVAL_MS), user_ms))
+        return user_ms
+
+    def _sync_poll_timer(self) -> None:
+        ms = self._effective_poll_ms()
+        self._timer.setInterval(ms)
+        if self._state is ConnectionState.CONNECTED and not self._stopping and self._timer.isActive():
+            self._timer.start(ms)
+
+    def _schedule_next_poll(self) -> None:
+        if not self._stopping and self._state is ConnectionState.CONNECTED:
+            self._timer.start(self._effective_poll_ms())
+
     def poll(self) -> None:
         """Периодическая задача. По умолчанию читает параметры с poll=True."""
         self._read_keys([k for k, p in self._params.items() if p.poll])
@@ -351,7 +375,7 @@ class VISAInstrument(QObject):
         if restored:
             log.warning("%s: связь восстановлена (%s)", self.transport.address, self.NAME)
         self._cancel_retry()
-        self._timer.start()          # до чтения: если прибор не ответит на что-то при чтении, опрос всё равно идёт
+        self._schedule_next_poll()   # до чтения: если прибор не ответит на что-то при чтении, опрос всё равно идёт
         self._sync_all()
 
     def _connect(self) -> None:
@@ -425,7 +449,19 @@ class VISAInstrument(QObject):
     @pyqtSlot(int)
     @guarded
     def set_poll_interval(self, ms: int) -> None:
-        self._timer.setInterval(max(50, int(ms)))
+        val = max(50, int(ms))
+        self.read_pause_s = val / 1000.0
+        self._sync_poll_timer()
+
+    @pyqtSlot(float)
+    @guarded
+    def set_read_pause(self, seconds: float) -> None:
+        """Пауза между считываниями в непрерывном режиме, с (минимум 50 мс)."""
+        val = float(seconds)
+        if not math.isfinite(val) or val < 0:
+            raise ValueError(f"недопустимая пауза считывания: {seconds!r}")
+        self.read_pause_s = max(0.05, val)
+        self._sync_poll_timer()
 
     @pyqtSlot(float)
     @guarded
@@ -818,7 +854,10 @@ class VISAInstrument(QObject):
 
     @pyqtSlot()
     def _on_poll(self) -> None:
-        if self._stopping or self._state is not ConnectionState.CONNECTED or self._pending:
+        if self._stopping or self._state is not ConnectionState.CONNECTED:
+            return
+        if self._pending:
+            self._schedule_next_poll()
             return
         self._quiet = not self.log_polling
         try:
@@ -847,3 +886,4 @@ class VISAInstrument(QObject):
             self.comm_error.emit(f"опрос: {exc}")
         finally:
             self._quiet = False
+            self._schedule_next_poll()

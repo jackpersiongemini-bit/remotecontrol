@@ -50,9 +50,9 @@ class ItechIT6300(VISAInstrument):
     POLL_INTERVAL_MS = 500
 
     def __init__(self, transport, model: IT6300Model | None = None, parent=None,
-                 command_delay_s: float | None = None):
+                 command_delay_s: float | None = None, read_pause_s: float | None = None):
         self.model = model or DEFAULT_MODEL
-        super().__init__(transport, parent, command_delay_s)
+        super().__init__(transport, parent, command_delay_s, read_pause_s)
 
     @property
     def channels(self) -> int:

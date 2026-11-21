@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import QApplication
 
 from ..applog import close_logging, default_ini_path, default_log_path, setup_logging
 from ..coord import COORD
-from .instrument_window import saved_connection, saved_delay
+from .instrument_window import saved_connection, saved_delay, saved_poll_pause
 from .models import all_models
 
 __all__ = ["run_window", "run_windows", "remember_windows", "connection_for", "lab_entry"]
@@ -121,6 +121,9 @@ def connection_for(window_cls, lab_key: str, lab_path: str, settings: QSettings,
     delay = saved_delay(settings, window_cls.CONNECTION_GROUP)          # DLY на странице адреса
     if delay is None:
         delay = lab.get("delay")
+    poll_pause = saved_poll_pause(settings, window_cls.CONNECTION_GROUP)  # POLL на странице адреса
+    if poll_pause is None:
+        poll_pause = lab.get("poll_pause")
     if sim:
         address = "sim"
     elif cli_address:
@@ -130,7 +133,7 @@ def connection_for(window_cls, lab_key: str, lab_path: str, settings: QSettings,
     else:
         address = lab.get("address", "sim")
         model = model or lab.get("model")
-    return {"kind": kind, "address": address, "model": model, "delay": delay}
+    return {"kind": kind, "address": address, "model": model, "delay": delay, "poll_pause": poll_pause}
 
 
 def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str | None,
@@ -138,12 +141,12 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
     """Открыть прибор (через координатор) и окно; по APPLY в окне - пересоздать. Возвращает {proxy, win}
     (обновляется; ``proxy`` - прибор координатора)."""
     conn = connection_for(window_cls, lab_key, args.lab, settings, args.sim, cli_address)
-    kind, address, model, delay = conn["kind"], conn["address"], conn["model"], conn["delay"]
+    kind, address, model, delay, poll_pause = conn["kind"], conn["address"], conn["model"], conn["delay"], conn["poll_pause"]
     current: dict = {}
 
     def build(kind: str, address: str, model: str | None, pos=None, visible: bool = True) -> None:
         proxy = COORD.open_instrument(kind, address, model=all_models(settings, kind).get(model) if model else None,
-                                      delay=delay, backend=args.backend, latency=args.latency)
+                                      delay=delay, backend=args.backend, latency=args.latency, poll_pause=poll_pause)
         win = window_cls(proxy, settings)
         win.reconnect_requested.connect(reconnect)
         if pos is not None:
@@ -155,7 +158,7 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
             proxy.open()
 
     def reconnect(kind: str, address: str, model: str) -> None:
-        nonlocal delay
+        nonlocal delay, poll_pause
         old_proxy, old_win = current["proxy"], current["win"]
         pos, visible = old_win.pos(), old_win.isVisible()
         old_win.save_size()
@@ -166,6 +169,7 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
         COORD.close_instrument(old_proxy)
         old_win.deleteLater()
         delay = saved_delay(settings, window_cls.CONNECTION_GROUP)
+        poll_pause = saved_poll_pause(settings, window_cls.CONNECTION_GROUP)
         try:
             build(kind, address, model or None, pos, visible)
         except Exception:  # noqa: BLE001 - не оставлять в current удалённое окно

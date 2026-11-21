@@ -69,6 +69,11 @@ class Coordinator(QObject):
         return _instruments.default_delay(kind)
 
     @staticmethod
+    def default_poll_pause(kind: str) -> float:
+        """Пауза между считываниями в непрерывном режиме по умолчанию для драйвера, с."""
+        return _instruments.default_poll_pause(kind)
+
+    @staticmethod
     def models(kind: str) -> dict:
         """Встроенные модели драйвера (пределы и функции): {имя: модель}."""
         return _instruments.models(kind)
@@ -85,12 +90,13 @@ class Coordinator(QObject):
 
     # ------------------------------------------------------------ приборы
     def open_instrument(self, kind: str, address: str | None, model=None, delay: float | None = None,
-                        backend: str = "", latency: float = 0.0) -> Instrument:
+                        backend: str = "", latency: float = 0.0, poll_pause: float | None = None) -> Instrument:
         """Прибор по типу драйвера (``e8267d``...) и адресу (VISA, IP, IP:порт, ``sim``) - в реестре, ещё не
         подключён (``open()``). ``model`` - имя встроенной модели, своя модель или None (по *IDN?);
-        ``delay`` - пауза между командами, с (None - по умолчанию драйвера); ``latency`` - задержка симулятора."""
+        ``delay`` - пауза между командами, с (None - по умолчанию драйвера); ``poll_pause`` - пауза между
+        считываниями в непрерывном режиме, с; ``latency`` - задержка симулятора."""
         return self.attach(_instruments.open_instrument(kind, address, model=model, delay=delay, backend=backend,
-                                                        latency=latency))
+                                                        latency=latency, poll_pause=poll_pause))
 
     def attach(self, proxy) -> Instrument:
         """Выдать UI уже созданный абстрактный прибор (слой 3): обернуть и внести в реестр."""

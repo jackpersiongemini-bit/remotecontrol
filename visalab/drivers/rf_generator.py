@@ -62,11 +62,11 @@ class RFSignalGenerator(VISAInstrument):
     COMMANDS: dict[str, tuple[str | None, str, dict]] = {}
 
     def __init__(self, transport, model: RFGenModel | None = None, parent=None,
-                 command_delay_s: float | None = None):
+                 command_delay_s: float | None = None, read_pause_s: float | None = None):
         self.model = model or self.DEFAULT_MODEL
         self._power_offset = 0.0
         self._power_offset_state = False
-        super().__init__(transport, parent, command_delay_s)
+        super().__init__(transport, parent, command_delay_s, read_pause_s)
 
     def _active_power_offset(self) -> float:
         return self._power_offset if self._power_offset_state else 0.0
