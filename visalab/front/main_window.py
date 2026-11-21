@@ -19,13 +19,14 @@ SET - пороги «измеряет / не измеряет» (сохраня�
 from __future__ import annotations
 
 import json
+import math
 
 from PyQt6 import sip
 from PyQt6.QtCore import QMimeData, QPoint, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QShortcut
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                             QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel,
+                             QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
@@ -34,16 +35,19 @@ from ..core.trace import Trace
 from .instrument_window import WINDOW_EVENTS, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
+from .power_meter import pm_time_scale
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
                     UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
 from .window import CustomFullButton, Window, mark_growing, short_address
 
-__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES"]
+__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES", "PM_UNITS"]
 
 TILE_MIN_HEIGHT = 38
 PLOT_MIN_HEIGHT = 240
 UI_REFRESH_MS = 60
 LAYOUT_MODES = ("1 COL", "2 COL", "ROW")
+PM_UNITS = ("dBm", "W", "dBW", "V", "dB")
+_PM_UNIT_LABELS = {"dBm": "dBm", "W": "W", "dBW": "dBW", "V": "V (50 Ω)", "dB": "dB (Pout − Pin)"}
 _PANEL_MIME = "application/x-visalab-livepanel"
 
 #: страница SET: (подпись, поле Thresholds, единица, множитель показа, подсказка)
@@ -86,7 +90,28 @@ def _dbm(v: float | None) -> str:
 
 
 def _num(v) -> float | None:
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+#: вертикальных делений на экране анализатора спектра (PSA) и ВАЦ (PNA)
+DEVICE_DIVS_Y = 10
+
+
+def _vna_scale(tr: Trace) -> tuple[float, float, float] | None:
+    """Шкала Y трассы ВАЦ ``(lo, hi, step)`` по метаданным прибора (10 делений); для POLAR/SMITH - None."""
+    meta = tr.meta or {}
+    if meta.get("format") in ("POLAR", "SMITH"):
+        return None
+    pdiv = _num(meta.get("scale_div"))
+    rlev = _num(meta.get("scale_ref"))
+    rpos = _num(meta.get("scale_rpos"))
+    if pdiv is None or rlev is None or rpos is None or pdiv <= 0:
+        return None
+    lo = rlev - rpos * pdiv
+    hi = lo + DEVICE_DIVS_Y * pdiv
+    if not (math.isfinite(lo) and math.isfinite(hi) and hi > lo):
+        return None
+    return (lo, hi, pdiv)
 
 
 class InstrumentTile(IndicatorButton):
@@ -134,18 +159,56 @@ class InstrumentTile(IndicatorButton):
             p.drawRoundedRect(rect.adjusted(0.25, 0.25, -0.25, -0.25), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
 
 
+def _dbm_to_w(dbm: float) -> float:
+    return 10.0 ** ((dbm - 30.0) / 10.0) if abs(dbm) <= 300.0 else math.nan
+
+
+def _fmt_num(value: float) -> str:
+    text = f"{round(float(value), 3):.3f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def _format_power(dbm: float, unit: str, src_dbm: float | None = None) -> str:
+    if unit == "W":
+        w = _dbm_to_w(dbm)
+        return si_format(w, "W", 4) if math.isfinite(w) else "--- W"
+    if unit == "dBW":
+        return f"{dbm - 30.0:.2f} dBW"
+    if unit == "V":
+        w = _dbm_to_w(dbm)
+        return si_format(math.sqrt(w * 50.0), "V", 4) if math.isfinite(w) and w >= 0.0 else "--- V"
+    if unit == "dB":
+        return f"{dbm - src_dbm:+.2f} dB" if src_dbm is not None else "---"
+    return f"{dbm:.2f} dBm"
+
+
+def _format_col_header(src_dbm: float | None, unit: str, has_numeric: bool) -> str:
+    if src_dbm is None:
+        return "---" if has_numeric else "POWER"
+    if unit == "W":
+        w = _dbm_to_w(src_dbm)
+        return si_format(w, "W", 4) if math.isfinite(w) else f"{_fmt_num(src_dbm)} dBm"
+    if unit == "dBW":
+        return f"{_fmt_num(src_dbm - 30.0)} dBW"
+    if unit == "V":
+        w = _dbm_to_w(src_dbm)
+        return si_format(math.sqrt(w * 50.0), "V", 4) if math.isfinite(w) and w >= 0.0 else f"{_fmt_num(src_dbm)} dBm"
+    return f"{_fmt_num(src_dbm)} dBm"
+
+
 class PowerTable(QTableWidget):
-    """Ваттметр в главном окне: частота датчика и мощность в этой точке (последнее показание с сигналом);
-    строка текущей частоты датчика выделена (Алексей 2026-11-14: вместо графика показаний во времени)."""
+    """Ваттметр в главном окне: матрица «частота датчика × подаваемая мощность источника»;
+    поддерживает переключение единиц (dBm / W / dBW / V / dB)."""
 
-    EMPTY = "NO POINTS YET: each sensor frequency gets a row\nwith the last reading that had a signal"
-    ALIGN = (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    EMPTY = "NO POINTS YET: each sensor frequency gets a row\nand each source power level gets a column"
+    ALIGN_LEFT = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    ALIGN_RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+    ALIGN = (ALIGN_LEFT, ALIGN_RIGHT)
 
-    def __init__(self, parent=None):
+    def __init__(self, unit: str = "dBm", parent=None):
         super().__init__(0, 2, parent)
         self.setObjectName("pmTable")
-        self.setHorizontalHeaderLabels(["FREQ", "POWER"])
+        self.unit = unit if unit in PM_UNITS else "dBm"
         self.verticalHeader().hide()
         self.verticalHeader().setDefaultSectionSize(20)
         self.setShowGrid(False)
@@ -153,70 +216,131 @@ class PowerTable(QTableWidget):
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         hh = self.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hh.setMinimumSectionSize(76)
         hh.setHighlightSections(False)
-        for col, align in enumerate(self.ALIGN):                # частота - слева, мощность - справа
-            self.horizontalHeaderItem(col).setTextAlignment(align)
         self.setMinimumHeight(PLOT_MIN_HEIGHT)
-        self.rows: list[tuple[float, float, float]] = []
+        self.columns: list[float | None] = []
+        self.rows: list[tuple[float, dict[float | None, float]]] = []
         self.current: float | None = None
-        self._cur_row = -1
+        self.current_power: float | None = None
+        self._cur_cell: tuple[int, int] = (-1, -1)
         self._normal_font = QFont(self.font())
         self._bold_font = QFont(self.font())
         self._bold_font.setBold(True)
         self._cur_color = QColor(UI_COLOR_TEXT)
         self._muted_color = QColor(UI_COLOR_TEXT_MUTED)
+        self._setup_headers([])
 
-    def _style_row(self, row: int, is_cur: bool) -> None:
-        font = self._bold_font if is_cur else self._normal_font
-        color = self._cur_color if is_cur else self._muted_color
-        for col in (0, 1):
-            item = self.item(row, col)
-            if item is not None:
-                item.setFont(font)
-                item.setForeground(color)
+    def _setup_headers(self, columns: list[float | None]) -> None:
+        has_num = any(c is not None for c in columns)
+        shown_cols = columns if columns else [None]
+        labels = ["FREQ", *(_format_col_header(c, self.unit, has_num) for c in shown_cols)]
+        if self.columnCount() != len(labels):
+            self.setColumnCount(len(labels))
+        self.setHorizontalHeaderLabels(labels)
+        hh = self.horizontalHeader()
+        mode = QHeaderView.ResizeMode.Stretch if len(labels) <= 5 else QHeaderView.ResizeMode.ResizeToContents
+        hh.setSectionResizeMode(mode)
+        hh.setStretchLastSection(False)
+        for col in range(len(labels)):
+            item = self.horizontalHeaderItem(col)
+            if item is None:
+                continue
+            item.setTextAlignment(self.ALIGN_LEFT if col == 0 else self.ALIGN_RIGHT)
+            if col == 0:
+                item.setToolTip("Sensor frequency")
+            else:
+                src_p = shown_cols[col - 1]
+                if src_p is None:
+                    item.setToolTip("Measured power (no matched RF source)")
+                else:
+                    w = _dbm_to_w(src_p)
+                    w_txt = f" ({si_format(w, 'W', 4)})" if math.isfinite(w) else ""
+                    item.setToolTip(f"Input source power: {_fmt_num(src_p)} dBm{w_txt}")
+
+    def set_unit(self, unit: str) -> None:
+        if unit not in PM_UNITS or unit == self.unit:
+            return
+        self.unit = unit
+        self._render(force=True)
+
+    def _style_cell(self, row: int, col: int, active: bool) -> None:
+        item = self.item(row, col)
+        if item is not None:
+            item.setFont(self._bold_font if active else self._normal_font)
+            item.setForeground(self._cur_color if active else self._muted_color)
+
+    @staticmethod
+    def _same_power(a: float | None, b: float | None) -> bool:
+        if a is None or b is None:
+            return a is b
+        return abs(a - b) <= 5e-4
 
     def set_rows(self, rows, current: float | None = None) -> None:
-        """rows: [(Hz, dBm, время)] по частоте; ``current`` - частота датчика (строка выделена, видна)."""
+        """Обратная совместимость: [(Hz, dBm, время)] -> таблица с одним столбцом POWER."""
         rows = list(rows)
-        if rows == self.rows and current == self.current:
+        cols: list[float | None] = [None] if rows else []
+        matrix_rows = [(f, {None: v}) for f, v, _t in rows]
+        self.set_matrix(cols, matrix_rows, current, None)
+
+    def set_matrix(self, columns: list[float | None], rows: list[tuple[float, dict[float | None, float]]],
+                   current: float | None = None, current_power: float | None = None) -> None:
+        """columns: [P_in dBm | None]; rows: [(Hz, {P_in: P_meas dBm})]."""
+        cols = list(columns)
+        rows = list(rows)
+        if cols == self.columns and rows == self.rows and current == self.current \
+                and self._same_power(current_power, self.current_power):
             return
-        old_len, old_cur = len(self.rows), self._cur_row
-        moved = current != self.current or len(rows) != old_len
-        self.rows, self.current = rows, current
-        if len(rows) != old_len:
-            self.setRowCount(len(rows))
-        cur_row = -1
-        changed = len(rows) != old_len
-        for i, (f, v, _t) in enumerate(rows):
-            is_cur = current is not None and abs(f - current) < 0.5
-            if is_cur:
+        self.columns = cols
+        self.rows = rows
+        self.current = current
+        self.current_power = current_power
+        self._render(force=False)
+
+    def _render(self, force: bool = False) -> None:
+        old_cell = self._cur_cell
+        self._setup_headers(self.columns)
+        shown_cols = self.columns if self.columns else [None]
+        if self.rowCount() != len(self.rows):
+            self.setRowCount(len(self.rows))
+        cur_row, cur_col = -1, -1
+        for i, (f, values) in enumerate(self.rows):
+            is_cur_row = self.current is not None and abs(f - self.current) < 0.5
+            if is_cur_row:
                 cur_row = i
-            created = False
-            for col, text in enumerate((si_format(f, "Hz", 9), f"{v:.2f} dBm")):
+            f_item = self.item(i, 0)
+            if f_item is None:
+                f_item = QTableWidgetItem()
+                f_item.setTextAlignment(self.ALIGN_LEFT)
+                self.setItem(i, 0, f_item)
+            f_txt = si_format(f, "Hz", 9)
+            if f_item.text() != f_txt:
+                f_item.setText(f_txt)
+            self._style_cell(i, 0, is_cur_row)
+            for j, col_p in enumerate(shown_cols):
+                col = j + 1
+                is_cur_cell = is_cur_row and self._same_power(col_p, self.current_power)
+                if is_cur_cell:
+                    cur_col = col
                 item = self.item(i, col)
                 if item is None:
                     item = QTableWidgetItem()
-                    item.setTextAlignment(self.ALIGN[col])
+                    item.setTextAlignment(self.ALIGN_RIGHT)
                     self.setItem(i, col, item)
-                    created = True
+                v = values.get(col_p)
+                text = _format_power(v, self.unit, col_p) if v is not None else ""
                 if item.text() != text:
                     item.setText(text)
-                    changed = True
-            if created:
-                self._style_row(i, is_cur)
-        if cur_row != old_cur:
-            if 0 <= old_cur < len(rows):
-                self._style_row(old_cur, False)
-            if 0 <= cur_row < len(rows):
-                self._style_row(cur_row, True)
-            changed = True
-        self._cur_row = cur_row
-        if moved and cur_row >= 0:
-            self.scrollToItem(self.item(cur_row, 0), QAbstractItemView.ScrollHint.EnsureVisible)
-        if changed:
-            self.viewport().update()
+                self._style_cell(i, col, is_cur_cell)
+        new_cell = (cur_row, cur_col if cur_col >= 0 else 0)
+        self._cur_cell = new_cell
+        if (force or new_cell != old_cell) and cur_row >= 0:
+            target = self.item(cur_row, max(0, cur_col))
+            if target is not None:
+                self.scrollToItem(target, QAbstractItemView.ScrollHint.EnsureVisible)
+        self.viewport().update()
 
     def paintEvent(self, e):  # noqa: N802 - Qt
         super().paintEvent(e)
@@ -264,9 +388,10 @@ class LivePanel(Panel):
     swap_requested = pyqtSignal(str, str)
     close_requested = pyqtSignal(object)
 
-    def __init__(self, proxy, monitor: ActivityMonitor, parent=None):
+    def __init__(self, proxy, monitor: ActivityMonitor, parent=None, settings: QSettings | None = None):
         self.proxy = proxy
         self.monitor = monitor
+        self.settings = settings
         self.profile = profile_name(proxy)
         self.panel_key = f"{monitor.name(proxy)}:{proxy.address}"
         self._drag_pos: QPoint | None = None
@@ -283,6 +408,18 @@ class LivePanel(Panel):
         self.source.setObjectName("source")
         self.level = QLabel()
         self.level.setObjectName("heading")
+        saved_unit = str(settings.value(f"MAIN/PM_UNIT/{self.panel_key}", "dBm") or "dBm") if settings else "dBm"
+        if saved_unit not in PM_UNITS:
+            saved_unit = "dBm"
+        self.unit_button = QPushButton(saved_unit)
+        self.unit_button.setObjectName("chip")
+        self.unit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.unit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.unit_button.setToolTip("Power table unit (dBm / W / dBW / V / dB gain). Click - next, right click - choose")
+        self.unit_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.unit_button.clicked.connect(self._next_pm_unit)
+        self.unit_button.customContextMenuRequested.connect(self._pm_unit_menu)
+        self.unit_button.hide()
         self.clear_button = QPushButton("CLEAR")
         self.clear_button.setObjectName("chip")
         self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -301,6 +438,7 @@ class LivePanel(Panel):
         head.addStretch()
         head.addWidget(self.source)
         head.addWidget(self.level)
+        head.addWidget(self.unit_button)
         head.addWidget(self.clear_button)
         head.addWidget(self.move_prev_button)
         head.addWidget(self.move_next_button)
@@ -312,7 +450,7 @@ class LivePanel(Panel):
         self.plots: list[LivePlot] = []
         self.power_table: PowerTable | None = None      # не ``table``: так Panel зовёт своё содержимое
         if self.profile == "power_meter":
-            self.power_table = PowerTable()
+            self.power_table = PowerTable(unit=saved_unit)
             lay.addWidget(self.power_table, 1)
         super().__init__(body, parent=parent)
         self.setAcceptDrops(True)
@@ -401,14 +539,25 @@ class LivePanel(Panel):
 
     def _refresh_vna(self, a: Activity) -> None:
         traces = self.monitor.vna_traces(self.proxy)
-        groups: dict[str, list] = {}
-        for name, tr in traces:                      # одна шкала - одна единица
-            groups.setdefault(tr.y_unit, []).append((name, tr))
-        for i, items in enumerate(groups.values()):
-            self._plot(i).set_traces(items)
+        groups: dict[tuple, tuple[tuple[float, float, float] | None, list]] = {}
+        for name, tr in traces:                      # одна шкала и единица -> один график
+            scale = _vna_scale(tr)
+            scale_key = None if scale is None else (round(scale[0], 12), round(scale[1], 12), round(scale[2], 12))
+            key = (tr.y_unit, scale_key)
+            entry = groups.get(key)
+            if entry is None:
+                groups[key] = (scale, [(name, tr)])
+            else:
+                entry[1].append((name, tr))
+        for i, (scale, items) in enumerate(groups.values()):
+            plot = self._plot(i)
+            plot.set_scale(scale, divs_y=DEVICE_DIVS_Y if scale is not None else None)
+            plot.set_traces(items)
         self._use_plots(max(1, len(groups)))
         if not groups:
-            self._plot(0).set_traces([])
+            plot = self._plot(0)
+            plot.set_scale(None)
+            plot.set_traces([])
         if a.connected:
             self.level.setText(f"{len(traces)} TRC" if traces else "NO TRC")
 
@@ -416,6 +565,17 @@ class LivePanel(Panel):
         tr = self.proxy.value("trace")
         plot = self._plot(0)
         self._use_plots(1)
+        rlev = _num(self.proxy.value("ref_level"))
+        sdiv = _num(self.proxy.value("scale_div"))
+        if isinstance(tr, Trace) and tr.meta:
+            if rlev is None:
+                rlev = _num(tr.meta.get("ref_level"))
+            if sdiv is None:
+                sdiv = _num(tr.meta.get("scale_div"))
+        if rlev is not None and sdiv is not None and sdiv > 0:
+            plot.set_scale((rlev - DEVICE_DIVS_Y * sdiv, rlev, sdiv), divs_y=DEVICE_DIVS_Y)
+        else:
+            plot.set_scale(None)
         plot.set_traces([("", tr)] if isinstance(tr, Trace) else [])
         present = bool(a.signal)
         if present and a.level is not None and isinstance(tr, Trace) and len(tr) > 0:
@@ -427,21 +587,60 @@ class LivePanel(Panel):
             where = f" @ {si_format(a.freq, 'Hz', 6)}" if a.freq is not None and present else ""
             self.level.setText(f"{_dbm(a.level)}{where}" if present else f"NOISE {_dbm(a.floor)}")
 
+    def set_pm_unit(self, unit: str) -> None:
+        if self.power_table is None or unit not in PM_UNITS:
+            return
+        self.power_table.set_unit(unit)
+        self.unit_button.setText(unit)
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/PM_UNIT/{self.panel_key}", unit)
+        self.refresh(self.monitor.activity(self.proxy))
+
+    def _next_pm_unit(self) -> None:
+        if self.power_table is None:
+            return
+        idx = PM_UNITS.index(self.power_table.unit)
+        self.set_pm_unit(PM_UNITS[(idx + 1) % len(PM_UNITS)])
+
+    def _pm_unit_menu(self, pos: QPoint) -> None:
+        if self.power_table is None:
+            return
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for u in PM_UNITS:
+            act = menu.addAction(_PM_UNIT_LABELS[u])
+            act.setCheckable(True)
+            act.setChecked(u == self.power_table.unit)
+            act.triggered.connect(lambda _=False, unit=u: self.set_pm_unit(unit))
+        menu.popup(self.unit_button.mapToGlobal(pos))
+
     def _refresh_pm(self, a: Activity) -> None:
-        """Временной режим (TRAC ON) - трасса во времени; иначе - таблица частота / мощность."""
+        """Временной режим (TRAC ON) - трасса во времени; иначе - таблица частота × подаваемая мощность."""
         tr = self.proxy.value("trace")
         timed = self.proxy.value("trace.state") is True and isinstance(tr, Trace)
         if timed:
             plot = self._plot(0)
             plot.x_range = None
+            scale, divs_y, y_unit, y_transform = pm_time_scale(self.proxy, tr, self.settings)
+            plot.set_scale(scale, divs_y=divs_y, y_unit=y_unit, y_transform=y_transform)
             plot.set_traces([("", tr)])
         self._use_plots(1 if timed else 0)
         self.power_table.setVisible(not timed)
+        self.unit_button.setVisible(not timed)
         self.clear_button.setVisible(not timed)
         if not timed:
-            self.power_table.set_rows(self.monitor.pm_table(self.proxy), _num(self.proxy.value("freq")))
+            cols, rows = self.monitor.pm_matrix(self.proxy)
+            cur_p = None if a.source is None or a.source.power is None else round(float(a.source.power), 3)
+            self.power_table.set_matrix(cols, rows, _num(self.proxy.value("freq")), cur_p)
         if a.connected:
-            self.level.setText(_dbm(a.level) or "NO DATA")
+            u = self.power_table.unit
+            if a.level is None:
+                self.level.setText("NO DATA")
+            elif u == "dB":
+                src_p = None if a.source is None else a.source.power
+                self.level.setText(_format_power(a.level, "dB", src_p) if src_p is not None else _dbm(a.level))
+            else:
+                self.level.setText(_format_power(a.level, u))
 
 
 class MainWindow(Window):
@@ -462,6 +661,8 @@ class MainWindow(Window):
         self.tiles: dict[object, InstrumentTile] = {}
         self.panels: dict[object, LivePanel] = {}
         self.restore_chips: dict[str, QPushButton] = {}
+        self.display_rules: dict[str, dict[str, Any]] = {}
+        self.display_controls: dict[str, tuple[QCheckBox, QCheckBox, SettingField]] = {}
         self._root_splitter: QSplitter | None = None
         self._splitters: list[tuple[str, QSplitter]] = []
         self._arranged_sig: tuple | None = None
@@ -523,7 +724,7 @@ class MainWindow(Window):
         self.strip_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         self.fields: dict[str, SettingField] = {}
-        lines = []
+        by_name: dict[str, PanelLine] = {}
         for label, name, unit, scale, tip in SETTINGS:
             saved = settings.value(f"{self.SETTINGS_GROUP}/THRESHOLDS/{name}", None)
             if saved is not None:
@@ -539,8 +740,34 @@ class MainWindow(Window):
             self.fields[name] = f
             line = PanelLine(label, f)
             line.setToolTip(tip)
-            lines.append(line)
-        self.settings_panel = Panel(PanelTable(*lines))
+            by_name[name] = line
+        settings_table = PanelTable(
+            (by_name["sa_margin_db"], by_name["pm_floor_dbm"]),
+            (by_name["freq_tol_hz"], by_name["freq_tol_rel"]),
+            by_name["hold_s"],
+        )
+        settings_table.build(130)
+        settings_body = QWidget()
+        s_lay = QVBoxLayout(settings_body)
+        s_lay.setContentsMargins(0, 0, 0, 0)
+        s_lay.setSpacing(10)
+        s_lay.addWidget(settings_table)
+        graphs_head = QLabel("DISPLAYED GRAPHS")
+        graphs_head.setObjectName("heading")
+        s_lay.addWidget(graphs_head)
+        self.display_host = QWidget()
+        self.display_layout = QVBoxLayout(self.display_host)
+        self.display_layout.setContentsMargins(0, 0, 0, 0)
+        self.display_layout.setSpacing(4)
+        s_lay.addWidget(self.display_host)
+        self.settings_panel = Panel(settings_body)
+        self.settings_panel.setStyleSheet(Panel.STYLE_SHEET + render_qss("""
+            Panel QCheckBox { color: $UI_COLOR_TEXT; spacing: 6px; background: transparent; border: none; }
+            Panel QCheckBox:disabled { color: $UI_COLOR_BORDER_LIGHT; }
+            Panel QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px;
+                border: 1px solid $UI_COLOR_BORDER_LIGHT; background: $UI_COLOR_BACKGROUND; }
+            Panel QCheckBox::indicator:checked { background: $UI_COLOR_INVERT; border-color: $UI_COLOR_TEXT; }
+        """))
         self.settings_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         self.idle = QLabel("NOTHING IS MEASURING")
@@ -574,7 +801,7 @@ class MainWindow(Window):
         self.tabs = PTabBar()
         for title in self.TABS:
             self.tabs.addTab(title)
-        self.tabs.setTabToolTip(1, "Thresholds: signal detection and source matching")
+        self.tabs.setTabToolTip(1, "Thresholds and displayed graphs settings")
         self.tabs_panel = Panel(self.tabs)
         self.tabs_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
@@ -591,7 +818,7 @@ class MainWindow(Window):
 
         self.monitor.roster_changed.connect(self._rebuild)
         self.monitor.changed.connect(self._on_changed)
-        WINDOW_EVENTS.changed.connect(self._update_tile)    # окно прибора открыли / закрыли, ошибка
+        WINDOW_EVENTS.changed.connect(self._on_window_event)    # окно прибора открыли / закрыли, ошибка, шкала TIME
         for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):
             sig.connect(self._on_runs)
         self._on_runs()
@@ -636,7 +863,7 @@ class MainWindow(Window):
             self.strip_layout.insertWidget(i, self.tiles[p])
         for p in self.monitor.receivers():
             if p not in self.panels:
-                panel = LivePanel(p, self.monitor)
+                panel = LivePanel(p, self.monitor, settings=self.settings)
                 panel.move_requested.connect(self.move_panel)
                 panel.swap_requested.connect(self.swap_panels)
                 panel.close_requested.connect(self.hide_panel)
@@ -651,6 +878,7 @@ class MainWindow(Window):
                 panel.refresh(self.monitor.activity(p))
         self._dirty_panels.clear()
         self._dirty_vis = False
+        self._rebuild_display_settings()
         self._update_visibility()
 
     # ------------------------------------------------------------ обновление
@@ -681,6 +909,16 @@ class MainWindow(Window):
                 panel.refresh(self.monitor.activity(proxy))
         if need_vis:
             self._update_visibility()
+
+    def _on_window_event(self, proxy) -> None:
+        if sip.isdeleted(self):
+            return
+        self._update_tile(proxy)
+        panel = self.panels.get(proxy)
+        if panel is not None and panel.profile == "power_meter":
+            self._dirty_panels.add(proxy)
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start()
 
     def _update_tile(self, proxy) -> None:
         """Плитка: имя прибора; индикатор - его окно открыто; красная - ошибка: индикатор ошибок окна горит
@@ -758,19 +996,184 @@ class MainWindow(Window):
         self._arranged_sig = None
         self._update_visibility()
 
-    def hide_panel(self, proxy) -> None:
-        """Закрыть (скрыть) панель измерения; вернуть можно чипом «+ ИМЯ» сверху."""
+    # ------------------------------------------------------------ отображение графиков (SET)
+    @staticmethod
+    def _default_display_level(profile: str) -> float:
+        if profile == "spectrum_analyzer":
+            return -50.0
+        if profile == "power_meter":
+            return -60.0
+        return -40.0
+
+    def _display_rule(self, proxy) -> dict[str, Any]:
         key = self._panel_key(proxy)
-        if key not in self.hidden_panels:
+        rule = self.display_rules.get(key)
+        if rule is not None:
+            return rule
+        prof = profile_name(proxy)
+        base = f"{self.SETTINGS_GROUP}/DISPLAY/{key}"
+        by_level = bool(self.settings.value(f"{base}/BY_LEVEL", False, type=bool))
+        default_lvl = self._default_display_level(prof)
+        raw_lvl = self.settings.value(f"{base}/LEVEL", None)
+        try:
+            lvl = float(raw_lvl) if raw_lvl not in (None, "") else default_lvl
+            if not math.isfinite(lvl):
+                lvl = default_lvl
+        except (TypeError, ValueError):
+            lvl = default_lvl
+        rule = {"by_level": by_level, "level": lvl}
+        self.display_rules[key] = rule
+        return rule
+
+    def _rebuild_display_settings(self) -> None:
+        self.display_controls.clear()
+        while self.display_layout.count():
+            item = self.display_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        receivers = self._ordered_receivers()
+        if not receivers:
+            empty = QLabel("No receivers connected")
+            empty.setStyleSheet("color: #8a8a8a;")
+            self.display_layout.addWidget(empty)
+            return
+        for p in receivers:
+            key = self._panel_key(p)
+            name = self.monitor.name(p)
+            prof = profile_name(p)
+            unit = "dB" if prof == "network_analyzer" else "dBm"
+            rule = self._display_rule(p)
+            shown = key not in self.hidden_panels
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+            lbl = QLabel(name)
+            lbl.setObjectName("lineName")
+            lbl.setFixedWidth(56)
+            lbl.setToolTip(f"{name}: {p.name} ({short_address(p.address)})")
+            show_cb = QCheckBox("Show")
+            show_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            show_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            show_cb.setChecked(shown)
+            show_cb.setToolTip(f"Show {name} in LIVE (unchecked - always hidden)")
+            level_cb = QCheckBox("Above level")
+            level_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            level_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            level_cb.setChecked(rule["by_level"])
+            level_cb.setEnabled(shown)
+            level_cb.setToolTip(f"Show {name} only when its measured signal level exceeds the threshold")
+            level_edit = SettingField(unit, 1.0)
+            level_edit.setMinimumWidth(110)
+            level_edit.show_value(rule["level"])
+            level_edit.setEnabled(shown and rule["by_level"])
+            level_edit.setToolTip(f"Video / signal level threshold for {name} ({unit}): show when level >= this value")
+            show_cb.toggled.connect(lambda checked, k=key: self.set_panel_shown(k, checked))
+            level_cb.toggled.connect(lambda checked, k=key: self.set_panel_by_level(k, checked))
+            level_edit.editingFinished.connect(lambda k=key: self._apply_display_level(k))
+            rl.addWidget(lbl)
+            rl.addWidget(show_cb)
+            rl.addWidget(level_cb)
+            rl.addWidget(level_edit, 1)
+            self.display_layout.addWidget(row)
+            self.display_controls[key] = (show_cb, level_cb, level_edit)
+
+    def set_panel_shown(self, key: str, shown: bool) -> None:
+        """Включить / выключить отображение графика прибора (галочка Show в SET или × / + в LIVE)."""
+        shown = bool(shown)
+        changed = (key in self.hidden_panels) == shown
+        if shown:
+            self.hidden_panels.discard(key)
+        else:
             self.hidden_panels.add(key)
+        if changed:
             self._save_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS", sorted(self.hidden_panels))
+        ctrls = self.display_controls.get(key)
+        if ctrls is not None:
+            show_cb, level_cb, level_edit = ctrls
+            if not sip.isdeleted(show_cb):
+                show_cb.blockSignals(True)
+                show_cb.setChecked(shown)
+                show_cb.blockSignals(False)
+                level_cb.setEnabled(shown)
+                level_edit.setEnabled(shown and level_cb.isChecked())
+        if changed:
             self._update_visibility()
 
+    def set_panel_by_level(self, key: str, enabled: bool) -> None:
+        """Включить / выключить показ графика только при превышении порога уровня."""
+        enabled = bool(enabled)
+        rule = self.display_rules.setdefault(key, {"by_level": False, "level": -50.0})
+        rule["by_level"] = enabled
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/DISPLAY/{key}/BY_LEVEL", enabled)
+        ctrls = self.display_controls.get(key)
+        if ctrls is not None:
+            show_cb, level_cb, level_edit = ctrls
+            if not sip.isdeleted(level_cb):
+                level_cb.blockSignals(True)
+                level_cb.setChecked(enabled)
+                level_cb.blockSignals(False)
+                level_edit.setEnabled(show_cb.isChecked() and enabled)
+        self._update_visibility()
+
+    def set_panel_level(self, key: str, level: float) -> None:
+        """Задать порог видеоуровня для показа графика (dBm / dB)."""
+        lvl = float(level)
+        if not math.isfinite(lvl):
+            return
+        rule = self.display_rules.setdefault(key, {"by_level": False, "level": lvl})
+        rule["level"] = lvl
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/DISPLAY/{key}/LEVEL", lvl)
+        ctrls = self.display_controls.get(key)
+        if ctrls is not None and not sip.isdeleted(ctrls[2]):
+            ctrls[2].show_value(lvl)
+        self._update_visibility()
+
+    def _apply_display_level(self, key: str) -> None:
+        ctrls = self.display_controls.get(key)
+        if ctrls is None or sip.isdeleted(ctrls[2]):
+            return
+        edit = ctrls[2]
+        rule = self.display_rules.get(key)
+        try:
+            value = edit.parsed()
+        except ValueError:
+            if rule is not None:
+                edit.show_value(rule["level"])
+            return
+        self.set_panel_level(key, value)
+
+    def _receiver_level(self, proxy) -> float | None:
+        """Текущий измеренный уровень сигнала приёмника (dBm для SA/PM, max dB для VNA)."""
+        prof = profile_name(proxy)
+        a = self.monitor.activity(proxy)
+        if prof == "spectrum_analyzer":
+            return a.level
+        if prof == "power_meter":
+            lvl = a.level
+            tr = proxy.value("trace")
+            if proxy.value("trace.state") is True and isinstance(tr, Trace) and len(tr) > 0:
+                finite = [float(y) for y in tr.y if math.isfinite(y)]
+                if finite:
+                    peak = max(finite)
+                    return peak if lvl is None else max(lvl, peak)
+            return lvl
+        if prof == "network_analyzer":
+            peaks = []
+            for _name, tr in self.monitor.vna_traces(proxy):
+                finite = [float(y) for y in tr.y if math.isfinite(y)]
+                if finite:
+                    peaks.append(max(finite))
+            return max(peaks) if peaks else None
+        return None
+
+    def hide_panel(self, proxy) -> None:
+        """Закрыть (скрыть) панель измерения; вернуть можно чипом «+ ИМЯ» сверху или галочкой в SET."""
+        self.set_panel_shown(self._panel_key(proxy), False)
+
     def show_panel(self, key: str) -> None:
-        if key in self.hidden_panels:
-            self.hidden_panels.discard(key)
-            self._save_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS", sorted(self.hidden_panels))
-            self._update_visibility()
+        self.set_panel_shown(key, True)
 
     def move_panel(self, proxy, delta: int) -> None:
         """Сдвинуть панель в порядке показа среди видимых панелей."""
@@ -802,7 +1205,15 @@ class MainWindow(Window):
         return sorted(receivers, key=lambda p: (rank.get(self._panel_key(p), len(rank)), receivers.index(p)))
 
     def _is_eligible(self, proxy) -> bool:
-        return self.all_button.isChecked() or self.monitor.activity(proxy).measuring
+        if self.all_button.isChecked():
+            return True
+        if not self.monitor.activity(proxy).measuring:
+            return False
+        rule = self._display_rule(proxy)
+        if rule["by_level"]:
+            lvl = self._receiver_level(proxy)
+            return lvl is not None and lvl >= rule["level"]
+        return True
 
     def _should_show(self, proxy) -> bool:
         return self._is_eligible(proxy) and self._panel_key(proxy) not in self.hidden_panels
@@ -954,7 +1365,7 @@ class MainWindow(Window):
         self._dirty_panels.clear()
         self.monitor.stop()
         try:
-            WINDOW_EVENTS.changed.disconnect(self._update_tile)
+            WINDOW_EVENTS.changed.disconnect(self._on_window_event)
         except (TypeError, RuntimeError):
             pass
         for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):

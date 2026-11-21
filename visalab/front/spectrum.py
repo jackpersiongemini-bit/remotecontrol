@@ -34,20 +34,33 @@ CONNECTION_GROUP = "CONNECTION/SPECTRUM"
 AUTO = [("MAN", False), ("AUTO", True)]
 ONOFF = [("OFF", False), ("ON", True)]
 
-#: вкладки: (название, строки); строка - (подпись, ключ значения, ключ второго виджета строки или None);
-#: второй виджет: ``*_auto`` - MAN / AUTO, другое булево - OFF / ON, не булево - поле
+#: вкладки: (название, группы строк); группа - 1-3 параметра в ряд;
+#: элемент - (подпись, ключ значения, ключ второго виджета или None)
 PAGES = (
-    ("FREQ", (("CENT", "freq.center", None), ("SPAN", "freq.span", None),
-              ("STAR", "freq.start", None), ("STOP", "freq.stop", None))),
-    ("BW", (("RBW", "bw.res", "bw.res_auto"), ("VBW", "bw.video", "bw.video_auto"))),
-    ("AMPL", (("RLEV", "ref_level", None), ("ROFF", "ref_offset", None), ("SDIV", "scale_div", None),
-              ("ATT", "atten", "atten_auto"), ("DET", "detector", None), ("PRE", "preamp", None),
-              ("CPL", "input.coupling", None))),
-    ("SWP", (("TIME", "sweep.time", "sweep.time_auto"), ("PTS", "sweep.points", None),
-             ("TYPE", "sweep.type", None), ("REF", "ref.source", None))),
-    ("TRAC", (("MODE", "trace.mode", None), ("AVG", "avg.state", "avg.count"))),
-    ("TRIG", (("SRC", "trig.source", None), ("LVL", "trig.level", None), ("SLOP", "trig.slope", None),
-              ("DLY", "trig.delay", "trig.delay_state"))),
+    ("FREQ", (
+        (("CENT", "freq.center", None), ("SPAN", "freq.span", None)),
+        (("STAR", "freq.start", None), ("STOP", "freq.stop", None)),
+    )),
+    ("BW", (
+        (("RBW", "bw.res", "bw.res_auto"),),
+        (("VBW", "bw.video", "bw.video_auto"),),
+    )),
+    ("AMPL", (
+        (("RLEV", "ref_level", None), ("ROFF", "ref_offset", None)),
+        (("SDIV", "scale_div", None), ("DET", "detector", None), ("CPL", "input.coupling", None)),
+        (("ATT", "atten", "atten_auto"), ("PRE", "preamp", None)),
+    )),
+    ("SWP", (
+        (("TIME", "sweep.time", "sweep.time_auto"), ("PTS", "sweep.points", None)),
+        (("TYPE", "sweep.type", None), ("REF", "ref.source", None)),
+    )),
+    ("TRAC", (
+        (("MODE", "trace.mode", None), ("AVG", "avg.state", "avg.count")),
+    )),
+    ("TRIG", (
+        (("SRC", "trig.source", None), ("LVL", "trig.level", None)),
+        (("SLOP", "trig.slope", None), ("DLY", "trig.delay", "trig.delay_state")),
+    )),
 )
 NOT_SAVED = ("freq.start", "freq.stop")          # связаны с центром и обзором - после Init не восстанавливаем
 
@@ -220,23 +233,27 @@ class SpectrumWindow(InstrumentWindow):
                 return PSButton(proxy, key, [(c, c) for c in spec.choices])
             return PLineEdit(proxy, key)
 
-        for title_, rows in PAGES:
+        for title_, groups in PAGES:
             lines = []
-            for name, key, extra in rows:
-                if not sup(key):
-                    continue
-                w = make(key)
-                ws = [w]
-                if extra and sup(extra):
-                    if proxy.params[extra].kind.name == "BOOL":
-                        ws.append(PSButton(proxy, extra, AUTO if extra.endswith("_auto") else ONOFF))
-                    else:
-                        ws.append(make(extra))
-                for x, k in zip(ws, (key, extra)):
-                    self.widgets[k] = x
-                    if k not in NOT_SAVED:
-                        self.saved_widgets.append(x)
-                lines.append(PanelLine(name, *ws))
+            for group in groups:
+                row = []
+                for name, key, extra in group:
+                    if not sup(key):
+                        continue
+                    w = make(key)
+                    ws = [w]
+                    if extra and sup(extra):
+                        if proxy.params[extra].kind.name == "BOOL":
+                            ws.append(PSButton(proxy, extra, AUTO if extra.endswith("_auto") else ONOFF))
+                        else:
+                            ws.append(make(extra))
+                    for x, k in zip(ws, (key, extra)):
+                        self.widgets[k] = x
+                        if k not in NOT_SAVED:
+                            self.saved_widgets.append(x)
+                    row.append(PanelLine(name, *ws))
+                if row:
+                    lines.append(tuple(row))
             if title_ == "FREQ" and sup("freq.span"):
                 lines.append(PanelLine("ZERO", ZeroSpan(proxy, self.settings, self._prefix)))
             if title_ == "SWP":
@@ -268,7 +285,12 @@ class SpectrumWindow(InstrumentWindow):
         c, s = self.proxy.value("freq.center"), self.proxy.value("freq.span")
         if c is None or s is None:
             return None
-        return f"{compact_si(c)}S{compact_si(s)}"
+        for dc, ds in ((3, 3), (3, 2), (2, 3), (2, 2), (2, 1), (1, 2), (1, 1)):
+            raw = f"{compact_si(abs(c), dc)}S{compact_si(abs(s), ds)}".upper()
+            clean = re.sub(r"[^A-Z0-9]", "", raw)
+            if 1 <= len(clean) <= 8:
+                return clean
+        return re.sub(r"[^A-Z0-9]", "", f"{compact_si(abs(c), 1)}S{compact_si(abs(s), 1)}".upper())[:8] or "STATE"
 
     def _add_preset(self) -> None:
         name = self.state_name()

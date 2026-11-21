@@ -19,6 +19,7 @@ from ..coord import Instrument
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
 from .params import PLineEdit, PSButton, PSpinBox, PanelLine, PanelTable
+from .source_cal import SourceCal
 from .theme import UI_COLUMN_WIDTH_PX
 
 __all__ = ["RFGenWindow", "MOD_TYPES", "saved_connection"]
@@ -42,15 +43,28 @@ def _auto(proxy: Instrument, key: str):
     return PLineEdit(proxy, key)
 
 
-#: вкладки: (название, ключ «режим включён», строки (подпись, ключ))
+#: вкладки: (название, ключ «режим включён», группы строк в ряд ((подпись, ключ), ...))
 PAGES = (
-    ("RF", "rf.output", (("OUT", "rf.output"), ("FREQ", "rf.frequency"), ("POW", "rf.power"),
-                         ("ALC", "rf.alc"), ("REF", "ref.source"))),
-    ("AM", "am.state", (("STAT", "am.state"), ("DEPT", "am.depth"), ("SRC", "am.source"), ("FRQ", "am.freq"))),
-    ("FM", "fm.state", (("STAT", "fm.state"), ("DEVI", "fm.deviation"), ("SRC", "fm.source"), ("FRQ", "fm.freq"))),
-    ("PM", "pm.state", (("STAT", "pm.state"), ("DEVI", "pm.deviation"), ("SRC", "pm.source"), ("FRQ", "pm.freq"))),
-    ("PULS", "pulse.state", (("STAT", "pulse.state"), ("SRC", "pulse.source"), ("PERI", "pulse.period"),
-                             ("WID", "pulse.width"))),
+    ("RF", "rf.output", (
+        (("OUT", "rf.output"), ("ALC", "rf.alc"), ("REF", "ref.source")),
+        (("FREQ", "rf.frequency"), ("POW", "rf.power")),
+    )),
+    ("AM", "am.state", (
+        (("STAT", "am.state"), ("SRC", "am.source")),
+        (("DEPT", "am.depth"), ("FRQ", "am.freq")),
+    )),
+    ("FM", "fm.state", (
+        (("STAT", "fm.state"), ("SRC", "fm.source")),
+        (("DEVI", "fm.deviation"), ("FRQ", "fm.freq")),
+    )),
+    ("PM", "pm.state", (
+        (("STAT", "pm.state"), ("SRC", "pm.source")),
+        (("DEVI", "pm.deviation"), ("FRQ", "pm.freq")),
+    )),
+    ("PULS", "pulse.state", (
+        (("STAT", "pulse.state"), ("SRC", "pulse.source")),
+        (("PERI", "pulse.period"), ("WID", "pulse.width")),
+    )),
 )
 #: порядок восстановления: частота -> мощность -> настройки -> включение модуляций -> общий MOD -> RF
 RESTORE_RANK = {"rf.frequency": 0, "rf.power": 1, "am.state": 3, "fm.state": 3, "pm.state": 3,
@@ -68,6 +82,9 @@ class RFGenWindow(InstrumentWindow):
         if tools is not None:
             tools.setMinimumWidth(0)
             tools.setFixedWidth(max(b.sizeHint().width() for b in tools.findChildren(QPushButton)))
+        if hasattr(self, "source_cal"):
+            proxy.sync_done.connect(self.source_cal.apply_correction)
+            proxy.action_done.connect(lambda name, _r: name == "reset" and self.source_cal.apply_correction())
 
     # ------------------------------------------------------------ сборка
     def build(self) -> None:
@@ -91,22 +108,50 @@ class RFGenWindow(InstrumentWindow):
         self.freq_spin = PSpinBox(proxy, "rf.frequency", ("k", "M", "G"))
         self.top_lines.append(PanelLine("FREQ", self.freq_spin))
 
-        # вкладки: один столбец
-        for title_, state, rows in PAGES:
-            present = [(t, k) for t, k in rows if sup(k)]
-            if not present:
-                continue
+        # вкладки: родственные параметры сгруппированы в 2-3 столбца
+        for title_, state, groups in PAGES:
             lines = []
-            for t, k in present:
-                w = _auto(proxy, k) if k != "rf.output" else PSButton(proxy, k, [("OFF", False), ("ON", True)])
-                self.widgets.setdefault(k, w)
-                self.saved_widgets.append(w)
-                lines.append(PanelLine(t, w))
-                if k == "rf.power":                   # пресеты мощности - под POW
+            for group in groups:
+                row = []
+                add_prst = False
+                for t, k in group:
+                    if not sup(k):
+                        continue
+                    w = _auto(proxy, k) if k != "rf.output" else PSButton(proxy, k, [("OFF", False), ("ON", True)])
+                    self.widgets.setdefault(k, w)
+                    self.saved_widgets.append(w)
+                    row.append(PanelLine(t, w))
+                    if k == "rf.power":
+                        add_prst = True
+                if row:
+                    lines.append(tuple(row))
+                if add_prst:                          # пресеты мощности - сразу под строкой POW
                     lines.append(self.power_levels_line("rf.power"))
-            self.page_specs.append((title_, (state,) if sup(state) else (), PanelTable(*lines)))
+            if lines:
+                self.page_specs.append((title_, (state,) if sup(state) else (), PanelTable(*lines)))
+        if sup("power.offset"):
+            self.source_cal = SourceCal(self, proxy, self.settings, self._prefix, "signal_generator",
+                                        lambda: self.proxy.value("rf.frequency"))
+            if self.source_cal.offset_label is not None:
+                self.widgets["power.offset"] = self.source_cal.offset_label
+            self.page_specs.append(("CAL", ("power.offset_state",) if sup("power.offset_state") else (),
+                                    PanelTable(*self.source_cal.lines())))
         if "mod.output" in self.widgets:
             self.saved_widgets.append(self.widgets["mod.output"])
+
+    def on_param(self, key: str, value: Any) -> None:
+        if key == "rf.frequency" and hasattr(self, "source_cal"):
+            self.source_cal.apply_correction()
+
+    def restore(self) -> None:
+        if hasattr(self, "source_cal"):
+            self.source_cal.apply_correction()
+        super().restore()
+
+    def cleanup(self) -> None:
+        if hasattr(self, "source_cal"):
+            self.source_cal.cleanup()
+        super().cleanup()
 
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)

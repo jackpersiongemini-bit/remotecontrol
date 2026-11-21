@@ -39,19 +39,30 @@ from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomS
 __all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay", "parse_power_list",
            "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "WINDOW_EVENTS", "window_for"]
 
-PRESET_SETTLE_S = 3.0      # после клика по пресету: столько ждать, пока прибор примет все значения
+PRESET_SETTLE_S = 5.0      # после клика по пресету: столько ждать, пока прибор примет все значения
 COMPACT_PADDING_PX = 9     # кнопка у спинбокса: поля по бокам от подписи
 PRESET_HEIGHT = 56          # высота чипа пресета; «+» и «−» вместе (с зазором) - такой же высоты
 PRESET_GAP = 4
 DEFAULT_POWER_LIST = (-20.0, -10.0, -5.0, 0.0)
 
 
-def parse_power_list(text: str) -> list[float]:
-    """``"-20, -10 0;5"`` -> [-20, -10, 0, 5] (по возрастанию, без повторов). ValueError при мусоре."""
+def _fmt_level(value: float) -> str:
+    """Форматирование уровня мощности для чипа и ini без потери дробных знаков и без «-0»."""
+    text = f"{round(float(value), 4):.4f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def parse_power_list(text: str | list | tuple) -> list[float]:
+    """``"-20, -10.5 0;5"`` -> [-20.0, -10.5, 0.0, 5.0] (по возрастанию, без повторов). ValueError при мусоре."""
+    if isinstance(text, (list, tuple)):
+        text = " ".join(str(x) for x in text)
     out = set()
-    for t in re.split(r"[\s,;]+", text.strip()):
+    for t in re.split(r"[\s,;]+", str(text).strip()):
         if t:
-            out.add(float(t))
+            v = float(t)
+            if not math.isfinite(v):
+                raise ValueError(f"неконечное число: {t!r}")
+            out.add(round(v, 4))
     return sorted(out)
 
 
@@ -72,8 +83,14 @@ def saved_delay(settings: QSettings, group: str) -> float | None:
 
 
 def _same(a, b) -> bool:
-    if isinstance(a, float) and isinstance(b, float):
-        return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-15)
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return math.isclose(float(a), float(b), rel_tol=1e-6, abs_tol=1e-12)
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
     return a == b
 
 
@@ -155,17 +172,24 @@ class PresetGroup(PBGroup):
             self.set_checked(index)
             self.save()
 
-    def find(self, *values) -> int:
-        target = self.normalize(*values)
+    def _find_exact(self, target: tuple) -> int:
         for i, preset in enumerate(self.data):
-            if all(_same(a, b) for a, b in zip(preset, target)):
+            if _same(preset, target):
                 return i
         return -1
 
+    def find(self, *values) -> int:
+        return self._find_exact(self.normalize(*values))
+
+    def match(self, *values) -> int:
+        """Какой пресет совпадает с текущими значениями прибора (для подсветки чипа)."""
+        return self.find(*values)
+
     def add(self, *values) -> bool:
-        i = self.find(*values)
+        target = self.normalize(*values)
+        i = self._find_exact(target)
         if i < 0:
-            self._append(self.normalize(*values))
+            self._append(target)
             i = len(self.data) - 1
         self.touch(i)
         return True
@@ -195,11 +219,12 @@ class PowerSpin(PSpinBox):
         if steps == 0:
             return
         cur = self._value if isinstance(self._value, (int, float)) else self.value()
+        tol = PowerLevels.TOL
         if steps > 0:
-            above = [v for v in self.levels if v > cur + 1e-9]
+            above = [v for v in self.levels if v > cur + tol]
             target = above[min(steps, len(above)) - 1] if above else self.levels[-1]
         else:
-            below = [v for v in self.levels if v < cur - 1e-9]
+            below = [v for v in self.levels if v < cur - tol]
             target = below[-min(-steps, len(below))] if below else self.levels[0]
         try:
             target = self.spec.validate(target)
@@ -215,6 +240,7 @@ class PowerLevels(QWidget):
     (один уровень остаётся всегда). ``on_change(levels)`` - после изменения списка."""
 
     COLUMNS = 4
+    TOL = 5e-4
 
     def __init__(self, proxy: Instrument, key: str, levels, on_change: Callable | None = None, parent=None):
         super().__init__(parent)
@@ -234,12 +260,18 @@ class PowerLevels(QWidget):
         return list(self._levels)
 
     def set_levels(self, levels) -> None:
-        self._levels = sorted({round(float(v), 3) for v in levels})
+        vals = sorted(round(float(v), 4) for v in levels if math.isfinite(float(v)))
+        uniq: list[float] = []
+        for v in vals:
+            if not uniq or abs(v - uniq[-1]) > self.TOL:
+                uniq.append(v)
+        self._levels = uniq
         while self.chips.buttons():
             self.chips.remove_button(0)
         for v in self._levels:
-            b = self.chips.add_button(f"{v:g}")
-            b.setToolTip(f"Set the power to {v:g} dBm")
+            txt = _fmt_level(v)
+            b = self.chips.add_button(txt)
+            b.setToolTip(f"Set the power to {txt} dBm")
         self._show()
 
     def _show(self) -> None:
@@ -248,7 +280,7 @@ class PowerLevels(QWidget):
         on = self.proxy.is_connected
         cur = self.proxy.value(self.key)
         i = next((k for k, v in enumerate(self._levels)
-                  if isinstance(cur, (int, float)) and abs(v - cur) < 1e-6), -1) if on else -1
+                  if isinstance(cur, (int, float)) and abs(v - cur) <= self.TOL), -1) if on else -1
         self.chips.set_checked(i)
         for b in self.chips.buttons():
             b.setEnabled(on)
@@ -266,10 +298,10 @@ class PowerLevels(QWidget):
         if not isinstance(cur, (int, float)):
             target = self._levels[0]
         elif steps > 0:
-            above = [v for v in self._levels if v > cur + 1e-6]
+            above = [v for v in self._levels if v > cur + self.TOL]
             target = above[min(steps, len(above)) - 1] if above else self._levels[-1]
         else:
-            below = [v for v in self._levels if v < cur - 1e-6]
+            below = [v for v in self._levels if v < cur - self.TOL]
             target = below[-min(-steps, len(below))] if below else self._levels[0]
         self.proxy.set(self.key, target)
 
@@ -279,7 +311,8 @@ class PowerLevels(QWidget):
 
     def add_current(self) -> bool:
         cur = self.proxy.value(self.key)
-        if not isinstance(cur, (int, float)) or any(abs(v - cur) < 1e-6 for v in self._levels):
+        if not isinstance(cur, (int, float)) or not math.isfinite(cur) \
+                or any(abs(v - cur) <= self.TOL for v in self._levels):
             return False
         self.set_levels([*self._levels, cur])
         self._changed()
@@ -427,8 +460,8 @@ class InstrumentWindow(Window):
         self.init_button = CustomInitButton()
         self.init_button.setToolTip("Reset (*RST) and restore saved values")
         self.init_button.clicked.connect(self._init)
-        # ответ *IDN? прибора занимает всё место между левыми и правыми кнопками заголовка (не кликабелен)
-        self.address = AddressLabel(COORD.display_name(proxy))
+        # имя драйвера прибора занимает всё место между левыми и правыми кнопками заголовка (не кликабелен)
+        self.address = AddressLabel(proxy.name or COORD.display_name(proxy))
         self._update_name()
         self.error_indicator = ErrorIndicator()
         # ход записи виден по цвету рамки самого поля; в заголовке остаётся только индикатор ошибок -
@@ -437,7 +470,7 @@ class InstrumentWindow(Window):
             bar.insert_widget(w, i)
         bar.insert_widget(self.address, 4, stretch=1)
         bar.hBoxLayout.setAlignment(self.on_button, Qt.AlignmentFlag.AlignVCenter)   # он ниже кнопок
-        bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает *IDN? прибора
+        bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает имя драйвера
         self.expand_button = CustomExpandButton()
         self.expand_button.setToolTip("Show / hide all parameters")
         self.expand_button.clicked.connect(lambda: self.set_expanded(not self.expand_button.expanded))
@@ -487,9 +520,9 @@ class InstrumentWindow(Window):
         label_w = 0
         for page in self.pages:
             page.build(UI_COLUMN_WIDTH_PX)
-            label_w = max([label_w, *(ln.label_hint() for ln in page.lines)])
+            label_w = max([label_w, *(ln.label_hint() for ln in page.first_column_lines())])
         for page in self.pages:
-            for ln in page.lines:
+            for ln in page.first_column_lines():
                 ln.set_label_width(label_w)
 
         lay = QVBoxLayout(self)
@@ -591,12 +624,12 @@ class InstrumentWindow(Window):
     def _load_levels(self) -> list[float]:
         raw = self.settings.value(f"{self._prefix}/POWER_LIST", "")
         try:
-            return parse_power_list(str(raw)) or list(DEFAULT_POWER_LIST)
+            return parse_power_list(raw) or list(DEFAULT_POWER_LIST)
         except ValueError:
             return list(DEFAULT_POWER_LIST)
 
     def _levels_edited(self, levels: list[float]) -> None:
-        self.settings.setValue(f"{self._prefix}/POWER_LIST", ", ".join(f"{v:g}" for v in levels))
+        self.settings.setValue(f"{self._prefix}/POWER_LIST", ", ".join(_fmt_level(v) for v in levels))
         self.levels_changed(levels)
 
     def levels_changed(self, levels: list[float]) -> None:
@@ -821,10 +854,15 @@ class InstrumentWindow(Window):
         if sip.isdeleted(self) or sip.isdeleted(self.proxy):
             return
         name = COORD.display_name(self.proxy)
+        driver = (self.proxy.name or self._driver_kind().upper() or name).strip()
         idn = (getattr(self.proxy, "idn", "") or "").strip()
-        self.address.setText(idn or name)
-        detail = idn or self.proxy.name
-        self.address.setToolTip(f"{name}: {detail}\n{self.proxy.address}")
+        self.address.setText(driver)
+        self.setWindowTitle(driver)
+        lines = [f"{name}: {driver}"]
+        if idn and idn != driver:
+            lines.append(idn)
+        lines.append(self.proxy.address)
+        self.address.setToolTip("\n".join(lines))
 
     def show_errors(self) -> None:
         """Клик по индикатору ошибок: вместо таблицы - журнал (выход - вкладка или CLEAR)."""
@@ -867,11 +905,13 @@ class InstrumentWindow(Window):
         self.delay_edit.returnPressed.connect(self.apply_delay)
         self.apply_button = self._tool("APPLY", "Save and reconnect with these settings", self.apply_connection)
         self.apply_button.setProperty("wide", True)
-        table = PanelTable(PanelLine("DRV", self.driver_choice),
-                           PanelLine("MDL", self.model_choice, self.new_model_button),
-                           PanelLine("ADDR", self.address_edit), PanelLine("DLY", self.delay_edit),
-                           PanelLine("", self.apply_button))
-        table.lines[-1].line_layout.insertStretch(1)
+        apply_line = PanelLine("", self.apply_button)
+        apply_line._name.hide()
+        table = PanelTable(
+            (PanelLine("DRV", self.driver_choice), PanelLine("MDL", self.model_choice, self.new_model_button)),
+            PanelLine("ADDR", self.address_edit),
+            (PanelLine("DLY", self.delay_edit), apply_line),
+        )
         table.hide()
         return table
 
@@ -971,7 +1011,7 @@ class InstrumentWindow(Window):
         if sip.isdeleted(self) or not self.PRESET_TRACKS_VALUES or not self.presets.data:
             return
         cur = self.preset_from_current()
-        i = self.presets.find(*cur) if cur is not None else -1
+        i = self.presets.match(*cur) if cur is not None else -1
         if i < 0 and time.monotonic() < self._preset_pending_until:
             return                            # пресет ещё пишется: значения приходят по одному
         if i != self.presets.checked_index():
@@ -999,7 +1039,7 @@ class InstrumentWindow(Window):
         """Для наследника: реакция на новое значение параметра."""
 
     def restore(self) -> None:
-        """Отправить сохранённые значения (только отличающиеся от текущих), в порядке restore_rank."""
+        """Отправить сохранённые значения в порядке restore_rank (неизменённые пропустит драйвер)."""
         for w in sorted(self.saved_widgets, key=lambda w: self.restore_rank(w.key)):
             raw = self.settings.value(self._settings_key(w.key))
             if raw is None:

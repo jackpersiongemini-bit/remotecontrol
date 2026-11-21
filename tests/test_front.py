@@ -55,31 +55,105 @@ def test_line_edit_and_cycle_button(qtbot, opened):
 def test_preset_add_apply_and_eqphase(qtbot, opened):
     sim, proxy, win = opened
     win.channels[0]["period"].set_value(2e-3)
-    _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(2e-3))
     win.channels[0]["width"].set_value(50e-6)
-    _wait(qtbot, proxy, "ch1.width", lambda v: v == pytest.approx(50e-6))
+    win.channels[0]["high"].set_value(3.0)
+    win.channels[0]["low"].set_value(0.0)
+    win.channels[0]["delay"].set_value(5e-6)
+    win.channels[0]["load"].set_value("50")
+    win.channels[1]["period"].set_value(4e-3)
+    win.channels[1]["width"].set_value(100e-6)
+    win.channels[1]["delay"].set_value(10e-6)
+    _wait(qtbot, proxy, "ch2.delay", lambda v: v == pytest.approx(10e-6))
     win._add_preset()
     idx = win.presets.find(2e-3, 50e-6)
     assert idx >= 0
-    eq0 = sim.eqphase_count
+    saved_preset = win.presets.data[idx]
+    assert saved_preset[3]["ch1.high"] == pytest.approx(3.0)
+    assert saved_preset[3]["ch1.load"] == "50"
+    assert saved_preset[3]["ch2.delay"] == pytest.approx(10e-6)
+    # меняем часть параметров: интерфейс при пресете передаст всё, но драйвер запишет только отличия
+    win.channels[0]["period"].set_value(5e-3)
+    win.channels[0]["high"].set_value(1.5)
+    win.channels[1]["delay"].set_value(25e-6)
+    _wait(qtbot, proxy, "ch2.delay", lambda v: v == pytest.approx(25e-6))
+    with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+        proxy.sync()                                     # дождаться окончания EQPHASE от предыдущей записи
+    sent = []
+    orig_set = proxy.set
+    proxy.set = lambda k, v: (sent.append(k), orig_set(k, v))
+    try:
+        del sim.history[:]
+        eq0 = sim.eqphase_count
+        win._apply_preset(idx)
+        _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(2e-3))
+        _wait(qtbot, proxy, "ch1.high", lambda v: v == pytest.approx(3.0))
+        _wait(qtbot, proxy, "ch2.delay", lambda v: v == pytest.approx(10e-6))
+        with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+            proxy.sync()                                 # дождаться окончания всех записей и EQPHASE
+    finally:
+        proxy.set = orig_set
+    # интерфейс передал все параметры пресета
+    assert {"ch1.wave", "ch1.load", "ch1.period", "ch1.width", "ch1.high", "ch1.low", "ch1.delay",
+            "ch2.wave", "ch2.period", "ch2.width", "ch2.delay"} <= set(sent)
+    # драйвер отправил прибору только отличающиеся (period, high на CH1 и delay на CH2)
+    writes = [h for h in sim.history if "?" not in h and h != "EQPHASE"]
+    assert set(writes) == {"C1:BSWV PERI,0.002", "C1:BSWV HLEV,3", "C2:BSWV DLY,1e-05"}, writes
+    assert sim.eqphase_count == eq0 + 2                  # EQPHASE после ch1.period и ch2.delay
+    # повторное применение того же пресета - ни одной записи в прибор
+    del sim.history[:]
+    eq1 = sim.eqphase_count
     win._apply_preset(idx)
-    for n in (1, 2):
-        _wait(qtbot, proxy, f"ch{n}.period", lambda v: v == pytest.approx(2e-3))
-        _wait(qtbot, proxy, f"ch{n}.width", lambda v: v == pytest.approx(50e-6))
-    assert sim.eqphase_count > eq0
+    with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+        proxy.sync()
+    assert [h for h in sim.history if "?" not in h] == [] and sim.eqphase_count == eq1
     # на экране порядок не меняется, в ini - по последнему использованию
     from visalab.front.pulse_gen import PresetGroup
     screen = list(win.presets.data)
     win._apply_preset(0)
     assert win.presets.data == screen
-    assert win.presets.saved_order()[:2] == [screen[0], (2e-3, 50e-6, "PULSE")]
+    assert win.presets.saved_order()[:2] == [screen[0], saved_preset]
     restarted = PresetGroup(win.presets.settings, win.presets.key)
-    assert restarted.data[:2] == [screen[0], (2e-3, 50e-6, "PULSE")]
+    assert restarted.data[:2] == [screen[0], saved_preset]
     idx = win.presets.find(2e-3, 50e-6)
     # пресеты сохраняются в ini и удаляются
     win.presets.set_checked(idx)
     assert win.presets.remove_selected()
     assert win.presets.find(2e-3, 50e-6) < 0
+
+
+def test_preset_full_params_modes_levels_and_highlight(qtbot, opened):
+    """Пресет сохраняет и восстанавливает режимы (BRST) и уровни (включая сдвиг вниз HLEV/LLEV), подсветка следит за всеми."""
+    sim, proxy, win = opened
+    win.channels[0]["high"].set_value(3.5)
+    win.channels[0]["low"].set_value(0.5)
+    win.channels[0]["burst_state"].set_value(True)
+    _wait(qtbot, proxy, "ch1.burst_state", lambda v: v is True)
+    win.channels[0]["burst_cycles"].set_value("5")
+    win.channels[1]["low"].set_value(-3.0)
+    win.channels[1]["high"].set_value(-1.0)
+    _wait(qtbot, proxy, "ch2.high", lambda v: v == pytest.approx(-1.0))
+    _wait(qtbot, proxy, "ch1.burst_cycles", lambda v: v == "5")
+    win._add_preset()
+    idx = win.presets.checked_index()
+    assert idx >= 0
+    win._preset_pending_until = 0.0
+    # поменяли только HLVL на CH1 - подсветка пресета гаснет
+    win.channels[0]["high"].set_value(1.5)
+    _wait(qtbot, proxy, "ch1.high", lambda v: v == pytest.approx(1.5))
+    qtbot.waitUntil(lambda: win.presets.checked_index() == -1, timeout=5000)
+    # сбили пакет и уровни CH2 вверх (потом пресет сдвинет их обратно вниз без ошибки high<=low)
+    win.channels[0]["burst_state"].set_value(False)
+    win.channels[1]["high"].set_value(2.0)
+    win.channels[1]["low"].set_value(0.0)
+    _wait(qtbot, proxy, "ch2.low", lambda v: v == pytest.approx(0.0))
+    win._apply_preset(idx)
+    _wait(qtbot, proxy, "ch1.high", lambda v: v == pytest.approx(3.5))
+    _wait(qtbot, proxy, "ch1.burst_state", lambda v: v is True)
+    _wait(qtbot, proxy, "ch1.burst_cycles", lambda v: v == "5")
+    _wait(qtbot, proxy, "ch2.low", lambda v: v == pytest.approx(-3.0))
+    _wait(qtbot, proxy, "ch2.high", lambda v: v == pytest.approx(-1.0))
+    qtbot.waitUntil(lambda: win.presets.checked_index() == idx, timeout=5000)
+    assert win.error_log.toPlainText() == ""
 
 
 def test_preset_highlight_follows_instrument(qtbot, opened):
@@ -328,8 +402,9 @@ def test_connection_page_from_address(qtbot, opened, settings):
     bar = win.titleBar.hBoxLayout                            # переключатель, рядом ошибки, ..., *IDN? прибора
     order = [bar.itemAt(i).widget() for i in range(bar.count()) if bar.itemAt(i).widget() is not None]
     assert order[:5] == [win.on_button, win.error_indicator, win.sync_button, win.init_button, win.address]
-    # В заголовке отображается ответ *IDN?, занимает оставшееся место и не кликабелен
-    assert win.address.text() == proxy.idn and win.proxy.address in win.address.toolTip()
+    # В заголовке отображается имя драйвера, *IDN? и адрес - в подсказке; не кликабелен
+    assert win.address.text() == proxy.name and win.windowTitle() == proxy.name
+    assert proxy.idn in win.address.toolTip() and win.proxy.address in win.address.toolTip()
     assert win.address.cursor().shape() != Qt.CursorShape.PointingHandCursor
     assert bar.stretch(bar.indexOf(win.address)) > 0
     assert win.address.width() >= win.width() - 260

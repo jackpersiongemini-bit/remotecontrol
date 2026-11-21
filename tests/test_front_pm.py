@@ -83,7 +83,7 @@ def test_trigger_toggle_from_readout(qtbot, pm):
     assert win.widgets["trig.slope"].isEnabled()
     win.readout.trig_button.click()
     _wait(qtbot, proxy, "trig.source", lambda v: v == "EXT")       # внешний запуск: ждём импульс на TRIG IN
-    qtbot.waitUntil(lambda: win.readout.trig_button.text() == "EXT · WAIT", timeout=5000)
+    qtbot.waitUntil(lambda: win.readout.trig_button.text() == "EXT", timeout=5000)
     sim = sim_of(proxy)
     before = proxy.value("meas.power")
     sim.set_signal(on_dbm=-3.0, width=None)
@@ -291,3 +291,27 @@ def test_follow_button_shows_source(qtbot, tmp_path):
         assert win.follow_button.text() == "FOLW" and not COORD.follow.enabled(pm)
     finally:
         COORD.close_all([gen, pm])
+
+
+def test_trigger_level_above_20dbm_with_cal_offset(qtbot, pm):
+    """С калибровкой +40 дБ поле LVL принимает уровни выше +20 дБм и запуск по уровню срабатывает."""
+    proxy, win, _s = pm
+    sim = sim_of(proxy)
+    sim.set_signal(on_dbm=5.0, width=200e-6, period=1e-3, off_dbm=-60.0)
+    win.cal_dir.mkdir(exist_ok=True)
+    save_csv(win.cal_dir / "att40.csv", [(1e6, 40.0), (18e9, 40.0)])
+    win.cal_choice.click()
+    win.cal_choice.set_value("att40.csv")
+    _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(40.0, abs=1e-3))
+    _wait(qtbot, proxy, "offset.state", lambda v: v is True)
+    lvl = win.widgets["trig.level"]
+    lvl.setValue(35.0)
+    lvl.commit(force=True)
+    _wait(qtbot, proxy, "trig.level", lambda v: v == pytest.approx(35.0, abs=1e-3))
+    proxy.set("gate.start", 20e-6)
+    proxy.set("gate.length", 100e-6)
+    proxy.set("trig.source", "INT")
+    _wait(qtbot, proxy, "trig.source", lambda v: v == "INT")
+    qtbot.waitUntil(lambda: proxy.value("meas.power") is not None
+                    and proxy.value("meas.power") == pytest.approx(45.0, abs=0.1), timeout=5000)
+    assert "LEVEL 35 dBm" in win.readout.trig_button.text()

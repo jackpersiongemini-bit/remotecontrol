@@ -33,6 +33,11 @@ def _db(mw: float) -> float:
 class KeysightU2021XASim(SimInstrument):
     IDN = "Keysight Technologies,U2021XA,MY00000001,A1.03.05"
 
+    def __init__(self, trig_level_includes_offset: bool = False):
+        """``trig_level_includes_offset=True`` — прошивка сама сдвигает TRIG:LEV и его MIN/MAX на CORR:GAIN2."""
+        self.trig_level_includes_offset = bool(trig_level_includes_offset)
+        super().__init__()
+
     def reset(self) -> None:
         self.cfg = {"freq": 50e6, "det": "NORM", "vid": "OFF", "aver": True, "coun": 4, "coun_auto": True,
                     "gain2": 0.0, "gain2_stat": False, "src": "IMM", "lev": 0.0, "lev_auto": True,
@@ -151,7 +156,7 @@ class KeysightU2021XASim(SimInstrument):
         self.on("[SENSe[1]:]SWEep[1]:TIME", num("swe", 0, 1), self._get("swe"))
         self.on("TRIGger[:SEQuence[1]]:SOURce", self._src_set, lambda a, g: self.cfg["src"])
         self.on("TRIGger[:SEQuence]:LEVel:AUTO", self._bool("lev_auto"), self._get("lev_auto"))
-        self.on("TRIGger[:SEQuence]:LEVel", self._lev_set, self._get("lev"))
+        self.on("TRIGger[:SEQuence]:LEVel", self._lev_set, self._lev_get)
         self.on("TRIGger[:SEQuence]:SLOPe", self._slop_set, lambda a, g: self.cfg["slop"])
         self.on("TRIGger[:SEQuence]:DELay", num("del", -1, 1), self._get("del"))
         self.on("TRIGger[:SEQuence]:HOLDoff", num("hold", 1e-6, 0.4), self._get("hold"))
@@ -233,8 +238,25 @@ class KeysightU2021XASim(SimInstrument):
         t = a.strip().upper()
         self.cfg["slop"] = {"POS": "POS", "POSITIVE": "POS", "NEG": "NEG", "NEGATIVE": "NEG"}[t]
 
+    def _lev_offset(self) -> float:
+        if self.trig_level_includes_offset and self.cfg["gain2_stat"]:
+            return float(self.cfg["gain2"])
+        return 0.0
+
+    def _lev_get(self, a, g):
+        off = self._lev_offset()
+        arg = a.strip().upper()
+        if arg in ("MIN", "MINIMUM"):
+            val = -40.0 + off
+        elif arg in ("MAX", "MAXIMUM"):
+            val = 20.0 + off
+        else:
+            val = self.cfg["lev"] + off
+        return f"{val:+.6E}"
+
     def _lev_set(self, a, g):
-        self.cfg["lev"] = self.num(a, -40, 20)
+        off = self._lev_offset()
+        self.cfg["lev"] = self.num(a, -40.0 + off, 20.0 + off) - off
         self.cfg["lev_auto"] = False
 
     def _count_set(self, a, g):

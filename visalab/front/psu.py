@@ -193,8 +193,6 @@ class SourceTile(QFrame):
         return self._value
 
     def set_value(self, value, force: bool = False) -> bool:
-        if not force and self._value is not None and bool(value) == bool(self._value):
-            return False
         self.proxy.set(self.key, bool(value))
         return True
 

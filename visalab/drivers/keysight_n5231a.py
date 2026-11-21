@@ -91,6 +91,7 @@ from ..core.params import Action, Kind, Param
 from ..core.units import parse_number
 from ..core.trace import Trace
 from ..profiles import NETWORK_ANALYZER
+from ..transport import TransportTimeout
 
 __all__ = ["KeysightPNA", "PNA_MODELS", "PNAModel"]
 
@@ -171,6 +172,9 @@ class KeysightPNA(VISAInstrument):
         self._armed = False
         self._oper_seen = False
         self._oper_supported = True
+        self._wnum_supported = True
+        self._scale_read_supported = True
+        self._scale_skip: set[tuple[int, str]] = set()
         self._last_cont_read = 0.0
         self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
         self._mark_n = 1
@@ -183,6 +187,8 @@ class KeysightPNA(VISAInstrument):
         self.meas_name = ""
         self._stim_ch = 1
         self._gen_port = 1
+        self._power_offset = 0.0
+        self._power_offset_state = False
         #: режим генератора: (канал, снимок GEN_KEYS, {канал: SWE:MODE}, {pow_coup, pow_modes, pow_levels, trig_source})
         self._gen: tuple[int, dict[str, Any], dict[int, str], dict[str, Any]] | None = None
         self._sel: tuple[int, str] | None = None                # trace.sel: (канал, имя измерения)
@@ -286,7 +292,12 @@ class KeysightPNA(VISAInstrument):
             Param("freq.cw", "Частота CW", section=st, query="SENS1:FREQ:CW?", write="SENS1:FREQ:CW {value}",
                   **{**freq, "also_read": ()}),
             Param("source.power", "Мощность", F, "dBm", section=st, query="SOUR1:POW1?",
-                  write="SOUR1:POW1 {value}", minimum=-90.0, maximum=20.0, tolerance=1e-3),
+                  write="SOUR1:POW1 {value}", minimum=-190.0, maximum=120.0, tolerance=1e-3),
+            Param("power.offset", "Поправка мощности", F, "dB", section=st, query="<virtual>",
+                  write="<virtual>", minimum=-100.0, maximum=100.0, tolerance=1e-3,
+                  also_read=("source.power",)),
+            Param("power.offset_state", "Калибровка мощности", B, section=st, query="<virtual>",
+                  write="<virtual>", also_read=("source.power",)),
             Param("rf.output", "Источник вкл.", B, section=st, query="OUTP?", write="OUTP {value}"),
             Param("bw.if", "Полоса ПЧ", F, "Hz", section=sw, query="SENS1:BWID?", write="SENS1:BWID {value}",
                   minimum=1.0, maximum=15e6, tolerance=1e-3, also_read=("sweep.time",)),
@@ -374,6 +385,9 @@ class KeysightPNA(VISAInstrument):
             slot.name = name
         self._slots[0].enabled = True
         self._oper_supported = True
+        self._wnum_supported = True
+        self._scale_read_supported = True
+        self._scale_skip = set()
         self._setup_oper_sync()
         mode = self.query(f"SENS{self._stim_ch}:SWE:MODE?").strip().upper()
         self._continuous = mode.startswith("CONT")
@@ -397,6 +411,11 @@ class KeysightPNA(VISAInstrument):
         self._cal = None
         self._gen = None
         self._sweep = {}
+        self._power_offset = 0.0
+        self._power_offset_state = False
+
+    def _active_power_offset(self) -> float:
+        return self._power_offset if self._power_offset_state else 0.0
 
     def _catalog(self, channel: int = 1) -> dict[str, str]:
         """{имя измерения: S-параметр} канала."""
@@ -432,6 +451,20 @@ class KeysightPNA(VISAInstrument):
         if self._gen is not None:
             return [self._gen[0]]
         return sorted({s.channel for s in self._slots if s.enabled and s.name}) or [1]
+
+    _POWER_RAW_MIN = -90.0
+    _POWER_RAW_MAX = 20.0
+
+    def validate_param(self, spec: Param, value: Any) -> Any:
+        val = super().validate_param(spec, value)
+        if spec.key == "source.power":
+            off = self._active_power_offset()
+            lo, hi = self._POWER_RAW_MIN - off, self._POWER_RAW_MAX - off
+            if val < lo - 1e-9:
+                raise ValueError(f"{spec.key}: минимум {lo:g} dBm (прибор {self._POWER_RAW_MIN:g} dBm, поправка {off:+.2f} dB)")
+            if val > hi + 1e-9:
+                raise ValueError(f"{spec.key}: максимум {hi:g} dBm (прибор {self._POWER_RAW_MAX:g} dBm, поправка {off:+.2f} dB)")
+        return val
 
     def write_param(self, spec: Param, value: Any) -> None:
         if spec.key == "meas.continuous":
@@ -498,6 +531,32 @@ class KeysightPNA(VISAInstrument):
                 raise ValueError(f"трейс {self._sel[1]!r} не показан на экране анализатора - масштаба нет")
             self.write(cmd + " " + spec.to_scpi(value))
             return
+        if spec.key == "power.offset_state":
+            # Включение / выключение поправки не меняет мощность на порту прибора (безопасно для DUT и датчика)
+            self._power_offset_state = bool(value)
+            return
+        if spec.key == "power.offset":
+            old_off = self._active_power_offset()
+            self._power_offset = float(value)
+            new_off = self._active_power_offset()
+            cur = self._values.get("source.power")
+            if self._power_offset_state and abs(new_off - old_off) > 1e-6 and isinstance(cur, (int, float)):
+                raw = max(self._POWER_RAW_MIN, min(self._POWER_RAW_MAX, float(cur) + new_off))
+                pspec = self._stim_spec(self._params["source.power"])
+                was_armed = self._armed
+                if not self._continuous:
+                    self._abort()
+                try:
+                    super().write_param(pspec, raw)
+                finally:
+                    if self._continuous:
+                        if self._cal is None:
+                            self._ensure_continuous()
+                            self._clear_oper_events()
+                            self._last_cont_read = time.monotonic()
+                    elif was_armed:
+                        self._start_sweep()
+            return
         if spec.key == "stim.channel":
             c = int(value)
             if self._gen is not None and c != self._gen[0]:
@@ -513,6 +572,8 @@ class KeysightPNA(VISAInstrument):
         try:
             if spec.key == "cal.set":
                 self._cal_apply(str(value or "").strip())
+            elif spec.key == "source.power":
+                super().write_param(spec, float(value) + self._active_power_offset())
             elif not self._write_slot(spec, value):
                 super().write_param(spec, value)
         finally:                                  # отказ записи не должен останавливать развёртки
@@ -523,6 +584,10 @@ class KeysightPNA(VISAInstrument):
                     self._last_cont_read = 0.0 if (spec.key.endswith(".enabled") and value) else time.monotonic()
             elif was_armed:
                 self._start_sweep()
+
+    def after_write(self, spec: Param, value: Any) -> None:
+        if spec.key in ("scale.div", "scale.ref", "scale.rpos"):
+            self._sync_sel_scale()
 
     def _write_slot(self, spec: Param, value: Any) -> bool:
         found = self._slot_of(spec.key)
@@ -599,8 +664,15 @@ class KeysightPNA(VISAInstrument):
             return spec.from_scpi(self.query(cmd + "?")) if cmd else None
         if key == "gen.channel":
             return self._gen[0] if self._gen is not None else None
+        if key == "power.offset":
+            return self._power_offset
+        if key == "power.offset_state":
+            return self._power_offset_state
         if key in STIM_KEYS:
-            return super().read_param_raw(self._stim_spec(spec))
+            val = super().read_param_raw(self._stim_spec(spec))
+            if key == "source.power" and isinstance(val, (int, float)):
+                return float(val) - self._active_power_offset()
+            return val
         if key == "sparam":
             return self._catalog().get(self.meas_name)
         found = self._slot_of(key)
@@ -732,6 +804,35 @@ class KeysightPNA(VISAInstrument):
         return out
 
     # ------------------------------------------------------- масштаб трейса trace.sel
+    def _window_trace(self, channel: int, allow_single_fallback: bool = False) -> tuple[int, int] | None:
+        """(окно, трейс) текущего выбранного измерения канала; None - не показано или запрос не поддерживается."""
+        if self._wnum_supported:
+            try:
+                w = int(parse_number(self.query(f"CALC{channel}:PAR:WNUM?")))
+                t = int(parse_number(self.query(f"CALC{channel}:PAR:TNUM?")))
+                return (w, t) if (w >= 1 and t >= 1) else None
+            except ValueError:
+                return None
+            except TransportTimeout:
+                if not self._try_resync():
+                    raise
+                errors = self._check_errors(context="scale")
+                if any(-199 <= code <= -100 for code, _ in errors):
+                    self._wnum_supported = False
+                else:
+                    return None
+        if allow_single_fallback:
+            try:
+                if self.query("DISP:WIND1:STAT?").strip().upper() in ("1", "ON"):
+                    return (1, 1)
+            except ValueError:
+                return None
+            except TransportTimeout:
+                if not self._try_resync():
+                    raise
+                self._check_errors(context="scale")
+        return None
+
     def _scale_cmd(self, key: str) -> str:
         """Команда (без ?) ключа масштаба/обработки для трейса ``trace.sel``; выбирает его измерение."""
         if not self._sel:
@@ -744,11 +845,65 @@ class KeysightPNA(VISAInstrument):
             return f"CALC{c}:SMO:STAT"
         if key == "smooth.aper":
             return f"CALC{c}:SMO:APER"
-        w = int(parse_number(self.query(f"CALC{c}:PAR:WNUM?")))
-        t = int(parse_number(self.query(f"CALC{c}:PAR:TNUM?")))
-        if w < 1 or t < 1:
+        wt = self._window_trace(c, allow_single_fallback=(c == 1 and len(self._catalog(1)) == 1))
+        if wt is None:
             return ""                                        # измерение не показано ни в одном окне
+        w, t = wt
         return f"DISP:WIND{w}:TRAC{t}:Y:" + {"scale.div": "PDIV", "scale.ref": "RLEV", "scale.rpos": "RPOS"}[key]
+
+    def _read_scale(self, channel: int, name: str = "",
+                    allow_single_fallback: bool = False) -> tuple[float, float, float] | None:
+        """(scale.div, scale.ref, scale.rpos) текущего выбранного измерения канала, или None если не читается."""
+        if not self._scale_read_supported or (name and (channel, name) in self._scale_skip):
+            return None
+        wt = self._window_trace(channel, allow_single_fallback=allow_single_fallback)
+        if wt is None:
+            return None
+        w, t = wt
+        base = f"DISP:WIND{w}:TRAC{t}:Y:SCAL:"
+        try:
+            return (
+                self._params["scale.div"].from_scpi(self.query(base + "PDIV?")),
+                self._params["scale.ref"].from_scpi(self.query(base + "RLEV?")),
+                self._params["scale.rpos"].from_scpi(self.query(base + "RPOS?")),
+            )
+        except ValueError:
+            return None
+        except TransportTimeout:
+            if not self._try_resync():
+                raise
+            errors = self._check_errors(context="scale")
+            if any(-199 <= code <= -100 for code, _ in errors):
+                self._scale_read_supported = False
+            elif name and errors:
+                self._scale_skip.add((channel, name))
+            return None
+
+    def _sync_sel_scale(self) -> None:
+        """Обновить масштаб в метаданных уже прочитанной трассы ``trace.sel`` (без ожидания новой развёртки)."""
+        if not self._sel:
+            return
+        div = self._values.get("scale.div")
+        ref = self._values.get("scale.ref")
+        rpos = self._values.get("scale.rpos")
+        if div is None or ref is None or rpos is None:
+            return
+        changed = False
+        for n, slot in enumerate(self._slots, 1):
+            if (slot.channel, slot.name) != self._sel:
+                continue
+            key = f"m{n}.trace"
+            tr = self._sweep.get(key)
+            if not isinstance(tr, Trace):
+                continue
+            new_tr = replace(tr, meta={**(tr.meta or {}), "scale_div": div, "scale_ref": ref, "scale_rpos": rpos})
+            self._sweep[key] = new_tr
+            self._publish(key, new_tr)
+            if n == 1:
+                self._sweep["trace"] = new_tr
+            changed = True
+        if changed:
+            self._publish("scale.div", div)
 
     # ------------------------------------------------------- режим генератора
     def _set_gen(self, on: bool) -> None:
@@ -893,7 +1048,18 @@ class KeysightPNA(VISAInstrument):
             y = [parse_number(t) for t in self.query(f"CALC{c}:DATA? FDATA").split(",") if t.strip()]
             if not y:
                 continue
+            scale = self._read_scale(c, slot.name, allow_single_fallback=(c == 1 and len(cat) == 1))
+            if scale is None and self._sel == (c, slot.name):
+                cached = tuple(self._values.get(k) for k in ("scale.div", "scale.ref", "scale.rpos"))
+                if all(isinstance(v, (int, float)) for v in cached):
+                    scale = cached
             meta = {**(stim if c == self._stim_ch else {}), "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
+            if scale is not None:
+                meta["scale_div"], meta["scale_ref"], meta["scale_rpos"] = scale
+                if self._sel == (c, slot.name):
+                    for k, v in zip(("scale.div", "scale.ref", "scale.rpos"), scale):
+                        if self._values.get(k) != v:
+                            self._publish(k, v)
             if fmt in COMPLEX_FORMATS:                         # пары re,im
                 pairs = len(y) // 2
                 if not pairs:
@@ -985,6 +1151,7 @@ class KeysightPNA(VISAInstrument):
                 raise ValueError(f"трейс {self._sel[1]!r} не показан на экране анализатора")
             self.write(cmd.rsplit(":", 1)[0] + ":AUTO")
             self._read_keys(SCALE_KEYS)
+            self._sync_sel_scale()
             return None
         if name == "trigger":
             if not self._armed and not self._continuous:  # нечего запускать: взвести одну развёртку

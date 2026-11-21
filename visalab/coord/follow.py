@@ -47,6 +47,7 @@ class FrequencyFollow(QObject):
         self.coord = coordinator
         self._enabled: dict[Any, bool] = {}
         self._sources: dict[Any, Any] = {}          # ваттметр -> источник, за которым он сейчас
+        self._source_freqs: dict[Any, float | None] = {}
         self._last: Any = None                       # источник, у которого частота менялась последней
         self._conns: dict[Any, tuple] = {}
         coordinator.links.changed.connect(self._sync)
@@ -93,6 +94,7 @@ class FrequencyFollow(QObject):
                     except (TypeError, RuntimeError):
                         pass
         self._sources.clear()
+        self._source_freqs.clear()
         self._last = None
 
     # ------------------------------------------------------------ приборы
@@ -111,6 +113,7 @@ class FrequencyFollow(QObject):
                         pass
             self._enabled.pop(inst, None)
             self._sources.pop(inst, None)
+            self._source_freqs.pop(inst, None)
             if self._last is inst:
                 self._last = None
             for pm, src in list(self._sources.items()):
@@ -123,9 +126,13 @@ class FrequencyFollow(QObject):
             prof = profile_name(inst)
             conns = []
             if prof in _SOURCE_KEYS:
+                self._source_freqs[inst] = source_frequency(inst)
                 slot = (lambda key, value, i=inst: self._on_source(i, key))
                 inst.param_updated.connect(slot)
                 conns.append((inst.param_updated, slot))
+                st_slot = (lambda _s, i=inst: not i.is_connected and self._source_freqs.pop(i, None))
+                inst.state_changed.connect(st_slot)
+                conns.append((inst.state_changed, st_slot))
             elif prof == "power_meter":
                 slot = (lambda i=inst: self._on_meter_synced(i))
                 inst.sync_done.connect(slot)
@@ -139,6 +146,8 @@ class FrequencyFollow(QObject):
         if sip.isdeleted(self) or sip.isdeleted(src) or key not in _SOURCE_KEYS.get(profile_name(src), ()):
             return
         f = source_frequency(src)
+        prev = self._source_freqs.get(src)
+        self._source_freqs[src] = f
         if f is None:
             if self._last is src:
                 self._last = None
@@ -149,9 +158,18 @@ class FrequencyFollow(QObject):
                         self.changed.emit(pm)
             return
         self._last = src
-        for pm in self.coord.links.proxies():
-            if profile_name(pm) == "power_meter" and self.enabled(pm):
-                self._push(pm, f, src)
+        freq_changed = (prev is not None and abs(f - prev) > max(1e-3, 1e-9 * abs(f))) or (
+            key == "gen.state" and prev is None
+        )
+        for inst in self.coord.links.proxies():
+            prof = profile_name(inst)
+            if prof == "power_meter":
+                if self.enabled(inst):
+                    self._push(inst, f, src, restart=freq_changed)
+                elif freq_changed:
+                    self._restart(inst, src)
+            elif prof == "spectrum_analyzer" and freq_changed:
+                self._restart(inst, src)
 
     def _on_meter_synced(self, pm) -> None:
         """Ваттметр подключился - сразу на частоту источника."""
@@ -162,7 +180,13 @@ class FrequencyFollow(QObject):
         if f is not None:
             self._push(pm, f, src)
 
-    def _push(self, pm, freq: float, src) -> None:
+    def _restart(self, inst, src) -> None:
+        if not inst.is_connected or self.coord.busy(inst) is not None or self.coord.busy(src) is not None:
+            return
+        if "restart" in inst.actions:
+            inst.action("restart")
+
+    def _push(self, pm, freq: float, src, restart: bool = False) -> None:
         if not pm.is_connected or self.coord.busy(pm) is not None or self.coord.busy(src) is not None:
             return                                   # сценарий сам ставит частоты
         spec = pm.params.get("freq")
@@ -171,9 +195,13 @@ class FrequencyFollow(QObject):
         try:
             freq = spec.validate(freq)
         except (TypeError, ValueError):
+            if restart:
+                self._restart(pm, src)
             return                                   # вне диапазона датчика
         self._sources[pm] = src
         cur = pm.value("freq")
         if cur is None or not spec.same(freq, cur):
             pm.set("freq", freq)
+        elif restart:
+            self._restart(pm, src)
         self.changed.emit(pm)

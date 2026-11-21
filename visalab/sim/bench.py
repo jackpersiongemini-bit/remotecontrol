@@ -18,6 +18,7 @@ import math
 import threading
 
 from .agilent_e4446a_sim import AgilentPSASim
+from .keysight_n5231a_sim import KeysightPNASim
 from .keysight_u2021xa_sim import KeysightU2021XASim
 from .rf_generator_sim import RFGenSim
 
@@ -49,6 +50,13 @@ class SimBench:
         with self._lock:
             generators = list(self.generators)
         for g in generators:
+            if isinstance(g, KeysightPNASim):
+                for st in [g.c, *g.other.values()]:
+                    if st.get("type") == "CW" and st.get("outp"):
+                        f = float(st["cw"])
+                        p = float(st["pow2"]) if st.get("pow_mode1") == "OFF" and st.get("pow_mode2") != "OFF" else float(st["pow"])
+                        out.append((f, p - self.loss(f)))
+                continue
             s = getattr(g, "s", {})
             if s.get("rf.output"):
                 f = float(s["rf.frequency"])
@@ -69,13 +77,13 @@ class SimBench:
 
     # ------------------------------------------------------------ симуляторы встают сами
     def _group(self, sim) -> list | None:
-        if isinstance(sim, RFGenSim):
+        if isinstance(sim, (RFGenSim, KeysightPNASim)):
             return self.generators
         if isinstance(sim, AgilentPSASim):
             return self.analyzers
         if isinstance(sim, KeysightU2021XASim):
             return self.meters
-        return None                              # источник питания, ГСС, ВАЦ - к тракту не подключены
+        return None                              # источник питания, ГСС - к тракту не подключены
 
     def join(self, sim) -> None:
         """Поставить симулятор на стенд (ресурс открыт). Генератор, анализатор, ваттметр - по классу."""

@@ -84,3 +84,51 @@ def test_sdg_has_default_delay():
     from visalab.drivers import default_delay
     assert D.COMMAND_DELAY_S == 0.15 and P.COMMAND_DELAY_S == 0.0      # как COMMAND_DELAY_SECONDS в PulseGen.py
     assert default_delay("sdg") == 0.15
+
+
+def test_proxy_skips_unchanged_writes_and_respects_also_read_in_flight(qtbot):
+    """Прокси хранит текущие характеристики прибора и не шлёт драйверу неизменённые параметры,
+    но не пропускает зависимые ключи (also_read), если в той же пачке ушла запись, влияющая на них."""
+    sim = SiglentSDGSim()
+    proxy = InstrumentProxy(SiglentSDG, SimTransport(sim), command_delay_s=0.0)
+    rec = Recorder(proxy)
+    try:
+        with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+            proxy.open()
+        for k, v in (("ch1.wave", "PULSE"), ("ch1.period", 2e-3), ("ch1.width", 50e-6),
+                     ("ch1.high", 3.0), ("ch1.low", 0.0), ("ch1.delay", 1e-6)):
+            proxy.set(k, v)
+        qtbot.waitUntil(lambda: proxy.value("ch1.delay") == pytest.approx(1e-6), timeout=5000)
+        with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+            proxy.sync()
+        del sim.history[:]
+        eq0 = sim.eqphase_count
+        # Повторная отправка тех же значений отфильтровывается в прокси без команд в драйвер/прибор
+        rec.statuses.clear()
+        keys = ("ch1.wave", "ch1.period", "ch1.width", "ch1.high", "ch1.low", "ch1.delay")
+        for k, v in zip(keys, ("PULSE", 2e-3, 50e-6, 3.0, 0.0, 1e-6)):
+            proxy.set(k, v)
+        qtbot.waitUntil(lambda: len(rec.statuses) == len(keys), timeout=2000)
+        assert sim.history == [] and sim.eqphase_count == eq0
+        assert all(rec.last_status(k)[0] is PStatus.WRITTEN for k in keys)
+
+        # Изменили только ch1.high среди всей пачки - прокси пропускает остальные и отправляет только ch1.high
+        for k, v in zip(keys, ("PULSE", 2e-3, 50e-6, 4.0, 0.0, 1e-6)):
+            proxy.set(k, v)
+        qtbot.waitUntil(lambda: proxy.value("ch1.high") == pytest.approx(4.0), timeout=5000)
+        writes = [h for h in sim.history if "?" not in h]
+        assert writes == ["C1:BSWV HLEV,4"] and sim.eqphase_count == eq0
+
+        # Если в пачке меняется ch1.load (влияет на ch1.high через also_read), запись ch1.high не пропускается
+        proxy.set("ch1.high", 6.0)
+        proxy.set("ch1.low", -6.0)
+        qtbot.waitUntil(lambda: proxy.value("ch1.high") == pytest.approx(6.0) and proxy.value("ch1.low") == pytest.approx(-6.0),
+                        timeout=5000)
+        del sim.history[:]
+        proxy.set("ch1.load", "50")                  # HIZ -> 50 Ом меняет пределы уровней
+        proxy.set("ch1.high", 6.0)                   # не должен быть пропущен прокси до завершения ch1.load
+        with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+            proxy.sync()
+        assert any(h.startswith("C1:BSWV HLEV") for h in sim.history)
+    finally:
+        proxy.shutdown()

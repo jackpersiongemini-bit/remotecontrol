@@ -97,7 +97,10 @@ HELP: dict[str, dict[str, str]] = {
     "signal_generator": {
         "rf.output": "RF output on / off. Off: no signal at the RF connector, settings stay.",
         "rf.frequency": "CW frequency of the RF output. Power meters with FOLW on follow it.",
-        "rf.power": "Output level (amplitude) in dBm.",
+        "rf.power": "Output level (amplitude) in dBm (at the DUT when source calibration is active).",
+        "power.offset": "Source path power offset in dB (CAL(f) − GAIN): hardware outputs POW + OFFS to compensate "
+                        "cable loss (+) or external amplifier gain (−).",
+        "power.offset_state": "Source power calibration on / off.",
         "rf.alc": "Automatic level control: the generator holds the output power by its internal detector. "
                   "Turn it off for pulses shorter than the ALC can follow.",
         "mod.output": "Master switch of all modulations. Off: no modulation even if AM / FM / PM / pulse is on.",
@@ -140,7 +143,8 @@ HELP: dict[str, dict[str, str]] = {
         "video_bw": "Video bandwidth of the sensor in NORM mode: wider - follows faster pulses, more noise.",
         "trig.source": "FREE - measures all the time; LEVEL - starts when the input power crosses TLVL; "
                        "EXT - external trigger input.",
-        "trig.level": "Power level that starts a measurement (TRIG LEVEL).",
+        "trig.level": "Power level that starts a measurement (TRIG LEVEL), in the calibrated dBm scale "
+                      "(sensor −40..+20 dBm shifted by the active CAL offset).",
         "trig.level_auto": "AUTO: the trigger level is set by the meter to the middle of the signal.",
         "trig.slope": "Trigger on the rising (POS) or falling (NEG) edge.",
         "trig.delay": "Delay of the measurement after the trigger.",
@@ -239,7 +243,10 @@ HELP: dict[str, dict[str, str]] = {
         "gen.port": "Output port used in generator mode (Port 1 or Port 2).",
         "gen.channel": "Channel used in generator mode (empty - generator mode off).",
         "bw.if": "IF bandwidth: narrower - lower noise, slower sweep.",
-        "source.power": "Source power at the port.",
+        "source.power": "Source power at the port (or at the DUT when source calibration is active).",
+        "power.offset": "Source path power offset in dB (CAL(f) − GAIN): hardware outputs POW + OFFS to compensate "
+                        "cable loss (+) or external amplifier gain (−).",
+        "power.offset_state": "Source power calibration on / off.",
         "rf.output": "Source power on / off (RF at the ports).",
         "avg.state": "Sweep averaging on / off.",
         "avg.count": "Number of sweeps averaged.",

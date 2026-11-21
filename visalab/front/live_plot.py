@@ -181,6 +181,7 @@ def decimate_trace_polygon(trace: Trace, x0: float, x1: float, lo: float, hi: fl
 
 class LivePlot(QWidget):
     DIVS_X, DIVS_Y = 10, 6
+    _SI_UNITS = ("W", "s", "Hz", "V", "A")
 
     def __init__(self, parent=None, min_height: int = 240):
         super().__init__(parent)
@@ -189,6 +190,10 @@ class LivePlot(QWidget):
         self.marker: tuple[float, float] | None = None
         self.x_range: tuple[float, float] | None = None      # фиксированная ось X (время ваттметра)
         self._scale: tuple[float, float, float] | None = None
+        self._fixed_scale: tuple[float, float, float] | None = None
+        self._divs_y: int = self.DIVS_Y
+        self._y_unit: str | None = None
+        self._y_transform = None
         self._mouse: QPointF | None = None
         self._cache: QPixmap | None = None
         self._cache_key: tuple | None = None
@@ -199,6 +204,31 @@ class LivePlot(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     # ------------------------------------------------------------ данные
+    def set_scale(self, scale: tuple[float, float, float] | None, *,
+                  divs_y: int | None = None, y_unit: str | None = None,
+                  y_transform=None) -> None:
+        """Задать шкалу Y ``(lo, hi, step)`` от прибора; ``None`` - автошкала по данным."""
+        new_divs = self.DIVS_Y if divs_y is None else max(1, int(divs_y))
+        if scale is not None:
+            lo, hi, step = float(scale[0]), float(scale[1]), float(scale[2])
+            if math.isfinite(lo) and math.isfinite(hi) and math.isfinite(step) and hi > lo and step > 0:
+                scale = (lo, hi, step)
+            else:
+                scale = None
+        if (scale == self._fixed_scale and new_divs == self._divs_y
+                and y_unit == self._y_unit and y_transform is self._y_transform):
+            return
+        self._fixed_scale = scale
+        self._divs_y = new_divs
+        self._y_unit = y_unit
+        self._y_transform = y_transform
+        if scale is not None:
+            self._scale = scale
+        else:
+            self._scale = None
+            self._rescale()
+        self.update()
+
     def set_traces(self, traces, points: bool = False) -> None:
         cleaned = [(n, t) for n, t in traces if isinstance(t, Trace) and len(t) > 0]
         points = bool(points)
@@ -218,32 +248,42 @@ class LivePlot(QWidget):
         self.update()
 
     def _rescale(self) -> None:
-        """Шкала держится, пока данные в ней и занимают больше четверти; иначе - новая."""
+        """Если задана шкала прибора - держим её; иначе автошкала (держится, пока данные > четверти)."""
+        if self._fixed_scale is not None:
+            self._scale = self._fixed_scale
+            return
         lo = math.inf
         hi = -math.inf
         isfinite = math.isfinite
+        yt = self._y_transform
         for _n, t in self.traces:
             y = t.y
-            t_lo, t_hi = min(y), max(y)
-            if isfinite(t_lo) and isfinite(t_hi):
-                if t_lo < lo:
-                    lo = t_lo
-                if t_hi > hi:
-                    hi = t_hi
-            else:
-                for v in y:
-                    if isfinite(v):
-                        if v < lo:
-                            lo = v
-                        if v > hi:
-                            hi = v
+            if yt is None:
+                t_lo, t_hi = min(y), max(y)
+                if isfinite(t_lo) and isfinite(t_hi):
+                    if t_lo < lo:
+                        lo = t_lo
+                    if t_hi > hi:
+                        hi = t_hi
+                    continue
+            for v in y:
+                if not isfinite(v):
+                    continue
+                if yt is not None:
+                    v = yt(v)
+                    if not isfinite(v):
+                        continue
+                if v < lo:
+                    lo = v
+                if v > hi:
+                    hi = v
         if lo > hi:
             self._scale = None
             return
         s = self._scale
         if s and s[0] <= lo and hi <= s[1] and (hi - lo) >= (s[1] - s[0]) / 4:
             return
-        self._scale = nice_range(lo, hi, self.DIVS_Y)
+        self._scale = nice_range(lo, hi, self._divs_y)
 
     # ------------------------------------------------------------ мышь
     def mouseMoveEvent(self, e):  # noqa: N802 - Qt
@@ -286,8 +326,8 @@ class LivePlot(QWidget):
         for i in range(self.DIVS_X + 1):
             x = r.left() + r.width() * i / self.DIVS_X
             p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
-        for i in range(self.DIVS_Y + 1):
-            y = r.top() + r.height() * i / self.DIVS_Y
+        for i in range(self._divs_y + 1):
+            y = r.top() + r.height() * i / self._divs_y
             p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
         muted = QColor(UI_COLOR_BORDER_LIGHT)
         if not self.traces or self._scale is None:
@@ -298,6 +338,7 @@ class LivePlot(QWidget):
         first = self.traces[0][1]
         x0, x1 = self._x_bounds()
         lo, hi, step = self._scale
+        yt = self._y_transform
 
         def px(x):
             return r.left() + (x - x0) / (x1 - x0) * r.width() if x1 != x0 else r.center().x()
@@ -311,7 +352,13 @@ class LivePlot(QWidget):
         for i, (_name, t) in enumerate(self.traces):
             color = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
             if self.points or len(t) == 1:
-                pts = [QPointF(px(x), py(y)) for x, y in zip(t.x, t.y) if math.isfinite(y)]
+                pts = []
+                for x, y in zip(t.x, t.y):
+                    if not math.isfinite(y):
+                        continue
+                    yv = yt(y) if yt is not None else y
+                    if math.isfinite(yv):
+                        pts.append(QPointF(px(x), py(yv)))
                 if len(pts) > 1:
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     p.setPen(QPen(color, 1.0))
@@ -321,7 +368,7 @@ class LivePlot(QWidget):
                 for pt in pts:
                     p.drawEllipse(pt, 2.2, 2.2)
             else:
-                poly = decimate_trace_polygon(t, x0, x1, lo, hi, r)
+                poly = decimate_trace_polygon(t, x0, x1, lo, hi, r, y_transform=yt)
                 if len(poly) > 1:
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     pen = QPen(color, 1)
@@ -329,14 +376,17 @@ class LivePlot(QWidget):
                     p.setPen(pen)
                     p.drawPolyline(poly)
         if self.marker and math.isfinite(self.marker[0]) and math.isfinite(self.marker[1]):
-            mx, my = px(self.marker[0]), py(self.marker[1])
-            p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPolygon(QPointF(mx, my - 5), QPointF(mx + 5, my), QPointF(mx, my + 5), QPointF(mx - 5, my))
+            my_val = yt(self.marker[1]) if yt is not None else self.marker[1]
+            if math.isfinite(my_val):
+                mx, my = px(self.marker[0]), py(my_val)
+                p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPolygon(QPointF(mx, my - 5), QPointF(mx + 5, my), QPointF(mx, my + 5), QPointF(mx - 5, my))
         p.restore()
 
         # подписи: легенда сверху слева, шкала сверху справа, ось X снизу
-        xu, yu = first.x_unit, first.y_unit
+        xu = first.x_unit
+        yu = self._y_unit if self._y_unit is not None else first.y_unit
         x_legend = r.left() + 2
         for i, (name, _t) in enumerate(self.traces):
             if not name:
@@ -346,7 +396,13 @@ class LivePlot(QWidget):
             p.drawText(QRectF(x_legend, 3, w, 14), Qt.AlignmentFlag.AlignLeft, name)
             x_legend += w
         p.setPen(muted)
-        scale = f"{hi:g} {yu}  {step:g} {yu}/div"
+        if yu in self._SI_UNITS:
+            scale = f"{si_format(hi, yu, 4)}  {si_format(step, yu, 3)}/div"
+        else:
+            div_u = "dB" if yu == "dBm" else yu
+            top_s = f"{hi:g} {yu}" if yu else f"{hi:g}"
+            div_s = f"{step:g} {div_u}/div" if div_u else f"{step:g}/div"
+            scale = f"{top_s}  {div_s}"
         p.drawText(QRectF(r.left(), 3, r.width(), 14), Qt.AlignmentFlag.AlignRight, scale)
         bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 14)
         p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, xu, 4))
@@ -361,7 +417,8 @@ class LivePlot(QWidget):
             return
         key = (self.width(), self.height(), self.devicePixelRatioF(),
                tuple((n, id(t)) for n, t in self.traces),
-               self.points, self.marker, self.x_range, self._scale)
+               self.points, self.marker, self.x_range, self._scale,
+               self._divs_y, self._y_unit, self._y_transform)
         if self._cache is None or self._cache_key != key:
             self._cache = self._render_base()
             self._cache_key = key
@@ -379,7 +436,10 @@ class LivePlot(QWidget):
             lo, hi, _step = self._scale
             x_target = x0 + (m.x() - r.left()) / r.width() * (x1 - x0) if x1 != x0 and r.width() > 0 else x0
             i = nearest_index(first, x_target)
-            yi = first.y[i]
+            yi_raw = first.y[i]
+            if not math.isfinite(yi_raw):
+                return
+            yi = self._y_transform(yi_raw) if self._y_transform is not None else yi_raw
             if not math.isfinite(yi):
                 return
             cx = r.left() + (first.x[i] - x0) / (x1 - x0) * r.width() if x1 != x0 else r.center().x()
@@ -393,5 +453,7 @@ class LivePlot(QWidget):
             p.setBrush(QColor(UI_COLOR_TEXT))
             p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
             p.setPen(QColor(UI_COLOR_TEXT))
+            yu = self._y_unit if self._y_unit is not None else first.y_unit
+            y_txt = si_format(yi, yu, 4) if yu in self._SI_UNITS else (f"{yi:.2f} {yu}" if yu else f"{yi:.3g}")
             p.drawText(QRectF(r.left(), r.top() + 2, r.width() - 4, 14), Qt.AlignmentFlag.AlignRight,
-                       f"{si_format(first.x[i], first.x_unit, 5)}  {yi:.2f} {first.y_unit}")
+                       f"{si_format(first.x[i], first.x_unit, 5)}  {y_txt}")

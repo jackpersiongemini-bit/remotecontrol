@@ -31,6 +31,8 @@ LABELS: dict[str, tuple[str, str]] = {
     "rf.output": ("Выход ВЧ", "ВЧ/Выход"),
     "rf.frequency": ("Частота", "ВЧ/Выход"),
     "rf.power": ("Мощность", "ВЧ/Выход"),
+    "power.offset": ("Поправка мощности", "ВЧ/Калибровка"),
+    "power.offset_state": ("Калибровка мощности", "ВЧ/Калибровка"),
     "rf.alc": ("ALC (АРУ)", "ВЧ/Выход"),
     "ref.source": ("Опора 10 МГц", "ВЧ/Опора"),
     "mod.output": ("Модуляция (общий)", "Модуляция/Общее"),
@@ -62,13 +64,20 @@ class RFSignalGenerator(VISAInstrument):
     def __init__(self, transport, model: RFGenModel | None = None, parent=None,
                  command_delay_s: float | None = None):
         self.model = model or self.DEFAULT_MODEL
+        self._power_offset = 0.0
+        self._power_offset_state = False
         super().__init__(transport, parent, command_delay_s)
+
+    def _active_power_offset(self) -> float:
+        return self._power_offset if self._power_offset_state else 0.0
 
     # ------------------------------------------------------------ описание
     def build_params(self):
         slots = self.PROFILE.expand()
         m = self.model
-        limits = {"rf.frequency": (m.f_min, m.f_max), "rf.power": (m.p_min, m.p_max),
+        limits = {"rf.frequency": (m.f_min, m.f_max),
+                  # статические пределы шире на ±100 дБ; фактические с учётом поправки проверяет validate_param()
+                  "rf.power": (m.p_min - 100.0, m.p_max + 100.0),
                   "am.depth": (0.0, 100.0)}
         params = []
         for key, (write, query, extra) in self.COMMANDS.items():
@@ -89,6 +98,16 @@ class RFSignalGenerator(VISAInstrument):
                 kw["tolerance"] = 1e-9 if key == "rf.frequency" else 1e-4
             kw.update(extra)
             params.append(Param(key, label, write=write, query=query, **kw))
+        if "rf.power" in self.COMMANDS:
+            off_label, off_sec = LABELS["power.offset"]
+            st_label, st_sec = LABELS["power.offset_state"]
+            params += [
+                Param("power.offset", off_label, Kind.FLOAT, unit="dB", section=off_sec,
+                      query="<virtual>", write="<virtual>", minimum=-100.0, maximum=100.0,
+                      tolerance=1e-3, also_read=("rf.power",)),
+                Param("power.offset_state", st_label, Kind.BOOL, section=st_sec,
+                      query="<virtual>", write="<virtual>", also_read=("rf.power",)),
+            ]
         return params
 
     def build_actions(self):
@@ -100,7 +119,49 @@ class RFSignalGenerator(VISAInstrument):
     EXCLUSIVE = {"fm.state": ("pm.state",), "pm.state": ("fm.state",)}
 
     # --------------------------------------------------------------- хуки
+    def on_closed(self) -> None:
+        self._power_offset = 0.0
+        self._power_offset_state = False
+
+    def validate_param(self, spec: Param, value: Any) -> Any:
+        val = super().validate_param(spec, value)
+        if spec.key == "rf.power":
+            off = self._active_power_offset()
+            lo, hi = self.model.p_min - off, self.model.p_max - off
+            if val < lo - 1e-9:
+                raise ValueError(f"{spec.key}: минимум {lo:g} dBm (прибор {self.model.p_min:g} dBm, поправка {off:+.2f} dB)")
+            if val > hi + 1e-9:
+                raise ValueError(f"{spec.key}: максимум {hi:g} dBm (прибор {self.model.p_max:g} dBm, поправка {off:+.2f} dB)")
+        return val
+
+    def read_param_raw(self, spec: Param) -> Any:
+        if spec.key == "power.offset":
+            return self._power_offset
+        if spec.key == "power.offset_state":
+            return self._power_offset_state
+        val = super().read_param_raw(spec)
+        if spec.key == "rf.power" and isinstance(val, (int, float)):
+            return float(val) - self._active_power_offset()
+        return val
+
     def write_param(self, spec: Param, value: Any) -> None:
+        if spec.key == "power.offset_state":
+            # Включение / выключение поправки не меняет мощность на разъёме прибора (безопасно для DUT и датчика)
+            self._power_offset_state = bool(value)
+            return
+        if spec.key == "power.offset":
+            old_off = self._active_power_offset()
+            self._power_offset = float(value)
+            new_off = self._active_power_offset()
+            cur = self._values.get("rf.power")
+            if self._power_offset_state and abs(new_off - old_off) > 1e-6 and isinstance(cur, (int, float)) \
+                    and "rf.power" in self._params:
+                raw = max(self.model.p_min, min(self.model.p_max, float(cur) + new_off))
+                super().write_param(self._params["rf.power"], raw)
+            return
+        if spec.key == "rf.power":
+            super().write_param(spec, float(value) + self._active_power_offset())
+            return
         if value is True:
             for other in self.EXCLUSIVE.get(spec.key, ()):
                 o = self._params.get(other)

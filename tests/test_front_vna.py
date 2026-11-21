@@ -50,7 +50,7 @@ def test_layout(qtbot, vna):
 def test_power_preset_mode(qtbot, vna):
     proxy, win, settings, sim = vna
     spin, pl = win.power_spin, win.power_levels
-    assert [ln.name for ln in win.pages[5].lines] == ["POW", "RF", "PRST"]
+    assert [ln.name for ln in win.pages[5].lines] == ["POW", "RF", "PRST", "", "TABL", "OFFS", "ACAL", "GAIN"]
     assert [b.text() for b in pl.chips.buttons()] == ["-20", "-10", "-5", "0"]
     pl.chips.buttons()[2].click()                              # чип -5 -> мощность
     _wait(qtbot, lambda: sim.c["pow"] == pytest.approx(-5.0) and pl.chips.checked_index() == 2)
@@ -504,3 +504,32 @@ def test_sweeps_do_not_rewrite_ini(qtbot, vna):
     assert not [k for k in writes if k.endswith(("FREQ.START", "FREQ.STOP", "SWEEP.TYPE"))], writes
     win.widgets["freq.start"].set_value(2e9)                   # новое значение - сохраняется
     _wait(qtbot, lambda: any(k.endswith("FREQ.START") for k in writes))
+
+
+def test_source_calibration_on_pwr_tab(qtbot, tmp_path):
+    """Калибровка источника ВАЦ на вкладке PWR: таблица CSV + GAIN по частоте CW компенсируют потери тракта."""
+    cal_dir = tmp_path / "calibrations"
+    cal_dir.mkdir()
+    (cal_dir / "vna_cable.csv").write_text("freq_hz,db\n1e9,-2.0\n3e9,2.0\n", encoding="utf-8")
+    proxy, win, _settings, sim = _open(qtbot, tmp_path)
+    try:
+        proxy.set("freq.cw", 1e9)
+        proxy.set("gen.state", True)
+        _wait(qtbot, lambda: proxy.value("gen.state") is True and proxy.value("freq.cw") == pytest.approx(1e9))
+        sc = win.source_cal
+        sc.refresh_tables()
+        sc.cal_choice.set_value("vna_cable.csv")
+        sc.gain.set_value(-10.0)
+        sc.gain_on.set_value(True)
+        # На 1 ГГц: CAL = −2.0, GAIN = −10.0 -> offset = +8.0 дБ
+        _wait(qtbot, lambda: proxy.value("power.offset") == pytest.approx(8.0) and proxy.value("power.offset_state") is True)
+        # Задаём −10 дБм на DUT -> порт ВАЦ выставляет −2 дБм
+        proxy.set("source.power", -10.0)
+        _wait(qtbot, lambda: sim.c["pow"] == pytest.approx(-2.0) and proxy.value("source.power") == pytest.approx(-10.0))
+        # Переходим на 3 ГГц: CAL = +2.0 -> offset = +12.0 дБ -> порт ВАЦ +2 дБм, на DUT остаётся −10 дБм
+        proxy.set("freq.cw", 3e9)
+        _wait(qtbot, lambda: proxy.value("power.offset") == pytest.approx(12.0) and sim.c["pow"] == pytest.approx(2.0))
+        assert proxy.value("source.power") == pytest.approx(-10.0)
+    finally:
+        win.cleanup()
+        proxy.shutdown()

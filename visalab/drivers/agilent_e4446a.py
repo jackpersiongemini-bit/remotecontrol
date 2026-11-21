@@ -178,6 +178,7 @@ class AgilentPSA(VISAInstrument):
 
     def build_actions(self):
         return [Action("single", "Одна развёртка"), Action("abort", "Прервать"),
+                Action("restart", "Перезапустить развёртку"),
                 Action("marker_peak", "Маркер на пик"),
                 Action("reset", "Сброс *RST", confirm="Сбросить анализатор (Preset)?"),
                 Action("state_list", "Состояния в памяти"), Action("state_save", "Сохранить состояние"),
@@ -254,10 +255,10 @@ class AgilentPSA(VISAInstrument):
         self.opc_latched = False
 
     def _read_trace(self) -> None:
-        # Ось - по прибору, а не по кэшу: частоты могли поменять с передней панели (Local) или другой
-        # программой. Изменились - перечитать и связанные ключи, окно покажет новые значения.
+        # Оси X и Y - по прибору, а не по кэшу: частоты и масштаб могли поменять с передней панели (Local)
+        # или другой программой. Изменились частоты - перечитать и связанные ключи, окно покажет новые значения.
         old = (self._values.get("freq.start"), self._values.get("freq.stop"))
-        self._read_keys(["freq.start", "freq.stop"])
+        self._read_keys(["freq.start", "freq.stop", "ref_level", "scale_div"])
         start, stop = self._values.get("freq.start"), self._values.get("freq.stop")
         if (start, stop) != old:
             self._read_keys(["freq.center", "freq.span", "sweep.time"])
@@ -268,8 +269,8 @@ class AgilentPSA(VISAInstrument):
             return
         span, swt = self._values.get("freq.span"), self._values.get("sweep.time")
         zero_span = span == 0 and swt is not None
-        meta = {k: self._values.get(k) for k in ("bw.res", "bw.video", "detector", "ref_level", "atten",
-                                                  "sweep.time", "avg.state", "avg.count")}
+        meta = {k: self._values.get(k) for k in ("bw.res", "bw.video", "detector", "ref_level", "scale_div",
+                                                  "atten", "sweep.time", "avg.state", "avg.count")}
         if zero_span:                                  # нулевая полоса: ось - время развёртки
             self._trace = Trace.linear(0.0, swt, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
         else:
@@ -307,6 +308,14 @@ class AgilentPSA(VISAInstrument):
             self._publish("meas.continuous", False)
             self._abort()
             self.write("ABOR")
+            return None
+        if name == "restart":
+            was_armed = self._armed
+            self._abort()
+            if not was_armed:
+                self.write("ABOR")
+            if was_armed or self._continuous:
+                self._start_sweep()
             return None
         if name == "marker_peak":
             if not self._values.get("marker.state"):

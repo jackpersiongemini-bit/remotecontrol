@@ -161,3 +161,38 @@ def test_zero_span_button_and_trigger_tabs(qtbot, sa):
     win.widgets["trace.mode"].set_value("MAXHOLD")
     _wait(qtbot, proxy, "trig.source", lambda v: v == "VIDEO")
     _wait(qtbot, proxy, "trace.mode", lambda v: v == "MAXHOLD")
+
+
+def test_panel_table_multi_column_grouping(qtbot, sa):
+    """Родственные параметры сгруппированы в 2-3 столбца без потери порядка ``page.lines`` и выравнивания."""
+    _proxy, win, _s = sa
+    win.show()
+    win.set_expanded(True)
+    win.set_page(0)
+    qtbot.wait(30)
+    freq = win.pages[0]
+    assert [[ln.name for ln in row] for row in freq._rows] == [["CENT", "SPAN"], ["STAR", "STOP"], ["ZERO"]]
+    assert [ln.name for ln in freq.lines] == ["CENT", "SPAN", "STAR", "STOP", "ZERO"]
+    # Две колонки в одной строке имеют равную ширину и одинаковый Y
+    cent, span = freq._rows[0]
+    assert abs(cent.width() - span.width()) <= 2 and cent.y() == span.y()
+    ampl = win.pages[2]
+    assert [[ln.name for ln in row] for row in ampl._rows] == [["RLEV", "ROFF"], ["SDIV", "DET"], ["ATT", "PRE"]]
+    # Вкладка подключения: DRV | MDL, ADDR, DLY | APPLY
+    assert [[ln.name for ln in row] for row in win.connection_page._rows] == [["DRV", "MDL"], ["ADDR"], ["DLY", ""]]
+
+
+def test_fractional_state_name_fits_psa_8char_limit(qtbot, sa):
+    """Дробные частоты в имени пресета анализатора спектра всегда укладываются в 8 символов [A-Z0-9]."""
+    import re
+    proxy, win, _s = sa
+    for cent, span in ((2.45e9, 12.5e6), (2.45e9, 100e6), (1.234e9, 50.5e6), (0.5, 0.25)):
+        proxy.set("freq.center", cent)
+        proxy.set("freq.span", span)
+        _wait(qtbot, proxy, "freq.span", lambda v, s=span: v == pytest.approx(s, rel=1e-3))
+        name = win.state_name()
+        assert name is not None and re.fullmatch(r"[A-Z0-9]{1,8}", name), (cent, span, name)
+    # Реальное сохранение состояния с дробными частотами не даёт ошибку _STATE_NAME
+    win._add_preset()
+    qtbot.waitUntil(lambda: bool(win.presets.names()), timeout=5000)
+    assert win.error_log.toPlainText() == ""

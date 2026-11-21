@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -39,14 +40,15 @@ from ..core.params import ConnectionState, Kind
 from ..core.units import SI_PREFIXES, si_format, si_parse
 from ..core.trace import Trace
 from . import instrument_window as _iw
-from .instrument_window import InstrumentWindow
+from .instrument_window import WINDOW_EVENTS, InstrumentWindow
 from .live_plot import decimate_trace_polygon, nearest_index
 from .params import IndicatorButton, PChoice, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
                     UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
 from .window import mark_growing
 
-__all__ = ["PowerMeterWindow", "PowerReadout", "TracePlot", "CalPlot", "load_csv", "save_csv", "saved_connection", "interpolate"]
+__all__ = ["PowerMeterWindow", "PowerReadout", "TracePlot", "CalPlot", "load_csv", "save_csv", "saved_connection",
+           "interpolate", "pm_time_scale"]
 
 CONNECTION_GROUP = "CONNECTION/POWER_METER"
 OFFSET_LIMIT = 100.0                    # CORR:GAIN2: ±100 dB
@@ -65,6 +67,61 @@ def _dbm_to_w(dbm: float) -> float:
     if not math.isfinite(dbm) or abs(dbm) > 300.0:
         return math.nan
     return 10.0 ** ((dbm - 30.0) / 10.0)
+
+
+def _parse_finite(v, positive: bool = False) -> float | None:
+    if v in (None, ""):
+        return None
+    try:
+        f = float(v)
+        return f if (math.isfinite(f) and (not positive or f > 0)) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _trace_auto_range(trace: Trace | None, unit: str, divs_y: int, db_per_div: float) -> tuple[float, float]:
+    """AUTO-шкала TIME: dBm - сверху максимум, округлённый вверх до 10 dB; W - от 0 с шагом 1/2/5."""
+    finite = [y for y in trace.y if math.isfinite(y) and abs(y) <= 300.0] if (trace is not None and len(trace.y)) else []
+    top_raw = max(finite) if finite else None
+    y_unit = "W" if unit == "W" and trace is not None and trace.y_unit == "dBm" else (
+        trace.y_unit if trace is not None else "")
+    if y_unit == "W":
+        top = (_dbm_to_w(top_raw) if unit == "W" and trace is not None and trace.y_unit == "dBm" else top_raw) \
+            if top_raw is not None else 1e-3
+        if not math.isfinite(top) or top <= 0:
+            top = 1e-3
+        raw = top / divs_y
+        mag = 10.0 ** math.floor(math.log10(raw))
+        step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw * (1 - 1e-9))
+        return 0.0, step * divs_y
+    top = math.ceil(top_raw / 10.0) * 10.0 if top_raw is not None else 0.0
+    return top - divs_y * db_per_div, top
+
+
+def pm_time_scale(proxy, trace: Trace, settings: QSettings | None = None) -> tuple[tuple[float, float, float], int, str, Any]:
+    """Шкала Y графика TIME ваттметра: ``((lo, hi, step), divs_y, y_unit, y_transform)`` - как в окне прибора."""
+    win = _iw.window_for(proxy)
+    plot = getattr(win, "plot", None) if win is not None else None
+    if isinstance(plot, TracePlot):
+        unit, auto, ref, per_div = plot.unit, plot.auto, plot.ref, plot.per_div
+    else:
+        unit, auto, ref, per_div = "dBm", True, None, None
+        if settings is not None:
+            pre = re.sub(r"\W+", "_", getattr(proxy, "address", "") or "").strip("_").upper() or PowerMeterWindow.DEFAULT_KIND.upper()
+            auto = settings.value(f"{pre}/TIME_AUTO", True, type=bool)
+            unit = "W" if settings.value(f"{pre}/TIME_UNIT", "dBm", type=str) == "W" else "dBm"
+            tag = "W" if unit == "W" else "DBM"
+            ref = _parse_finite(settings.value(f"{pre}/TIME_REF_{tag}", None))
+            per_div = _parse_finite(settings.value(f"{pre}/TIME_DIV_{tag}", None), positive=True)
+    divs = TracePlot.DIVS_Y
+    to_w = unit == "W" and trace.y_unit == "dBm"
+    y_unit = "W" if to_w else trace.y_unit
+    y_transform = _dbm_to_w if to_w else None
+    if not auto and ref is not None and per_div:
+        lo, hi = ref - divs * per_div, ref
+    else:
+        lo, hi = _trace_auto_range(trace, unit, divs, TracePlot.DB_PER_DIV)
+    return (lo, hi, (hi - lo) / divs), divs, y_unit, y_transform
 
 
 def _auto(proxy: Instrument, key: str):
@@ -310,7 +367,6 @@ class PowerReadout(QFrame):
         PowerReadout QLabel#main { font-size: 24pt; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT;
             padding: 0; }
         PowerReadout QLabel#mainUnit { color: $UI_COLOR_BORDER_LIGHT; padding: 0 2px 5px 2px; }
-        PowerReadout QPushButton#trig[armed="true"] { color: $UI_COLOR_PROCESS; }
     """)
 
     def __init__(self, secondary: str = "W", main_unit: str = "dBm", parent=None):
@@ -404,18 +460,14 @@ class PowerReadout(QFrame):
             ptav = v.get("ptav")
             sec = "PTAV " + ("---" if ptav is None else f"{ptav:.2f} dB")
         self.sec_button.setText(sec)
-        src, level, auto, armed = v.get("source"), v.get("level"), v.get("level_auto"), v.get("armed")
+        src, level, auto = v.get("source"), v.get("level"), v.get("level_auto")
         if src == "IMM":
             trig = "FREE RUN"
         elif src == "INT":
             trig = "LEVEL AUTO" if auto else ("LEVEL" if level is None else f"LEVEL {level:g} dBm")
         else:
             trig = src or "TRIG ---"
-        waiting = bool(armed) and src != "IMM"
-        self.trig_button.setText(trig + (" · WAIT" if waiting else ""))
-        if self.trig_button.property("armed") != waiting:
-            self.trig_button.setProperty("armed", waiting)
-            _repolish(self.trig_button)
+        self.trig_button.setText(trig)
         cal, acal = v.get("cal"), v.get("acal")
         self.cal_button.setText(acal or "CAL " + ("---" if cal is None else f"{cal:+.2f} dB"))
 
@@ -487,20 +539,7 @@ class TracePlot(QWidget):
     def auto_range(self) -> tuple[float, float]:
         """AUTO: dBm - сверху максимум, округлённый вверх до 10 dB, 10 dB / дел; W - от 0 до максимума
         с круглой ценой деления (1, 2, 5)."""
-        t = self.trace
-        finite = [y for y in t.y if math.isfinite(y) and abs(y) <= 300.0] if (t is not None and len(t.y)) else []
-        top_raw = max(finite) if finite else None
-        if self.y_unit() == "W":
-            top = (_dbm_to_w(top_raw) if self.unit == "W" and t is not None and t.y_unit == "dBm" else top_raw) \
-                if top_raw is not None else 1e-3
-            if not math.isfinite(top) or top <= 0:
-                top = 1e-3
-            raw = top / self.DIVS_Y
-            mag = 10.0 ** math.floor(math.log10(raw))
-            step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw * (1 - 1e-9))
-            return 0.0, step * self.DIVS_Y
-        top = math.ceil(top_raw / 10.0) * 10.0 if top_raw is not None else 0.0
-        return top - self.DIVS_Y * self.DB_PER_DIV, top
+        return _trace_auto_range(self.trace, self.unit, self.DIVS_Y, self.DB_PER_DIV)
 
     def y_range(self) -> tuple[float, float]:
         if not self.auto and self.ref is not None and self.per_div:
@@ -744,12 +783,12 @@ class PowerMeterWindow(InstrumentWindow):
                     lines.append(PanelLine(t, *ws))
             return lines
 
-        # MAIN: частота, усреднение, режим детектора, видеополоса, непрерывный счёт
-        main = add((("FREQ", "freq", lambda p, k: PSpinBox(p, k, ("k", "M", "G"))),
-                    ("AVG", "avg.state", None, ("avg.count", None),         # усреднение: вкл, число, авто
-                     ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)]))),
-                    ("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
-                    ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
+        # MAIN: частота, усреднение; режим детектора, видеополоса и непрерывный счёт - в три столбца
+        main_top = add((("FREQ", "freq", lambda p, k: PSpinBox(p, k, ("k", "M", "G"))),
+                        ("AVG", "avg.state", None, ("avg.count", None),         # усреднение: вкл, число, авто
+                         ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)])))))
+        main_flags = add((("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
+                          ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
         # FREQ следует за генератором / ВАЦ в CW (координатор); кнопка - вкл / выкл, видно за кем
         self.follow_button = IndicatorButton("FOLW")
         self.follow_button.setObjectName("choice")
@@ -758,29 +797,35 @@ class PowerMeterWindow(InstrumentWindow):
         self.follow_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.follow_button.setChecked(s.value(f"{pre}/FREQ_FOLLOW", True, type=bool))
         self.follow_button.toggled.connect(self._set_follow)
-        for ln in main:
+        for ln in main_top:
             if ln.name == "FREQ":
                 ln.add_widget(self.follow_button)
+        main = [*main_top, *([tuple(main_flags)] if main_flags else [])]
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
 
-        # TRIG: настройка запуска (источник, уровень, фронт, задержка, блокировка) и строба (Gate)
+        # TRIG: настройка запуска (источник + фронт, уровень, задержка + блокировка) и строба (Gate)
         trig_src = lambda p, k: PSButton(p, k, [("FREE", "IMM"), ("LEVEL", "INT"), ("EXT", "EXT"), ("BUS", "BUS")])  # noqa: E731
         trig_auto = lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)])  # noqa: E731
-        trig_lines = add((
-            ("SRC", "trig.source", trig_src),
-            ("LVL", "trig.level", lambda p, k: PSpinBox(p, k, ("",)), ("trig.level_auto", trig_auto)),
-            ("SLOP", "trig.slope", None),
-            ("DLY", "trig.delay", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
-            ("HOLD", "trig.holdoff", lambda p, k: PSpinBox(p, k, ("µ", "m", ""))),
-            ("GSTR", "gate.start", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
-            ("GLEN", "gate.length", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
-        ))
+        trig_row1 = add((("SRC", "trig.source", trig_src), ("SLOP", "trig.slope", None)))
         if "trigger" in proxy.actions:
             self.trig_bus_button = ActionButton(proxy, "trigger", "TRIG", "Software trigger (*TRG for BUS mode)")
-            for ln in trig_lines:
+            for ln in trig_row1:
                 if ln.name == "SRC":
                     ln.add_widget(self.trig_bus_button)
                     break
+        trig_lvl = add((("LVL", "trig.level", lambda p, k: PSpinBox(p, k, ("",)), ("trig.level_auto", trig_auto)),))
+        trig_time = add((("DLY", "trig.delay", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
+                         ("HOLD", "trig.holdoff", lambda p, k: PSpinBox(p, k, ("µ", "m", "")))))
+        trig_gate = add((("GSTR", "gate.start", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
+                         ("GLEN", "gate.length", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", "")))))
+        trig_lines: list = []
+        if trig_row1:
+            trig_lines.append(tuple(trig_row1))
+        trig_lines.extend(trig_lvl)
+        if trig_time:
+            trig_lines.append(tuple(trig_time))
+        if trig_gate:
+            trig_lines.append(tuple(trig_gate))
         trig_acts = []
         if "single" in proxy.actions:
             self.single_button = ActionButton(proxy, "single", "SING", "Arm / run a single triggered measurement")
@@ -835,14 +880,15 @@ class PowerMeterWindow(InstrumentWindow):
         plot_line = PanelLine("", self.cal_plot)
         plot_line._name.hide()
         # выбранная таблица и есть «поправка включена»; NONE - без таблицы
-        cal = [plot_line, PanelLine("TABL", self.cal_choice),
-               PanelLine("ACAL", self.acal_start, self.acal_stop, self.acal_points, self.acal_run),
-               PanelLine("GAIN", self.gain_on, self.gain), PanelLine("DUTY", self.duty_src, self.duty)]
+        tabl_row = [PanelLine("TABL", self.cal_choice)]
         if sup("offset"):
             off = PNLabel(proxy, "offset")
             off.setToolTip("Total correction written to the meter (CORR:GAIN2)")
             self.widgets["offset"] = off
-            cal.append(PanelLine("OFFS", off))
+            tabl_row.append(PanelLine("OFFS", off))
+        cal: list = [plot_line, tuple(tabl_row),
+                     PanelLine("ACAL", self.acal_start, self.acal_stop, self.acal_points, self.acal_run),
+                     PanelLine("GAIN", self.gain_on, self.gain), PanelLine("DUTY", self.duty_src, self.duty)]
         acts = []
         if "zero" in proxy.actions:
             self.zero_button = ActionButton(proxy, "zero", "ZERO", "Zero the sensor: remove the signal first!",
@@ -854,11 +900,19 @@ class PowerMeterWindow(InstrumentWindow):
             cal.append(PanelLine("SENS", *acts))
         self.page_specs.append(("CAL", ("offset.state",) if sup("offset.state") else (), PanelTable(*cal)))
 
-        # TIME: режим временной области (график - в избранном, пока TRAC ON) и его настройки
+        # TIME: режим временной области (график - в избранном, пока TRAC ON) и его настройки в два столбца
         # Запуск и строб вынесены на отдельную вкладку TRIG.
-        time_ = add((("TRAC", "trace.state", None), ("TLEN", "trace.time", None), ("TOFS", "trace.offset", None),
-                     ("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
-        time_ += self._time_scale_lines()
+        time_len = add((("TLEN", "trace.time", None), ("TOFS", "trace.offset", None)))
+        time_meas = add((("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
+        time_trac = add((("TRAC", "trace.state", None),))
+        scal_line, ref_line, div_line = self._time_scale_lines()
+        time_: list = []
+        if time_len:
+            time_.append(tuple(time_len))
+        if time_meas:
+            time_.append(tuple(time_meas))
+        time_.append((*time_trac, scal_line) if time_trac else scal_line)
+        time_.append((ref_line, div_line))
         self.page_specs.append(("TIME", ("trace.state",) if sup("trace.state") else (),
                                 PanelTable(*time_)))
 
@@ -887,15 +941,7 @@ class PowerMeterWindow(InstrumentWindow):
         tag = "W" if unit == "W" else "DBM"
         ref = self.settings.value(f"{self._prefix}/TIME_REF_{tag}", None)
         div = self.settings.value(f"{self._prefix}/TIME_DIV_{tag}", None)
-        def _f(v, positive: bool = False) -> float | None:
-            if v in (None, ""):
-                return None
-            try:
-                f = float(v)
-                return f if (math.isfinite(f) and (not positive or f > 0)) else None
-            except (TypeError, ValueError):
-                return None
-        return unit, _f(ref), _f(div, positive=True)
+        return unit, _parse_finite(ref), _parse_finite(div, positive=True)
 
     def _apply_scale(self) -> None:
         """Шкала - в график, поля REF / DIV - в единице шкалы (в AUTO показывают текущую шкалу)."""
@@ -921,6 +967,7 @@ class PowerMeterWindow(InstrumentWindow):
         if self.settings.value(f"{self._prefix}/{name}") != value:
             self.settings.setValue(f"{self._prefix}/{name}", value)
         self._apply_scale()
+        WINDOW_EVENTS.changed.emit(self.proxy)
 
     def _scale_typed(self, what: str, value: float) -> None:
         """Ввели REF или DIV - шкала ручная; второе значение берётся с текущей шкалы."""
@@ -931,12 +978,18 @@ class PowerMeterWindow(InstrumentWindow):
         if self.settings.value(f"{self._prefix}/TIME_{other[0]}_{tag}", None) in (None, ""):
             self.settings.setValue(f"{self._prefix}/TIME_{other[0]}_{tag}", float(other[1]))
         if self.scale_auto.value is not False:
-            self.scale_auto.set_value(False)      # -> _scale_changed -> _apply_scale
+            self.scale_auto.set_value(False)      # -> _scale_changed -> _apply_scale + WINDOW_EVENTS
         else:
             self._apply_scale()
+            WINDOW_EVENTS.changed.emit(self.proxy)
 
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
+
+    def restore(self) -> None:
+        # поправка (CORR:GAIN2) должна восстановиться до trig.level, чтобы его диапазон уже учитывал калибровку
+        self.apply_correction()
+        super().restore()
 
     def _tab_index(self, title: str) -> int:
         for i in range(self.tabs.count()):
@@ -1098,7 +1151,7 @@ class PowerMeterWindow(InstrumentWindow):
         run = self._acal
         self.readout.update_values(power=v("meas.power"), peak=v("meas.peak"), ptav=v("meas.ptav"),
                                    source=v("trig.source"), level=v("trig.level"),
-                                   level_auto=v("trig.level_auto"), armed=v("meas.armed"),
+                                   level_auto=v("trig.level_auto"),
                                    cal=self.total_correction(),
                                    acal=f"ACAL {run.done}/{run.total}" if run is not None else None)
         self.readout.setEnabled(self.proxy.is_connected)

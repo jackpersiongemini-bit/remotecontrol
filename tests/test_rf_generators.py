@@ -111,3 +111,31 @@ def test_smf_alc_auto_reads_as_on(make):
     assert sim.s["rf.alc"] == "AUTO" and rec.values["rf.alc"] is True
     drv.set_param("rf.alc", False); flush(drv)
     assert sim.s["rf.alc"] == "OFF" and rec.values["rf.alc"] is False
+
+
+def test_source_power_calibration(gen):
+    """Калибровка выходного тракта генератора: power.offset / power.offset_state."""
+    drv, sim, rec = gen
+    drv.set_param("rf.power", -10.0); flush(drv)
+    assert sim.s["rf.power"] == pytest.approx(-10.0)
+    # 10 дБ потерь кабеля (+10 дБ поправка): включение не дёргает аппаратную мощность
+    drv.set_param("power.offset", 10.0); flush(drv)
+    drv.set_param("power.offset_state", True); flush(drv)
+    assert sim.s["rf.power"] == pytest.approx(-10.0)
+    assert rec.values["rf.power"] == pytest.approx(-20.0)          # на DUT приходит −20 дБм
+    # Задание −10 дБм на DUT -> прибор выставляет 0 дБм
+    drv.set_param("rf.power", -10.0); flush(drv)
+    assert sim.s["rf.power"] == pytest.approx(0.0)
+    assert rec.values["rf.power"] == pytest.approx(-10.0)
+    # Изменение поправки (на новой частоте кабель теряет 11.5 дБ) держит −10 дБм на DUT
+    drv.set_param("power.offset", 11.5); flush(drv)
+    assert sim.s["rf.power"] == pytest.approx(1.5)
+    assert rec.values["rf.power"] == pytest.approx(-10.0)
+    # Динамический предел с учётом поправки (+11.5 дБ -> макс на DUT = p_max − 11.5)
+    drv.set_param("rf.power", drv.model.p_max - 11.0); flush(drv)
+    assert rec.last_status("rf.power")[0] is PStatus.INVALID
+    assert sim.s["rf.power"] == pytest.approx(1.5)
+    # Выключение калибровки не дёргает аппаратную мощность
+    drv.set_param("power.offset_state", False); flush(drv)
+    assert sim.s["rf.power"] == pytest.approx(1.5)
+    assert rec.values["rf.power"] == pytest.approx(1.5)

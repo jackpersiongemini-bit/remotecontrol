@@ -59,6 +59,11 @@ class KeysightU2021XA(VISAInstrument):
         self._continuous = True
         self._armed = False
         self._results: dict[str, float | None] = dict.fromkeys(RESULT_KEYS)
+        #: границы TRIG:LEV прибора и сдвигает ли датчик TRIG:LEV на CORR:GAIN2 сам (определяется по TRIG:LEV? MAX)
+        self._trig_level_min = -40.0
+        self._trig_level_max = 20.0
+        self._trig_level_offset_in_hw: bool | None = None
+        self._bounds_dirty = True
         super().__init__(transport, parent, command_delay_s)
 
     # ------------------------------------------------------------ описание
@@ -71,6 +76,12 @@ class KeysightU2021XA(VISAInstrument):
             Param("trace", "Мощность во времени", Kind.TRACE, "dBm", section=meas, group="MEAS"),
             Param("meas.armed", "Ждём запуск", B, section=meas, query="<virtual>"),
             Param("meas.continuous", "Непрерывно", B, section=trig, query="<virtual>", write="<virtual>"),
+            # offset / offset.state читаются до trig.level, чтобы сразу учесть поправку в шкале уровня запуска
+            Param("offset", "Поправка", F, "dB", section=sens, query="CORR:GAIN2?",
+                  write="CORR:GAIN2 {value}", minimum=-100.0, maximum=100.0, tolerance=1e-3,
+                  also_read=("trig.level",)),
+            Param("offset.state", "Поправка вкл.", B, section=sens, query="CORR:GAIN2:STAT?",
+                  write="CORR:GAIN2:STAT {value}", also_read=("trig.level",)),
             Param("trig.source", "Запуск", E, section=trig, query="TRIG:SOUR?", write="TRIG:SOUR {value}",
                   choices=("IMM", "INT", "EXT", "BUS", "HOLD"),
                   labels=("Свободный", "По уровню", "Внешний", "Программный", "Удержание"),
@@ -78,7 +89,7 @@ class KeysightU2021XA(VISAInstrument):
                             ("EXT", "EXT"), ("EXT", "EXTERNAL"), ("IMM", "IMM"), ("IMM", "IMMEDIATE")),
                   also_read=("detector", "trig.level", "trig.level_auto", "trig.slope")),
             Param("trig.level", "Уровень запуска", F, "dBm", section=trig, query="TRIG:LEV?",
-                  write="TRIG:LEV {value}", minimum=-40.0, maximum=20.0, tolerance=1e-3,
+                  write="TRIG:LEV {value}", minimum=-140.0, maximum=120.0, tolerance=1e-3,
                   also_read=("trig.level_auto",)),
             Param("trig.level_auto", "Уровень авто", B, section=trig, query="TRIG:LEV:AUTO?",
                   write="TRIG:LEV:AUTO {value}", also_read=("trig.level",)),
@@ -111,16 +122,13 @@ class KeysightU2021XA(VISAInstrument):
                   write="AVER:COUN {value}", minimum=1, maximum=1024, also_read=("avg.auto",)),
             Param("avg.auto", "Усреднения авто", B, section=sens, query="AVER:COUN:AUTO?",
                   write="AVER:COUN:AUTO {value}", also_read=("avg.count",)),
-            Param("offset", "Поправка", F, "dB", section=sens, query="CORR:GAIN2?",
-                  write="CORR:GAIN2 {value}", minimum=-100.0, maximum=100.0, tolerance=1e-3),
-            Param("offset.state", "Поправка вкл.", B, section=sens, query="CORR:GAIN2:STAT?",
-                  write="CORR:GAIN2:STAT {value}"),
         ]
 
     def build_actions(self):
         return [
             Action("single", "Одно измерение"),
             Action("abort", "Отменить ожидание"),
+            Action("restart", "Перезапустить измерение"),
             Action("trigger", "Программный запуск (BUS)"),
             Action("zero", "Обнуление", confirm="Снимите сигнал со входа датчика. Обнулить?"),
             Action("calibrate", "Калибровка"),
@@ -131,6 +139,10 @@ class KeysightU2021XA(VISAInstrument):
     def on_connected(self) -> None:
         self._armed = False
         self._results = dict.fromkeys(RESULT_KEYS)
+        self._trig_level_min = -40.0
+        self._trig_level_max = 20.0
+        self._trig_level_offset_in_hw = None
+        self._bounds_dirty = True
         self.write("INIT:CONT OFF")
         self.write("ABOR")
         for n in FEEDS:
@@ -146,6 +158,10 @@ class KeysightU2021XA(VISAInstrument):
     def on_closed(self) -> None:
         self._armed = False
         self._results = dict.fromkeys(RESULT_KEYS)
+        self._trig_level_min = -40.0
+        self._trig_level_max = 20.0
+        self._trig_level_offset_in_hw = None
+        self._bounds_dirty = True
 
     def on_disconnecting(self) -> None:
         if self._armed:
@@ -185,6 +201,50 @@ class KeysightU2021XA(VISAInstrument):
             self._set_armed(False)
         return was_armed, was_cont_free
 
+    def _active_offset(self) -> float:
+        """Активная поправка CORR:GAIN2, дБ (0, если выключена)."""
+        if self._values.get("offset.state") is True:
+            off = self._values.get("offset")
+            if isinstance(off, (int, float)) and math.isfinite(off):
+                return float(off)
+        return 0.0
+
+    def _refresh_trig_bounds(self) -> None:
+        """Узнать у прибора границы TRIG:LEV? MIN/MAX и понять, сдвигает ли датчик TRIG:LEV на CORR:GAIN2 сам."""
+        self._bounds_dirty = False
+        off = self._active_offset()
+        lo, hi = -40.0, 20.0
+        try:
+            q_lo = self.query_float("TRIG:LEV? MIN")
+            q_hi = self.query_float("TRIG:LEV? MAX")
+            if math.isfinite(q_lo) and math.isfinite(q_hi) and q_lo < q_hi:
+                lo, hi = q_lo, q_hi
+        except ValueError:
+            self._check_errors(context="trig.level bounds")
+        self._trig_level_min, self._trig_level_max = lo, hi
+        if abs(off) >= 0.1:
+            self._trig_level_offset_in_hw = abs(hi - (20.0 + off)) < abs(hi - 20.0)
+
+    def _trig_level_bounds(self) -> tuple[float, float]:
+        """Допустимый диапазон trig.level в шкале показаний (с учётом активной поправки)."""
+        if self._trig_level_offset_in_hw is False:
+            off = self._active_offset()
+            return self._trig_level_min + off, self._trig_level_max + off
+        return self._trig_level_min, self._trig_level_max
+
+    def validate_param(self, spec: Param, value: Any) -> Any:
+        value = super().validate_param(spec, value)
+        if spec.key == "trig.level":
+            if self._bounds_dirty and self.transport.is_open:
+                self._refresh_trig_bounds()
+            lo, hi = self._trig_level_bounds()
+            if value < lo - 1e-6 or value > hi + 1e-6:
+                off = self._active_offset()
+                raise ValueError(
+                    f"{spec.label}: {value:g} дБм вне диапазона {lo:g}..{hi:g} дБм (поправка {off:+g} дБ)"
+                )
+        return value
+
     def write_param(self, spec: Param, value: Any) -> None:
         key = spec.key
         if key == "meas.continuous":
@@ -200,8 +260,16 @@ class KeysightU2021XA(VISAInstrument):
             return
         try:
             if key == "trig.level":
+                if self._bounds_dirty:
+                    self._refresh_trig_bounds()
+                off = self._active_offset()
+                hw_value = value - off if self._trig_level_offset_in_hw is False else value
                 self.write("TRIG:LEV:AUTO OFF")               # ручной уровень не должен конфликтовать с AUTO
-            super().write_param(spec, value)
+                self.write(spec.write.format(value=spec.to_scpi(hw_value)))
+            else:
+                super().write_param(spec, value)
+                if key in ("offset", "offset.state"):
+                    self._bounds_dirty = True
         finally:
             if was_cont_free:
                 self._apply_run_mode()
@@ -261,7 +329,17 @@ class KeysightU2021XA(VISAInstrument):
             return self._armed
         if spec.key in ("trace.time", "trace.offset") and not self._normal:
             return None
-        return super().read_param_raw(spec)
+        if spec.key == "trig.level":
+            if self._bounds_dirty:
+                self._refresh_trig_bounds()
+            hw = super().read_param_raw(spec)
+            if self._trig_level_offset_in_hw is False:
+                return hw + self._active_offset()
+            return hw
+        val = super().read_param_raw(spec)
+        if spec.key in ("offset", "offset.state") and val != self._values.get(spec.key):
+            self._bounds_dirty = True
+        return val
 
     def read_group(self, group: str) -> dict[str, Any]:
         # Результаты не запрашиваются при синхронизации: FETC? без готового измерения
@@ -368,6 +446,15 @@ class KeysightU2021XA(VISAInstrument):
             self._abort()
             self.write("INIT:CONT OFF")
             self.write("ABOR")
+            return None
+        if name == "restart":
+            was_armed, was_cont_free = self._stop_acquisition()
+            if not (was_armed or was_cont_free):
+                self.write("ABOR")
+            if was_cont_free or self._continuous:
+                self._apply_run_mode()
+            elif was_armed:
+                self._arm()
             return None
         if name == "trigger":
             self.write("*TRG")

@@ -25,7 +25,8 @@ from ..core.units import si_format
 from .calibration import fit_gain_table, save_csv
 from .scenario import MEASURE_TIMEOUT_S, Device, Run, Scenario, ScenarioError, Stopped
 
-__all__ = ["frequency_points", "FrequencySweep", "AutoCalibration", "AcalResult", "acal_file_name"]
+__all__ = ["frequency_points", "FrequencySweep", "AutoCalibration", "SourceAutoCalibration",
+           "AcalResult", "acal_file_name"]
 
 
 def frequency_points(start: float, stop: float, points: int) -> list[float]:
@@ -42,9 +43,9 @@ def _compact(freq: float) -> str:
     return si_format(freq, "Hz", 6).replace(" ", "").replace("Hz", "")
 
 
-def acal_file_name(start: float, stop: float, points: int) -> str:
+def acal_file_name(start: float, stop: float, points: int, prefix: str = "ACAL") -> str:
     """Имя таблицы ACAL: ``ACAL_1G-18G_101.csv`` (та же полоса и число точек - файл перезаписывается)."""
-    return f"ACAL_{_compact(start)}-{_compact(stop)}_{int(points)}.csv"
+    return f"{prefix}_{_compact(start)}-{_compact(stop)}_{int(points)}.csv"
 
 
 class FrequencySweep(Scenario):
@@ -52,6 +53,9 @@ class FrequencySweep(Scenario):
 
     NAME = "SWEEP"
     needs = ("signal_generator", "power_meter")
+    source_profile = "signal_generator"
+    freq_key = "rf.frequency"
+    power_key = "rf.power"
     #: пауза после смены частоты до замера, с (генератор и датчик установились)
     SETTLE_S = 0.3
     #: показание устоялось: два подряд различаются не больше, dB
@@ -76,39 +80,40 @@ class FrequencySweep(Scenario):
 
     # ------------------------------------------------------------ шаги
     def steps(self, run: Run):
-        gen, pm = run.device("signal_generator"), run.device("power_meter")
-        gen.require("rf.frequency", "rf.power", "rf.output")
+        gen, pm = run.device(self.source_profile), run.device("power_meter")
+        fk, pk = self.freq_key, self.power_key
+        gen.require(fk, pk, "rf.output")
         pm.require("meas.power")
         for f in self.freqs:                     # вне диапазона модели - отказ до первой команды
-            gen.check("rf.frequency", f)
+            gen.check(fk, f)
             if pm.supports("freq"):
                 pm.check("freq", f)
-        if gen.value("rf.power") is None:
-            raise ScenarioError(f"{gen.name}: level (rf.power) unknown - sync the generator")
+        if gen.value(pk) is None:
+            raise ScenarioError(f"{gen.name}: level ({pk}) unknown - sync the source")
         self.check(run, gen, pm)
         saved: list[tuple[Device, str, object]] = []      # что вернуть (в обратном порядке)
         self.points = []
         try:
-            self.remember(saved, gen, "rf.frequency")
+            self.remember(saved, gen, fk)
             if pm.supports("freq"):
                 self.remember(saved, pm, "freq")
             yield from self.prepare(run, gen, pm, saved)
             n = len(self.freqs)
             for i, f in enumerate(self.freqs):
                 run.report(i, n, si_format(f, "Hz", 6))
-                sets = [gen.set("rf.frequency", f)]
+                sets = [gen.set(fk, f)]
                 if pm.supports("freq"):
                     sets.append(pm.set("freq", f))           # поправка датчика на этой частоте
                 # что приборы подтвердили (могли округлить) - с этим и сверять, не поменял ли кто
-                confirmed = list(zip(((gen, "rf.frequency"), (pm, "freq")), (yield sets)))
+                confirmed = list(zip(((gen, fk), (pm, "freq")), (yield sets)))
                 if self.settle_s > 0:
                     yield run.sleep(self.settle_s)
                 power = yield from self.reading(run, pm, f)
                 if not gen.connected:
                     raise ScenarioError(f"{gen.name}: connection lost during {self.NAME}")
-                raw_level = gen.value("rf.power")
+                raw_level = gen.value(pk)
                 if raw_level is None:
-                    raise ScenarioError(f"{gen.name}: level (rf.power) lost during {self.NAME}")
+                    raise ScenarioError(f"{gen.name}: level ({pk}) lost during {self.NAME}")
                 level = float(raw_level)
                 self.check_point(gen, pm, f, power, level, confirmed)
                 self.points.append((f, power, level))
@@ -280,3 +285,39 @@ class AutoCalibration(FrequencySweep):
                 + (f", DUTY {duty:+.2f} dB" if duty else "") + (f", table {self.path.stem}" if self.path is not None else ""))
         return AcalResult(gain=gain, table=table, response=response, duty_db=duty, path=self.path,
                           points=list(self.points))
+
+
+class SourceAutoCalibration(AutoCalibration):
+    """ACAL источника СВЧ (генератор ``signal_generator`` или ВАЦ ``network_analyzer`` в CW) по ваттметру.
+
+    На время измерения выключается поправка источника (``power.offset_state``), а ваттметр выступает
+    эталоном в опорной плоскости (его собственная поправка не сбрасывается). Для ВАЦ на время
+    сценария включается режим генератора (``gen.state``). Результат - GAIN и таблица CAL(f) CSV:
+    поправка источника ``CAL(f) − GAIN`` компенсирует потери / усиление выходного тракта."""
+
+    NAME = "SRC ACAL"
+
+    def __init__(self, start: float, stop: float, points: int, source_profile: str = "signal_generator",
+                 path=None, duty_db: float = 0.0, **kw):
+        self.source_profile = source_profile
+        self.needs = (source_profile, "power_meter")
+        if source_profile == "network_analyzer":
+            self.freq_key = "freq.cw"
+            self.power_key = "source.power"
+        else:
+            self.freq_key = "rf.frequency"
+            self.power_key = "rf.power"
+        super().__init__(start, stop, points, path=path, duty_db=duty_db, **kw)
+
+    def check(self, run: Run, gen: Device, pm: Device) -> None:
+        if self.source_profile == "signal_generator":
+            self.pulsed = gen.value("pulse.state") is True and gen.value("mod.output") is not False
+        else:
+            self.pulsed = False
+
+    def prepare(self, run: Run, gen: Device, pm: Device, saved: list):
+        if gen.supports("power.offset_state"):
+            yield from self.change(saved, gen, "power.offset_state", False)
+        if self.source_profile == "network_analyzer" and gen.supports("gen.state"):
+            yield from self.change(saved, gen, "gen.state", True)
+        yield from FrequencySweep.prepare(self, run, gen, pm, saved)

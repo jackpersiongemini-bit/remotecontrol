@@ -701,6 +701,10 @@ class VISAInstrument(QObject):
                 log.exception("%s: запись %s", self.NAME, key)
                 self.param_status.emit(key, PStatus.ERROR, str(exc))
 
+    def validate_param(self, spec: Param, value: Any) -> Any:
+        """Проверка значения перед записью. Переопределить для динамических границ."""
+        return spec.validate(value)
+
     def _apply(self, key: str, value: Any) -> None:
         spec = self._params.get(key)
         if spec is None:
@@ -709,7 +713,7 @@ class VISAInstrument(QObject):
             self.param_status.emit(key, PStatus.INVALID, "параметр только для чтения")
             return
         try:
-            value = spec.validate(value)
+            value = self.validate_param(spec, value)
         except (ValueError, TypeError) as exc:
             self.param_status.emit(key, PStatus.INVALID, str(exc))
             self._read_keys([key])  # вернуть GUI фактическое значение

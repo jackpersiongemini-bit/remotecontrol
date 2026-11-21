@@ -9,7 +9,7 @@ from PyQt6.QtCore import QSettings, QTimer
 
 from conftest import attach, l3, sim_of, worker
 from visalab.coord import (COORD, LINKS, AutoCalibration, Coordinator, FrequencySweep, ProxyLinks, Scenario,
-                           ScenarioError, acal_file_name, frequency_points, load_csv)
+                           ScenarioError, SourceAutoCalibration, acal_file_name, frequency_points, load_csv)
 from visalab.core import ConnectionState, PStatus
 from visalab.instruments import InstrumentProxy
 from visalab.transport import SimTransport
@@ -516,6 +516,105 @@ def test_vna_in_cw_is_the_generator(qtbot):
         assert run.result[0] == pytest.approx(2e9)
         assert vna.value("source.power") == pytest.approx(-7.0)              # rf.power -> source.power
         assert vna.value("freq.cw") == pytest.approx(2.5e9)                  # возврат: freq.cw как было
+    finally:
+        coord.stop_all(wait_ms=3000)
+        coord.close_all()
+
+
+def test_source_acal_generator_and_vna(qtbot, tmp_path):
+    """SourceAutoCalibration работает и для генератора СВЧ, и для ВАЦ (временно включает CW, не сбрасывает
+    калибровку эталонного ваттметра и восстанавливает исходные состояния)."""
+    # Линейная потеря кабеля от 8 дБ (1 ГГц) до 12 дБ (3 ГГц) -> среднее 10 дБ
+    bench = SimBench(loss_db=6.0, slope_db_per_ghz=2.0)
+    bench.INTERVAL_MS = 20
+    coord = Coordinator(ProxyLinks())
+    gen_drv, gen_sim_cls = DRIVERS["e8267d"]
+    vna_drv, vna_sim_cls = DRIVERS["pna"]
+    pm_drv, pm_sim_cls = DRIVERS["u2021xa"]
+    gen_sim, vna_sim, pm_sim = gen_sim_cls(), vna_sim_cls(), pm_sim_cls()
+    gen = coord.attach(InstrumentProxy(gen_drv, SimTransport(gen_sim, bench=bench)))
+    vna = coord.attach(InstrumentProxy(vna_drv, SimTransport(vna_sim, bench=bench)))
+    pm = coord.attach(InstrumentProxy(pm_drv, SimTransport(pm_sim, bench=bench)))
+    for p in (gen, vna, pm):
+        _open(qtbot, p)
+    try:
+        # 1) Генератор СВЧ: собственная поправка генератора на время ACAL выключается, поправка ваттметра остаётся
+        gen.set("rf.power", -5.0)
+        gen.set("power.offset", 4.0)
+        gen.set("power.offset_state", True)
+        pm.set("offset", 2.0)                                   # эталонный ваттметр откалиброван с +2 дБ
+        pm.set("offset.state", True)
+        _wait_value(qtbot, gen, "power.offset_state", lambda v: v is True)
+        _wait_value(qtbot, pm, "offset.state", lambda v: v is True)
+        p1 = tmp_path / "src_gen.csv"
+        run1 = _finish(qtbot, coord.start(
+            SourceAutoCalibration(1e9, 3e9, 3, source_profile="signal_generator", path=p1, settle_s=0.05),
+            bind={"signal_generator": gen, "power_meter": pm},
+        ))
+        assert run1.state == "done", run1.error
+        # Потери −8/−10/−12 дБ + 2 дБ на ваттметре => измеренная характеристика R = −6/−8/−10 дБ, GAIN = −8 дБ
+        assert run1.result.gain == pytest.approx(-8.0, abs=0.15)
+        pts1 = load_csv(p1)
+        assert len(pts1) == 3 and pts1[0][1] == pytest.approx(-2.0, abs=0.15) and pts1[-1][1] == pytest.approx(2.0, abs=0.15)
+        assert gen.value("power.offset_state") is True          # восстановлено
+        assert pm.value("offset.state") is True and pm.value("offset") == pytest.approx(2.0)
+
+        # 2) ВАЦ: изначально в LIN-развёртке; SourceAutoCalibration временно включает CW и возвращает LIN
+        gen.set("rf.output", False)
+        _wait_value(qtbot, gen, "rf.output", lambda v: v is False)
+        pm.set("offset.state", False)
+        _wait_value(qtbot, pm, "offset.state", lambda v: v is False)
+        assert vna.value("gen.state") is False and vna.value("sweep.type") == "LIN"
+        p2 = tmp_path / "src_vna.csv"
+        run2 = _finish(qtbot, coord.start(
+            SourceAutoCalibration(1e9, 3e9, 3, source_profile="network_analyzer", path=p2, settle_s=0.05),
+            bind={"network_analyzer": vna, "power_meter": pm},
+        ))
+        assert run2.state == "done", run2.error
+        assert run2.result.gain == pytest.approx(-10.0, abs=0.15)
+        pts2 = load_csv(p2)
+        assert len(pts2) == 3 and pts2[0][1] == pytest.approx(-2.0, abs=0.15) and pts2[-1][1] == pytest.approx(2.0, abs=0.15)
+        assert vna.value("gen.state") is False and vna.value("sweep.type") == "LIN"
+    finally:
+        coord.stop_all(wait_ms=3000)
+        for p in (gen, vna, pm):
+            coord.close_instrument(p)
+        coord.close_all()
+
+
+def test_source_freq_change_aborts_and_restarts_pm_and_sa(qtbot):
+    """При смене частоты источника СВЧ (генератора / ВАЦ в CW) ваттметр и анализатор спектра
+    прерывают текущее измерение/развёртку (ABOR) и сразу перезапускают новое (в режиме CONT)."""
+    coord = Coordinator(ProxyLinks())
+    gen = coord.attach(_proxy("e8267d"))
+    pm = coord.attach(_proxy("u2021xa"))
+    sa = coord.attach(_proxy("e4446a"))
+    for p in (gen, pm, sa):
+        _open(qtbot, p)
+    try:
+        pm_sim, sa_sim = _sim(pm), _sim(sa)
+        _wait_value(qtbot, pm, "freq", lambda v: v == pytest.approx(gen.value("rf.frequency")))
+        pm_idx0 = len(pm_sim.history)
+        sa_idx0 = len(sa_sim.history)
+
+        # 1) FOLW включён: смена частоты генератора -> ABOR и перезапуск на PM и на SA
+        gen.set("rf.frequency", 3.5e9)
+        _wait_value(qtbot, pm, "freq", lambda v: v == pytest.approx(3.5e9))
+        qtbot.waitUntil(lambda: "ABOR" in sa_sim.history[sa_idx0:] and "INIT" in sa_sim.history[sa_idx0:], timeout=5000)
+        qtbot.waitUntil(lambda: "ABOR" in pm_sim.history[pm_idx0:], timeout=5000)
+        assert pm.value("meas.continuous") is True and sa.value("meas.continuous") is True
+
+        # 2) FOLW выключен: частота PM остаётся 3.5 GHz, но ABOR + перезапуск всё равно выполняются на PM и SA
+        coord.follow.set_enabled(pm, False)
+        pm_idx1 = len(pm_sim.history)
+        sa_idx1 = len(sa_sim.history)
+        gen.set("rf.frequency", 4.2e9)
+        _wait_value(qtbot, gen, "rf.frequency", lambda v: v == pytest.approx(4.2e9))
+        qtbot.waitUntil(lambda: "ABOR" in pm_sim.history[pm_idx1:] and "INIT:CONT ON" in pm_sim.history[pm_idx1:],
+                        timeout=5000)
+        qtbot.waitUntil(lambda: "ABOR" in sa_sim.history[sa_idx1:] and "INIT" in sa_sim.history[sa_idx1:],
+                        timeout=5000)
+        assert pm.value("freq") == pytest.approx(3.5e9)
     finally:
         coord.stop_all(wait_ms=3000)
         coord.close_all()

@@ -185,3 +185,32 @@ def test_level_mode_stops_free_run_and_disables_auto_level(pm):
     i_lev = next(i for i, c in enumerate(sim.history) if c.startswith("TRIG:LEV "))
     assert i_auto < i_lev and rec.values["trig.level"] == pytest.approx(-12.0)
     assert rec.values["trig.level_auto"] is False and not rec.errors
+
+
+@pytest.mark.parametrize("hw_shifts", [False, True])
+def test_trig_level_accounts_for_calibration_offset(make, hw_shifts):
+    """Калибровка (CORR:GAIN2) сдвигает диапазон уровня запуска выше +20 дБм (и для сырых, и для сдвинутых датчиков)."""
+    drv, sim, rec = make(KeysightU2021XA, KeysightU2021XASim,
+                         sim=KeysightU2021XASim(trig_level_includes_offset=hw_shifts))
+    # физически на датчике импульс +5 дБм; с калибровкой +40 дБ это +45 дБм (> +20 дБм!)
+    sim.set_signal(on_dbm=5.0, width=200e-6, period=1e-3, off_dbm=-60.0)
+    assert setp(drv, rec, "offset", 40.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "offset.state", True) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.level", 35.0) is PStatus.WRITTEN
+    assert rec.values["trig.level"] == pytest.approx(35.0)
+    assert sim.cfg["lev"] == pytest.approx(-5.0)                # физический порог на датчике: 35 - 40 = -5 дБм
+    assert setp(drv, rec, "gate.start", 20e-6) is PStatus.WRITTEN
+    assert setp(drv, rec, "gate.length", 100e-6) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(45.0, abs=0.05)
+    assert rec.values["meas.peak"] == pytest.approx(45.0, abs=0.05)
+    # выход за динамический диапазон [0..60] дБм (при поправке +40 дБ) отклоняется
+    assert setp(drv, rec, "trig.level", 65.0) is PStatus.INVALID
+    assert setp(drv, rec, "trig.level", -5.0) is PStatus.INVALID
+    # отрицательная поправка (усиление 30 дБ -> offset -30 дБ): допустимы уровни ниже -40 дБм
+    assert setp(drv, rec, "offset", -30.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.level", -55.0) is PStatus.WRITTEN
+    assert rec.values["trig.level"] == pytest.approx(-55.0)
+    assert sim.cfg["lev"] == pytest.approx(-25.0)
+    assert not rec.errors

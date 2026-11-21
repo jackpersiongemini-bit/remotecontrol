@@ -221,8 +221,8 @@ class ActivityMonitor(QObject):
         self._sa: dict[Any, tuple[bool, float, float, float]] = {}
         self._measuring: dict[Any, bool] = {}
         self.history: dict[Any, deque] = {}
-        #: ваттметр -> {частота датчика, Hz: (время, dBm)} - последнее показание с сигналом на каждой частоте
-        self.pm_points: dict[Any, dict[float, tuple[float, float]]] = {}
+        #: ваттметр -> {(частота датчика Hz, мощность источника dBm | None): (время, dBm)}
+        self.pm_points: dict[Any, dict[tuple[float, float | None], tuple[float, float]]] = {}
         self._mag_cache: dict[tuple[Any, str], tuple[Trace, Trace]] = {}
         links.changed.connect(self._sync_roster)
         self._timer = QTimer(self)
@@ -339,18 +339,25 @@ class ActivityMonitor(QObject):
             self._last_data[proxy] = now
             if v >= self.th.pm_floor_dbm:
                 self._last_signal[proxy] = now
-            f = _num(proxy.value("freq"))
-            if f is not None:
-                points = self.pm_points.setdefault(proxy, {})
-                fk = float(round(f))
-                points.pop(fk, None)
-                points[fk] = (now, v)                 # O(1) LRU по порядку вставки
-                while len(points) > HISTORY:
-                    points.pop(next(iter(points)))
+                f = _num(proxy.value("freq"))
+                if f is not None:
+                    sources = self.sources(exclude=proxy)
+                    src = match_source(f, sources, self._tol(f, 0.0))
+                    if src is None and len(sources) == 1:
+                        src = sources[0]
+                    pk = None if src is None or src.power is None else round(float(src.power), 3)
+                    points = self.pm_points.setdefault(proxy, {})
+                    pt_key = (float(round(f)), pk)
+                    points.pop(pt_key, None)
+                    points[pt_key] = (now, v)             # O(1) LRU по порядку вставки
+                    while len(points) > HISTORY:
+                        points.pop(next(iter(points)))
             self._emit(proxy)
         elif prof == "power_meter" and key == "trace" and isinstance(value, Trace) and len(value) > 0:
             self._updated[proxy] = now
             self._last_data[proxy] = now
+            self._emit(proxy)
+        elif prof == "power_meter" and key == "trace.state":
             self._emit(proxy)
         elif prof == "spectrum_analyzer" and key == "trace" and isinstance(value, Trace) and len(value) > 1:
             self._sa[proxy] = spectrum_peak(value, self.th.sa_margin_db)
@@ -358,6 +365,8 @@ class ActivityMonitor(QObject):
             self._last_data[proxy] = now
             if self._sa[proxy][0]:
                 self._last_signal[proxy] = now
+            self._emit(proxy)
+        elif prof == "spectrum_analyzer" and key in ("ref_level", "scale_div"):
             self._emit(proxy)
         elif prof == "network_analyzer" and key == "trace":
             self._updated[proxy] = now                # ``trace`` публикуется последним в развёртке
@@ -368,7 +377,10 @@ class ActivityMonitor(QObject):
             if proxy.value("rf.output") is not False and self.vna_has_signal(proxy):
                 self._last_signal[proxy] = now
             self._emit(proxy)                         # одна перерисовка на развёртку
-        elif prof == "network_analyzer" and key.startswith("m") and key.endswith(".enabled"):
+        elif prof == "network_analyzer" and (
+            (key.startswith("m") and key.endswith(".enabled"))
+            or key in ("scale.div", "scale.ref", "scale.rpos")
+        ):
             self._emit(proxy)
         elif prof == "network_analyzer" and key == "rf.output" and value is False:
             self._last_signal.pop(proxy, None)
@@ -520,9 +532,30 @@ class ActivityMonitor(QObject):
         return max(self.th.freq_tol_hz, self.th.freq_tol_rel * abs(freq or 0.0), 2 * step)
 
     def pm_table(self, proxy) -> list[tuple[float, float, float]]:
-        """Таблица ваттметра: [(частота Hz, dBm, время показания)] по возрастанию частоты - на каждой
-        частоте датчика последнее показание с сигналом (не ниже ``pm_floor_dbm``)."""
-        return sorted((f, v, t) for f, (t, v) in self.pm_points.get(proxy, {}).items())
+        """Таблица ваттметра (сводка по частоте): [(частота Hz, dBm, время)] по возрастанию частоты -
+        на каждой частоте последнее показание с сигналом (не ниже ``pm_floor_dbm``)."""
+        by_freq: dict[float, tuple[float, float]] = {}
+        for (f, _p), (t, v) in self.pm_points.get(proxy, {}).items():
+            prev = by_freq.get(f)
+            if prev is None or t >= prev[0]:
+                by_freq[f] = (t, v)
+        return sorted((f, v, t) for f, (t, v) in by_freq.items())
+
+    def pm_matrix(self, proxy) -> tuple[list[float | None], list[tuple[float, dict[float | None, float]]]]:
+        """Матрица ваттметра: ``(columns, rows)``, где ``columns`` - отсортированные уровни мощности
+        источника (dBm; ``None`` в конце, если были измерения без источника), а ``rows`` -
+        ``[(частота Hz, {уровень источника: измеренная мощность dBm})]`` по возрастанию частоты."""
+        pts = self.pm_points.get(proxy, {})
+        if not pts:
+            return [], []
+        num_cols = sorted({p for _f, p in pts if p is not None})
+        cols: list[float | None] = list(num_cols)
+        if any(p is None for _f, p in pts):
+            cols.append(None)
+        by_freq: dict[float, dict[float | None, float]] = {}
+        for (f, p), (_t, v) in pts.items():
+            by_freq.setdefault(f, {})[p] = v
+        return cols, sorted(by_freq.items())
 
     def clear_pm_table(self, proxy) -> None:
         self.pm_points.pop(proxy, None)

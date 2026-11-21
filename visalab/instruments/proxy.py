@@ -12,7 +12,7 @@ import logging
 from collections import defaultdict
 from typing import Any, Callable
 
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 
 from ..applog import Throttle
 from ..core.params import Action, ConnectionState, Param, PStatus
@@ -86,6 +86,8 @@ class InstrumentProxy(QObject):
         self.idn = ""
         self._values: dict[str, Any] = {}
         self._statuses: dict[str, PStatus] = {}
+        self._in_flight: set[str] = set()
+        self._actions_in_flight = 0
         self._subs: dict[str, list[Callable]] = defaultdict(list)
         self._status_subs: dict[str, list[Callable]] = defaultdict(list)
         self._throttle = Throttle()          # журнал в файл: одинаковое сообщение - не чаще раза в минуту
@@ -113,8 +115,9 @@ class InstrumentProxy(QObject):
             (w.reconnect_pending, self._on_reconnect),
             (w.instrument_error, self._on_instrument_error),
             (w.comm_error, self._on_comm_error),
+            (w.action_done, self._on_action_done),
         ]
-        for name in ("scpi_log", "action_done", "sync_done", "raw_response"):
+        for name in ("scpi_log", "sync_done", "raw_response"):
             self._worker_conns.append((getattr(w, name), getattr(self, name)))
         for sig, slot in self._worker_conns:
             sig.connect(slot, _Q)
@@ -134,13 +137,62 @@ class InstrumentProxy(QObject):
     def sync(self) -> None:
         self._req_sync.emit()
 
+    _AUTO_SIBLING = {
+        "bw.res": "bw.res_auto",
+        "bw.video": "bw.video_auto",
+        "atten": "atten_auto",
+        "sweep.time": "sweep.time_auto",
+        "trig.level": "trig.level_auto",
+        "avg.count": "avg.auto",
+    }
+
+    def should_skip_write(self, key: str, value: Any) -> bool:
+        """Не отправлять запись драйверу, если в прокси уже хранится эквивалентное значение."""
+        if self._shut_down or not self.is_connected or self._actions_in_flight > 0 or key in self._in_flight:
+            return False
+        spec = self.params.get(key)
+        if spec is None or spec.readonly:
+            return False
+        current = self._values.get(key)
+        if current is None or self._statuses.get(key) in (PStatus.ERROR, PStatus.INVALID):
+            return False
+        for k in self._in_flight:
+            other = self.params.get(k)
+            if other is not None and key in other.also_read:
+                return False
+        if key == "output_all":
+            return False                              # действует на все каналы сразу
+        auto = self._AUTO_SIBLING.get(key)
+        if auto and self._values.get(auto) is True:
+            return False                              # ручная запись выключает AUTO
+        if key == "mark.x" and self._values.get("mark.state") is not True:
+            return False                              # запись X включает маркер
+        if key == "marker.freq" and self._values.get("marker.state") is not True:
+            return False
+        if key == "cal.set" and value and self._values.get("cal.state") is not True:
+            return False                              # повторный выбор cal set включает коррекцию
+        try:
+            val = spec.validate(value)
+        except (TypeError, ValueError):
+            return False
+        return spec.same(val, current)
+
     def set(self, key: str, value: Any) -> None:
+        if self.should_skip_write(key, value):
+            QTimer.singleShot(
+                0,
+                lambda k=key: (not self._shut_down and k not in self._in_flight)
+                and self._on_status(k, PStatus.WRITTEN, ""),
+            )
+            return
+        self._in_flight.add(key)
         self._req_set.emit(key, value)
 
     def read(self, key: str) -> None:
         self._req_read.emit(key)
 
     def action(self, name: str, *args) -> None:
+        self._actions_in_flight += 1
         self._req_action.emit(name, args)
 
     def write_raw(self, command: str) -> None:
@@ -231,6 +283,8 @@ class InstrumentProxy(QObject):
         self.reconnecting = False
         self._values.clear()
         self._statuses.clear()
+        self._in_flight.clear()
+        self._actions_in_flight = 0
         if self.state is not ConnectionState.DISCONNECTED:
             self.state = ConnectionState.DISCONNECTED
             self.state_changed.emit(ConnectionState.DISCONNECTED)
@@ -264,6 +318,8 @@ class InstrumentProxy(QObject):
         if state is not ConnectionState.CONNECTED:
             self._values.clear()
             self._statuses.clear()
+            self._in_flight.clear()
+            self._actions_in_flight = 0
         if state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTED):
             self.reconnecting = False
         self.state_changed.emit(state)
@@ -284,6 +340,7 @@ class InstrumentProxy(QObject):
     def _on_comm_error(self, message: str) -> None:
         if self._shut_down:
             return
+        self._actions_in_flight = 0
         if self._throttle("comm", message):
             log.warning("%s %s: %s", self.name, self.address, message)
         self.comm_error.emit(message)
@@ -291,9 +348,16 @@ class InstrumentProxy(QObject):
     def _on_instrument_error(self, code: int, message: str) -> None:
         if self._shut_down:
             return
+        self._actions_in_flight = 0
         if self._throttle(f"error {code}", message):
             log.warning("%s %s: ошибка прибора %d: %s", self.name, self.address, code, message)
         self.instrument_error.emit(code, message)
+
+    def _on_action_done(self, name: str, result: Any) -> None:
+        if self._shut_down:
+            return
+        self._actions_in_flight = max(0, self._actions_in_flight - 1)
+        self.action_done.emit(name, result)
 
     def _on_value(self, key: str, value: Any) -> None:
         if self._shut_down:
@@ -314,6 +378,8 @@ class InstrumentProxy(QObject):
     def _on_status(self, key: str, status: PStatus, message: str) -> None:
         if self._shut_down:
             return
+        if status is not PStatus.WRITING:
+            self._in_flight.discard(key)
         if status in (PStatus.ERROR, PStatus.INVALID) and self._throttle(f"key {key}", message):
             log.warning("%s %s: %s %s: %s", self.name, self.address, key, status.value, message)
         self._statuses[key] = status

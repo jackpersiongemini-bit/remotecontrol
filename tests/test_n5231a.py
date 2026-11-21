@@ -772,3 +772,89 @@ def test_strict_markers_off_do_not_error(make):
     drv.run_action("mark_peak")
     assert rec.values["mark.state"] is True and rec.values["mark.x"] is not None
     assert not rec.errors and not rec.comm
+
+
+def test_trace_meta_includes_device_scale_and_tracks_changes(vna):
+    """Метаданные трассы содержат масштаб экрана (PDIV/RLEV/RPOS) и обновляются с прибора и через драйвер."""
+    drv, sim, rec = vna
+    drv.poll()
+    t = rec.values["m1.trace"]
+    assert t.meta["scale_div"] == pytest.approx(10.0)
+    assert t.meta["scale_ref"] == pytest.approx(0.0)
+    assert t.meta["scale_rpos"] == pytest.approx(5.0)
+    # Изменение масштаба на экране прибора
+    sim.meas["CH1_S11_1"].update(pdiv=5.0, rlev=-20.0, rpos=8.0)
+    drv.poll()
+    drv.poll()
+    t2 = rec.values["m1.trace"]
+    assert t2.meta["scale_div"] == pytest.approx(5.0)
+    assert t2.meta["scale_ref"] == pytest.approx(-20.0)
+    assert t2.meta["scale_rpos"] == pytest.approx(8.0)
+    assert rec.values["scale.div"] == pytest.approx(5.0)
+    # Изменение масштаба через драйвер в HOLD сразу обновляет метаданные трассы
+    drv.run_action("abort")
+    assert setp(drv, rec, "scale.div", 2.0) is PStatus.WRITTEN
+    assert rec.values["m1.trace"].meta["scale_div"] == pytest.approx(2.0)
+    assert not rec.errors and not rec.comm
+
+
+def test_trace_reads_even_when_wnum_or_scale_queries_unsupported(make):
+    """Если прошивка PNA не поддерживает WNUM?/TNUM? или Y:SCAL:PDIV? (-113, нет ответа), трасса всё равно читается."""
+    # 1) Нет WNUM?/TNUM?, но DISP:WIND1:TRAC1:Y:SCAL:* работает -> фоллбэк (1, 1) читает масштаб
+    sim1 = KeysightPNASim()
+    sim1.meas["CH1_S11_1"].update(pdiv=5.0, rlev=-10.0, rpos=8.0)
+    sim1._handlers = [h for h in sim1._handlers if "WNUM" not in h[0] and "TNUM" not in h[0]]
+    drv1, _s1, rec1 = make(KeysightPNA, KeysightPNASim, sim=sim1)
+    assert drv1._wnum_supported is False
+    drv1.poll()
+    t1 = rec1.values["m1.trace"]
+    assert isinstance(t1, Trace) and len(t1) > 1 and not rec1.comm
+    assert t1.meta["scale_div"] == pytest.approx(5.0)
+    assert t1.meta["scale_ref"] == pytest.approx(-10.0)
+    assert t1.meta["scale_rpos"] == pytest.approx(8.0)
+
+    # 2) Нет и WNUM?/TNUM?, и PDIV? -> трасса всё равно читается (без масштаба, без зависаний и обрыва)
+    sim2 = KeysightPNASim()
+    sim2._handlers = [h for h in sim2._handlers
+                      if "WNUM" not in h[0] and "TNUM" not in h[0] and "PDIV" not in h[0]]
+    drv2, _s2, rec2 = make(KeysightPNA, KeysightPNASim, sim=sim2)
+    drv2.poll()
+    t2 = rec2.values["m1.trace"]
+    assert isinstance(t2, Trace) and len(t2) > 1 and not rec2.comm
+    assert drv2._scale_read_supported is False
+    assert "scale_div" not in t2.meta
+    # Повторный опрос уже не шлёт неподдерживаемый PDIV? и WNUM?
+    before = len(sim2.history)
+    drv2.poll()
+    assert not any("PDIV" in c or "WNUM" in c for c in sim2.history[before:])
+    assert not rec2.comm
+
+
+def test_source_power_calibration(make):
+    """Калибровка выходного тракта ВАЦ: power.offset / power.offset_state."""
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
+    assert setp(drv, rec, "source.power", -10.0) is PStatus.WRITTEN
+    assert sim.c["pow"] == pytest.approx(-10.0)
+    # Внешний усилитель +20 дБ (поправка −20 дБ): включение не дёргает порт прибора
+    assert setp(drv, rec, "power.offset", -20.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "power.offset_state", True) is PStatus.WRITTEN
+    assert sim.c["pow"] == pytest.approx(-10.0)
+    assert rec.values["source.power"] == pytest.approx(10.0)       # на DUT +10 дБм
+    # Задание +5 дБм на DUT -> порт ставит −15 дБм
+    assert setp(drv, rec, "source.power", 5.0) is PStatus.WRITTEN
+    assert sim.c["pow"] == pytest.approx(-15.0)
+    assert rec.values["source.power"] == pytest.approx(5.0)
+    # Новая частота: усиление 18.5 дБ (поправка −18.5 дБ) -> порт подстраивается до −13.5 дБм, DUT остаётся +5 дБм
+    assert setp(drv, rec, "power.offset", -18.5) is PStatus.WRITTEN
+    assert sim.c["pow"] == pytest.approx(-13.5)
+    assert rec.values["source.power"] == pytest.approx(5.0)
+    # Предел мощности источника сдвинут на −off: максимум на DUT = 20 − (−18.5) = +38.5 дБм
+    assert setp(drv, rec, "source.power", 35.0) is PStatus.WRITTEN
+    assert sim.c["pow"] == pytest.approx(16.5)
+    assert setp(drv, rec, "source.power", 40.0) is PStatus.INVALID
+    assert sim.c["pow"] == pytest.approx(16.5)
+    # Выключение калибровки не меняет мощность на порту
+    assert setp(drv, rec, "power.offset_state", False) is PStatus.WRITTEN
+    assert sim.c["pow"] == pytest.approx(16.5)
+    assert rec.values["source.power"] == pytest.approx(16.5)
+    assert not rec.comm

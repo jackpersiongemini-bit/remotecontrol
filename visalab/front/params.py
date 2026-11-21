@@ -19,7 +19,7 @@ from typing import Any
 from PyQt6.QtCore import QEvent, QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QMenu, QPushButton, QTabBar, QToolButton, QToolTip, QVBoxLayout,
+                             QLineEdit, QMenu, QPushButton, QSizePolicy, QTabBar, QToolButton, QToolTip, QVBoxLayout,
                              QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
@@ -264,9 +264,7 @@ class PLineEdit(QLineEdit, _Bound):
         self.show_value(self._value)
 
     def set_value(self, value: Any) -> bool:
-        """Отправить значение, если оно отличается от текущего. True - если отправлено."""
-        if self._value is not None and self.spec.same(value, self._value):
-            return False
+        """Отправить значение в драйвер (проверку, отличается ли оно от текущего, делает драйвер)."""
         self.proxy.set(self.key, value)
         return True
 
@@ -315,8 +313,10 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         #: постоянный шаг в единицах параметра; None - AUTO (последняя цифра)
         self.step_setting: float | None = None
         self._step_lock: float | None = None    # AUTO: шаг (в единицах префикса), пока крутят колесо
+        self._dirty = False                     # QAbstractSpinBox::interpretText() сбрасывает isModified() до editingFinished
         super().__init__(parent)
         self.setLineEdit(StepLineEdit(self))
+        self.lineEdit().textEdited.connect(self._mark_dirty)
         self.unit = proxy.params[key].unit
         self.prefixes = prefixes or UNIT_PREFIXES.get(self.unit, ("",))
         self.prefix = "" if "" in self.prefixes else self.prefixes[0]
@@ -434,8 +434,11 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         except ValueError:
             return self.value()
 
+    def _mark_dirty(self, _text: str = "") -> None:
+        self._dirty = True
+
     def show_value(self, value, force: bool = False):
-        if not force and self.hasFocus() and self.lineEdit().isModified():
+        if not force and self.hasFocus() and (self._dirty or self.lineEdit().isModified()):
             return                                      # пользователь печатает
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             if not self.hasFocus():
@@ -446,6 +449,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
             self.blockSignals(False)
         else:
             self.lineEdit().setText("")
+        self._dirty = False
         self.lineEdit().setModified(False)
 
     # -------------------------------------------------------- шаг и запись
@@ -508,7 +512,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         """Кончили крутить (мышь ушла, фокус ушёл, печатают): AUTO снова по последней цифре."""
         if self._step_lock is not None:
             self._step_lock = None
-            if not (self.hasFocus() and self.lineEdit().isModified()):
+            if not (self.hasFocus() and (self._dirty or self.lineEdit().isModified())):
                 self.show_value(self._value, force=True)
         self.lineEdit().update()
 
@@ -522,6 +526,11 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self._release_step()
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
+        if e.key() == Qt.Key.Key_Escape:
+            self._dirty = False
+            self.show_value(self._value, force=True)
+            self.clearFocus()
+            return
         super().keyPressEvent(e)
         self.lineEdit().update()                  # курсор сдвинулся - подчёркнут другой разряд
 
@@ -578,8 +587,9 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         e.accept()
 
     def commit(self, force: bool = False) -> None:
-        if not force and not self.lineEdit().isModified():
+        if not force and not (self._dirty or self.lineEdit().isModified()):
             return
+        self._dirty = False
         self.lineEdit().setModified(False)
         value = self.value() * self._factor()
         try:
@@ -591,8 +601,6 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self.set_value(value)
 
     def set_value(self, value: Any) -> bool:
-        if self._value is not None and self.spec.same(value, self._value):
-            return False
         self.proxy.set(self.key, value)
         return True
 
@@ -705,8 +713,6 @@ class PSButton(IndicatorButton, _Bound):
         self.set_value(self._data[(i + 1) % len(self._data)], force=len(self._data) == 1)
 
     def set_value(self, value, force: bool = False) -> bool:
-        if not force and self._index(self._value) == self._index(value) >= 0:
-            return False
         self.proxy.set(self.key, value)
         return True
 
@@ -1034,32 +1040,90 @@ class PanelLine(QWidget):
 
 
 class PanelTable(QWidget):
-    """Строки панели одна под другой; подписи выравниваются по самой длинной."""
+    """Строки панели одна под другой; строка - один ``PanelLine`` или группа из 2-3 ``PanelLine`` в ряд."""
 
-    def __init__(self, *lines: PanelLine, parent=None):
+    ROW_SPACING = 10
+
+    def __init__(self, *items: PanelLine | tuple[PanelLine, ...] | list[PanelLine], parent=None):
         super().__init__(parent)
         self.lines: list[PanelLine] = []
+        self._rows: list[tuple[PanelLine, ...]] = []
         self.table_layout = QVBoxLayout(self)
         self.table_layout.setContentsMargins(0, 0, 0, 0)
         self.table_layout.setSpacing(4)
         self.table_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.add_line(*lines)
+        self.add_line(*items)
 
-    def add_line(self, *lines: PanelLine) -> None:
-        for line in lines:
+    def add_line(self, *items: PanelLine | tuple[PanelLine, ...] | list[PanelLine]) -> None:
+        for item in items:
+            if isinstance(item, (tuple, list)):
+                group = tuple(ln for ln in item if ln is not None)
+                if not group:
+                    continue
+                if len(group) == 1:
+                    self._append_single(group[0])
+                else:
+                    self._append_group(group)
+            else:
+                self._append_single(item)
+
+    def _append_single(self, line: PanelLine) -> None:
+        self.lines.append(line)
+        self._rows.append((line,))
+        self.table_layout.addWidget(line)
+
+    @staticmethod
+    def _is_fixed_width(w: QWidget) -> bool:
+        return (w.minimumWidth() == w.maximumWidth() and w.minimumWidth() > 0) or w.objectName() == "tool"
+
+    def _append_group(self, group: tuple[PanelLine, ...]) -> None:
+        box = QWidget(self)
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(self.ROW_SPACING)
+        flexes = [sum(1 for w in ln.widgets if not self._is_fixed_width(w)) for ln in group]
+        any_flex = any(flexes)
+        for line, flex in zip(group, flexes):
             self.lines.append(line)
-            self.table_layout.addWidget(line)
+            lay.addWidget(line, flex if any_flex else 1)
+        self._rows.append(group)
+        self.table_layout.addWidget(box)
+
+    def first_column_lines(self) -> list[PanelLine]:
+        """Левый столбец каждой строки (для выравнивания подписей между вкладками)."""
+        src = [row[0] for row in self._rows] if self._rows else list(self.lines)
+        return [ln for ln in src if not ln._name.isHidden()]
 
     def build(self, column_width: int | None = None) -> None:
         """Вызывать после применения стиля (размеры зависят от шрифта)."""
-        if not self.lines:
+        if not self._rows:
             return
-        width = max(line.label_hint() for line in self.lines)
-        for line in self.lines:
-            line.set_label_width(width)
+        col_widths: dict[int, int] = {}
+        for row in self._rows:
+            for col, line in enumerate(row):
+                if not line._name.isHidden():
+                    col_widths[col] = max(col_widths.get(col, 0), line.label_hint())
+        for row in self._rows:
+            multi = len(row) > 1
+            flex_total = sum(
+                sum(1 for w in ln.widgets if not self._is_fixed_width(w))
+                for ln in row
+            )
             if column_width:
+                min_w = min(column_width, 60) if (multi and flex_total >= 3) else column_width
+            else:
+                min_w = None
+            for col, line in enumerate(row):
+                if not line._name.isHidden() and col in col_widths:
+                    line.set_label_width(col_widths[col])
                 for w in line.widgets:
-                    w.setMinimumWidth(column_width)
+                    if self._is_fixed_width(w):
+                        continue
+                    if min_w:
+                        w.setMinimumWidth(min_w)
+                    if multi:
+                        w.setSizePolicy(QSizePolicy.Policy.Ignored, w.sizePolicy().verticalPolicy())
+                        line.line_layout.setStretchFactor(w, 1)
 
 
 class Panel(QFrame):

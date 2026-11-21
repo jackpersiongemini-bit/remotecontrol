@@ -484,3 +484,245 @@ def test_activity_fast_vna_signal_matches_reference():
     assert _trace_has_signal(lin, "S21", -25.0, -3.0) is True
     assert _trace_has_signal(lin, "S21", -15.0, -3.0) is False
     assert _trace_has_signal(lin, "S11", -40.0, -50.0) is True
+
+
+def test_main_window_sa_plot_matches_device_scale(qtbot, lab, tmp_path):
+    """График SA в Main Window имеет такой же масштаб Y (RLEV, SDIV, 10 делений), как прибор."""
+    links, px, _bench = lab
+    sa = px["e4446a"]
+    settings = QSettings(str(tmp_path / "sa_scale.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win)
+    win.show()
+    panel = win.panels[sa]
+    qtbot.waitUntil(lambda: bool(panel.plots) and panel.plots[0]._scale == pytest.approx((-100.0, 0.0, 10.0)), timeout=10000)
+    assert panel.plots[0]._divs_y == 10
+
+    sa.set("ref_level", -20.0)
+    sa.set("scale_div", 5.0)
+    qtbot.waitUntil(lambda: panel.plots[0]._scale == pytest.approx((-70.0, -20.0, 5.0)), timeout=5000)
+    assert panel.plots[0]._divs_y == 10
+
+    # Изменили масштаб на передней панели прибора -> обновится при следующей развёртке
+    _sim(sa).c.update(rlev=-10.0, pdiv=2.0)
+    qtbot.waitUntil(lambda: panel.plots[0]._scale == pytest.approx((-30.0, -10.0, 2.0)), timeout=5000)
+    panel.plots[0].grab()
+
+
+def test_main_window_vna_plot_matches_device_scale(qtbot, lab, tmp_path):
+    """Графики VNA в Main Window имеют такой же масштаб Y (PDIV, RLEV, RPOS, 10 делений), как на приборе."""
+    links, px, _bench = lab
+    vna = px["pna"]
+    settings = QSettings(str(tmp_path / "vna_scale.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win)
+    win.show()
+    panel = win.panels[vna]
+    # По умолчанию на PNA: pdiv=10, rlev=0, rpos=5, 10 делений -> [-50, +50]
+    qtbot.waitUntil(lambda: bool(panel.plots) and panel.plots[0]._scale == pytest.approx((-50.0, 50.0, 10.0)), timeout=10000)
+    assert panel.plots[0]._divs_y == 10
+
+    # Изменяем масштаб трейса через драйвер
+    vna.set("scale.div", 5.0)
+    vna.set("scale.ref", -10.0)
+    vna.set("scale.rpos", 8.0)
+    qtbot.waitUntil(lambda: panel.plots[0]._scale == pytest.approx((-50.0, 0.0, 5.0)), timeout=5000)
+    assert panel.plots[0]._divs_y == 10
+
+    # Даже в HOLD (без новых развёрток) autoscale и смена scale.* сразу обновляют график
+    vna.action("abort")
+    qtbot.waitUntil(lambda: vna.value("meas.continuous") is False, timeout=5000)
+    vna.action("autoscale")
+    qtbot.waitUntil(lambda: vna.value("scale.rpos") == pytest.approx(5.0), timeout=5000)
+    pdiv, rlev, rpos = vna.value("scale.div"), vna.value("scale.ref"), vna.value("scale.rpos")
+    expected = (rlev - rpos * pdiv, rlev + (10 - rpos) * pdiv, pdiv)
+    qtbot.waitUntil(lambda: panel.plots[0]._scale == pytest.approx(expected), timeout=5000)
+
+    # Второй трейс с другим масштабом -> отдельный график со своим масштабом прибора
+    sim = _sim(vna)
+    sim.meas["CH1_S21_2"] = {"s": "S21", "fmt": "MLOG", "ch": 1, "pdiv": 2.0, "rlev": 0.0, "rpos": 5.0}
+    sim.windows[2] = {1: "CH1_S21_2"}
+    vna.set("m2.channel", 1)
+    vna.set("m2.name", "CH1_S21_2")
+    vna.set("m2.enabled", True)
+    vna.set("meas.continuous", True)
+    qtbot.waitUntil(lambda: len([p for p in panel.plots if p.isVisibleTo(panel)]) == 2, timeout=10000)
+    scales = [p._scale for p in panel.plots if p.isVisibleTo(panel)]
+    assert any(s == pytest.approx((-10.0, 10.0, 2.0)) for s in scales)
+    assert any(s == pytest.approx(expected) for s in scales)
+    for p in panel.plots:
+        if p.isVisibleTo(panel):
+            p.grab()
+
+
+def test_main_window_pm_time_plot_matches_power_meter_scale(qtbot, lab, tmp_path):
+    """Во временном режиме (TRAC ON) график PM в Main Window повторяет шкалу окна PowerMeterWindow (AUTO/MAN, dBm/W)."""
+    from visalab.front import PowerMeterWindow
+    links, px, _bench = lab
+    pm = px["u2021xa"]
+    settings = QSettings(str(tmp_path / "pm_scale.ini"), QSettings.Format.IniFormat)
+    pm_win = PowerMeterWindow(pm, settings)
+    qtbot.addWidget(pm_win)
+    win = MainWindow(settings, ActivityMonitor(links))
+    qtbot.addWidget(win)
+    win.show()
+    pm.set("trace.state", True)
+    panel = win.panels[pm]
+    qtbot.waitUntil(lambda: bool(panel.plots) and panel.plots[0].isVisibleTo(panel) and panel.plots[0]._scale is not None,
+                    timeout=10000)
+    qtbot.waitUntil(lambda: pm_win.plot.trace is not None, timeout=5000)
+    lo, hi = pm_win.plot.y_range()
+    assert panel.plots[0]._divs_y == 6
+    assert panel.plots[0]._scale == pytest.approx((lo, hi, (hi - lo) / 6))
+
+    # Ручная шкала в PowerMeterWindow (REF=10 dBm, DIV=5 dB) -> Main Window сразу обновляется
+    pm_win.scale_ref.set_value(10.0)
+    pm_win.scale_div.set_value(5.0)
+    qtbot.waitUntil(lambda: panel.plots[0]._scale == pytest.approx((-20.0, 10.0, 5.0)), timeout=5000)
+    assert panel.plots[0]._y_unit == "dBm"
+
+    # Переключение в W -> Main Window переходит на линейную шкалу в ваттах
+    pm_win.scale_auto.set_value(True)
+    pm_win.scale_unit.set_value("W")
+    lo_w, hi_w = pm_win.plot.y_range()
+    qtbot.waitUntil(lambda: panel.plots[0]._y_unit == "W"
+                    and panel.plots[0]._scale == pytest.approx((lo_w, hi_w, (hi_w - lo_w) / 6)), timeout=5000)
+    panel.plots[0].grab()
+
+
+def test_pm_table_matrix_and_unit_switch(qtbot, lab, tmp_path):
+    """Таблица ваттметра: строки - частота, колонки - подаваемая мощность источника;
+    кнопка единицы переключает dBm / W / dBW / V / dB и сохраняется в ini."""
+    links, px, bench = lab
+    gen, pm = px["e8267d"], px["u2021xa"]
+    ini = tmp_path / "pm_matrix.ini"
+    settings = QSettings(str(ini), QSettings.Format.IniFormat)
+    mon = ActivityMonitor(links)
+    win = MainWindow(settings, mon)
+    qtbot.addWidget(win)
+    win.show()
+    panel = win.panels[pm]
+    tbl = panel.power_table
+
+    def measure_at(freq_hz: float, power_dbm: float, expected_meas: float):
+        gen.set("rf.frequency", freq_hz)
+        gen.set("rf.power", power_dbm)
+        gen.set("rf.output", True)
+        pm.set("freq", freq_hz)
+        qtbot.waitUntil(lambda: gen.value("rf.output") is True
+                        and gen.value("rf.frequency") == pytest.approx(freq_hz)
+                        and gen.value("rf.power") == pytest.approx(power_dbm)
+                        and pm.value("freq") == pytest.approx(freq_hz), timeout=5000)
+        bench.step()
+        qtbot.waitUntil(lambda: pm.value("meas.power") is not None
+                        and abs(pm.value("meas.power") - expected_meas) < 0.3, timeout=5000)
+        qtbot.waitUntil(lambda: any(abs(f - freq_hz) < 1.0 and power_dbm in vals
+                                    and abs(vals[power_dbm] - expected_meas) < 0.3
+                                    for f, vals in tbl.rows), timeout=5000)
+
+    # Стенд: потери 10 дБ
+    measure_at(1e9, -10.0, -20.0)
+    measure_at(1e9, -5.0, -15.0)
+    measure_at(2e9, -5.0, -15.0)
+    measure_at(2e9, -10.0, -20.0)
+
+    assert tbl.columnCount() == 3
+    assert [tbl.horizontalHeaderItem(c).text() for c in range(3)] == ["FREQ", "-10 dBm", "-5 dBm"]
+    assert tbl.rowCount() == 2
+    assert tbl.item(0, 0).text() == "1 GHz" and tbl.item(1, 0).text() == "2 GHz"
+    assert tbl.item(0, 1).text() == "-20.00 dBm" and tbl.item(0, 2).text() == "-15.00 dBm"
+    assert tbl.item(1, 1).text() == "-20.00 dBm" and tbl.item(1, 2).text() == "-15.00 dBm"
+    # Текущая ячейка (2 GHz, -10 dBm) выделена жирным
+    assert tbl.item(1, 0).font().bold() and tbl.item(1, 1).font().bold() and not tbl.item(0, 2).font().bold()
+
+    # Переключение единиц: dBm -> W -> dBW -> V -> dB -> dBm
+    assert panel.unit_button.isVisibleTo(panel) and panel.unit_button.text() == "dBm"
+    panel.unit_button.click()                                   # W
+    assert tbl.unit == "W" and panel.unit_button.text() == "W"
+    assert tbl.horizontalHeaderItem(1).text().endswith("W")
+    assert tbl.item(0, 1).text().endswith("W") and panel.level.text().endswith("W")
+    panel.unit_button.click()                                   # dBW
+    assert tbl.unit == "dBW" and tbl.horizontalHeaderItem(1).text() == "-40 dBW"
+    assert tbl.item(0, 1).text() == "-50.00 dBW"
+    panel.unit_button.click()                                   # V (50 Ω)
+    assert tbl.unit == "V" and tbl.horizontalHeaderItem(1).text().endswith("V")
+    assert tbl.item(0, 1).text().endswith("V")
+    panel.unit_button.click()                                   # dB (Pout - Pin = -10.00 dB)
+    assert tbl.unit == "dB" and tbl.horizontalHeaderItem(1).text() == "-10 dBm"
+    assert tbl.item(0, 1).text() == "-10.00 dB" and tbl.item(1, 2).text() == "-10.00 dB"
+
+    # Выбранная единица сохраняется в ini и восстанавливается в новом окне
+    settings.sync()
+    win2 = MainWindow(QSettings(str(ini), QSettings.Format.IniFormat), mon)
+    qtbot.addWidget(win2)
+    assert win2.panels[pm].power_table.unit == "dB" and win2.panels[pm].unit_button.text() == "dB"
+    panel.unit_button.click()                                   # обратно в dBm
+    assert tbl.unit == "dBm"
+    gen.set("rf.output", False)
+    qtbot.waitUntil(lambda: gen.value("rf.output") is False, timeout=5000)
+    bench.step()
+    qtbot.waitUntil(lambda: pm.value("meas.power") is not None and pm.value("meas.power") < -60.0, timeout=5000)
+    mon.clear_pm_table(pm)
+    qtbot.waitUntil(lambda: tbl.rowCount() == 0, timeout=5000)
+
+
+def test_settings_displayed_graphs_and_level_trigger(qtbot, lab, tmp_path):
+    """Настройки отображаемых графиков во вкладке SET: галочки Show / Above level и порог видеоуровня."""
+    links, px, bench = lab
+    gen, sa, pm = px["e8267d"], px["e4446a"], px["u2021xa"]
+    ini = tmp_path / "display_rules.ini"
+    settings = QSettings(str(ini), QSettings.Format.IniFormat)
+    mon = ActivityMonitor(links)
+    win = MainWindow(settings, mon)
+    qtbot.addWidget(win)
+    win.show()
+    qtbot.waitUntil(lambda: len(win.visible_panels()) == 3, timeout=10000)
+
+    sa_key, pm_key = win._panel_key(sa), win._panel_key(pm)
+    assert {sa_key, pm_key, win._panel_key(px["pna"])} <= set(win.display_controls)
+    sa_show, sa_by_lvl, sa_edit = win.display_controls[sa_key]
+    pm_show, pm_by_lvl, pm_edit = win.display_controls[pm_key]
+
+    # 1) Сняли галочку Show у PM -> панель скрылась, Above level / порог недоступны
+    pm_show.setChecked(False)
+    assert win.panels[pm] not in win.visible_panels()
+    assert not pm_by_lvl.isEnabled() and not pm_edit.isEnabled()
+    pm_show.setChecked(True)
+    assert win.panels[pm] in win.visible_panels() and pm_by_lvl.isEnabled()
+
+    # 2) Включили Above level у SA с порогом -30 dBm: при шуме (-90 dBm) SA скрыт
+    sa_by_lvl.setChecked(True)
+    sa_edit.setText("-30")
+    sa_edit.editingFinished.emit()
+    assert win.display_rules[sa_key]["level"] == pytest.approx(-30.0)
+    assert win.panels[sa] not in win.visible_panels()
+
+    # Подали сигнал -10 dBm (на SA пик -20 dBm >= -30 dBm) -> SA появился
+    gen.set("rf.frequency", 1e9)
+    gen.set("rf.power", -10.0)
+    gen.set("rf.output", True)
+    qtbot.waitUntil(lambda: gen.value("rf.output") is True and gen.value("rf.power") == pytest.approx(-10.0), timeout=5000)
+    bench.step()
+    qtbot.waitUntil(lambda: win.panels[sa] in win.visible_panels(), timeout=10000)
+
+    # Подняли порог до -15 dBm (-20 < -15) -> SA снова скрылся
+    sa_edit.setText("-15")
+    sa_edit.editingFinished.emit()
+    assert win.panels[sa] not in win.visible_panels()
+
+    # 3) Проверим сохранение в ini и восстановление в новом MainWindow
+    pm_by_lvl.setChecked(True)
+    pm_edit.setText("-25")
+    pm_edit.editingFinished.emit()
+    pm_show.setChecked(False)
+    settings.sync()
+
+    win2 = MainWindow(QSettings(str(ini), QSettings.Format.IniFormat), mon)
+    qtbot.addWidget(win2)
+    sa_show2, sa_by_lvl2, sa_edit2 = win2.display_controls[sa_key]
+    pm_show2, pm_by_lvl2, pm_edit2 = win2.display_controls[pm_key]
+    assert sa_show2.isChecked() is True and sa_by_lvl2.isChecked() is True
+    assert win2.display_rules[sa_key]["level"] == pytest.approx(-15.0) and sa_edit2.text() == "-15 dBm"
+    assert pm_show2.isChecked() is False and pm_by_lvl2.isChecked() is True
+    assert win2.display_rules[pm_key]["level"] == pytest.approx(-25.0) and pm_edit2.text() == "-25 dBm"
+    assert win2.panels[pm] not in win2.visible_panels() and win2.panels[sa] not in win2.visible_panels()

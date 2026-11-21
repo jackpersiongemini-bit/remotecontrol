@@ -41,6 +41,7 @@ from .instrument_window import (PRESET_GAP, HScrollArea, InstrumentWindow, Power
                                 parse_power_list)
 from .params import IndicatorButton, PBGroup, PLineEdit, PSButton, PSpinBox, Panel, PanelLine, PanelTable
 from .power_meter import CONFIRM_MS, ActionButton
+from .source_cal import SourceCal
 from .spectrum import StatePresets
 from .theme import UI_COLUMN_WIDTH_PX, WINDOW_BAR_HEIGHT
 from .window import Window
@@ -56,21 +57,26 @@ MATH = (("DATA", "NORM"), ("D/M", "DIV"), ("D−M", "SUBT"), ("D+M", "ADD"), ("D
 TRACE_CHIP_HEIGHT = 44            # чипы трейсов в избранном: две строки (формат / канал·S-параметр)
 CAL_WINDOW_WIDTH = 440            # окно калибровки: полные названия наборов и шагов
 
-#: вкладка STIM: (подпись, ключ, второй ключ или None)
-STIM_ROWS = (("STAR", "freq.start", None), ("STOP", "freq.stop", None), ("CENT", "freq.center", None),
-             ("SPAN", "freq.span", None), ("PTS", "sweep.points", None), ("IFBW", "bw.if", None),
-             ("TIME", "sweep.time", "sweep.time_auto"), ("TYPE", "sweep.type", None),
-             ("AVG", "avg.state", "avg.count"))
-#: вкладка TRIG: (подпись, ключ, кнопки или None - по профилю, подсказка)
-TRIG_ROWS = (("SRC", "trig.source", [("INT", "IMM"), ("EXT", "EXT"), ("MAN", "MAN")],
-              "Trigger source: internal, external input (rear BNC), manual (TRIG button)"),
-             ("SCOP", "trig.scope", [("ALL", "ALL"), ("CH", "CURRENT")],
-              "One trigger sweeps all channels in turn, or only the current one"),
-             ("MODE", "trig.mode", [("CHAN", "CHANNEL"), ("SWP", "SWEEP"), ("PNT", "POINT"), ("TRAC", "TRACE")],
-              "What one trigger does on the CH channel: the whole channel, one sweep, one point, one trace"),
-             ("SLOP", "trig.slope", [("POS", "POS"), ("NEG", "NEG")], "External trigger edge / level polarity"),
-             ("TYPE", "trig.type", [("EDGE", "EDGE"), ("LEVEL", "LEVEL")], "External trigger by edge or by level"),
-             ("DLY", "trig.delay", None, "Delay after the external trigger, s"))
+#: вкладка STIM: строки из групп ``((подпись, ключ, второй ключ или None), ...)``
+STIM_ROWS = (
+    (("STAR", "freq.start", None), ("STOP", "freq.stop", None)),
+    (("CENT", "freq.center", None), ("SPAN", "freq.span", None)),
+    (("PTS", "sweep.points", None), ("IFBW", "bw.if", None)),
+    (("TIME", "sweep.time", "sweep.time_auto"), ("TYPE", "sweep.type", None)),
+    (("AVG", "avg.state", "avg.count"),),
+)
+#: вкладка TRIG: строки из групп ``((подпись, ключ, кнопки или None, подсказка), ...)``
+TRIG_ROWS = (
+    (("SRC", "trig.source", [("INT", "IMM"), ("EXT", "EXT"), ("MAN", "MAN")],
+      "Trigger source: internal, external input (rear BNC), manual (TRIG button)"),
+     ("SCOP", "trig.scope", [("ALL", "ALL"), ("CH", "CURRENT")],
+      "One trigger sweeps all channels in turn, or only the current one")),
+    (("MODE", "trig.mode", [("CHAN", "CHANNEL"), ("SWP", "SWEEP"), ("PNT", "POINT"), ("TRAC", "TRACE")],
+      "What one trigger does on the CH channel: the whole channel, one sweep, one point, one trace"),
+     ("SLOP", "trig.slope", [("POS", "POS"), ("NEG", "NEG")], "External trigger edge / level polarity"),
+     ("TYPE", "trig.type", [("EDGE", "EDGE"), ("LEVEL", "LEVEL")], "External trigger by edge or by level")),
+    (("DLY", "trig.delay", None, "Delay after the external trigger, s"),),
+)
 NOT_SAVED = ("freq.center", "freq.span", "cal.state")       # центр/обзор следуют из старта/стопа; калибровку не вернуть
 RESTORE_RANK = {"freq.start": 0, "freq.stop": 0, "sweep.type": 1, "freq.cw": 1, "rf.output": 5, "trig.source": 6}
 
@@ -971,6 +977,9 @@ class VNAWindow(InstrumentWindow):
                 tools.setFixedWidth(max(b.sizeHint().width() for b in tools.findChildren(QPushButton)))
         proxy.action_done.connect(self._on_action)
         proxy.sync_done.connect(self.refresh_lists)
+        if hasattr(self, "source_cal"):
+            proxy.sync_done.connect(self.source_cal.apply_correction)
+            proxy.action_done.connect(lambda name, _r: name == "reset" and self.source_cal.apply_correction())
         if proxy.is_connected:
             self.refresh_lists()
 
@@ -1033,46 +1042,64 @@ class VNAWindow(InstrumentWindow):
 
         # STIM: настройки канала, выбранного в избранном (CH)
         lines = []
-        for name, key, extra in STIM_ROWS:
-            if not sup(key):
-                continue
-            ws = [_auto(proxy, key)] + ([_auto(proxy, extra)] if extra and sup(extra) else [])
-            for w in ws:
-                self.widgets[w.key] = w
-                if w.key not in NOT_SAVED:
-                    self.saved_widgets.append(w)
-            lines.append(PanelLine(name, *ws))
+        for group in STIM_ROWS:
+            row = []
+            for name, key, extra in group:
+                if not sup(key):
+                    continue
+                ws = [_auto(proxy, key)] + ([_auto(proxy, extra)] if extra and sup(extra) else [])
+                for w in ws:
+                    self.widgets[w.key] = w
+                    if w.key not in NOT_SAVED:
+                        self.saved_widgets.append(w)
+                row.append(PanelLine(name, *ws))
+            if row:
+                lines.append(tuple(row))
         self.page_specs.append(("STIM", (), PanelTable(*lines)))
 
         # TRIG: запуск развёрток (источник и вход - общие, режим - у канала CH)
         trig = []
-        for name, key, choices, tip in TRIG_ROWS:
-            if not sup(key):
-                continue
-            w = PSButton(proxy, key, choices) if choices else _auto(proxy, key)
-            w.setToolTip(tip)
-            self.widgets[key] = w
-            self.saved_widgets.append(w)
-            ws = [w]
-            if key == "trig.source" and "trigger" in proxy.actions:
-                ws.append(ActionButton(proxy, "trigger", "TRIG", "Manual trigger (SRC = MAN)"))
-            trig.append(PanelLine(name, *ws))
+        for group in TRIG_ROWS:
+            row = []
+            for name, key, choices, tip in group:
+                if not sup(key):
+                    continue
+                w = PSButton(proxy, key, choices) if choices else _auto(proxy, key)
+                w.setToolTip(tip)
+                self.widgets[key] = w
+                self.saved_widgets.append(w)
+                ws = [w]
+                if key == "trig.source" and "trigger" in proxy.actions:
+                    ws.append(ActionButton(proxy, "trigger", "TRIG", "Manual trigger (SRC = MAN)"))
+                row.append(PanelLine(name, *ws))
+            if row:
+                trig.append(tuple(row))
         if sup("meas.continuous"):
             cont = PSButton(proxy, "meas.continuous", [("CONT", True), ("SINGLE", False)])
             self.widgets["meas.continuous"] = cont
             mode = [cont] + ([ActionButton(proxy, "single", "SWEEP", "Single sweep")] if "single" in proxy.actions
                              else [])
-            trig.append(PanelLine("RUN", *mode))
+            run_line = PanelLine("RUN", *mode)
+            if trig and len(trig[-1]) == 1 and trig[-1][0].name == "DLY":
+                trig[-1] = (*trig[-1], run_line)
+            else:
+                trig.append(run_line)
         if trig:
             self.page_specs.append(("TRIG", (), PanelTable(*trig)))
 
         # PWR
         prst = self.power_levels_line("source.power")
-        pwr = [PanelLine("POW", _auto(proxy, "source.power"))]
+        pwr_top = [PanelLine("POW", _auto(proxy, "source.power"))]
         if sup("rf.output"):
-            pwr.append(PanelLine("RF", PSButton(proxy, "rf.output", ONOFF)))
-        pwr.append(prst)
-        self.page_specs.append(("PWR", ("rf.output",) if sup("rf.output") else (), PanelTable(*pwr)))
+            pwr_top.append(PanelLine("RF", PSButton(proxy, "rf.output", ONOFF)))
+        pwr: list = [tuple(pwr_top), prst]
+        if sup("power.offset"):
+            self.source_cal = SourceCal(self, proxy, self.settings, pre, "network_analyzer", self._source_cal_freq)
+            if self.source_cal.offset_label is not None:
+                self.widgets["power.offset"] = self.source_cal.offset_label
+            pwr.extend(self.source_cal.lines())
+        pwr_ind = tuple(k for k in ("rf.output", "power.offset_state") if sup(k))
+        self.page_specs.append(("PWR", pwr_ind, PanelTable(*pwr)))
 
         # CAL: калибровка канала выбранного трейса - cal set из памяти прибора
         if sup("cal.set") and "cal_list" in proxy.actions:
@@ -1092,6 +1119,7 @@ class VNAWindow(InstrumentWindow):
             cal = [PanelLine("CSET", cs, tools).set_help(
                 "Cal sets on the analyzer: click one - apply it to the channel. ↻ re-reads the list, "
                 "− deletes the cal set of this channel.")]
+            cal_flags = []
             for name, key, choices, tip in (
                     ("STIM", "cal.stim", [("CAL", True), ("KEEP", False)],
                      "Applying a cal set: CAL - take its stimulus too (start, stop, points, IFBW, power),\n"
@@ -1102,7 +1130,9 @@ class VNAWindow(InstrumentWindow):
                     w = PSButton(proxy, key, choices)
                     w.setToolTip(tip)
                     self.widgets.setdefault(key, w)
-                    cal.append(PanelLine(name, w))
+                    cal_flags.append(PanelLine(name, w))
+            if cal_flags:
+                cal.append(tuple(cal_flags))
             if "cal_start" in proxy.actions:          # сама калибровка - в отдельном окне
                 self.cal_window = CalWindow(proxy, self.settings, pre)
                 self.cal_wizard = self.cal_window.wizard
@@ -1118,8 +1148,8 @@ class VNAWindow(InstrumentWindow):
         # TRAC (первая вкладка): трейс, выбранный в избранном (TRC)
         if "meas_table" in proxy.actions:
             te = self.trace_editor
-            trac = [PanelLine("CH", te.channel, te.read), PanelLine("SPAR", te.sparam),
-                    PanelLine("FMT", te.format), PanelLine("MATH", te.math)]
+            trac = [PanelLine("CH", te.channel, te.read),
+                    (PanelLine("SPAR", te.sparam), PanelLine("FMT", te.format), PanelLine("MATH", te.math))]
             quick = [ActionButton(proxy, a, t, tip) for a, t, tip in
                      (("meas_all", "ALL", "Read every trace (first 16)"), ("meas_none", "NONE", "Read nothing"))
                      if a in proxy.actions]
@@ -1129,23 +1159,29 @@ class VNAWindow(InstrumentWindow):
 
         # SCAL: масштаб выбранного трейса на экране прибора, задержка и сглаживание (меняют данные)
         if sup("trace.sel"):
-            scal = []
-            if "autoscale" in proxy.actions:
-                scal.append(PanelLine("AUTO", ActionButton(proxy, "autoscale", "AUTOSCALE",
-                                                           "Autoscale the selected trace on the analyzer screen")))
-            for name, keys, tip in (("DIV", ("scale.div",), "Scale per division, units of the trace format"),
-                                    ("REF", ("scale.ref",), "Reference level"),
-                                    ("RPOS", ("scale.rpos",), "Reference position, divisions from the bottom"),
-                                    ("EDEL", ("scale.edel",), "Electrical delay: removes the phase slope of a "
-                                                              "cable (changes the data read)"),
-                                    ("SMO", ("smooth.state", "smooth.aper"), "Smoothing on/off and aperture, % "
-                                                                             "of span (changes the data read)")):
-                ws = [_auto(proxy, k) for k in keys if sup(k)]
-                for w in ws:
-                    w.setToolTip(tip)
-                    self.widgets[w.key] = w
-                if ws:
-                    scal.append(PanelLine(name, *ws))
+            scal: list = []
+            auto_line = (PanelLine("AUTO", ActionButton(proxy, "autoscale", "AUTOSCALE",
+                                                        "Autoscale the selected trace on the analyzer screen"))
+                         if "autoscale" in proxy.actions else None)
+            for idx, group in enumerate((
+                (("DIV", ("scale.div",), "Scale per division, units of the trace format"),),
+                (("REF", ("scale.ref",), "Reference level"),
+                 ("RPOS", ("scale.rpos",), "Reference position, divisions from the bottom")),
+                (("EDEL", ("scale.edel",), "Electrical delay: removes the phase slope of a "
+                                           "cable (changes the data read)"),
+                 ("SMO", ("smooth.state", "smooth.aper"), "Smoothing on/off and aperture, % "
+                                                          "of span (changes the data read)")),
+            )):
+                row = [auto_line] if (idx == 0 and auto_line is not None) else []
+                for name, keys, tip in group:
+                    ws = [_auto(proxy, k) for k in keys if sup(k)]
+                    for w in ws:
+                        w.setToolTip(tip)
+                        self.widgets[w.key] = w
+                    if ws:
+                        row.append(PanelLine(name, *ws))
+                if row:
+                    scal.append(tuple(row))
             self.page_specs.insert(1 if "meas_table" in proxy.actions else 0, ("SCAL", (), PanelTable(*scal)))
 
         # MARK: маркеры выбранного трейса (после SCAL)
@@ -1174,10 +1210,13 @@ class VNAWindow(InstrumentWindow):
             search = [ActionButton(proxy, a, t, tip) for a, t, tip in
                       (("mark_peak", "MAX", "Selected marker to the maximum"),
                        ("mark_min", "MIN", "Selected marker to the minimum")) if a in proxy.actions]
+            bottom_mark = []
             if search:
-                mark.append(PanelLine("SRCH", *search))
+                bottom_mark.append(PanelLine("SRCH", *search))
             if "mark_aoff" in proxy.actions:
-                mark.append(PanelLine("ALL", ActionButton(proxy, "mark_aoff", "OFF", "All markers of the trace off")))
+                bottom_mark.append(PanelLine("ALL", ActionButton(proxy, "mark_aoff", "OFF", "All markers of the trace off")))
+            if bottom_mark:
+                mark.append(tuple(bottom_mark))
             pos = next((i + 1 for i, (n, *_r) in enumerate(self.page_specs) if n == "SCAL"), len(self.page_specs))
             self.page_specs.insert(pos, ("MARK", ("mark.state",), PanelTable(*mark)))
 
@@ -1209,8 +1248,8 @@ class VNAWindow(InstrumentWindow):
             self.name_edit.setToolTip("Prefix of the file name; date and time are added: <prefix>_YYYYMMDD_HHMMSS.csv")
             self.name_edit.editingFinished.connect(
                 lambda: self.settings.setValue(f"{pre}/DATA_NAME", self.name_edit.text().strip()))
-            save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit),
-                     PanelLine("DATA", self.data_button)]
+            save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit)]
+            export_row = [PanelLine("DATA", self.data_button)]
             if "snp_read" in proxy.actions:           # S-параметры канала выбранного трейса -> .s2p
                 b = self.s2p_button = QPushButton("SAVE")
                 b.setObjectName("choice")
@@ -1224,7 +1263,8 @@ class VNAWindow(InstrumentWindow):
                                 and self._flash("ERROR", self.s2p_button))
                 proxy.state_changed.connect(self._on_s2p_state)
                 b.setEnabled(proxy.is_connected)
-                save.append(PanelLine("S2P", b))
+                export_row.append(PanelLine("S2P", b))
+            save.append(tuple(export_row))
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
 
@@ -1241,7 +1281,33 @@ class VNAWindow(InstrumentWindow):
             self.s2p_button.setText("SAVE")
         self.s2p_button.setEnabled(self.proxy.is_connected and self.s2p_button.text() != "…")
 
+    def _source_cal_freq(self) -> float | None:
+        p = self.proxy
+        if p.value("gen.state") is True or p.value("sweep.type") == "CW":
+            f = p.value("freq.cw")
+            if isinstance(f, (int, float)):
+                return float(f)
+        c = p.value("freq.center")
+        if isinstance(c, (int, float)):
+            return float(c)
+        lo, hi = p.value("freq.start"), p.value("freq.stop")
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            return (float(lo) + float(hi)) / 2.0
+        return None
+
+    def on_param(self, key: str, value: Any) -> None:
+        if hasattr(self, "source_cal") and key in ("freq.cw", "freq.center", "freq.start", "freq.stop",
+                                                   "sweep.type", "gen.state"):
+            self.source_cal.apply_correction()
+
+    def restore(self) -> None:
+        if hasattr(self, "source_cal"):
+            self.source_cal.apply_correction()
+        super().restore()
+
     def cleanup(self) -> None:
+        if hasattr(self, "source_cal"):
+            self.source_cal.cleanup()
         cw = getattr(self, "cal_window", None)
         if cw is not None and not sip.isdeleted(cw):
             cw.close()
@@ -1412,10 +1478,16 @@ class VNAWindow(InstrumentWindow):
             parts = [self.proxy.value("freq.start"), self.proxy.value("freq.stop")]
         if any(v is None for v in parts):
             return None
-        text = lambda v: v if isinstance(v, str) else si_format(v, "Hz", 4).replace(" ", "").replace(".", "p")
-        base, name, n = "_".join(text(v) for v in parts), None, 1
+        def text(v):
+            if isinstance(v, str):
+                return v
+            s = si_format(v, "Hz", 4).replace(" ", "").replace(".", "p").replace("µ", "u")
+            return re.sub(r"[^A-Za-z0-9_\-]", "", s)
+        base = "_".join(text(v) for v in parts)[:28] or "STATE"
+        name, n = None, 1
         while name is None or name in self.presets.names():
-            name = base if n == 1 else f"{base}-{n}"
+            suffix = "" if n == 1 else f"-{n}"
+            name = f"{base[:32 - len(suffix)]}{suffix}"
             n += 1
         return name
 
