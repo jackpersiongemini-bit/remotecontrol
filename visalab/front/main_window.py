@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import json
 import math
+from typing import Any
 
 from PyQt6 import sip
 from PyQt6.QtCore import QMimeData, QPoint, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QShortcut
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget,
+                             QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
@@ -36,16 +37,21 @@ from .instrument_window import WINDOW_EVENTS, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
 from .power_meter import pm_time_scale
+from .split_layout import (CUSTOM_LAYOUT_MODE, DROP_ZONES, LAYOUT_DESCRIPTIONS, LAYOUT_MODES, PLOT_LAYOUT_MODES,
+                           DropZoneOverlay, GraphSplitter, PaneLeaf, PaneNode, PaneSplit, build_preset_tree,
+                           clone_tree, detect_drop_zone, dock_panel, equalize_tree, layout_preset_icon, leaf_order,
+                           project_tree, swap_panels_in_tree, sync_weights_into_tree, tree_from_dict,
+                           tree_structure_sig, tree_to_dict)
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
                     UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
 from .window import CustomFullButton, Window, mark_growing, short_address
 
-__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES", "PM_UNITS"]
+__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable",
+           "LAYOUT_MODES", "CUSTOM_LAYOUT_MODE", "PLOT_LAYOUT_MODES", "PM_UNITS"]
 
 TILE_MIN_HEIGHT = 38
 PLOT_MIN_HEIGHT = 240
 UI_REFRESH_MS = 60
-LAYOUT_MODES = ("1 COL", "2 COL", "ROW")
 PM_UNITS = ("dBm", "W", "dBW", "V", "dB")
 _PM_UNIT_LABELS = {"dBm": "dBm", "W": "W", "dBW": "dBW", "V": "V (50 Ω)", "dB": "dB (Pout − Pin)"}
 _PANEL_MIME = "application/x-visalab-livepanel"
@@ -382,10 +388,13 @@ class ScenarioChip(IndicatorButton):
 
 
 class LivePanel(Panel):
-    """Живые данные одного приёмника: можно переставлять (кнопками / перетаскиванием) и закрывать."""
+    """Живые данные одного приёмника: можно разделять экран перетаскиванием, разворачивать, переставлять и закрывать."""
 
     move_requested = pyqtSignal(object, int)
     swap_requested = pyqtSignal(str, str)
+    dock_requested = pyqtSignal(str, str, str)
+    maximize_requested = pyqtSignal(object)
+    context_menu_requested = pyqtSignal(object, QPoint)
     close_requested = pyqtSignal(object)
 
     def __init__(self, proxy, monitor: ActivityMonitor, parent=None, settings: QSettings | None = None):
@@ -395,12 +404,17 @@ class LivePanel(Panel):
         self.profile = profile_name(proxy)
         self.panel_key = f"{monitor.name(proxy)}:{proxy.address}"
         self._drag_pos: QPoint | None = None
+        self._maximized = False
+        self._active_plot_count = 0
+        self._plots_sig: tuple | None = None
+        self._plot_root: QWidget | None = None
+        self._plot_splitters: list[tuple[str, GraphSplitter]] = []
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
         head = QHBoxLayout()
-        head.setSpacing(6)
+        head.setSpacing(4)
         self.title = QLabel()
         self.title.setObjectName("heading")
         self.address = QLabel(short_address(proxy.address))
@@ -408,6 +422,26 @@ class LivePanel(Panel):
         self.source.setObjectName("source")
         self.level = QLabel()
         self.level.setObjectName("heading")
+        saved_vna_split = bool(settings.value(f"MAIN/VNA_SPLIT/{self.panel_key}", False, type=bool)) if settings else False
+        self.split_traces_button = QPushButton("SPLIT")
+        self.split_traces_button.setObjectName("chip")
+        self.split_traces_button.setCheckable(True)
+        self.split_traces_button.setChecked(saved_vna_split)
+        self.split_traces_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.split_traces_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.split_traces_button.setToolTip("Split each VNA trace into its own graph (unchecked - group traces with the same scale)")
+        self.split_traces_button.toggled.connect(self.set_split_traces)
+        self.split_traces_button.hide()
+        saved_plot_mode = str(settings.value(f"MAIN/PLOT_LAYOUT/{self.panel_key}", PLOT_LAYOUT_MODES[0])
+                              or PLOT_LAYOUT_MODES[0]) if settings else PLOT_LAYOUT_MODES[0]
+        self.plot_layout_mode = saved_plot_mode if saved_plot_mode in PLOT_LAYOUT_MODES else PLOT_LAYOUT_MODES[0]
+        self.plot_layout_button = QPushButton(self.plot_layout_mode)
+        self.plot_layout_button.setObjectName("chip")
+        self.plot_layout_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.plot_layout_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plot_layout_button.setToolTip("Arrange plots inside this panel: 1 COL (stack), 2 COL (grid), ROW (side by side). Click to switch")
+        self.plot_layout_button.clicked.connect(self._cycle_plot_layout)
+        self.plot_layout_button.hide()
         saved_unit = str(settings.value(f"MAIN/PM_UNIT/{self.panel_key}", "dBm") or "dBm") if settings else "dBm"
         if saved_unit not in PM_UNITS:
             saved_unit = "dBm"
@@ -431,6 +465,8 @@ class LivePanel(Panel):
                                                lambda: self.move_requested.emit(self.proxy, -1))
         self.move_next_button = self._tool_btn("▶", "Move measurement panel later",
                                                lambda: self.move_requested.emit(self.proxy, 1))
+        self.maximize_button = self._tool_btn("⤢", "Maximize this panel to fill the screen (double-click header or Esc to restore)",
+                                              lambda: self.maximize_requested.emit(self.proxy))
         self.close_button = self._tool_btn("×", "Hide this measurement panel",
                                            lambda: self.close_requested.emit(self.proxy))
         head.addWidget(self.title)
@@ -438,22 +474,30 @@ class LivePanel(Panel):
         head.addStretch()
         head.addWidget(self.source)
         head.addWidget(self.level)
+        head.addWidget(self.split_traces_button)
+        head.addWidget(self.plot_layout_button)
         head.addWidget(self.unit_button)
         head.addWidget(self.clear_button)
         head.addWidget(self.move_prev_button)
         head.addWidget(self.move_next_button)
+        head.addWidget(self.maximize_button)
         head.addWidget(self.close_button)
         lay.addLayout(head)
-        self.plots_box = QVBoxLayout()
-        self.plots_box.setSpacing(6)
-        lay.addLayout(self.plots_box, 1)
+        self._plots_host = QWidget()
+        self.plots_box = QVBoxLayout(self._plots_host)
+        self.plots_box.setContentsMargins(0, 0, 0, 0)
+        self.plots_box.setSpacing(0)
+        lay.addWidget(self._plots_host, 1)
         self.plots: list[LivePlot] = []
         self.power_table: PowerTable | None = None      # не ``table``: так Panel зовёт своё содержимое
         if self.profile == "power_meter":
             self.power_table = PowerTable(unit=saved_unit)
             lay.addWidget(self.power_table, 1)
+            self._plots_host.hide()
         super().__init__(body, parent=parent)
         self.setAcceptDrops(True)
+        self.setMinimumWidth(220)
+        self._drop_overlay = DropZoneOverlay(self)
         self.address.setStyleSheet("color: #8a8a8a;")
         self.source.setStyleSheet("color: #8a8a8a;")
 
@@ -467,12 +511,43 @@ class LivePanel(Panel):
         b.clicked.connect(slot)
         return b
 
+    def set_maximized(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._maximized:
+            return
+        self._maximized = on
+        self.maximize_button.setText("⤡" if on else "⤢")
+        self.maximize_button.setToolTip(
+            "Restore split view (double-click header or Esc)" if on
+            else "Maximize this panel to fill the screen (double-click header or Esc to restore)"
+        )
+
+    def resizeEvent(self, e):  # noqa: N802 - Qt
+        super().resizeEvent(e)
+        if self._drop_overlay.isVisible():
+            self._drop_overlay.setGeometry(self.rect())
+
     def mousePressEvent(self, e):  # noqa: N802 - Qt
         if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 40:
             self._drag_pos = e.position().toPoint()
         else:
             self._drag_pos = None
         super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 40:
+            self._drag_pos = None
+            self.maximize_requested.emit(self.proxy)
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def contextMenuEvent(self, e):  # noqa: N802 - Qt
+        if e.pos().y() <= 40:
+            self.context_menu_requested.emit(self.proxy, e.globalPos())
+            e.accept()
+            return
+        super().contextMenuEvent(e)
 
     def mouseMoveEvent(self, e):  # noqa: N802 - Qt
         if (self._drag_pos is not None and (e.buttons() & Qt.MouseButton.LeftButton)
@@ -490,31 +565,157 @@ class LivePanel(Panel):
         self._drag_pos = None
         super().mouseReleaseEvent(e)
 
+    @staticmethod
+    def _drag_source(e) -> str:
+        if not e.mimeData().hasFormat(_PANEL_MIME):
+            return ""
+        return bytes(e.mimeData().data(_PANEL_MIME)).decode("utf-8", errors="ignore")
+
     def dragEnterEvent(self, e):  # noqa: N802 - Qt
-        if e.mimeData().hasFormat(_PANEL_MIME):
+        src = self._drag_source(e)
+        if src and src != self.panel_key:
+            self._drop_overlay.set_zone(detect_drop_zone(QRectF(self.rect()), e.position()))
             e.acceptProposedAction()
             return
         super().dragEnterEvent(e)
 
+    def dragMoveEvent(self, e):  # noqa: N802 - Qt
+        src = self._drag_source(e)
+        if src and src != self.panel_key:
+            self._drop_overlay.set_zone(detect_drop_zone(QRectF(self.rect()), e.position()))
+            e.acceptProposedAction()
+            return
+        super().dragMoveEvent(e)
+
+    def dragLeaveEvent(self, e):  # noqa: N802 - Qt
+        self._drop_overlay.set_zone(None)
+        super().dragLeaveEvent(e)
+
     def dropEvent(self, e):  # noqa: N802 - Qt
-        if e.mimeData().hasFormat(_PANEL_MIME):
-            src = bytes(e.mimeData().data(_PANEL_MIME)).decode("utf-8")
-            if src and src != self.panel_key:
-                self.swap_requested.emit(src, self.panel_key)
+        self._drop_overlay.set_zone(None)
+        src = self._drag_source(e)
+        if src and src != self.panel_key:
+            zone = detect_drop_zone(QRectF(self.rect()), e.position())
+            self.dock_requested.emit(src, self.panel_key, zone)
             e.acceptProposedAction()
             return
         super().dropEvent(e)
 
+    # ------------------------------------------------------------ внутренние графики панели
+    def set_split_traces(self, on: bool) -> None:
+        on = bool(on)
+        if self.split_traces_button.isChecked() != on:
+            self.split_traces_button.blockSignals(True)
+            self.split_traces_button.setChecked(on)
+            self.split_traces_button.blockSignals(False)
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/VNA_SPLIT/{self.panel_key}", on)
+        if self.profile == "network_analyzer":
+            self._refresh_vna(self.monitor.activity(self.proxy))
+
+    def _cycle_plot_layout(self) -> None:
+        nxt = PLOT_LAYOUT_MODES[(PLOT_LAYOUT_MODES.index(self.plot_layout_mode) + 1) % len(PLOT_LAYOUT_MODES)]
+        self.set_plot_layout_mode(nxt)
+
+    def set_plot_layout_mode(self, mode: str) -> None:
+        if mode not in PLOT_LAYOUT_MODES or mode == self.plot_layout_mode:
+            return
+        self._save_plot_splitters()
+        self.plot_layout_mode = mode
+        self.plot_layout_button.setText(mode)
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/PLOT_LAYOUT/{self.panel_key}", mode)
+        self._plots_sig = None
+        self._use_plots(self._active_plot_count)
+
+    def equalize_plots(self) -> None:
+        for _tag, sp in self._plot_splitters:
+            if not sip.isdeleted(sp):
+                sp.equalize()
+
+    def _plot_splitter_key(self, tag: str, count: int) -> str:
+        return f"MAIN/PLOT_SPLITTER/{self.panel_key}/{self.plot_layout_mode}/{tag}_{count}"
+
+    def _save_plot_splitters(self) -> None:
+        if self.settings is None:
+            return
+        for tag, sp in self._plot_splitters:
+            if not sip.isdeleted(sp):
+                w = sp.current_weights()
+                if w is not None:
+                    self.settings.setValue(self._plot_splitter_key(tag, len(w)), json.dumps([round(x, 5) for x in w]))
+
+    def _load_plot_weights(self, tag: str, count: int, default: list[float]) -> list[float]:
+        if self.settings is None:
+            return default
+        raw = self.settings.value(self._plot_splitter_key(tag, count), "", type=str)
+        try:
+            vals = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            vals = []
+        if isinstance(vals, list) and len(vals) == count and all(isinstance(x, (int, float)) and x > 0 for x in vals):
+            return [float(x) for x in vals]
+        return default
+
+    def _build_plot_node(self, node: PaneNode, path: str = "root", parent: QWidget | None = None) -> QWidget:
+        if isinstance(node, PaneLeaf):
+            plot = self.plots[int(node.key)]
+            plot.show()
+            return plot
+        orient = Qt.Orientation.Horizontal if node.orientation == "H" else Qt.Orientation.Vertical
+        sp = GraphSplitter(orient, parent or self._plots_host)
+        for i, child in enumerate(node.children):
+            sp.addWidget(self._build_plot_node(child, f"{path}_{i}", sp))
+            sp.setStretchFactor(i, 1)
+        sp.apply_weights(self._load_plot_weights(path, len(node.children), node.weights))
+        sp.splitterMoved.connect(lambda _p, _i: self._save_plot_splitters())
+        sp.equalized.connect(self._save_plot_splitters)
+        self._plot_splitters.append((path, sp))
+        sp.show()
+        return sp
+
     def _plot(self, i: int) -> LivePlot:
         while len(self.plots) <= i:
             p = mark_growing(LivePlot(min_height=PLOT_MIN_HEIGHT))
+            p.setParent(self._plots_host)
+            p.hide()
             self.plots.append(p)
-            self.plots_box.addWidget(p)
         return self.plots[i]
 
     def _use_plots(self, n: int) -> None:
-        for i, p in enumerate(self.plots):
-            p.setVisible(i < n)
+        self._active_plot_count = max(0, int(n))
+        self.plot_layout_button.setVisible(self._active_plot_count >= 2)
+        if self._active_plot_count == 0:
+            self._plots_host.hide()
+            for p in self.plots:
+                p.hide()
+            return
+        self._plot(self._active_plot_count - 1)
+        self._plots_host.show()
+        sig = (self.plot_layout_mode, self._active_plot_count)
+        if sig == self._plots_sig:
+            for i, p in enumerate(self.plots):
+                p.setVisible(i < self._active_plot_count)
+            return
+        self._save_plot_splitters()
+        self._plots_sig = sig
+        for p in self.plots:
+            p.setParent(self._plots_host)
+            p.hide()
+        if self._plot_root is not None:
+            self.plots_box.removeWidget(self._plot_root)
+            if isinstance(self._plot_root, GraphSplitter):
+                self._plot_root.deleteLater()
+            self._plot_root = None
+        self._plot_splitters.clear()
+        if self._active_plot_count == 1:
+            root: QWidget = self.plots[0]
+            root.show()
+        else:
+            tree = build_preset_tree(self.plot_layout_mode, [str(i) for i in range(self._active_plot_count)])
+            root = self._build_plot_node(tree) if tree is not None else self.plots[0]
+        self._plot_root = root
+        self.plots_box.addWidget(root, 1)
 
     def refresh(self, a: Activity) -> None:
         self.title.setText(a.name)
@@ -539,22 +740,30 @@ class LivePanel(Panel):
 
     def _refresh_vna(self, a: Activity) -> None:
         traces = self.monitor.vna_traces(self.proxy)
-        groups: dict[tuple, tuple[tuple[float, float, float] | None, list]] = {}
-        for name, tr in traces:                      # одна шкала и единица -> один график
-            scale = _vna_scale(tr)
-            scale_key = None if scale is None else (round(scale[0], 12), round(scale[1], 12), round(scale[2], 12))
-            key = (tr.y_unit, scale_key)
-            entry = groups.get(key)
-            if entry is None:
-                groups[key] = (scale, [(name, tr)])
-            else:
-                entry[1].append((name, tr))
-        for i, (scale, items) in enumerate(groups.values()):
+        split_each = self.split_traces_button.isChecked()
+        self.split_traces_button.setVisible(len(traces) > 1 or split_each)
+        if split_each:
+            groups_list: list[tuple[tuple[float, float, float] | None, list]] = [
+                (_vna_scale(tr), [(name, tr)]) for name, tr in traces
+            ]
+        else:
+            groups: dict[tuple, tuple[tuple[float, float, float] | None, list]] = {}
+            for name, tr in traces:                      # одна шкала и единица -> один график
+                scale = _vna_scale(tr)
+                scale_key = None if scale is None else (round(scale[0], 12), round(scale[1], 12), round(scale[2], 12))
+                key = (tr.y_unit, scale_key)
+                entry = groups.get(key)
+                if entry is None:
+                    groups[key] = (scale, [(name, tr)])
+                else:
+                    entry[1].append((name, tr))
+            groups_list = list(groups.values())
+        for i, (scale, items) in enumerate(groups_list):
             plot = self._plot(i)
             plot.set_scale(scale, divs_y=DEVICE_DIVS_Y if scale is not None else None)
             plot.set_traces(items)
-        self._use_plots(max(1, len(groups)))
-        if not groups:
+        self._use_plots(max(1, len(groups_list)))
+        if not groups_list:
             plot = self._plot(0)
             plot.set_scale(None)
             plot.set_traces([])
@@ -663,8 +872,10 @@ class MainWindow(Window):
         self.restore_chips: dict[str, QPushButton] = {}
         self.display_rules: dict[str, dict[str, Any]] = {}
         self.display_controls: dict[str, tuple[QCheckBox, QCheckBox, SettingField]] = {}
-        self._root_splitter: QSplitter | None = None
-        self._splitters: list[tuple[str, QSplitter]] = []
+        self._root_widget: QWidget | None = None
+        self._splitters: list[tuple[str, PaneSplit, GraphSplitter]] = []
+        self._active_tree: PaneNode | None = None
+        self._maximized_key: str | None = None
         self._arranged_sig: tuple | None = None
         self._visible_proxies: set = set()
         self._measuring_proxies: set = set()
@@ -676,8 +887,14 @@ class MainWindow(Window):
         self._refresh_timer.timeout.connect(self._flush_panels)
         self.panel_order: list[str] = self._load_list(f"{self.SETTINGS_GROUP}/PANEL_ORDER")
         self.hidden_panels: set[str] = set(self._load_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS"))
+        self._custom_tree: PaneNode | None = self._load_split_tree()
         saved_mode = str(settings.value(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", LAYOUT_MODES[0]) or LAYOUT_MODES[0])
-        self.layout_mode = saved_mode if saved_mode in LAYOUT_MODES else LAYOUT_MODES[0]
+        if saved_mode == CUSTOM_LAYOUT_MODE and self._custom_tree is not None:
+            self.layout_mode = CUSTOM_LAYOUT_MODE
+        elif saved_mode in LAYOUT_MODES:
+            self.layout_mode = saved_mode
+        else:
+            self.layout_mode = LAYOUT_MODES[0]
 
         # во весь экран: кнопка в заголовке правее «свернуть» и F11
         self.full_button = CustomFullButton()
@@ -686,6 +903,8 @@ class MainWindow(Window):
         self.titleBar.insert_control_widget(self.full_button, after_minimize=True)
         self._full_key = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
         self._full_key.activated.connect(self.toggle_full_screen)
+        self._esc_key = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_key.activated.connect(self._exit_maximize)
 
         strip = QWidget()
         self.strip_layout = QHBoxLayout(strip)
@@ -699,8 +918,26 @@ class MainWindow(Window):
         self.layout_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.layout_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.layout_button.setMinimumHeight(28)
-        self.layout_button.setToolTip("Measurement panel layout: 1 COL (stack), 2 COL (grid), ROW (side by side). Click to switch")
+        self.layout_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.layout_button.setToolTip(
+            "Split screen layout: 1 COL, 2 COL, ROW, MAIN L, MAIN T (or custom SPLIT by dragging panel headers to edges). "
+            "Click - next preset, right click - choose"
+        )
         self.layout_button.clicked.connect(self._cycle_layout_mode)
+        self.layout_button.customContextMenuRequested.connect(
+            lambda pos: self._open_split_menu(self.layout_button.mapToGlobal(pos))
+        )
+        self.split_menu_button = QPushButton("⊞")
+        self.split_menu_button.setObjectName("chip")
+        self.split_menu_button.setProperty("tight", True)
+        self.split_menu_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.split_menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.split_menu_button.setMinimumWidth(30)
+        self.split_menu_button.setMinimumHeight(28)
+        self.split_menu_button.setToolTip("Choose screen split preset, equalize dividers, or reset custom split")
+        self.split_menu_button.clicked.connect(
+            lambda: self._open_split_menu(self.split_menu_button.mapToGlobal(QPoint(0, self.split_menu_button.height())))
+        )
         self.all_button = QPushButton("ALL")
         self.all_button.setObjectName("chip")
         self.all_button.setCheckable(True)
@@ -717,10 +954,14 @@ class MainWindow(Window):
         self.strip_layout.addLayout(self.restore_layout)
         self.strip_layout.addWidget(self.scenario_chip)
         self.strip_layout.addWidget(self.layout_button)
+        self.strip_layout.addWidget(self.split_menu_button)
         self.strip_layout.addWidget(self.all_button)
         self.strip_panel = Panel(strip)
         self.strip_panel.setStyleSheet(
-            Panel.STYLE_SHEET + f'\nPanel QPushButton#chip[tile="true"] {{ min-height: {TILE_MIN_HEIGHT}px; }}'
+            Panel.STYLE_SHEET + render_qss(
+                f'\nPanel QPushButton#chip[tile="true"] {{ min-height: {TILE_MIN_HEIGHT}px; }}'
+                '\nQMenu#psmenu::separator { height: 1px; background: $UI_COLOR_BORDER; margin: 4px 6px; }'
+            )
         )
         self.strip_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
@@ -793,7 +1034,6 @@ class MainWindow(Window):
             QSplitter::handle { background: transparent; }
             QSplitter::handle:vertical { height: 8px; }
             QSplitter::handle:horizontal { width: 8px; }
-            QSplitter::handle:hover { background: $UI_COLOR_BORDER_LIGHT; border-radius: 2px; }
         """))
         live.addWidget(self.live_scroll, 1)
         live.addWidget(self.idle)
@@ -839,6 +1079,19 @@ class MainWindow(Window):
     def _save_list(self, key: str, items) -> None:
         self.settings.setValue(key, json.dumps(list(items)))
 
+    def _load_split_tree(self) -> PaneNode | None:
+        raw = self.settings.value(f"{self.SETTINGS_GROUP}/SPLIT_TREE", "", type=str)
+        if not raw:
+            return None
+        try:
+            return tree_from_dict(json.loads(raw))
+        except (TypeError, ValueError):
+            return None
+
+    def _save_split_tree(self) -> None:
+        data = tree_to_dict(self._custom_tree)
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/SPLIT_TREE", json.dumps(data) if data is not None else "")
+
     def _panel_key(self, proxy) -> str:
         panel = self.panels.get(proxy)
         if panel is not None:
@@ -867,6 +1120,9 @@ class MainWindow(Window):
                 panel = LivePanel(p, self.monitor, settings=self.settings)
                 panel.move_requested.connect(self.move_panel)
                 panel.swap_requested.connect(self.swap_panels)
+                panel.dock_requested.connect(self.dock_panel_to)
+                panel.maximize_requested.connect(self.toggle_maximize_panel)
+                panel.context_menu_requested.connect(self._open_panel_menu)
                 panel.close_requested.connect(self.hide_panel)
                 panel.hide()
                 self.panels[p] = panel
@@ -997,13 +1253,22 @@ class MainWindow(Window):
         self._update_visibility()
 
     def _cycle_layout_mode(self) -> None:
-        nxt = LAYOUT_MODES[(LAYOUT_MODES.index(self.layout_mode) + 1) % len(LAYOUT_MODES)]
+        if self.layout_mode in LAYOUT_MODES:
+            nxt = LAYOUT_MODES[(LAYOUT_MODES.index(self.layout_mode) + 1) % len(LAYOUT_MODES)]
+        else:
+            nxt = LAYOUT_MODES[0]
         self.set_layout_mode(nxt)
 
     def set_layout_mode(self, mode: str) -> None:
-        if mode not in LAYOUT_MODES or mode == self.layout_mode:
+        if mode == CUSTOM_LAYOUT_MODE:
+            if self._custom_tree is None:
+                return
+        elif mode not in LAYOUT_MODES:
+            return
+        if mode == self.layout_mode and self._maximized_key is None:
             return
         self._save_splitters()
+        self._maximized_key = None
         self.layout_mode = mode
         self.layout_button.setText(mode)
         self.settings.setValue(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", mode)
@@ -1206,15 +1471,18 @@ class MainWindow(Window):
 
     def move_panel(self, proxy, delta: int) -> None:
         """Сдвинуть панель в порядке показа среди видимых панелей."""
-        ordered = self._ordered_receivers()
-        vis = [p for p in ordered if self._should_show(p)]
-        if proxy not in vis:
+        key = self._panel_key(proxy)
+        if self.layout_mode == CUSTOM_LAYOUT_MODE and self._active_tree is not None:
+            vis_keys = leaf_order(self._active_tree)
+        else:
+            vis_keys = [self._panel_key(p) for p in self._ordered_receivers() if self._should_show(p)]
+        if key not in vis_keys:
             return
-        i = vis.index(proxy)
+        i = vis_keys.index(key)
         j = i + (-1 if delta < 0 else 1)
-        if not 0 <= j < len(vis):
+        if not 0 <= j < len(vis_keys):
             return
-        self.swap_panels(self._panel_key(vis[i]), self._panel_key(vis[j]))
+        self.swap_panels(vis_keys[i], vis_keys[j])
 
     def swap_panels(self, src_key: str, dst_key: str) -> None:
         if src_key == dst_key:
@@ -1225,8 +1493,150 @@ class MainWindow(Window):
         i, j = self.panel_order.index(src_key), self.panel_order.index(dst_key)
         self.panel_order[i], self.panel_order[j] = self.panel_order[j], self.panel_order[i]
         self._save_list(f"{self.SETTINGS_GROUP}/PANEL_ORDER", self.panel_order)
+        if self._custom_tree is not None:
+            self._custom_tree = swap_panels_in_tree(self._custom_tree, src_key, dst_key)
+            self._save_split_tree()
         self._arranged_sig = None
         self._update_visibility()
+
+    def dock_panel_to(self, src_key: str, dst_key: str, zone: str) -> None:
+        """Разделить область целевой панели (left / right / top / bottom) или обменять местами (center)."""
+        if not src_key or not dst_key or src_key == dst_key or zone not in DROP_ZONES:
+            return
+        if zone == "center" and self.layout_mode != CUSTOM_LAYOUT_MODE:
+            self.swap_panels(src_key, dst_key)
+            return
+        self._save_splitters()
+        ordered_vis = [self._panel_key(p) for p in self._ordered_receivers() if self._should_show(p)]
+        if self.layout_mode == CUSTOM_LAYOUT_MODE and self._custom_tree is not None:
+            base = project_tree(self._custom_tree, ordered_vis)
+            # Сохраним и скрытые узлы, если они уже были в дереве, чтобы не терять их позиции
+            base_full = self._custom_tree
+            new_tree = dock_panel(base_full, src_key, dst_key, zone)
+            # Если какой-то из ключей был новым и отсутствовал в base_full, подстрахуемся проекцией
+            if new_tree is None or src_key not in leaf_order(new_tree) or dst_key not in leaf_order(new_tree):
+                new_tree = dock_panel(base, src_key, dst_key, zone)
+        else:
+            base = clone_tree(self._active_tree) if self._active_tree is not None else build_preset_tree(self.layout_mode, ordered_vis)
+            new_tree = dock_panel(base, src_key, dst_key, zone)
+        if new_tree is None:
+            return
+        self._custom_tree = new_tree
+        self._maximized_key = None
+        self.layout_mode = CUSTOM_LAYOUT_MODE
+        self.layout_button.setText(CUSTOM_LAYOUT_MODE)
+        order = leaf_order(new_tree)
+        self.panel_order = order + [k for k in self.panel_order if k not in order]
+        self._save_list(f"{self.SETTINGS_GROUP}/PANEL_ORDER", self.panel_order)
+        self._save_split_tree()
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", self.layout_mode)
+        self._arranged_sig = None
+        self._update_visibility()
+
+    def toggle_maximize_panel(self, proxy) -> None:
+        """Развернуть одну панель на всю область графиков (повторно - вернуть разделённый экран)."""
+        key = self._panel_key(proxy)
+        self.set_maximized_panel(None if self._maximized_key == key else key)
+
+    def set_maximized_panel(self, key: str | None) -> None:
+        if key == self._maximized_key:
+            return
+        self._save_splitters()
+        self._maximized_key = key
+        self._arranged_sig = None
+        self._update_visibility()
+
+    def _exit_maximize(self) -> None:
+        if self._maximized_key is not None:
+            self.set_maximized_panel(None)
+
+    def equalize_splits(self) -> None:
+        """Выровнять все делители экрана (и внутренних графиков панелей) поровну."""
+        for _tag, node, sp in self._splitters:
+            if not sip.isdeleted(sp):
+                sp.equalize()
+                node.weights = [1.0 / len(node.children)] * len(node.children)
+        if self.layout_mode == CUSTOM_LAYOUT_MODE and self._custom_tree is not None:
+            self._custom_tree = equalize_tree(self._custom_tree)
+            self._save_split_tree()
+        else:
+            self._save_splitters()
+        for panel in self.panels.values():
+            if not sip.isdeleted(panel):
+                panel.equalize_plots()
+
+    def reset_split_layout(self) -> None:
+        """Сбросить пользовательское разделение и пропорции, вернуться к базовой раскладке."""
+        self._custom_tree = None
+        self._maximized_key = None
+        self._save_split_tree()
+        self.settings.remove(f"{self.SETTINGS_GROUP}/SPLITTER_WEIGHTS")
+        self.layout_mode = LAYOUT_MODES[0]
+        self.layout_button.setText(self.layout_mode)
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", self.layout_mode)
+        self._arranged_sig = None
+        self._update_visibility()
+
+    def _open_split_menu(self, global_pos: QPoint) -> None:
+        menu = QMenu(self.strip_panel)
+        menu.setObjectName("psmenu")
+        for mode in LAYOUT_MODES:
+            act = menu.addAction(layout_preset_icon(mode), f"{mode}   {LAYOUT_DESCRIPTIONS[mode]}")
+            act.setCheckable(True)
+            act.setChecked(self.layout_mode == mode and self._maximized_key is None)
+            act.triggered.connect(lambda _=False, m=mode: self.set_layout_mode(m))
+        if self._custom_tree is not None:
+            act = menu.addAction(layout_preset_icon(CUSTOM_LAYOUT_MODE),
+                                 f"{CUSTOM_LAYOUT_MODE}   {LAYOUT_DESCRIPTIONS[CUSTOM_LAYOUT_MODE]}")
+            act.setCheckable(True)
+            act.setChecked(self.layout_mode == CUSTOM_LAYOUT_MODE and self._maximized_key is None)
+            act.triggered.connect(lambda _=False: self.set_layout_mode(CUSTOM_LAYOUT_MODE))
+        menu.addSeparator()
+        has_splits = bool(self._splitters) or any(p._active_plot_count >= 2 for p in self.panels.values())
+        eq_act = menu.addAction("Equalize splits")
+        eq_act.setEnabled(has_splits)
+        eq_act.triggered.connect(self.equalize_splits)
+        if self._maximized_key is not None:
+            restore_act = menu.addAction("Restore split view (Esc)")
+            restore_act.triggered.connect(self._exit_maximize)
+        reset_act = menu.addAction("Reset split layout")
+        reset_act.triggered.connect(self.reset_split_layout)
+        menu.popup(global_pos)
+
+    def _open_panel_menu(self, proxy, global_pos: QPoint) -> None:
+        panel = self.panels.get(proxy)
+        if panel is None:
+            return
+        src_key = panel.panel_key
+        eligible = [p for p in self._ordered_receivers() if self._should_show(p)]
+        others = [p for p in eligible if p is not proxy]
+        menu = QMenu(panel)
+        menu.setObjectName("psmenu")
+        if self._maximized_key == src_key:
+            act = menu.addAction("Restore split view")
+        else:
+            act = menu.addAction("Maximize panel")
+            act.setEnabled(len(eligible) > 1)
+        act.triggered.connect(lambda _=False, pr=proxy: self.toggle_maximize_panel(pr))
+        if others:
+            menu.addSeparator()
+            for title, zone in (("Split left of", "left"), ("Split right of", "right"),
+                                ("Split above", "top"), ("Split below", "bottom"),
+                                ("Swap with", "center")):
+                sub = menu.addMenu(title)
+                sub.setObjectName("psmenu")
+                for other in others:
+                    dst_key = self._panel_key(other)
+                    name = self.monitor.name(other)
+                    a = sub.addAction(name)
+                    a.triggered.connect(lambda _=False, s=src_key, d=dst_key, z=zone: self.dock_panel_to(s, d, z))
+        menu.addSeparator()
+        if self._splitters or panel._active_plot_count >= 2:
+            eq = menu.addAction("Equalize splits")
+            eq.triggered.connect(self.equalize_splits)
+        hide_act = menu.addAction("Hide panel")
+        hide_act.triggered.connect(lambda _=False, pr=proxy: self.hide_panel(pr))
+        menu.popup(global_pos)
 
     def _ordered_receivers(self) -> list:
         rank = {k: i for i, k in enumerate(self.panel_order)}
@@ -1247,33 +1657,57 @@ class MainWindow(Window):
     def _should_show(self, proxy) -> bool:
         return self._is_eligible(proxy) and self._panel_key(proxy) not in self.hidden_panels
 
-    def _splitter_key(self, tag: str, count: int) -> str:
-        return f"{self.SETTINGS_GROUP}/SPLITTER_SIZES/{self.layout_mode}/{tag}_{count}"
+    def _splitter_weights_key(self, tag: str, count: int) -> str:
+        return f"{self.SETTINGS_GROUP}/SPLITTER_WEIGHTS/{self.layout_mode}/{tag}_{count}"
+
+    def _load_preset_weights(self, tag: str, count: int, default: list[float]) -> list[float]:
+        raw = self.settings.value(self._splitter_weights_key(tag, count), "", type=str)
+        try:
+            vals = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            vals = []
+        if isinstance(vals, list) and len(vals) == count and all(isinstance(x, (int, float)) and x > 0 for x in vals):
+            return [float(x) for x in vals]
+        return default
 
     def _save_splitters(self) -> None:
-        for tag, sp in self._splitters:
-            if not sip.isdeleted(sp):
-                sizes = sp.sizes()
-                if len(sizes) > 1 and any(sizes):
-                    self.settings.setValue(self._splitter_key(tag, len(sizes)), json.dumps(sizes))
+        updated = False
+        for tag, node, sp in self._splitters:
+            if sip.isdeleted(sp):
+                continue
+            weights = sp.current_weights()
+            if weights is None or len(weights) != len(node.children):
+                continue
+            node.weights = weights
+            updated = True
+            if self.layout_mode != CUSTOM_LAYOUT_MODE:
+                self.settings.setValue(
+                    self._splitter_weights_key(tag, len(weights)),
+                    json.dumps([round(w, 5) for w in weights]),
+                )
+        if updated and self.layout_mode == CUSTOM_LAYOUT_MODE and self._custom_tree is not None and self._active_tree is not None:
+            self._custom_tree = sync_weights_into_tree(self._custom_tree, self._active_tree)
+            self._save_split_tree()
 
-    def _restore_splitter(self, tag: str, sp: QSplitter) -> None:
-        raw = self.settings.value(self._splitter_key(tag, sp.count()), "", type=str)
-        try:
-            sizes = json.loads(raw) if raw else []
-        except (TypeError, ValueError):
-            sizes = []
-        if isinstance(sizes, list) and len(sizes) == sp.count() and all(isinstance(x, int) and x > 0 for x in sizes):
-            sp.setSizes(sizes)
-        else:
-            sp.setSizes([1000] * sp.count())
-
-    def _make_splitter(self, orientation: Qt.Orientation, tag: str) -> QSplitter:
-        sp = QSplitter(orientation)
-        sp.setChildrenCollapsible(False)
-        sp.setHandleWidth(8)
+    def _build_split_widget(self, node: PaneNode, by_key: dict[str, LivePanel], path: str = "root",
+                            parent: QWidget | None = None) -> QWidget:
+        if isinstance(node, PaneLeaf):
+            panel = by_key[node.key]
+            panel.show()
+            return panel
+        orient = Qt.Orientation.Horizontal if node.orientation == "H" else Qt.Orientation.Vertical
+        sp = GraphSplitter(orient, parent or self._live_host)
+        for i, child in enumerate(node.children):
+            sp.addWidget(self._build_split_widget(child, by_key, f"{path}_{i}", sp))
+            sp.setStretchFactor(i, 1)
+        weights = (node.weights if self.layout_mode == CUSTOM_LAYOUT_MODE
+                   else self._load_preset_weights(path, len(node.children), node.weights))
+        node.weights = list(weights)
+        sp.apply_weights(weights)
         sp.splitterMoved.connect(lambda _p, _i: self._save_splitters())
-        self._splitters.append((tag, sp))
+        sp.equalized.connect(self._save_splitters)
+        self._splitters.append((path, node, sp))
+        sp.show()
         return sp
 
     def _update_restore_chips(self, ordered: list) -> None:
@@ -1298,63 +1732,64 @@ class MainWindow(Window):
     def _update_visibility(self) -> None:
         ordered = self._ordered_receivers()
         self._update_restore_chips(ordered)
-        visible = [p for p in ordered if self._should_show(p)]
-        self._visible_proxies = set(visible)
-        sig = (self.layout_mode, tuple(self._panel_key(p) for p in visible))
+        eligible = [p for p in ordered if self._should_show(p)]
+        self._visible_proxies = set(eligible)
+        by_key = {self._panel_key(p): self.panels[p] for p in eligible}
+        eligible_keys = [self._panel_key(p) for p in eligible]
+
+        if self._maximized_key is not None and self._maximized_key not in by_key:
+            self._maximized_key = None
+
+        if not eligible_keys:
+            tree: PaneNode | None = None
+        elif self._maximized_key is not None:
+            tree = PaneLeaf(self._maximized_key)
+        elif self.layout_mode == CUSTOM_LAYOUT_MODE and self._custom_tree is not None:
+            tree = project_tree(self._custom_tree, eligible_keys)
+        else:
+            tree = build_preset_tree(self.layout_mode, eligible_keys)
+
+        sig = (self.layout_mode, self._maximized_key, tree_structure_sig(tree))
         if sig != self._arranged_sig:
             self._save_splitters()
             self._arranged_sig = sig
+            self._active_tree = tree
             for panel in self.panels.values():
                 panel.setParent(self._live_host)
                 panel.hide()
-            if self._root_splitter is not None:
-                self.live_layout.removeWidget(self._root_splitter)
-                self._root_splitter.deleteLater()
-                self._root_splitter = None
+            if self._root_widget is not None:
+                self.live_layout.removeWidget(self._root_widget)
+                if isinstance(self._root_widget, GraphSplitter):
+                    self._root_widget.deleteLater()
+                self._root_widget = None
             self._splitters.clear()
-            if visible:
-                if self.layout_mode == "ROW":
-                    root = self._make_splitter(Qt.Orientation.Horizontal, "root")
-                    for i, p in enumerate(visible):
-                        root.addWidget(self.panels[p])
-                        root.setStretchFactor(i, 1)
-                        self.panels[p].show()
-                    self._restore_splitter("root", root)
-                elif self.layout_mode == "2 COL" and len(visible) > 1:
-                    root = self._make_splitter(Qt.Orientation.Vertical, "root")
-                    for r, i in enumerate(range(0, len(visible), 2)):
-                        chunk = visible[i:i + 2]
-                        if len(chunk) == 2:
-                            row_sp = self._make_splitter(Qt.Orientation.Horizontal, f"row{r}")
-                            for c, p in enumerate(chunk):
-                                row_sp.addWidget(self.panels[p])
-                                row_sp.setStretchFactor(c, 1)
-                                self.panels[p].show()
-                            self._restore_splitter(f"row{r}", row_sp)
-                            root.addWidget(row_sp)
-                        else:
-                            root.addWidget(self.panels[chunk[0]])
-                            self.panels[chunk[0]].show()
-                        root.setStretchFactor(r, 1)
-                    self._restore_splitter("root", root)
-                else:
-                    root = self._make_splitter(Qt.Orientation.Vertical, "root")
-                    for i, p in enumerate(visible):
-                        root.addWidget(self.panels[p])
-                        root.setStretchFactor(i, 1)
-                        self.panels[p].show()
-                    self._restore_splitter("root", root)
-                self._root_splitter = root
+            if tree is not None:
+                root = self._build_split_widget(tree, by_key)
+                self._root_widget = root
                 self.live_layout.addWidget(root, 1)
-        for i, p in enumerate(visible):
-            panel = self.panels[p]
-            panel.move_prev_button.setEnabled(i > 0)
-            panel.move_next_button.setEnabled(i < len(visible) - 1)
-        self.live_scroll.setVisible(bool(visible))
-        self.idle.setVisible(not visible)
+
+        shown_keys = leaf_order(self._active_tree)
+        for i, key in enumerate(shown_keys):
+            panel = by_key.get(key)
+            if panel is None:
+                continue
+            is_max = self._maximized_key == key
+            panel.set_maximized(is_max)
+            panel.maximize_button.setEnabled(len(eligible_keys) > 1 or is_max)
+            panel.move_prev_button.setEnabled(not is_max and i > 0)
+            panel.move_next_button.setEnabled(not is_max and i < len(shown_keys) - 1)
+        for p in self.panels:
+            k = self._panel_key(p)
+            if k not in shown_keys:
+                self.panels[p].set_maximized(False)
+        self.live_scroll.setVisible(bool(shown_keys))
+        self.idle.setVisible(not shown_keys)
 
     def visible_panels(self) -> list[LivePanel]:
-        return [self.panels[p] for p in self._ordered_receivers() if self._should_show(p)]
+        by_key = {self._panel_key(p): self.panels[p] for p in self._ordered_receivers() if self._should_show(p)}
+        if self._active_tree is not None:
+            return [by_key[k] for k in leaf_order(self._active_tree) if k in by_key]
+        return list(by_key.values())
 
     # ------------------------------------------------------------ во весь экран
     def show_window(self) -> None:
@@ -1407,6 +1842,9 @@ class MainWindow(Window):
         self._refresh_timer.stop()
         self._dirty_panels.clear()
         self._save_splitters()
+        for panel in self.panels.values():
+            if not sip.isdeleted(panel):
+                panel._save_plot_splitters()
         if self.quit_on_close:
             for fn in self.before_quit:
                 fn()
