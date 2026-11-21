@@ -398,7 +398,7 @@ class LivePanel(Panel):
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
+        lay.setSpacing(4)
         head = QHBoxLayout()
         head.setSpacing(6)
         self.title = QLabel()
@@ -427,6 +427,20 @@ class LivePanel(Panel):
         self.clear_button.setToolTip("Clear the frequency / power table")
         self.clear_button.clicked.connect(lambda: self.monitor.clear_pm_table(self.proxy))
         self.clear_button.hide()
+        self.mem_button = QPushButton("MEM")
+        self.mem_button.setObjectName("chip")
+        self.mem_button.setCheckable(True)
+        self.mem_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mem_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mem_button.setToolTip("Store or clear trace memory (MEM) — or double-click directly on a graph")
+        self.mem_button.clicked.connect(self._toggle_panel_mem)
+        self.mem_button.hide()
+        self.plot_settings_button = self._tool_btn(
+            "⚙",
+            "Graph scale, memory (MEM / DATA−MEM), and trace analysis checkboxes (or right-click graph)",
+            self._open_plot_settings,
+        )
+        self.plot_settings_button.hide()
         self.move_prev_button = self._tool_btn("◀", "Move measurement panel earlier",
                                                lambda: self.move_requested.emit(self.proxy, -1))
         self.move_next_button = self._tool_btn("▶", "Move measurement panel later",
@@ -436,10 +450,11 @@ class LivePanel(Panel):
         head.addWidget(self.title)
         head.addWidget(self.address)
         head.addStretch()
-        head.addWidget(self.source)
         head.addWidget(self.level)
         head.addWidget(self.unit_button)
         head.addWidget(self.clear_button)
+        head.addWidget(self.mem_button)
+        head.addWidget(self.plot_settings_button)
         head.addWidget(self.move_prev_button)
         head.addWidget(self.move_next_button)
         head.addWidget(self.close_button)
@@ -452,10 +467,18 @@ class LivePanel(Panel):
         if self.profile == "power_meter":
             self.power_table = PowerTable(unit=saved_unit)
             lay.addWidget(self.power_table, 1)
+
+        # Источник сигнала (← GEN ... / CW ...) вынесен под график, чтобы не перегружать заголовок
+        self.source.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.source.hide()
+        lay.addWidget(self.source)
+        self._active_plot_count = 0
+
         super().__init__(body, parent=parent)
         self.setAcceptDrops(True)
         self.address.setStyleSheet("color: #8a8a8a;")
         self.source.setStyleSheet("color: #8a8a8a;")
+        self._sync_footer()
 
     @staticmethod
     def _tool_btn(text: str, tip: str, slot) -> QPushButton:
@@ -507,14 +530,73 @@ class LivePanel(Panel):
 
     def _plot(self, i: int) -> LivePlot:
         while len(self.plots) <= i:
+            idx = len(self.plots)
             p = mark_growing(LivePlot(min_height=PLOT_MIN_HEIGHT))
+            p.bind_settings(self.settings, f"MAIN/PLOT/{self.panel_key}/{idx}")
+            p.settings_changed.connect(self._sync_footer)
             self.plots.append(p)
             self.plots_box.addWidget(p)
         return self.plots[i]
 
     def _use_plots(self, n: int) -> None:
+        self._active_plot_count = max(0, int(n))
         for i, p in enumerate(self.plots):
-            p.setVisible(i < n)
+            p.setVisible(i < self._active_plot_count)
+        self._sync_footer()
+
+    def _active_plots(self) -> list[LivePlot]:
+        return self.plots[:self._active_plot_count]
+
+    def _sync_footer(self) -> None:
+        active = self._active_plots()
+        has_plots = bool(active)
+        has_source = bool(self.source.text())
+        self.mem_button.setVisible(has_plots)
+        self.plot_settings_button.setVisible(has_plots)
+        self.source.setVisible(has_source)
+        if has_plots:
+            any_mem = any(bool(p.memory) for p in active)
+            any_diff = any(bool(p.memory_diff) for p in active)
+            self.mem_button.blockSignals(True)
+            self.mem_button.setChecked(any_mem)
+            self.mem_button.setText("ΔMEM" if any_diff else "MEM")
+            self.mem_button.blockSignals(False)
+            n_an = sum(len(p.analysis_metrics) for p in active)
+            any_man = any(p.manual_scale or p.manual_x_range is not None for p in active)
+            tip_parts = ["Graph scale, memory (MEM / DATA−MEM), and trace analysis checkboxes (or right-click graph)"]
+            if any_man:
+                tip_parts.append("Manual scale active")
+            if n_an:
+                tip_parts.append(f"Analysis metrics active: {n_an}")
+            self.plot_settings_button.setToolTip("\n".join(tip_parts))
+
+    def _toggle_panel_mem(self) -> None:
+        active = self._active_plots()
+        if not active:
+            return
+        if any(p.memory for p in active):
+            for p in active:
+                p.clear_memory()
+        else:
+            for p in active:
+                p.store_memory()
+        self._sync_footer()
+
+    def _open_plot_settings(self) -> None:
+        active = self._active_plots()
+        if not active:
+            return
+        pos = self.plot_settings_button.mapToGlobal(QPoint(0, self.plot_settings_button.height() + 2))
+        if len(active) == 1:
+            active[0].open_settings(pos)
+            return
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for i, p in enumerate(active):
+            names = ", ".join(n for n, _t in p.traces if n) or f"Plot {i + 1}"
+            act = menu.addAction(f"Plot {i + 1}: {names}")
+            act.triggered.connect(lambda _=False, pl=p, pt=pos: pl.open_settings(pt))
+        menu.popup(pos)
 
     def refresh(self, a: Activity) -> None:
         self.title.setText(a.name)
@@ -536,6 +618,7 @@ class LivePanel(Panel):
             self.source.setText(f"CW{pt} {si_format(self.proxy.value('freq.cw'), 'Hz', 6)}{rf_off}")
         else:
             self.source.setText("")
+        self._sync_footer()
 
     def _refresh_vna(self, a: Activity) -> None:
         traces = self.monitor.vna_traces(self.proxy)
