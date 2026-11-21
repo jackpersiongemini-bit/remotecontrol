@@ -205,10 +205,11 @@ class LNumber(QLineEdit):
         self.setTextMargins(w if not b.isHidden() else 0, 0, 0, 0)
 
     def _update_unit(self, value) -> None:
-        """Пустое поле с подсказкой - без единицы (подсказке нужно место); при вводе единица видна."""
-        show = not (self.hint and value is None and not self.hasFocus())
+        """Пустое поле с подсказкой или без единицы - без кнопки единицы; при вводе единица видна."""
+        show = bool(self.unit) and not (self.hint and value is None and not self.hasFocus())
         # подсказка пустого поля - по центру, число - справа
-        self.setAlignment((Qt.AlignmentFlag.AlignRight if show else Qt.AlignmentFlag.AlignHCenter)
+        self.setAlignment((Qt.AlignmentFlag.AlignRight if not (self.hint and value is None and not self.hasFocus())
+                           else Qt.AlignmentFlag.AlignHCenter)
                           | Qt.AlignmentFlag.AlignVCenter)
         if self.unit_button.isVisibleTo(self) != show or self.unit_button.isHidden() == show:
             self.unit_button.setVisible(show)
@@ -916,6 +917,13 @@ class PowerMeterWindow(InstrumentWindow):
         self.page_specs.append(("TIME", ("trace.state",) if sup("trace.state") else (),
                                 PanelTable(*time_)))
 
+        # SWP: sweep-режимы по частоте, мощности источника и 2D (координатор + подключённый источник СВЧ)
+        from .sweep import SweepController
+        self.sweep = SweepController(self, proxy, s, pre, "power_meter", offset_fn=self._sweep_offset)
+        self.sweep.running_changed.connect(lambda _on: (self._update_tabs(), self._refresh_readout()))
+        self.sweep.progress_changed.connect(lambda *_a: self._refresh_readout())
+        self.page_specs.append(("SWP", (), PanelTable(*self.sweep.lines())))
+
     # ------------------------------------------------------------ шкала графика TIME (настройка окна)
     def _time_scale_lines(self) -> list[PanelLine]:
         """SCAL: AUTO / MAN и единица dBm / W; REF - верх шкалы, DIV - цена деления (ini TIME_*)."""
@@ -1003,6 +1011,19 @@ class PowerMeterWindow(InstrumentWindow):
         if idx >= 0:
             src = self.proxy.value("trig.source")
             self.tabs.set_on(idx, src is not None and src != "IMM")
+        swp_idx = self._tab_index("SWP")
+        if swp_idx >= 0 and hasattr(self, "sweep"):
+            self.tabs.set_on(swp_idx, self.sweep.running)
+
+    def _sweep_offset(self, freq: float) -> float | None:
+        """Суммарная поправка окна на частоте ``freq`` для sweep-режима (None, если поправки не заданы)."""
+        if not self.cal_points and not self.gain_on.value and self.duty_src.value == "OFF":
+            return None
+        cal = interpolate(self.cal_points, freq)
+        gain = -self.gain.value if self.gain_on.value else 0.0
+        duty = self.duty_value()
+        total = cal + gain + (10.0 * math.log10(100.0 / duty) if duty else 0.0)
+        return round(min(max(total, -OFFSET_LIMIT), OFFSET_LIMIT), 3)
 
     def _update_trig_enabled(self) -> None:
         slope = self.widgets.get("trig.slope")
@@ -1149,11 +1170,15 @@ class PowerMeterWindow(InstrumentWindow):
             return
         v = self.proxy.value
         run = self._acal
+        swp = getattr(self, "sweep", None)
+        swp_run = swp.run if swp is not None else None
+        badge = (f"ACAL {run.done}/{run.total}" if run is not None
+                 else (f"SWP {swp_run.done}/{swp_run.total}" if swp_run is not None else None))
         self.readout.update_values(power=v("meas.power"), peak=v("meas.peak"), ptav=v("meas.ptav"),
                                    source=v("trig.source"), level=v("trig.level"),
                                    level_auto=v("trig.level_auto"),
                                    cal=self.total_correction(),
-                                   acal=f"ACAL {run.done}/{run.total}" if run is not None else None)
+                                   acal=badge)
         self.readout.setEnabled(self.proxy.is_connected)
 
     def _on_state(self, state: ConnectionState) -> None:
@@ -1265,6 +1290,8 @@ class PowerMeterWindow(InstrumentWindow):
             self.apply_correction()
 
     def cleanup(self) -> None:
+        if hasattr(self, "sweep"):
+            self.sweep.cleanup()
         if self._acal is not None:
             for sig, slot in ((self._acal.progress, self._acal_progress), (self._acal.point, self._acal_point),
                               (self._acal.message, self._acal_message), (self._acal.ended, self._acal_ended)):
