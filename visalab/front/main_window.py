@@ -32,12 +32,14 @@ from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
 from ..core.units import si_format, si_parse
 from ..core.trace import Trace
-from .instrument_window import WINDOW_EVENTS, window_for
+from .instrument_dock import InstrumentDock, unregister_dock
+from .instrument_window import WINDOW_EVENTS, all_instrument_windows, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
 from .power_meter import pm_time_scale
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
-                    UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
+                    UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, checkbox_qss,
+                    render_qss)
 from .window import CustomFullButton, Window, mark_growing, short_address
 
 __all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES", "PM_UNITS"]
@@ -710,12 +712,21 @@ class MainWindow(Window):
         self.all_button.setToolTip("Show all receivers, also those without data now")
         self.all_button.setChecked(settings.value(f"{self.SETTINGS_GROUP}/SHOW_ALL", False, type=bool))
         self.all_button.toggled.connect(self._on_all)
+        self.dock_button = QPushButton("DOCK")
+        self.dock_button.setObjectName("chip")
+        self.dock_button.setCheckable(True)
+        self.dock_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.dock_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dock_button.setMinimumHeight(28)
+        self.dock_button.setToolTip("Show / hide the instrument dock panel (attach or detach instrument windows)")
+        self.dock_button.clicked.connect(self._on_dock_button)
         self.scenario_chip = ScenarioChip()
         self.scenario_chip.clicked.connect(self._open_scenario)
         self.scenario_chip.hide()
         self.strip_layout.addStretch()
         self.strip_layout.addLayout(self.restore_layout)
         self.strip_layout.addWidget(self.scenario_chip)
+        self.strip_layout.addWidget(self.dock_button)
         self.strip_layout.addWidget(self.layout_button)
         self.strip_layout.addWidget(self.all_button)
         self.strip_panel = Panel(strip)
@@ -762,12 +773,9 @@ class MainWindow(Window):
         self.display_layout.setSpacing(4)
         s_lay.addWidget(self.display_host)
         self.settings_panel = Panel(settings_body)
-        self.settings_panel.setStyleSheet(Panel.STYLE_SHEET + render_qss("""
-            Panel QCheckBox { color: $UI_COLOR_TEXT; spacing: 6px; background: transparent; border: none; }
-            Panel QCheckBox:disabled { color: $UI_COLOR_BORDER_LIGHT; }
-            Panel QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px;
-                border: 1px solid $UI_COLOR_BORDER_LIGHT; background: $UI_COLOR_BACKGROUND; }
-            Panel QCheckBox::indicator:checked { background: $UI_COLOR_INVERT; border-color: $UI_COLOR_TEXT; }
+        self.settings_panel.setStyleSheet(
+            Panel.STYLE_SHEET + "\n" + checkbox_qss("Panel ") + render_qss("""
+            Panel QCheckBox { color: $UI_COLOR_TEXT; }
         """))
         self.settings_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
@@ -806,14 +814,40 @@ class MainWindow(Window):
         self.tabs_panel = Panel(self.tabs)
         self.tabs_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
+        self._left_pane = QWidget()
+        left_lay = QVBoxLayout(self._left_pane)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(8)
+        left_lay.addWidget(self.tabs_panel)
+        left_lay.addWidget(self.live_page, 1)            # растянули окно - графики растут (Алексей 2026-11-18)
+        left_lay.addWidget(self.settings_panel)
+        left_lay.addStretch(0)                            # SET: поля сверху, пустое место снизу
+
+        self.instrument_dock = InstrumentDock(self, closable=True, is_standalone=False)
+        self.instrument_dock.close_requested.connect(lambda: self.set_dock_visible(False))
+        self.instrument_dock.changed.connect(self._on_dock_changed)
+        self.instrument_dock.hide()
+
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
+        self.main_splitter.setStyleSheet(render_qss("""
+            QSplitter { background: $UI_COLOR_BACKGROUND; }
+            QSplitter::handle { background: transparent; }
+            QSplitter::handle:horizontal { width: 8px; }
+            QSplitter::handle:hover { background: $UI_COLOR_BORDER_LIGHT; border-radius: 2px; }
+        """))
+        self.main_splitter.addWidget(self._left_pane)
+        self.main_splitter.addWidget(self.instrument_dock)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.splitterMoved.connect(lambda _p, _i: self._save_dock_splitter())
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
         lay.setSpacing(8)
         lay.addWidget(self.strip_panel)
-        lay.addWidget(self.tabs_panel)
-        lay.addWidget(self.live_page, 1)            # растянули окно - графики растут (Алексей 2026-11-18)
-        lay.addWidget(self.settings_panel)
-        lay.addStretch(0)                            # SET: поля сверху, пустое место снизу
+        lay.addWidget(self.main_splitter, 1)
         self.tabs.currentChanged.connect(self.set_page)
         self.set_page(settings.value(f"{self.SETTINGS_GROUP}/TAB", 0, type=int))
 
@@ -826,6 +860,7 @@ class MainWindow(Window):
         self.setMinimumWidth(560)
         self.recall_size(QSize(860, 760))
         self._rebuild()
+        self.restore_docked_windows()
 
     # ------------------------------------------------------------ состав
     def _load_list(self, key: str) -> list[str]:
@@ -958,7 +993,11 @@ class MainWindow(Window):
         tip = [f"{name}: {proxy.name}", short_address(proxy.address), link]
         if errors:
             tip.append(w.error_indicator.toolTip())
-        tip.append(("Window is open" if window_open else "Window is closed") + ". Click - show the window")
+        if w is not None and w.is_docked:
+            state_txt = "Window is docked" if window_open else "Window is docked (hidden)"
+        else:
+            state_txt = "Window is open" if window_open else "Window is closed"
+        tip.append(f"{state_txt}. Click - show the window")
         tile.show_state(name, window_open, errors or lost, "\n".join(tip))
 
     def _on_runs(self, *_args) -> None:
@@ -1376,12 +1415,81 @@ class MainWindow(Window):
     def toggle_full_screen(self) -> None:
         self.set_full_screen(not self.isFullScreen())
 
+    # ------------------------------------------------------------ док приборов
+    def _save_dock_splitter(self) -> None:
+        if not self.instrument_dock.isVisible():
+            return
+        sizes = self.main_splitter.sizes()
+        if len(sizes) == 2 and sizes[0] > 0 and sizes[1] > 0:
+            self.settings.setValue(f"{self.SETTINGS_GROUP}/DOCK_SPLITTER", json.dumps(sizes))
+
+    def _restore_dock_splitter(self) -> None:
+        raw = self.settings.value(f"{self.SETTINGS_GROUP}/DOCK_SPLITTER", "", type=str)
+        try:
+            sizes = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            sizes = []
+        if isinstance(sizes, list) and len(sizes) == 2 and all(isinstance(x, int) and x > 0 for x in sizes):
+            self.main_splitter.setSizes(sizes)
+        else:
+            total = max(self.width(), 900)
+            dock_w = min(480, max(420, int(total * 0.38)))
+            self.main_splitter.setSizes([max(300, total - dock_w), dock_w])
+
+    def set_dock_visible(self, on: bool, *, save: bool = True) -> None:
+        on = bool(on)
+        if not on:
+            self._save_dock_splitter()
+        self.instrument_dock.setVisible(on)
+        self.dock_button.blockSignals(True)
+        self.dock_button.setChecked(on)
+        self.dock_button.blockSignals(False)
+        if on:
+            self._restore_dock_splitter()
+        if save:
+            self.settings.setValue(f"{self.SETTINGS_GROUP}/DOCK_VISIBLE", on)
+        for proxy in list(self.tiles):
+            self._update_tile(proxy)
+
+    def _on_dock_button(self) -> None:
+        self.set_dock_visible(self.dock_button.isChecked())
+
+    def _on_dock_changed(self) -> None:
+        if sip.isdeleted(self):
+            return
+        shown = self.instrument_dock.visible_windows()
+        self.dock_button.setText(f"DOCK ({len(shown)})" if shown else "DOCK")
+        if shown and not self.instrument_dock.isVisible():
+            self.set_dock_visible(True)
+        for proxy in list(self.tiles):
+            self._update_tile(proxy)
+
+    def restore_docked_windows(self) -> None:
+        """Прикрепить в док окна приборов, которые были прикреплены в прошлом сеансе."""
+        restored_visible = False
+        for w in all_instrument_windows():
+            if w.want_docked() and not w.is_docked:
+                was_open = w.isVisible()
+                self.instrument_dock.attach(w, show=was_open, save=False)
+                if was_open:
+                    restored_visible = True
+        want_open = self.settings.value(f"{self.SETTINGS_GROUP}/DOCK_VISIBLE", False, type=bool)
+        if want_open or restored_visible:
+            self.set_dock_visible(True, save=False)
+
     # ------------------------------------------------------------ окна приборов
     def open_instrument(self, proxy) -> None:
-        """Показать окно прибора (окна открыты в этом же процессе, возможно скрыты); не вспомогательные
-        окна (TraceEditor, CAL...)."""
+        """Показать окно прибора (окна открыты в этом же процессе, возможно скрыты или прикреплены
+        к доку); не вспомогательные окна (TraceEditor, CAL...)."""
         w = window_for(proxy)
         if w is None:
+            return
+        if w.is_docked:
+            if w._dock is self.instrument_dock:
+                self.set_dock_visible(True)
+                self.instrument_dock.reveal(w)
+            else:
+                w._dock.reveal(w)
             return
         if w.isMinimized():
             w.showNormal()
@@ -1393,6 +1501,10 @@ class MainWindow(Window):
         self._refresh_timer.stop()
         self._dirty_panels.clear()
         self.monitor.stop()
+        if hasattr(self, "instrument_dock") and not sip.isdeleted(self.instrument_dock):
+            unregister_dock(self.instrument_dock)
+            for w in list(self.instrument_dock.windows()):
+                self.instrument_dock.detach(w, show=False, save=False)
         try:
             WINDOW_EVENTS.changed.disconnect(self._on_window_event)
         except (TypeError, RuntimeError):
@@ -1407,6 +1519,7 @@ class MainWindow(Window):
         self._refresh_timer.stop()
         self._dirty_panels.clear()
         self._save_splitters()
+        self._save_dock_splitter()
         if self.quit_on_close:
             for fn in self.before_quit:
                 fn()

@@ -93,3 +93,40 @@ def scrollbar_qss(scope: str = "") -> str:
         lines.append(f"{scoped} {{ {body} }}")
     return Template("\n".join(lines)).safe_substitute(
         {**{k: str(v) for k, v in TOKENS.items()}, "SCROLLBAR_HANDLE_RADIUS_PX": str(radius)})
+
+
+#: правила чекбоксов: кружок, при выборе внутри ещё один кружок
+_CHECKBOX_RULES = (
+    ("QCheckBox", "spacing: 6px; padding: 0; color: $UI_COLOR_TEXT_MUTED; background: transparent; border: none;"),
+    ("QCheckBox:disabled", "color: $UI_COLOR_BORDER_LIGHT;"),
+    ("QCheckBox::indicator",
+     "width: 14px; height: 14px; border-radius: 8px;"
+     " border: 1px solid $UI_COLOR_BORDER_LIGHT; background: $UI_COLOR_BACKGROUND;"),
+    ("QCheckBox::indicator:hover", "border-color: $UI_COLOR_TEXT;"),
+    ("QCheckBox::indicator:checked",
+     "border-color: $UI_COLOR_TEXT;"
+     " background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,"
+     " stop:0 $UI_COLOR_TEXT, stop:0.46 $UI_COLOR_TEXT,"
+     " stop:0.56 $UI_COLOR_BACKGROUND, stop:1 $UI_COLOR_BACKGROUND);"),
+    ("QCheckBox::indicator:checked:hover",
+     "border-color: $UI_COLOR_INVERT_HOVER;"
+     " background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,"
+     " stop:0 $UI_COLOR_TEXT, stop:0.46 $UI_COLOR_TEXT,"
+     " stop:0.56 $UI_COLOR_BACKGROUND, stop:1 $UI_COLOR_BACKGROUND);"),
+    ("QCheckBox::indicator:disabled",
+     "border-color: $UI_COLOR_BORDER; background: $UI_COLOR_BACKGROUND;"),
+    ("QCheckBox::indicator:checked:disabled",
+     "border-color: $UI_COLOR_BORDER;"
+     " background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,"
+     " stop:0 $UI_COLOR_BORDER_LIGHT, stop:0.46 $UI_COLOR_BORDER_LIGHT,"
+     " stop:0.56 $UI_COLOR_BACKGROUND, stop:1 $UI_COLOR_BACKGROUND);"),
+)
+
+
+def checkbox_qss(scope: str = "") -> str:
+    """Чекбоксы в стиле «кружок с внутренним кружком при выборе»."""
+    lines = []
+    for selector, body in _CHECKBOX_RULES:
+        scoped = ", ".join(scope + part.strip() for part in selector.split(","))
+        lines.append(f"{scoped} {{ {body} }}")
+    return Template("\n".join(lines)).safe_substitute({k: str(v) for k, v in TOKENS.items()})

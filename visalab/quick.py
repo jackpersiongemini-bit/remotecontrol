@@ -77,10 +77,11 @@ QDoubleSpinBox[pstatus="coerced"] {{ border-color: #d9822b; }}
 QDoubleSpinBox[pstatus="invalid"], QDoubleSpinBox[pstatus="error"] {{ border-color: #f85149; }}
 QComboBox QAbstractItemView {{ background: #1a2029; border: 1px solid #343d4a; selection-background-color: #2b3440; }}
 
-QRadioButton::indicator, QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid #4b5562; background: #0f1318; }}
-QRadioButton::indicator {{ border-radius: 8px; }}
-QCheckBox::indicator {{ border-radius: 3px; }}
-QRadioButton::indicator:checked, QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QRadioButton::indicator, QCheckBox::indicator {{ width: 14px; height: 14px; border-radius: 8px; border: 1px solid #4b5562; background: #0f1318; }}
+QRadioButton::indicator:hover, QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+QRadioButton::indicator:checked, QCheckBox::indicator:checked {{ border-color: {ACCENT};
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+        stop:0 {ACCENT}, stop:0.46 {ACCENT}, stop:0.56 #0f1318, stop:1 #0f1318); }}
 QRadioButton:disabled, QCheckBox:disabled {{ color: #565e69; }}
 QScrollBar:vertical {{ background: #11151b; width: 10px; }}
 QScrollBar::handle:vertical {{ background: #2b3440; border-radius: 5px; min-height: 30px; }}

@@ -16,6 +16,7 @@ from ..core.params import Kind, Param, PStatus
 from ..coord import Instrument
 from ..core.units import si_format, si_parse
 from ..front.live_plot import decimate_trace_polygon
+from ..front.theme import checkbox_qss
 
 STYLE = """
 QLineEdit[pstatus="writing"], QComboBox[pstatus="writing"], QPushButton[pstatus="writing"] { border: 1px solid #c9a227; }
@@ -25,7 +26,7 @@ QLineEdit[pstatus="error"], QComboBox[pstatus="error"], QPushButton[pstatus="err
 QPushButton[class="toggle"]:checked { background: #2e7d32; color: white; font-weight: bold; }
 QLabel[class="readout"] { font-family: monospace; font-size: 15pt; }
 QLabel#led { border-radius: 7px; min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; }
-"""
+""" + checkbox_qss()
 
 
 class ParamWidget:

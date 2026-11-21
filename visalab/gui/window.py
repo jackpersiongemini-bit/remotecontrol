@@ -135,6 +135,13 @@ class InstrumentWindow(QMainWindow):
         send.clicked.connect(self._send_raw)
         self.poll_log = QCheckBox("Показывать опрос")
         self.poll_log.setToolTip("Логировать трафик периодического опроса (много строк)")
+        self.poll_log.setStyleSheet(
+            "QCheckBox::indicator { width: 14px; height: 14px; border-radius: 8px;"
+            " border: 1px solid #8a8a8a; background: #222222; }"
+            "QCheckBox::indicator:checked { border-color: #f2f2f2;"
+            " background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,"
+            " stop:0 #f2f2f2, stop:0.46 #f2f2f2, stop:0.56 #222222, stop:1 #222222); }"
+        )
         self.poll_log.toggled.connect(self.proxy.set_log_polling)
         row.addWidget(self.cmd_edit, 1)
         row.addWidget(send)
