@@ -40,7 +40,8 @@ from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LI
                     UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
 from .window import CustomFullButton, Window, mark_growing, short_address
 
-__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES", "PM_UNITS"]
+__all__ = ["MainWindow", "InstrumentTile", "LivePanel", "CurrentPanel", "ScenarioChip", "PowerTable", "CurrentTable",
+           "LAYOUT_MODES", "PM_UNITS", "CURRENT_UNITS"]
 
 TILE_MIN_HEIGHT = 38
 PLOT_MIN_HEIGHT = 240
@@ -48,6 +49,8 @@ UI_REFRESH_MS = 60
 LAYOUT_MODES = ("1 COL", "2 COL", "ROW")
 PM_UNITS = ("dBm", "W", "dBW", "V", "dB")
 _PM_UNIT_LABELS = {"dBm": "dBm", "W": "W", "dBW": "dBW", "V": "V (50 Ω)", "dB": "dB (Pout − Pin)"}
+CURRENT_UNITS = ("AUTO", "mA", "A", "µA")
+_CURR_UNIT_LABELS = {"AUTO": "Auto (SI)", "mA": "mA", "A": "A", "µA": "µA"}
 _PANEL_MIME = "application/x-visalab-livepanel"
 
 #: страница SET: (подпись, поле Thresholds, единица, множитель показа, подсказка)
@@ -348,6 +351,389 @@ class PowerTable(QTableWidget):
             p = QPainter(self.viewport())
             p.setPen(QColor(UI_COLOR_BORDER_LIGHT))
             p.drawText(QRectF(self.viewport().rect()), Qt.AlignmentFlag.AlignCenter, self.EMPTY)
+
+
+def _format_current(amps: float, unit: str) -> str:
+    if not math.isfinite(amps):
+        return "---"
+    if unit == "mA":
+        return f"{amps * 1e3:.2f} mA"
+    if unit == "A":
+        return f"{amps:.4f} A"
+    if unit == "µA":
+        return f"{amps * 1e6:.1f} µA"
+    return si_format(amps, "A", 4)
+
+
+class CurrentTable(QTableWidget):
+    """Таблица токов канала ИП: матрица «частота генератора × выходная мощность генератора»."""
+
+    EMPTY = "NO POINTS YET: turn on an RF generator and PSU output\neach frequency gets a row and each generator power gets a column"
+    ALIGN_LEFT = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    ALIGN_RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+
+    def __init__(self, unit: str = "AUTO", parent=None):
+        super().__init__(0, 2, parent)
+        self.setObjectName("currTable")
+        self.unit = unit if unit in CURRENT_UNITS else "AUTO"
+        self.verticalHeader().hide()
+        self.verticalHeader().setDefaultSectionSize(22)
+        self.setShowGrid(False)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        hh = self.horizontalHeader()
+        hh.setMinimumSectionSize(76)
+        hh.setHighlightSections(False)
+        self.setMinimumHeight(PLOT_MIN_HEIGHT)
+        self.columns: list[float | None] = []
+        self.rows: list[tuple[float, dict[float | None, float]]] = []
+        self.current: float | None = None
+        self.current_power: float | None = None
+        self._cur_cell: tuple[int, int] = (-1, -1)
+        self._normal_font = QFont(self.font())
+        self._bold_font = QFont(self.font())
+        self._bold_font.setBold(True)
+        self._cur_color = QColor(UI_COLOR_TEXT)
+        self._muted_color = QColor(UI_COLOR_TEXT_MUTED)
+        self._setup_headers([])
+
+    def _setup_headers(self, columns: list[float | None]) -> None:
+        has_num = any(c is not None for c in columns)
+        shown_cols = columns if columns else [None]
+        labels = ["FREQ", *(_format_col_header(c, "dBm", has_num) for c in shown_cols)]
+        if self.columnCount() != len(labels):
+            self.setColumnCount(len(labels))
+        self.setHorizontalHeaderLabels(labels)
+        hh = self.horizontalHeader()
+        mode = QHeaderView.ResizeMode.Stretch if len(labels) <= 5 else QHeaderView.ResizeMode.ResizeToContents
+        hh.setSectionResizeMode(mode)
+        hh.setStretchLastSection(False)
+        for col in range(len(labels)):
+            item = self.horizontalHeaderItem(col)
+            if item is None:
+                continue
+            item.setTextAlignment(self.ALIGN_LEFT if col == 0 else self.ALIGN_RIGHT)
+            if col == 0:
+                item.setToolTip("RF generator frequency")
+            else:
+                src_p = shown_cols[col - 1]
+                if src_p is None:
+                    item.setToolTip("Measured PSU current (generator output power unknown)")
+                else:
+                    w = _dbm_to_w(src_p)
+                    w_txt = f" ({si_format(w, 'W', 4)})" if math.isfinite(w) else ""
+                    item.setToolTip(f"RF generator output power: {_fmt_num(src_p)} dBm{w_txt}")
+
+    def set_unit(self, unit: str) -> None:
+        if unit not in CURRENT_UNITS or unit == self.unit:
+            return
+        self.unit = unit
+        self._render(force=True)
+
+    def _style_cell(self, row: int, col: int, active: bool) -> None:
+        item = self.item(row, col)
+        if item is not None:
+            item.setFont(self._bold_font if active else self._normal_font)
+            item.setForeground(self._cur_color if active else self._muted_color)
+
+    @staticmethod
+    def _same_power(a: float | None, b: float | None) -> bool:
+        if a is None or b is None:
+            return a is b
+        return abs(a - b) <= 5e-4
+
+    def set_matrix(self, columns: list[float | None], rows: list[tuple[float, dict[float | None, float]]],
+                   current: float | None = None, current_power: float | None = None) -> None:
+        cols = list(columns)
+        rows = list(rows)
+        if cols == self.columns and rows == self.rows and current == self.current \
+                and self._same_power(current_power, self.current_power):
+            return
+        self.columns = cols
+        self.rows = rows
+        self.current = current
+        self.current_power = current_power
+        self._render(force=False)
+
+    def _render(self, force: bool = False) -> None:
+        old_cell = self._cur_cell
+        self._setup_headers(self.columns)
+        shown_cols = self.columns if self.columns else [None]
+        if self.rowCount() != len(self.rows):
+            self.setRowCount(len(self.rows))
+        cur_row, cur_col = -1, -1
+        for i, (f, values) in enumerate(self.rows):
+            is_cur_row = self.current is not None and abs(f - self.current) < 0.5
+            if is_cur_row:
+                cur_row = i
+            f_item = self.item(i, 0)
+            if f_item is None:
+                f_item = QTableWidgetItem()
+                f_item.setTextAlignment(self.ALIGN_LEFT)
+                self.setItem(i, 0, f_item)
+            f_txt = si_format(f, "Hz", 9)
+            if f_item.text() != f_txt:
+                f_item.setText(f_txt)
+            self._style_cell(i, 0, is_cur_row)
+            for j, col_p in enumerate(shown_cols):
+                col = j + 1
+                is_cur_cell = is_cur_row and self._same_power(col_p, self.current_power)
+                if is_cur_cell:
+                    cur_col = col
+                item = self.item(i, col)
+                if item is None:
+                    item = QTableWidgetItem()
+                    item.setTextAlignment(self.ALIGN_RIGHT)
+                    self.setItem(i, col, item)
+                v = values.get(col_p)
+                text = _format_current(v, self.unit) if v is not None else ""
+                if item.text() != text:
+                    item.setText(text)
+                self._style_cell(i, col, is_cur_cell)
+        new_cell = (cur_row, cur_col if cur_col >= 0 else 0)
+        self._cur_cell = new_cell
+        if (force or new_cell != old_cell) and cur_row >= 0:
+            target = self.item(cur_row, max(0, cur_col))
+            if target is not None:
+                self.scrollToItem(target, QAbstractItemView.ScrollHint.EnsureVisible)
+        self.viewport().update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        if not self.rows:
+            p = QPainter(self.viewport())
+            p.setPen(QColor(UI_COLOR_BORDER_LIGHT))
+            p.drawText(QRectF(self.viewport().rect()), Qt.AlignmentFlag.AlignCenter, self.EMPTY)
+
+
+class CurrentPanel(Panel):
+    """Панель таблицы токов одного канала ИП (частота × мощность генератора)."""
+
+    move_requested = pyqtSignal(str, int)
+    swap_requested = pyqtSignal(str, str)
+    close_requested = pyqtSignal(str)
+
+    def __init__(self, proxy, channel: int, monitor: ActivityMonitor, parent=None, settings: QSettings | None = None):
+        self.proxy = proxy
+        self.channel = int(channel)
+        self.monitor = monitor
+        self.settings = settings
+        self.profile = "power_supply"
+        self.panel_key = f"CURR:{monitor.name(proxy)}:CH{self.channel}:{proxy.address}"
+        self.plots: list[LivePlot] = []
+        self.power_table: PowerTable | None = None
+        self._drag_pos: QPoint | None = None
+        self._rf_choice_key: str = ""
+        if settings is not None:
+            self._rf_choice_key = str(settings.value(f"MAIN/CURR_RF/{self.panel_key}", "") or "")
+
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        self.title = QLabel(f"{monitor.name(proxy)} CH{self.channel}")
+        self.title.setObjectName("heading")
+        self.title.setToolTip(f"{monitor.name(proxy)} CH{self.channel}: {proxy.name} ({short_address(proxy.address)})")
+        self.address = QLabel(short_address(proxy.address))
+        self.source = QLabel()
+        self.source.setObjectName("source")
+        self.level = QLabel()
+        self.level.setObjectName("heading")
+
+        self.rf_button = QPushButton("RF: AUTO")
+        self.rf_button.setObjectName("chip")
+        self.rf_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rf_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rf_button.setToolTip("Select RF generator source for frequency / output power axes (AUTO or specific generator)")
+        self.rf_button.clicked.connect(self._open_rf_menu)
+
+        saved_unit = str(settings.value(f"MAIN/CURR_UNIT/{self.panel_key}", "AUTO") or "AUTO") if settings else "AUTO"
+        if saved_unit not in CURRENT_UNITS:
+            saved_unit = "AUTO"
+        self.unit_button = QPushButton(saved_unit)
+        self.unit_button.setObjectName("chip")
+        self.unit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.unit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.unit_button.setToolTip("Current table unit (AUTO / mA / A / µA). Click - next, right click - choose")
+        self.unit_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.unit_button.clicked.connect(self._next_unit)
+        self.unit_button.customContextMenuRequested.connect(self._unit_menu)
+
+        self.clear_button = QPushButton("CLEAR")
+        self.clear_button.setObjectName("chip")
+        self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_button.setToolTip("Clear this channel's current table")
+        self.clear_button.clicked.connect(lambda: self.monitor.clear_psu_table(self.proxy, self.channel))
+
+        self.move_prev_button = LivePanel._tool_btn("◀", "Move current table earlier",
+                                                    lambda: self.move_requested.emit(self.panel_key, -1))
+        self.move_next_button = LivePanel._tool_btn("▶", "Move current table later",
+                                                    lambda: self.move_requested.emit(self.panel_key, 1))
+        self.close_button = LivePanel._tool_btn("×", "Hide this current table",
+                                                lambda: self.close_requested.emit(self.panel_key))
+        head.addWidget(self.title)
+        head.addStretch()
+        head.addWidget(self.level)
+        head.addWidget(self.rf_button)
+        head.addWidget(self.unit_button)
+        head.addWidget(self.clear_button)
+        head.addWidget(self.move_prev_button)
+        head.addWidget(self.move_next_button)
+        head.addWidget(self.close_button)
+        lay.addLayout(head)
+
+        self.current_table = mark_growing(CurrentTable(unit=saved_unit))
+        lay.addWidget(self.current_table, 1)
+        foot = QHBoxLayout()
+        foot.setContentsMargins(2, 0, 2, 0)
+        foot.setSpacing(6)
+        foot.addWidget(self.source)
+        foot.addStretch()
+        foot.addWidget(self.address)
+        lay.addLayout(foot)
+        super().__init__(body, parent=parent)
+        self.setAcceptDrops(True)
+        self.address.setStyleSheet("color: #8a8a8a;")
+        self.source.setStyleSheet("color: #8a8a8a;")
+        self._apply_saved_rf_source()
+
+    def _rf_proxy_key(self, rf_proxy) -> str:
+        return f"{self.monitor.name(rf_proxy)}:{rf_proxy.address}"
+
+    def _apply_saved_rf_source(self) -> None:
+        if not self._rf_choice_key:
+            self.monitor.set_psu_rf_source(self.proxy, self.channel, None)
+            self.rf_button.setText("RF: AUTO")
+            return
+        for p in self.monitor.rf_source_proxies():
+            if self._rf_proxy_key(p) == self._rf_choice_key:
+                self.monitor.set_psu_rf_source(self.proxy, self.channel, p)
+                self.rf_button.setText(f"RF: {self.monitor.name(p)}")
+                return
+        self.monitor.set_psu_rf_source(self.proxy, self.channel, None)
+        self.rf_button.setText("RF: AUTO")
+
+    def set_rf_source(self, rf_proxy) -> None:
+        self._rf_choice_key = "" if rf_proxy is None else self._rf_proxy_key(rf_proxy)
+        if self.settings is not None:
+            if self._rf_choice_key:
+                self.settings.setValue(f"MAIN/CURR_RF/{self.panel_key}", self._rf_choice_key)
+            else:
+                self.settings.remove(f"MAIN/CURR_RF/{self.panel_key}")
+        self.monitor.set_psu_rf_source(self.proxy, self.channel, rf_proxy)
+        self.rf_button.setText("RF: AUTO" if rf_proxy is None else f"RF: {self.monitor.name(rf_proxy)}")
+        self.refresh()
+
+    def _open_rf_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        cur_pref = self.monitor.psu_rf_source.get((self.proxy, self.channel))
+        act_auto = menu.addAction("AUTO")
+        act_auto.setCheckable(True)
+        act_auto.setChecked(cur_pref is None)
+        act_auto.triggered.connect(lambda _=False: self.set_rf_source(None))
+        for p in self.monitor.rf_source_proxies():
+            act = menu.addAction(f"{self.monitor.name(p)} ({short_address(p.address)})")
+            act.setCheckable(True)
+            act.setChecked(cur_pref is p)
+            act.triggered.connect(lambda _=False, rp=p: self.set_rf_source(rp))
+        menu.popup(self.rf_button.mapToGlobal(self.rf_button.rect().bottomLeft()))
+
+    def set_unit(self, unit: str) -> None:
+        if unit not in CURRENT_UNITS or unit == self.current_table.unit:
+            return
+        self.current_table.set_unit(unit)
+        self.unit_button.setText(unit)
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/CURR_UNIT/{self.panel_key}", unit)
+        self.refresh()
+
+    def _next_unit(self) -> None:
+        idx = CURRENT_UNITS.index(self.current_table.unit)
+        self.set_unit(CURRENT_UNITS[(idx + 1) % len(CURRENT_UNITS)])
+
+    def _unit_menu(self, pos: QPoint) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for u in CURRENT_UNITS:
+            act = menu.addAction(_CURR_UNIT_LABELS[u])
+            act.setCheckable(True)
+            act.setChecked(u == self.current_table.unit)
+            act.triggered.connect(lambda _=False, unit=u: self.set_unit(unit))
+        menu.popup(self.unit_button.mapToGlobal(pos))
+
+    def mousePressEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 40:
+            self._drag_pos = e.position().toPoint()
+        else:
+            self._drag_pos = None
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):  # noqa: N802 - Qt
+        if (self._drag_pos is not None and (e.buttons() & Qt.MouseButton.LeftButton)
+                and (e.position().toPoint() - self._drag_pos).manhattanLength() >= QApplication.startDragDistance()):
+            self._drag_pos = None
+            mime = QMimeData()
+            mime.setData(_PANEL_MIME, self.panel_key.encode("utf-8"))
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            drag.exec(Qt.DropAction.MoveAction)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
+        self._drag_pos = None
+        super().mouseReleaseEvent(e)
+
+    def dragEnterEvent(self, e):  # noqa: N802 - Qt
+        if e.mimeData().hasFormat(_PANEL_MIME):
+            e.acceptProposedAction()
+            return
+        super().dragEnterEvent(e)
+
+    def dropEvent(self, e):  # noqa: N802 - Qt
+        if e.mimeData().hasFormat(_PANEL_MIME):
+            src = bytes(e.mimeData().data(_PANEL_MIME)).decode("utf-8")
+            if src and src != self.panel_key:
+                self.swap_requested.emit(src, self.panel_key)
+            e.acceptProposedAction()
+            return
+        super().dropEvent(e)
+
+    def refresh(self, _activity=None) -> None:
+        self.title.setText(f"{self.monitor.name(self.proxy)} CH{self.channel}")
+        self._apply_saved_rf_source()
+        src = self.monitor.psu_source(self.proxy, self.channel)
+        if src is not None:
+            pw = f"  {_fmt_num(src.power)} dBm" if src.power is not None else ""
+            self.source.setText(f"← {src.name} {si_format(src.freq, 'Hz', 6)}{pw}")
+        else:
+            self.source.setText("")
+
+        cols, rows = self.monitor.psu_matrix(self.proxy, self.channel)
+        cur_f = None if src is None else src.freq
+        cur_p = None if src is None or src.power is None else round(float(src.power), 3)
+        self.current_table.set_matrix(cols, rows, cur_f, cur_p)
+
+        if self.proxy.state is not ConnectionState.CONNECTED:
+            self.level.setText("OFF")
+            return
+        ch_on = self.proxy.value(f"ch{self.channel}.output")
+        cur_i = _num(self.proxy.value(f"ch{self.channel}.meas_i"))
+        cur_v = _num(self.proxy.value(f"ch{self.channel}.meas_v"))
+        if ch_on is False:
+            self.level.setText("OFF")
+        elif cur_i is not None:
+            v_txt = f"  {cur_v:.2f} V" if cur_v is not None else ""
+            self.level.setText(f"{_format_current(cur_i, self.current_table.unit)}{v_txt}")
+        else:
+            self.level.setText("NO DATA")
 
 
 class ScenarioChip(IndicatorButton):
@@ -660,6 +1046,8 @@ class MainWindow(Window):
         self.before_quit: list = []
         self.tiles: dict[object, InstrumentTile] = {}
         self.panels: dict[object, LivePanel] = {}
+        self.current_panels: dict[tuple[object, int], CurrentPanel] = {}
+        self.current_controls: dict[str, QCheckBox] = {}
         self.restore_chips: dict[str, QPushButton] = {}
         self.display_rules: dict[str, dict[str, Any]] = {}
         self.display_controls: dict[str, tuple[QCheckBox, QCheckBox, SettingField]] = {}
@@ -669,6 +1057,7 @@ class MainWindow(Window):
         self._visible_proxies: set = set()
         self._measuring_proxies: set = set()
         self._dirty_panels: set = set()
+        self._dirty_current: set[tuple[object, int]] = set()
         self._dirty_vis = False
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -676,6 +1065,7 @@ class MainWindow(Window):
         self._refresh_timer.timeout.connect(self._flush_panels)
         self.panel_order: list[str] = self._load_list(f"{self.SETTINGS_GROUP}/PANEL_ORDER")
         self.hidden_panels: set[str] = set(self._load_list(f"{self.SETTINGS_GROUP}/HIDDEN_PANELS"))
+        self.enabled_current_panels: set[str] = set(self._load_list(f"{self.SETTINGS_GROUP}/ENABLED_CURRENT_TABLES"))
         saved_mode = str(settings.value(f"{self.SETTINGS_GROUP}/LAYOUT_MODE", LAYOUT_MODES[0]) or LAYOUT_MODES[0])
         self.layout_mode = saved_mode if saved_mode in LAYOUT_MODES else LAYOUT_MODES[0]
 
@@ -710,12 +1100,22 @@ class MainWindow(Window):
         self.all_button.setToolTip("Show all receivers, also those without data now")
         self.all_button.setChecked(settings.value(f"{self.SETTINGS_GROUP}/SHOW_ALL", False, type=bool))
         self.all_button.toggled.connect(self._on_all)
+        self.current_button = QPushButton("CURR")
+        self.current_button.setObjectName("chip")
+        self.current_button.setCheckable(True)
+        self.current_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.current_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.current_button.setMinimumHeight(28)
+        self.current_button.setToolTip("Choose power supply channels to show current tables vs frequency and RF power")
+        self.current_button.clicked.connect(self._open_current_menu)
+        self.current_button.hide()
         self.scenario_chip = ScenarioChip()
         self.scenario_chip.clicked.connect(self._open_scenario)
         self.scenario_chip.hide()
         self.strip_layout.addStretch()
         self.strip_layout.addLayout(self.restore_layout)
         self.strip_layout.addWidget(self.scenario_chip)
+        self.strip_layout.addWidget(self.current_button)
         self.strip_layout.addWidget(self.layout_button)
         self.strip_layout.addWidget(self.all_button)
         self.strip_panel = Panel(strip)
@@ -761,6 +1161,16 @@ class MainWindow(Window):
         self.display_layout.setContentsMargins(0, 0, 0, 0)
         self.display_layout.setSpacing(4)
         s_lay.addWidget(self.display_host)
+        self.current_head = QLabel("CURRENT TABLES (PSU)")
+        self.current_head.setObjectName("heading")
+        self.current_head.hide()
+        s_lay.addWidget(self.current_head)
+        self.current_host = QWidget()
+        self.current_settings_layout = QVBoxLayout(self.current_host)
+        self.current_settings_layout.setContentsMargins(0, 0, 0, 0)
+        self.current_settings_layout.setSpacing(4)
+        self.current_host.hide()
+        s_lay.addWidget(self.current_host)
         self.settings_panel = Panel(settings_body)
         self.settings_panel.setStyleSheet(Panel.STYLE_SHEET + render_qss("""
             Panel QCheckBox { color: $UI_COLOR_TEXT; spacing: 6px; background: transparent; border: none; }
@@ -856,6 +1266,12 @@ class MainWindow(Window):
             panel = self.panels.pop(p)
             panel.setParent(None)
             panel.deleteLater()
+        psu_ch_list = self.monitor.psu_channels()
+        valid_curr = {(p, ch) for p, ch, _lbl in psu_ch_list}
+        for key in [k for k in self.current_panels if k not in valid_curr]:
+            panel = self.current_panels.pop(key)
+            panel.setParent(None)
+            panel.deleteLater()
         for i, p in enumerate(proxies):
             if p not in self.tiles:
                 tile = InstrumentTile(p)
@@ -872,6 +1288,17 @@ class MainWindow(Window):
                 self.panels[p] = panel
                 if panel.panel_key not in self.panel_order:
                     self.panel_order.append(panel.panel_key)
+        for p, ch, _lbl in psu_ch_list:
+            ck = (p, ch)
+            if ck not in self.current_panels:
+                cpanel = CurrentPanel(p, ch, self.monitor, settings=self.settings)
+                cpanel.move_requested.connect(self.move_panel)
+                cpanel.swap_requested.connect(self.swap_panels)
+                cpanel.close_requested.connect(lambda pk: self.set_current_panel_enabled(pk, False))
+                cpanel.hide()
+                self.current_panels[ck] = cpanel
+                if cpanel.panel_key not in self.panel_order:
+                    self.panel_order.append(cpanel.panel_key)
         for p in proxies:
             self._update_tile(p)
             panel = self.panels.get(p)
@@ -882,8 +1309,12 @@ class MainWindow(Window):
                 else:
                     self._measuring_proxies.discard(p)
                 panel.refresh(act)
+        for cpanel in self.current_panels.values():
+            cpanel.refresh()
         self._dirty_panels.clear()
+        self._dirty_current.clear()
         self._dirty_vis = False
+        self._update_current_button()
         self._rebuild_display_settings()
         self._update_visibility()
 
@@ -892,6 +1323,13 @@ class MainWindow(Window):
         if sip.isdeleted(self):
             return
         self._update_tile(proxy)
+        if profile_name(proxy) == "power_supply":
+            for ck, cpanel in self.current_panels.items():
+                if ck[0] is proxy:
+                    self._dirty_current.add(ck)
+            if self._dirty_current and not self._refresh_timer.isActive():
+                self._refresh_timer.start()
+            return
         panel = self.panels.get(proxy)
         if panel is None:
             return
@@ -910,6 +1348,8 @@ class MainWindow(Window):
             return
         dirty = list(self._dirty_panels)
         self._dirty_panels.clear()
+        dirty_curr = list(self._dirty_current)
+        self._dirty_current.clear()
         need_vis = self._dirty_vis
         self._dirty_vis = False
         for proxy in dirty:
@@ -921,6 +1361,10 @@ class MainWindow(Window):
                 else:
                     self._measuring_proxies.discard(proxy)
                 panel.refresh(act)
+        for ck in dirty_curr:
+            cpanel = self.current_panels.get(ck)
+            if cpanel is not None and not sip.isdeleted(cpanel):
+                cpanel.refresh()
         if need_vis:
             self._update_visibility()
 
@@ -1051,6 +1495,7 @@ class MainWindow(Window):
             empty = QLabel("No receivers connected")
             empty.setStyleSheet("color: #8a8a8a;")
             self.display_layout.addWidget(empty)
+            self._rebuild_current_settings()
             return
         for p in receivers:
             key = self._panel_key(p)
@@ -1092,6 +1537,105 @@ class MainWindow(Window):
             rl.addWidget(level_edit, 1)
             self.display_layout.addWidget(row)
             self.display_controls[key] = (show_cb, level_cb, level_edit)
+        self._rebuild_current_settings()
+
+    # ------------------------------------------------------------ выбор таблиц токов ИП
+    def _update_current_button(self) -> None:
+        has_psu = bool(self.current_panels)
+        self.current_button.setVisible(has_psu)
+        if not has_psu:
+            return
+        active = sum(1 for cp in self.current_panels.values() if cp.panel_key in self.enabled_current_panels)
+        self.current_button.setText(f"CURR ({active})" if active else "CURR")
+        self.current_button.blockSignals(True)
+        self.current_button.setChecked(active > 0)
+        self.current_button.blockSignals(False)
+
+    def _open_current_menu(self) -> None:
+        self._update_current_button()
+        if not self.current_panels:
+            return
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        for (p, ch), cp in self.current_panels.items():
+            label = f"{self.monitor.name(p)} CH{ch}"
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(cp.panel_key in self.enabled_current_panels)
+            act.triggered.connect(lambda checked=False, pk=cp.panel_key: self.set_current_panel_enabled(pk, checked))
+        menu.addSeparator()
+        act_all = menu.addAction("Show all")
+        act_all.triggered.connect(self._show_all_current_panels)
+        act_none = menu.addAction("Hide all")
+        act_none.triggered.connect(self._hide_all_current_panels)
+        menu.popup(self.current_button.mapToGlobal(self.current_button.rect().bottomLeft()))
+
+    def _show_all_current_panels(self) -> None:
+        for cp in self.current_panels.values():
+            self.enabled_current_panels.add(cp.panel_key)
+        self._persist_current_panels()
+
+    def _hide_all_current_panels(self) -> None:
+        for cp in self.current_panels.values():
+            self.enabled_current_panels.discard(cp.panel_key)
+        self._persist_current_panels()
+
+    def set_current_panel_enabled(self, panel_key: str, enabled: bool) -> None:
+        """Включить / выключить отдельную таблицу тока для выбранного канала ИП."""
+        enabled = bool(enabled)
+        if enabled:
+            self.enabled_current_panels.add(panel_key)
+        else:
+            self.enabled_current_panels.discard(panel_key)
+        self._persist_current_panels()
+
+    def _persist_current_panels(self) -> None:
+        self._save_list(f"{self.SETTINGS_GROUP}/ENABLED_CURRENT_TABLES", sorted(self.enabled_current_panels))
+        for pk, cb in self.current_controls.items():
+            if not sip.isdeleted(cb):
+                cb.blockSignals(True)
+                cb.setChecked(pk in self.enabled_current_panels)
+                cb.blockSignals(False)
+        self._update_current_button()
+        for cp in self.current_panels.values():
+            if cp.panel_key in self.enabled_current_panels:
+                cp.refresh()
+        self._update_visibility()
+
+    def _rebuild_current_settings(self) -> None:
+        self.current_controls.clear()
+        while self.current_settings_layout.count():
+            item = self.current_settings_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        has_psu = bool(self.current_panels)
+        self.current_head.setVisible(has_psu)
+        self.current_host.setVisible(has_psu)
+        if not has_psu:
+            return
+        for (p, ch), cp in self.current_panels.items():
+            pk = cp.panel_key
+            label = f"{self.monitor.name(p)} CH{ch}"
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+            lbl = QLabel(label)
+            lbl.setObjectName("lineName")
+            lbl.setFixedWidth(72)
+            lbl.setToolTip(f"{label}: {p.name} ({short_address(p.address)})")
+            cb = QCheckBox("Show current table (Freq × RF Power)")
+            cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            cb.setChecked(pk in self.enabled_current_panels)
+            cb.setToolTip(f"Show a dedicated current table for {label} in LIVE")
+            cb.toggled.connect(lambda checked, k=pk: self.set_current_panel_enabled(k, checked))
+            rl.addWidget(lbl)
+            rl.addWidget(cb)
+            rl.addStretch(1)
+            self.current_settings_layout.addWidget(row)
+            self.current_controls[pk] = cb
 
     def set_panel_shown(self, key: str, shown: bool) -> None:
         """Включить / выключить отображение графика прибора (галочка Show в SET или × / + в LIVE)."""
@@ -1204,17 +1748,18 @@ class MainWindow(Window):
     def show_panel(self, key: str) -> None:
         self.set_panel_shown(key, True)
 
-    def move_panel(self, proxy, delta: int) -> None:
+    def move_panel(self, item, delta: int) -> None:
         """Сдвинуть панель в порядке показа среди видимых панелей."""
-        ordered = self._ordered_receivers()
-        vis = [p for p in ordered if self._should_show(p)]
-        if proxy not in vis:
+        vis = self.visible_panels()
+        target_key = item if isinstance(item, str) else self._panel_key(item)
+        keys = [p.panel_key for p in vis]
+        if target_key not in keys:
             return
-        i = vis.index(proxy)
+        i = keys.index(target_key)
         j = i + (-1 if delta < 0 else 1)
-        if not 0 <= j < len(vis):
+        if not 0 <= j < len(keys):
             return
-        self.swap_panels(self._panel_key(vis[i]), self._panel_key(vis[j]))
+        self.swap_panels(keys[i], keys[j])
 
     def swap_panels(self, src_key: str, dst_key: str) -> None:
         if src_key == dst_key:
@@ -1232,6 +1777,16 @@ class MainWindow(Window):
         rank = {k: i for i, k in enumerate(self.panel_order)}
         receivers = list(self.panels)
         return sorted(receivers, key=lambda p: (rank.get(self._panel_key(p), len(rank)), receivers.index(p)))
+
+    def _ordered_all_panels(self) -> list:
+        rank = {k: i for i, k in enumerate(self.panel_order)}
+        items = list(self.panels.values()) + list(self.current_panels.values())
+        return sorted(items, key=lambda p: (rank.get(p.panel_key, len(rank)), items.index(p)))
+
+    def _panel_visible(self, panel) -> bool:
+        if isinstance(panel, CurrentPanel):
+            return panel.panel_key in self.enabled_current_panels
+        return self._should_show(panel.proxy)
 
     def _is_eligible(self, proxy) -> bool:
         if self.all_button.isChecked():
@@ -1298,13 +1853,14 @@ class MainWindow(Window):
     def _update_visibility(self) -> None:
         ordered = self._ordered_receivers()
         self._update_restore_chips(ordered)
-        visible = [p for p in ordered if self._should_show(p)]
-        self._visible_proxies = set(visible)
-        sig = (self.layout_mode, tuple(self._panel_key(p) for p in visible))
+        visible_rx = [p for p in ordered if self._should_show(p)]
+        self._visible_proxies = set(visible_rx)
+        visible_widgets = [p for p in self._ordered_all_panels() if self._panel_visible(p)]
+        sig = (self.layout_mode, tuple(p.panel_key for p in visible_widgets))
         if sig != self._arranged_sig:
             self._save_splitters()
             self._arranged_sig = sig
-            for panel in self.panels.values():
+            for panel in (*self.panels.values(), *self.current_panels.values()):
                 panel.setParent(self._live_host)
                 panel.hide()
             if self._root_splitter is not None:
@@ -1312,49 +1868,48 @@ class MainWindow(Window):
                 self._root_splitter.deleteLater()
                 self._root_splitter = None
             self._splitters.clear()
-            if visible:
+            if visible_widgets:
                 if self.layout_mode == "ROW":
                     root = self._make_splitter(Qt.Orientation.Horizontal, "root")
-                    for i, p in enumerate(visible):
-                        root.addWidget(self.panels[p])
+                    for i, w in enumerate(visible_widgets):
+                        root.addWidget(w)
                         root.setStretchFactor(i, 1)
-                        self.panels[p].show()
+                        w.show()
                     self._restore_splitter("root", root)
-                elif self.layout_mode == "2 COL" and len(visible) > 1:
+                elif self.layout_mode == "2 COL" and len(visible_widgets) > 1:
                     root = self._make_splitter(Qt.Orientation.Vertical, "root")
-                    for r, i in enumerate(range(0, len(visible), 2)):
-                        chunk = visible[i:i + 2]
+                    for r, i in enumerate(range(0, len(visible_widgets), 2)):
+                        chunk = visible_widgets[i:i + 2]
                         if len(chunk) == 2:
                             row_sp = self._make_splitter(Qt.Orientation.Horizontal, f"row{r}")
-                            for c, p in enumerate(chunk):
-                                row_sp.addWidget(self.panels[p])
+                            for c, w in enumerate(chunk):
+                                row_sp.addWidget(w)
                                 row_sp.setStretchFactor(c, 1)
-                                self.panels[p].show()
+                                w.show()
                             self._restore_splitter(f"row{r}", row_sp)
                             root.addWidget(row_sp)
                         else:
-                            root.addWidget(self.panels[chunk[0]])
-                            self.panels[chunk[0]].show()
+                            root.addWidget(chunk[0])
+                            chunk[0].show()
                         root.setStretchFactor(r, 1)
                     self._restore_splitter("root", root)
                 else:
                     root = self._make_splitter(Qt.Orientation.Vertical, "root")
-                    for i, p in enumerate(visible):
-                        root.addWidget(self.panels[p])
+                    for i, w in enumerate(visible_widgets):
+                        root.addWidget(w)
                         root.setStretchFactor(i, 1)
-                        self.panels[p].show()
+                        w.show()
                     self._restore_splitter("root", root)
                 self._root_splitter = root
                 self.live_layout.addWidget(root, 1)
-        for i, p in enumerate(visible):
-            panel = self.panels[p]
+        for i, panel in enumerate(visible_widgets):
             panel.move_prev_button.setEnabled(i > 0)
-            panel.move_next_button.setEnabled(i < len(visible) - 1)
-        self.live_scroll.setVisible(bool(visible))
-        self.idle.setVisible(not visible)
+            panel.move_next_button.setEnabled(i < len(visible_widgets) - 1)
+        self.live_scroll.setVisible(bool(visible_widgets))
+        self.idle.setVisible(not visible_widgets)
 
-    def visible_panels(self) -> list[LivePanel]:
-        return [self.panels[p] for p in self._ordered_receivers() if self._should_show(p)]
+    def visible_panels(self) -> list:
+        return [p for p in self._ordered_all_panels() if self._panel_visible(p)]
 
     # ------------------------------------------------------------ во весь экран
     def show_window(self) -> None:
@@ -1392,6 +1947,7 @@ class MainWindow(Window):
     def cleanup(self) -> None:
         self._refresh_timer.stop()
         self._dirty_panels.clear()
+        self._dirty_current.clear()
         self.monitor.stop()
         try:
             WINDOW_EVENTS.changed.disconnect(self._on_window_event)
@@ -1406,6 +1962,7 @@ class MainWindow(Window):
     def closeEvent(self, event):  # noqa: N802 - Qt
         self._refresh_timer.stop()
         self._dirty_panels.clear()
+        self._dirty_current.clear()
         self._save_splitters()
         if self.quit_on_close:
             for fn in self.before_quit:

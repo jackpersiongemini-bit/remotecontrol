@@ -1217,14 +1217,18 @@ class Panel(QFrame):
         Panel [wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         Panel [wstate="error"] { border-color: $UI_COLOR_ERROR; }
         Panel QPushButton#chip[wstate="error"] { color: $UI_COLOR_ERROR; }
-        Panel QTableWidget#pmTable, Panel QTableWidget#pmTable QWidget { background-color: $UI_COLOR_BACKGROUND; }
-        Panel QTableWidget#pmTable { color: $UI_COLOR_TEXT_MUTED; padding: 2px 4px; }
+        Panel QTableWidget#pmTable, Panel QTableWidget#pmTable QWidget,
+        Panel QTableWidget#currTable, Panel QTableWidget#currTable QWidget { background-color: $UI_COLOR_BACKGROUND; }
+        Panel QTableWidget#pmTable, Panel QTableWidget#currTable { color: $UI_COLOR_TEXT_MUTED; padding: 2px 4px; }
         Panel QTableWidget#pmTable::item { border: none; padding: 0 8px; }
-        Panel QTableWidget#pmTable QHeaderView::section {
+        Panel QTableWidget#currTable::item { border: none; border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 0 8px; }
+        Panel QTableWidget#pmTable QHeaderView::section,
+        Panel QTableWidget#currTable QHeaderView::section {
             background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_BORDER_LIGHT; border: none;
             border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 3px 8px; font-weight: normal;
         }
-        Panel QTableWidget#pmTable QTableCornerButton::section { background: transparent; border: none; }
+        Panel QTableWidget#pmTable QTableCornerButton::section,
+        Panel QTableWidget#currTable QTableCornerButton::section { background: transparent; border: none; }
     """) + scrollbar_qss("Panel ")
 
     def __init__(self, table: QWidget, column_width: int | None = None, parent=None):
