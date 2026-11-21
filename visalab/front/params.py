@@ -1219,7 +1219,7 @@ class Panel(QFrame):
         Panel QPushButton#chip[wstate="error"] { color: $UI_COLOR_ERROR; }
         Panel QTableWidget#pmTable, Panel QTableWidget#pmTable QWidget { background-color: $UI_COLOR_BACKGROUND; }
         Panel QTableWidget#pmTable { color: $UI_COLOR_TEXT_MUTED; padding: 2px 4px; }
-        Panel QTableWidget#pmTable::item { border: none; padding: 0 8px; }
+        Panel QTableWidget#pmTable::item { border: none; border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 0 8px; }
         Panel QTableWidget#pmTable QHeaderView::section {
             background-color: $UI_COLOR_BACKGROUND; color: $UI_COLOR_BORDER_LIGHT; border: none;
             border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 3px 8px; font-weight: normal;

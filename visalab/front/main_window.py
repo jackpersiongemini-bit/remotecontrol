@@ -35,6 +35,7 @@ from ..core.trace import Trace
 from .instrument_window import WINDOW_EVENTS, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
+from .pm_view import PMPointsDialog, PowerCurvePlot, filter_pm_matrix, load_pm_points_csv
 from .power_meter import pm_time_scale
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
                     UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
@@ -223,6 +224,7 @@ class PowerTable(QTableWidget):
         self.setMinimumHeight(PLOT_MIN_HEIGHT)
         self.columns: list[float | None] = []
         self.rows: list[tuple[float, dict[float | None, float]]] = []
+        self.planned_cells: set[tuple[float, float | None]] = set()
         self.current: float | None = None
         self.current_power: float | None = None
         self._cur_cell: tuple[int, int] = (-1, -1)
@@ -231,6 +233,7 @@ class PowerTable(QTableWidget):
         self._bold_font.setBold(True)
         self._cur_color = QColor(UI_COLOR_TEXT)
         self._muted_color = QColor(UI_COLOR_TEXT_MUTED)
+        self._dim_color = QColor(UI_COLOR_BORDER_LIGHT)
         self._setup_headers([])
 
     def _setup_headers(self, columns: list[float | None]) -> None:
@@ -266,11 +269,11 @@ class PowerTable(QTableWidget):
         self.unit = unit
         self._render(force=True)
 
-    def _style_cell(self, row: int, col: int, active: bool) -> None:
+    def _style_cell(self, row: int, col: int, active: bool, dim: bool = False) -> None:
         item = self.item(row, col)
         if item is not None:
             item.setFont(self._bold_font if active else self._normal_font)
-            item.setForeground(self._cur_color if active else self._muted_color)
+            item.setForeground(self._cur_color if active else (self._dim_color if dim else self._muted_color))
 
     @staticmethod
     def _same_power(a: float | None, b: float | None) -> bool:
@@ -286,15 +289,18 @@ class PowerTable(QTableWidget):
         self.set_matrix(cols, matrix_rows, current, None)
 
     def set_matrix(self, columns: list[float | None], rows: list[tuple[float, dict[float | None, float]]],
-                   current: float | None = None, current_power: float | None = None) -> None:
+                   current: float | None = None, current_power: float | None = None,
+                   planned_cells: set[tuple[float, float | None]] | None = None) -> None:
         """columns: [P_in dBm | None]; rows: [(Hz, {P_in: P_meas dBm})]."""
         cols = list(columns)
         rows = list(rows)
-        if cols == self.columns and rows == self.rows and current == self.current \
-                and self._same_power(current_power, self.current_power):
+        planned = set(planned_cells) if planned_cells else set()
+        if (cols == self.columns and rows == self.rows and planned == self.planned_cells
+                and current == self.current and self._same_power(current_power, self.current_power)):
             return
         self.columns = cols
         self.rows = rows
+        self.planned_cells = planned
         self.current = current
         self.current_power = current_power
         self._render(force=False)
@@ -330,10 +336,18 @@ class PowerTable(QTableWidget):
                     item.setTextAlignment(self.ALIGN_RIGHT)
                     self.setItem(i, col, item)
                 v = values.get(col_p)
-                text = _format_power(v, self.unit, col_p) if v is not None else ""
+                if v is not None:
+                    text = _format_power(v, self.unit, col_p)
+                    dim = False
+                elif (f, col_p) in self.planned_cells:
+                    text = "---"
+                    dim = True
+                else:
+                    text = ""
+                    dim = False
                 if item.text() != text:
                     item.setText(text)
-                self._style_cell(i, col, is_cur_cell)
+                self._style_cell(i, col, is_cur_cell, dim=dim)
         new_cell = (cur_row, cur_col if cur_col >= 0 else 0)
         self._cur_cell = new_cell
         if (force or new_cell != old_cell) and cur_row >= 0:
@@ -411,11 +425,54 @@ class LivePanel(Panel):
         saved_unit = str(settings.value(f"MAIN/PM_UNIT/{self.panel_key}", "dBm") or "dBm") if settings else "dBm"
         if saved_unit not in PM_UNITS:
             saved_unit = "dBm"
+        saved_pm_plot = bool(settings.value(f"MAIN/PM_SHOW_PLOT/{self.panel_key}", True, type=bool)) if settings else True
+        saved_pm_table = bool(settings.value(f"MAIN/PM_SHOW_TABLE/{self.panel_key}", True, type=bool)) if settings else True
+        if not saved_pm_plot and not saved_pm_table:
+            saved_pm_plot = True
+        saved_csv_on = bool(settings.value(f"MAIN/PM_CSV_ON/{self.panel_key}", False, type=bool)) if settings else False
+        self.pm_csv_path: str = str(settings.value(f"MAIN/PM_CSV_PATH/{self.panel_key}", "", type=str) or "") if settings else ""
+        self.pm_csv_points: list[tuple[float, float | None]] = self._load_pm_csv_points()
+        self.pm_csv_enabled: bool = saved_csv_on and bool(self.pm_csv_points)
+
+        self.pm_plot_button = QPushButton("PLOT")
+        self.pm_plot_button.setObjectName("chip")
+        self.pm_plot_button.setCheckable(True)
+        self.pm_plot_button.setChecked(saved_pm_plot)
+        self.pm_plot_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.pm_plot_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pm_plot_button.setToolTip("Show / hide power meter frequency-power curve graph")
+        self.pm_plot_button.toggled.connect(self.set_pm_show_plot)
+        self.pm_plot_button.hide()
+
+        self.pm_table_button = QPushButton("TBL")
+        self.pm_table_button.setObjectName("chip")
+        self.pm_table_button.setCheckable(True)
+        self.pm_table_button.setChecked(saved_pm_table)
+        self.pm_table_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.pm_table_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pm_table_button.setToolTip("Show / hide power meter frequency × power table")
+        self.pm_table_button.toggled.connect(self.set_pm_show_table)
+        self.pm_table_button.hide()
+
+        self.pm_csv_button = QPushButton("CSV")
+        self.pm_csv_button.setObjectName("chip")
+        self.pm_csv_button.setCheckable(True)
+        self.pm_csv_button.setChecked(self.pm_csv_enabled)
+        self.pm_csv_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.pm_csv_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pm_csv_button.setToolTip("Filter displayed points by CSV target list (click to toggle, ✎ to load/edit CSV)")
+        self.pm_csv_button.toggled.connect(self.set_pm_csv_enabled)
+        self.pm_csv_button.hide()
+
+        self.pm_csv_edit_button = self._tool_btn("✎", "Load, edit, generate, or save CSV list of points to display",
+                                                 self.edit_pm_csv_points)
+        self.pm_csv_edit_button.hide()
+
         self.unit_button = QPushButton(saved_unit)
         self.unit_button.setObjectName("chip")
         self.unit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.unit_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.unit_button.setToolTip("Power table unit (dBm / W / dBW / V / dB gain). Click - next, right click - choose")
+        self.unit_button.setToolTip("Power table and graph unit (dBm / W / dBW / V / dB gain). Click - next, right click - choose")
         self.unit_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.unit_button.clicked.connect(self._next_pm_unit)
         self.unit_button.customContextMenuRequested.connect(self._pm_unit_menu)
@@ -424,7 +481,7 @@ class LivePanel(Panel):
         self.clear_button.setObjectName("chip")
         self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clear_button.setToolTip("Clear the frequency / power table")
+        self.clear_button.setToolTip("Clear the frequency / power table and graph")
         self.clear_button.clicked.connect(lambda: self.monitor.clear_pm_table(self.proxy))
         self.clear_button.hide()
         self.move_prev_button = self._tool_btn("◀", "Move measurement panel earlier",
@@ -438,6 +495,10 @@ class LivePanel(Panel):
         head.addStretch()
         head.addWidget(self.source)
         head.addWidget(self.level)
+        head.addWidget(self.pm_plot_button)
+        head.addWidget(self.pm_table_button)
+        head.addWidget(self.pm_csv_button)
+        head.addWidget(self.pm_csv_edit_button)
         head.addWidget(self.unit_button)
         head.addWidget(self.clear_button)
         head.addWidget(self.move_prev_button)
@@ -449,9 +510,21 @@ class LivePanel(Panel):
         lay.addLayout(self.plots_box, 1)
         self.plots: list[LivePlot] = []
         self.power_table: PowerTable | None = None      # не ``table``: так Panel зовёт своё содержимое
+        self.pm_plot: PowerCurvePlot | None = None
+        self.pm_splitter: QSplitter | None = None
         if self.profile == "power_meter":
+            self.pm_splitter = QSplitter(Qt.Orientation.Horizontal)
+            self.pm_splitter.setChildrenCollapsible(False)
+            self.pm_splitter.setHandleWidth(8)
+            self.pm_plot = mark_growing(PowerCurvePlot(unit=saved_unit, min_height=PLOT_MIN_HEIGHT))
             self.power_table = PowerTable(unit=saved_unit)
-            lay.addWidget(self.power_table, 1)
+            self.pm_splitter.addWidget(self.pm_plot)
+            self.pm_splitter.addWidget(self.power_table)
+            self.pm_splitter.setStretchFactor(0, 1)
+            self.pm_splitter.setStretchFactor(1, 1)
+            self._restore_pm_splitter()
+            self.pm_splitter.splitterMoved.connect(lambda _p, _i: self._save_pm_splitter())
+            lay.addWidget(self.pm_splitter, 1)
         super().__init__(body, parent=parent)
         self.setAcceptDrops(True)
         self.address.setStyleSheet("color: #8a8a8a;")
@@ -587,10 +660,148 @@ class LivePanel(Panel):
             where = f" @ {si_format(a.freq, 'Hz', 6)}" if a.freq is not None and present else ""
             self.level.setText(f"{_dbm(a.level)}{where}" if present else f"NOISE {_dbm(a.floor)}")
 
+    def _load_pm_csv_points(self) -> list[tuple[float, float | None]]:
+        if self.settings is None:
+            return []
+        if self.pm_csv_path:
+            try:
+                pts = load_pm_points_csv(self.pm_csv_path)
+                if pts:
+                    return pts
+            except OSError:
+                pass
+        raw = self.settings.value(f"MAIN/PM_CSV_POINTS/{self.panel_key}", "", type=str)
+        try:
+            items = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            return []
+        out: list[tuple[float, float | None]] = []
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, list) and len(it) == 2 and isinstance(it[0], (int, float)):
+                    p = None if it[1] is None else float(it[1])
+                    out.append((float(it[0]), p))
+        return out
+
+    def _save_pm_csv_state(self) -> None:
+        if self.settings is None:
+            return
+        self.settings.setValue(f"MAIN/PM_CSV_ON/{self.panel_key}", self.pm_csv_enabled)
+        self.settings.setValue(f"MAIN/PM_CSV_PATH/{self.panel_key}", self.pm_csv_path)
+        self.settings.setValue(
+            f"MAIN/PM_CSV_POINTS/{self.panel_key}",
+            json.dumps([[f, p] for f, p in self.pm_csv_points]),
+        )
+
+    def _save_pm_splitter(self) -> None:
+        if self.settings is None or self.pm_splitter is None or sip.isdeleted(self.pm_splitter):
+            return
+        sizes = self.pm_splitter.sizes()
+        if len(sizes) == 2 and all(s > 0 for s in sizes):
+            self.settings.setValue(f"MAIN/PM_VIEW_SPLIT/{self.panel_key}", json.dumps(sizes))
+
+    def _restore_pm_splitter(self) -> None:
+        if self.pm_splitter is None:
+            return
+        raw = self.settings.value(f"MAIN/PM_VIEW_SPLIT/{self.panel_key}", "", type=str) if self.settings else ""
+        try:
+            sizes = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            sizes = []
+        if isinstance(sizes, list) and len(sizes) == 2 and all(isinstance(x, int) and x > 0 for x in sizes):
+            self.pm_splitter.setSizes(sizes)
+        else:
+            self.pm_splitter.setSizes([560, 440])
+
+    def set_pm_show_plot(self, on: bool) -> None:
+        if self.pm_plot is None:
+            return
+        on = bool(on)
+        if not on and not self.pm_table_button.isChecked():
+            self.pm_table_button.blockSignals(True)
+            self.pm_table_button.setChecked(True)
+            self.pm_table_button.blockSignals(False)
+            if self.settings is not None:
+                self.settings.setValue(f"MAIN/PM_SHOW_TABLE/{self.panel_key}", True)
+        if self.pm_plot_button.isChecked() != on:
+            self.pm_plot_button.blockSignals(True)
+            self.pm_plot_button.setChecked(on)
+            self.pm_plot_button.blockSignals(False)
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/PM_SHOW_PLOT/{self.panel_key}", on)
+        self.refresh(self.monitor.activity(self.proxy))
+
+    def set_pm_show_table(self, on: bool) -> None:
+        if self.power_table is None:
+            return
+        on = bool(on)
+        if not on and not self.pm_plot_button.isChecked():
+            self.pm_plot_button.blockSignals(True)
+            self.pm_plot_button.setChecked(True)
+            self.pm_plot_button.blockSignals(False)
+            if self.settings is not None:
+                self.settings.setValue(f"MAIN/PM_SHOW_PLOT/{self.panel_key}", True)
+        if self.pm_table_button.isChecked() != on:
+            self.pm_table_button.blockSignals(True)
+            self.pm_table_button.setChecked(on)
+            self.pm_table_button.blockSignals(False)
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/PM_SHOW_TABLE/{self.panel_key}", on)
+        self.refresh(self.monitor.activity(self.proxy))
+
+    def set_pm_csv_enabled(self, on: bool) -> None:
+        on = bool(on)
+        if on and not self.pm_csv_points:
+            # Нет загруженных точек -> сразу открыть редактор CSV
+            self.pm_csv_button.blockSignals(True)
+            self.pm_csv_button.setChecked(False)
+            self.pm_csv_button.blockSignals(False)
+            self.edit_pm_csv_points(enable_on_accept=True)
+            return
+        self.pm_csv_enabled = on
+        if self.pm_csv_button.isChecked() != on:
+            self.pm_csv_button.blockSignals(True)
+            self.pm_csv_button.setChecked(on)
+            self.pm_csv_button.blockSignals(False)
+        self._save_pm_csv_state()
+        self.refresh(self.monitor.activity(self.proxy))
+
+    def set_pm_csv_points(self, points: list[tuple[float, float | None]], *,
+                          csv_path: str | None = None, enable: bool | None = None) -> None:
+        self.pm_csv_points = [(float(f), None if p is None else round(float(p), 3)) for f, p in points]
+        if csv_path is not None:
+            self.pm_csv_path = str(csv_path)
+        if enable is not None:
+            self.pm_csv_enabled = bool(enable) and bool(self.pm_csv_points)
+        elif not self.pm_csv_points:
+            self.pm_csv_enabled = False
+        self.pm_csv_button.blockSignals(True)
+        self.pm_csv_button.setChecked(self.pm_csv_enabled)
+        self.pm_csv_button.blockSignals(False)
+        self._save_pm_csv_state()
+        self.refresh(self.monitor.activity(self.proxy))
+
+    def load_pm_csv(self, path, *, enable: bool = True) -> list[tuple[float, float | None]]:
+        pts = load_pm_points_csv(path)
+        self.set_pm_csv_points(pts, csv_path=str(path), enable=enable)
+        return pts
+
+    def edit_pm_csv_points(self, enable_on_accept: bool = False) -> None:
+        cols, rows = self.monitor.pm_matrix(self.proxy)
+        measured = [(f, p) for f, vals in rows for p in vals]
+        dlg = PMPointsDialog(self.pm_csv_points, csv_path=self.pm_csv_path,
+                             measured_points=measured, parent=self)
+        if dlg.exec() == PMPointsDialog.DialogCode.Accepted:
+            pts = dlg.points()
+            self.set_pm_csv_points(pts, csv_path=dlg.csv_path,
+                                   enable=(True if (enable_on_accept and pts) else (self.pm_csv_enabled and bool(pts))))
+
     def set_pm_unit(self, unit: str) -> None:
         if self.power_table is None or unit not in PM_UNITS:
             return
         self.power_table.set_unit(unit)
+        if self.pm_plot is not None:
+            self.pm_plot.set_unit(unit)
         self.unit_button.setText(unit)
         if self.settings is not None:
             self.settings.setValue(f"MAIN/PM_UNIT/{self.panel_key}", unit)
@@ -615,7 +826,7 @@ class LivePanel(Panel):
         menu.popup(self.unit_button.mapToGlobal(pos))
 
     def _refresh_pm(self, a: Activity) -> None:
-        """Временной режим (TRAC ON) - трасса во времени; иначе - таблица частота × подаваемая мощность."""
+        """Временной режим (TRAC ON) - трасса во времени; иначе - график кривых по мощностям и/или таблица."""
         tr = self.proxy.value("trace")
         timed = self.proxy.value("trace.state") is True and isinstance(tr, Trace)
         if timed:
@@ -625,13 +836,29 @@ class LivePanel(Panel):
             plot.set_scale(scale, divs_y=divs_y, y_unit=y_unit, y_transform=y_transform)
             plot.set_traces([("", tr)])
         self._use_plots(1 if timed else 0)
-        self.power_table.setVisible(not timed)
-        self.unit_button.setVisible(not timed)
-        self.clear_button.setVisible(not timed)
-        if not timed:
+        show_normal = not timed
+        if self.pm_splitter is not None:
+            self.pm_splitter.setVisible(show_normal)
+        if self.pm_plot is not None:
+            self.pm_plot.setVisible(show_normal and self.pm_plot_button.isChecked())
+        self.power_table.setVisible(show_normal and self.pm_table_button.isChecked())
+        self.pm_plot_button.setVisible(show_normal)
+        self.pm_table_button.setVisible(show_normal)
+        self.pm_csv_button.setVisible(show_normal)
+        self.pm_csv_edit_button.setVisible(show_normal)
+        self.unit_button.setVisible(show_normal)
+        self.clear_button.setVisible(show_normal)
+        if show_normal:
             cols, rows = self.monitor.pm_matrix(self.proxy)
+            planned: set[tuple[float, float | None]] = set()
+            target_freqs: list[float] = []
+            if self.pm_csv_enabled and self.pm_csv_points:
+                cols, rows, planned = filter_pm_matrix(cols, rows, self.pm_csv_points)
+                target_freqs = sorted({f for f, _p in self.pm_csv_points})
             cur_p = None if a.source is None or a.source.power is None else round(float(a.source.power), 3)
-            self.power_table.set_matrix(cols, rows, _num(self.proxy.value("freq")), cur_p)
+            self.power_table.set_matrix(cols, rows, _num(self.proxy.value("freq")), cur_p, planned_cells=planned)
+            if self.pm_plot is not None:
+                self.pm_plot.set_matrix(cols, rows, unit=self.power_table.unit, target_freqs=target_freqs)
         if a.connected:
             u = self.power_table.unit
             if a.level is None:
