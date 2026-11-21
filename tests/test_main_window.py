@@ -726,3 +726,35 @@ def test_settings_displayed_graphs_and_level_trigger(qtbot, lab, tmp_path):
     assert pm_show2.isChecked() is False and pm_by_lvl2.isChecked() is True
     assert win2.display_rules[pm_key]["level"] == pytest.approx(-25.0) and pm_edit2.text() == "-25 dBm"
     assert win2.panels[pm] not in win2.visible_panels() and win2.panels[sa] not in win2.visible_panels()
+
+
+def test_vna_panel_stays_visible_in_hold_and_with_non_m1_slot(qtbot, lab, tmp_path):
+    """График ВАЦ не пропадает через hold_s в режиме HOLD / SINGLE или когда включён только слот m2 (m1 выкл)."""
+    links, px, _bench = lab
+    vna = px["pna"]
+    sim = _sim(vna)
+    sim.meas["CH1_S21_2"] = {"s": "S21", "fmt": "MLOG", "ch": 1}
+    sim.windows[1][2] = "CH1_S21_2"
+    mon = ActivityMonitor(links, Thresholds(hold_s=0.2))
+    settings = QSettings(str(tmp_path / "vna_hold.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(settings, mon)
+    qtbot.addWidget(win)
+    win.show()
+    panel = win.panels[vna]
+    qtbot.waitUntil(lambda: panel in win.visible_panels() and bool(panel.plots[0].traces), timeout=5000)
+
+    # Переключаемся только на m2 (m1 выключен) и останавливаем развёртку (HOLD)
+    vna.set("m2.channel", 1)
+    vna.set("m2.name", "CH1_S21_2")
+    vna.set("m2.enabled", True)
+    vna.set("m1.enabled", False)
+    qtbot.waitUntil(lambda: vna.value("m2.trace") is not None and vna.value("m1.enabled") is False, timeout=5000)
+    vna.action("abort")
+    qtbot.waitUntil(lambda: vna.value("meas.continuous") is False, timeout=5000)
+
+    # Ждём дольше hold_s (0.2 с): график ВАЦ остаётся на экране и показывает трассу m2
+    qtbot.wait(450)
+    mon.tick()
+    assert mon.activity(vna).measuring is True
+    assert panel in win.visible_panels()
+    assert panel.plots[0].traces and "S21" in panel.plots[0].traces[0][0]

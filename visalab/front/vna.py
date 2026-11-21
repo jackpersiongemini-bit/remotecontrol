@@ -1298,7 +1298,10 @@ class VNAWindow(InstrumentWindow):
     def on_param(self, key: str, value: Any) -> None:
         if hasattr(self, "source_cal") and key in ("freq.cw", "freq.center", "freq.start", "freq.stop",
                                                    "sweep.type", "gen.state"):
-            self.source_cal.apply_correction()
+            freq = self._source_cal_freq()
+            if freq != getattr(self, "_last_cal_freq", object()):
+                self._last_cal_freq = freq
+                self.source_cal.apply_correction()
 
     def restore(self) -> None:
         if hasattr(self, "source_cal"):

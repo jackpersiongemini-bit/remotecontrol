@@ -148,7 +148,9 @@ class SourceCal(QObject):
         self.cal_plot.set_freq(self._freq_getter())
         total = round(self.total_correction(), 3)
         p = self.proxy
-        if not p.is_connected or self.owner._resetting or COORD.busy(p) is not None:
+        if (not p.is_connected or self.owner._resetting or COORD.busy(p) is not None
+                or (p.supports("power.offset") and p.value("power.offset") is None)
+                or (p.supports("power.offset_state") and p.value("power.offset_state") is None)):
             return
         on = abs(total) > 5e-4
         if not on:

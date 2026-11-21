@@ -1161,11 +1161,26 @@ class MainWindow(Window):
             return lvl
         if prof == "network_analyzer":
             peaks = []
-            for _name, tr in self.monitor.vna_traces(proxy):
-                finite = [float(y) for y in tr.y if math.isfinite(y)]
-                if finite:
+            has_non_mag = False
+            for n in range(1, 17):
+                if not proxy.value(f"m{n}.enabled"):
+                    continue
+                tr = proxy.value(f"m{n}.trace")
+                if not isinstance(tr, Trace) or len(tr) < 2:
+                    continue
+                mag = self.monitor.slot_magnitude_db(tr) if hasattr(self.monitor, "slot_magnitude_db") else None
+                vals = mag if mag is not None else [float(y) for y in tr.y if math.isfinite(y)]
+                finite = [float(v) for v in vals if math.isfinite(v)]
+                if mag is None and (tr.meta or {}).get("format") in ("PHASE", "UPHASE", "GDELAY", "REAL", "IMAG"):
+                    has_non_mag = True
+                elif finite:
                     peaks.append(max(finite))
-            return max(peaks) if peaks else None
+            if not peaks and not has_non_mag:
+                for _name, tr in self.monitor.vna_traces(proxy):
+                    finite = [float(y) for y in tr.y if math.isfinite(y)]
+                    if finite:
+                        peaks.append(max(finite))
+            return math.inf if (has_non_mag and not peaks) else (max(peaks) if peaks else None)
         return None
 
     def hide_panel(self, proxy) -> None:

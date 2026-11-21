@@ -830,6 +830,20 @@ def test_trace_reads_even_when_wnum_or_scale_queries_unsupported(make):
     assert not rec2.comm
 
 
+def test_continuous_poll_recovers_when_oper_bit_fires_once_then_stops(make):
+    """Если STAT:OPER:EVEN? вернул бит 4 один раз (_oper_seen=True), а затем в CONT возвращает 0,
+    фоллбэк по времени всё равно продолжает читать трассы."""
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
+    drv.poll()
+    assert drv._oper_seen is True
+    first = rec.values["m1.trace"]
+    # Теперь прибор больше не взводит бит 4 в STAT:OPER:EVEN? в свободном CONT
+    sim.on("STATus:OPERation[:EVENt]", get=lambda a, g: "0")
+    drv._last_cont_read = 0.0
+    drv.poll()
+    assert rec.values["m1.trace"] is not first and not rec.errors and not rec.comm
+
+
 def test_source_power_calibration(make):
     """Калибровка выходного тракта ВАЦ: power.offset / power.offset_state."""
     drv, sim, rec = make(KeysightPNA, KeysightPNASim)

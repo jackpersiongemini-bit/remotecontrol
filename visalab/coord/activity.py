@@ -207,6 +207,7 @@ class ActivityMonitor(QObject):
 
     changed = pyqtSignal(object)
     roster_changed = pyqtSignal()
+    slot_magnitude_db = staticmethod(slot_magnitude_db)
 
     def __init__(self, links: ProxyLinks = LINKS, thresholds: Thresholds | None = None, parent=None,
                  clock: Callable[[], float] = time.monotonic):
@@ -378,9 +379,13 @@ class ActivityMonitor(QObject):
                 self._last_signal[proxy] = now
             self._emit(proxy)                         # одна перерисовка на развёртку
         elif prof == "network_analyzer" and (
-            (key.startswith("m") and key.endswith(".enabled"))
+            (key.startswith("m") and key.endswith((".enabled", ".trace")))
             or key in ("scale.div", "scale.ref", "scale.rpos")
         ):
+            if self._has_vna_traces(proxy):
+                self._last_data[proxy] = now
+            else:
+                self._last_data.pop(proxy, None)
             self._emit(proxy)
         elif prof == "network_analyzer" and key == "rf.output" and value is False:
             self._last_signal.pop(proxy, None)
@@ -388,12 +393,17 @@ class ActivityMonitor(QObject):
 
     def _has_vna_traces(self, proxy) -> bool:
         """Есть ли хотя бы одна непустая трасса у ВАЦ (без конвертации в dB)."""
+        has_slots = False
         for n in range(1, 17):
+            if proxy.supports(f"m{n}.enabled"):
+                has_slots = True
             if not proxy.value(f"m{n}.enabled"):
                 continue
             tr = proxy.value(f"m{n}.trace")
             if isinstance(tr, Trace) and len(tr) >= 2:
                 return True
+        if has_slots:
+            return False
         tr = proxy.value("trace")
         return isinstance(tr, Trace) and len(tr) > 1
 
@@ -466,14 +476,14 @@ class ActivityMonitor(QObject):
 
     # ------------------------------------------------------------ результат
     def _is_measuring(self, proxy) -> bool:
-        """Прибор подключён и выдаёт данные (за последние ``hold_s`` секунд)."""
+        """Прибор подключён и выдаёт данные (за последние ``hold_s`` секунд; у ВАЦ - пока есть читаемые трассы)."""
         if proxy.state is not ConnectionState.CONNECTED:
-            return False
-        t = self._last_data.get(proxy)
-        if t is None or self.clock() - t >= self.th.hold_s:
             return False
         if profile_name(proxy) == "network_analyzer":
             return self._has_vna_traces(proxy)
+        t = self._last_data.get(proxy)
+        if t is None or self.clock() - t >= self.th.hold_s:
+            return False
         return True
 
     def _has_signal(self, proxy) -> bool:

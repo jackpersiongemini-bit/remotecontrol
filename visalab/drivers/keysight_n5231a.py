@@ -277,6 +277,11 @@ class KeysightPNA(VISAInstrument):
             Param("cal.busy", "Идёт измерение стандарта", B, section=rs, query="<virtual>"),
             Param("cal.interp", "Интерполяция калибровки", B, section=rs, query="SENS1:CORR:INT?",
                   write="SENS1:CORR:INT {value}", also_read=("cal.state",)),
+            Param("power.offset", "Поправка мощности", F, "dB", section=st, query="<virtual>",
+                  write="<virtual>", minimum=-100.0, maximum=100.0, tolerance=1e-3,
+                  also_read=("source.power",)),
+            Param("power.offset_state", "Калибровка мощности", B, section=st, query="<virtual>",
+                  write="<virtual>", also_read=("source.power",)),
             Param("freq.start", "Старт", section=st, query="SENS1:FREQ:STAR?", write="SENS1:FREQ:STAR {value}",
                   **freq),
             Param("freq.stop", "Стоп", section=st, query="SENS1:FREQ:STOP?", write="SENS1:FREQ:STOP {value}",
@@ -293,11 +298,6 @@ class KeysightPNA(VISAInstrument):
                   **{**freq, "also_read": ()}),
             Param("source.power", "Мощность", F, "dBm", section=st, query="SOUR1:POW1?",
                   write="SOUR1:POW1 {value}", minimum=-190.0, maximum=120.0, tolerance=1e-3),
-            Param("power.offset", "Поправка мощности", F, "dB", section=st, query="<virtual>",
-                  write="<virtual>", minimum=-100.0, maximum=100.0, tolerance=1e-3,
-                  also_read=("source.power",)),
-            Param("power.offset_state", "Калибровка мощности", B, section=st, query="<virtual>",
-                  write="<virtual>", also_read=("source.power",)),
             Param("rf.output", "Источник вкл.", B, section=st, query="OUTP?", write="OUTP {value}"),
             Param("bw.if", "Полоса ПЧ", F, "Hz", section=sw, query="SENS1:BWID?", write="SENS1:BWID {value}",
                   minimum=1.0, maximum=15e6, tolerance=1e-3, also_read=("sweep.time",)),
@@ -657,6 +657,15 @@ class KeysightPNA(VISAInstrument):
             if key == "mark.x":
                 return spec.from_scpi(self.query(cmd + ":X?"))
             return parse_number(self.query(cmd + ":Y?").split(",")[0])
+        if key in ("scale.div", "scale.ref", "scale.rpos"):
+            if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
+                return None
+            c, name = self._sel
+            self.write(f"CALC{c}:PAR:SEL '{name}'")
+            scale = self._read_scale(c, name, allow_single_fallback=(c == 1 and len(self._catalog(1)) == 1))
+            if scale is None:
+                return None
+            return scale[("scale.div", "scale.ref", "scale.rpos").index(key)]
         if key in SCALE_KEYS:
             if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
                 return None
@@ -708,17 +717,25 @@ class KeysightPNA(VISAInstrument):
     def read_group(self, group: str) -> dict[str, Any]:
         return dict(self._sweep)
 
+    def _safe_read_trace(self) -> None:
+        try:
+            self._read_trace()
+        except TransportTimeout:
+            self._try_resync()
+            self._drain_scale_errors()
+        except Exception:  # noqa: BLE001 - на приборе может ещё не быть данных
+            pass
+
     def _sync_all(self) -> None:
-        super()._sync_all()
+        self._read_keys(list(self._params))
         if self._cal is None and any(s.enabled and s.name for s in self._slots):
-            try:
-                self._read_trace()
-            except Exception:  # noqa: BLE001 - на приборе может ещё не быть данных
-                pass
+            self._safe_read_trace()
         if self._continuous:
             self._ensure_continuous()
             self._clear_oper_events()
-            self._last_cont_read = time.monotonic()
+            self._last_cont_read = time.monotonic() if self._sweep.get("meas.count") else 0.0
+        self._check_errors(context="sync")
+        self.sync_done.emit()
 
     # ------------------------------------------------------- развёртки
     def _set_armed(self, armed: bool) -> None:
@@ -804,34 +821,44 @@ class KeysightPNA(VISAInstrument):
         return out
 
     # ------------------------------------------------------- масштаб трейса trace.sel
+    def _drain_scale_errors(self) -> list[tuple[int, str]]:
+        """Снять ошибки прибора после пробного чтения масштаба без зажигания индикатора ошибок окна."""
+        try:
+            self.read_esr()
+            return self.read_error_queue()
+        except Exception:  # noqa: BLE001
+            return []
+
     def _window_trace(self, channel: int, allow_single_fallback: bool = False) -> tuple[int, int] | None:
         """(окно, трейс) текущего выбранного измерения канала; None - не показано или запрос не поддерживается."""
-        if self._wnum_supported:
-            try:
-                w = int(parse_number(self.query(f"CALC{channel}:PAR:WNUM?")))
-                t = int(parse_number(self.query(f"CALC{channel}:PAR:TNUM?")))
-                return (w, t) if (w >= 1 and t >= 1) else None
-            except ValueError:
-                return None
-            except TransportTimeout:
-                if not self._try_resync():
-                    raise
-                errors = self._check_errors(context="scale")
-                if any(-199 <= code <= -100 for code, _ in errors):
-                    self._wnum_supported = False
-                else:
+        old_timeout = self.transport.timeout_ms
+        self.transport.timeout_ms = min(old_timeout, 1500)
+        try:
+            if self._wnum_supported:
+                try:
+                    w = int(parse_number(self.query(f"CALC{channel}:PAR:WNUM?")))
+                    t = int(parse_number(self.query(f"CALC{channel}:PAR:TNUM?")))
+                    return (w, t) if (w >= 1 and t >= 1) else None
+                except ValueError:
                     return None
-        if allow_single_fallback:
-            try:
-                if self.query("DISP:WIND1:STAT?").strip().upper() in ("1", "ON"):
-                    return (1, 1)
-            except ValueError:
-                return None
-            except TransportTimeout:
-                if not self._try_resync():
-                    raise
-                self._check_errors(context="scale")
-        return None
+                except TransportTimeout:
+                    if not self._try_resync():
+                        raise
+                    self._drain_scale_errors()
+                    self._wnum_supported = False
+            if allow_single_fallback:
+                try:
+                    if self.query("DISP:WIND1:STAT?").strip().upper() in ("1", "ON"):
+                        return (1, 1)
+                except ValueError:
+                    return None
+                except TransportTimeout:
+                    if not self._try_resync():
+                        raise
+                    self._drain_scale_errors()
+            return None
+        finally:
+            self.transport.timeout_ms = old_timeout
 
     def _scale_cmd(self, key: str) -> str:
         """Команда (без ?) ключа масштаба/обработки для трейса ``trace.sel``; выбирает его измерение."""
@@ -860,7 +887,9 @@ class KeysightPNA(VISAInstrument):
         if wt is None:
             return None
         w, t = wt
-        base = f"DISP:WIND{w}:TRAC{t}:Y:SCAL:"
+        base = f"DISP:WIND{w}:TRAC{t}:Y:"
+        old_timeout = self.transport.timeout_ms
+        self.transport.timeout_ms = min(old_timeout, 1500)
         try:
             return (
                 self._params["scale.div"].from_scpi(self.query(base + "PDIV?")),
@@ -872,12 +901,14 @@ class KeysightPNA(VISAInstrument):
         except TransportTimeout:
             if not self._try_resync():
                 raise
-            errors = self._check_errors(context="scale")
-            if any(-199 <= code <= -100 for code, _ in errors):
+            errors = self._drain_scale_errors()
+            if any(-199 <= code <= -100 for code, _ in errors) or not name or (w, t) == (1, 1):
                 self._scale_read_supported = False
-            elif name and errors:
+            if name:
                 self._scale_skip.add((channel, name))
             return None
+        finally:
+            self.transport.timeout_ms = old_timeout
 
     def _sync_sel_scale(self) -> None:
         """Обновить масштаб в метаданных уже прочитанной трассы ``trace.sel`` (без ожидания новой развёртки)."""
@@ -1071,12 +1102,19 @@ class KeysightPNA(VISAInstrument):
                 out[f"m{n}.trace"] = Trace.linear(start, stop, y, x_unit=x_unit, y_unit=Y_UNITS.get(fmt, ""),
                                                   name=sparam, meta=meta)
             if self._complex:
-                raw = [parse_number(t) for t in self.query(f"CALC{c}:DATA? SDATA").split(",") if t.strip()]
-                spairs = len(raw) // 2
-                if spairs:
-                    raw = raw[:2 * spairs]
-                    out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit=x_unit, y_unit="",
-                                                      name=sparam, meta={**meta, "format": "SDATA", "math": "NORM"})
+                try:
+                    raw = [parse_number(t) for t in self.query(f"CALC{c}:DATA? SDATA").split(",") if t.strip()]
+                    spairs = len(raw) // 2
+                    if spairs:
+                        raw = raw[:2 * spairs]
+                        out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit=x_unit, y_unit="",
+                                                          name=sparam, meta={**meta, "format": "SDATA", "math": "NORM"})
+                except ValueError:
+                    pass
+                except TransportTimeout:
+                    if not self._try_resync():
+                        raise
+                    self._drain_scale_errors()
             count += 1
             for k, v in ((f"m{n}.sparam", sparam), (f"m{n}.format", fmt), (f"m{n}.math", math)):
                 if self._values.get(k) != v:
@@ -1121,9 +1159,11 @@ class KeysightPNA(VISAInstrument):
                     self._last_cont_read = time.monotonic()
                     self._read_trace()
                     return
-            trig = self._values.get("trig.source", "IMM")
-            if (not self._oper_seen and trig == "IMM"
-                    and time.monotonic() - self._last_cont_read >= self._cont_fallback_s()):
+            trig = self._values.get("trig.source") or "IMM"
+            fallback_s = self._cont_fallback_s()
+            if self._oper_seen:
+                fallback_s = max(1.0, fallback_s)
+            if trig == "IMM" and time.monotonic() - self._last_cont_read >= fallback_s:
                 self._last_cont_read = time.monotonic()
                 self._read_trace()
             return
