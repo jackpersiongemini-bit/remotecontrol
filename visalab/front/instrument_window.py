@@ -77,6 +77,18 @@ def _same(a, b) -> bool:
     return a == b
 
 
+class _PresetChip(QPushButton):
+    """Чип пресета во всю высоту строки PRST (QSS `min-height: 0` у `#chip` не сжимает его)."""
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt
+        hint = super().sizeHint()
+        return QSize(hint.width(), max(hint.height(), PRESET_HEIGHT))
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt
+        hint = super().minimumSizeHint()
+        return QSize(hint.width(), max(hint.height(), PRESET_HEIGHT))
+
+
 class PresetGroup(PBGroup):
     """Пресеты - кортежи значений в QSettings (JSON); чип - несколько строк текста.
 
@@ -91,13 +103,16 @@ class PresetGroup(PBGroup):
     def __init__(self, settings: QSettings, key: str, defaults, normalize: Callable[..., tuple],
                  describe: Callable[[tuple], tuple[str, str]], parent=None):
         super().__init__(parent=parent)
-        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.group_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.settings, self.key = settings, key
         self.normalize, self.describe = normalize, describe
         self.data: list[tuple] = []
         self._recent: list[tuple] = []          # использованные за сеанс, последний - первый
         for preset in self._load(defaults):
             self._append(preset)
+
+    def _make_button(self, name: str) -> QPushButton:
+        return _PresetChip(name)
 
     def _load(self, defaults):
         raw = self.settings.value(self.key) if self.key else None
@@ -127,7 +142,7 @@ class PresetGroup(PBGroup):
             text, tip = self.describe(preset)
             b.setText(text)
             b.setToolTip(tip)
-            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
             b.setFixedHeight(PRESET_HEIGHT)
 
     def touch(self, index: int) -> None:
@@ -177,6 +192,8 @@ class PowerSpin(PSpinBox):
         if not self.preset_mode or not self.levels:
             super().stepBy(steps)
             return
+        if steps == 0:
+            return
         cur = self._value if isinstance(self._value, (int, float)) else self.value()
         if steps > 0:
             above = [v for v in self.levels if v > cur + 1e-9]
@@ -184,6 +201,10 @@ class PowerSpin(PSpinBox):
         else:
             below = [v for v in self.levels if v < cur - 1e-9]
             target = below[-min(-steps, len(below))] if below else self.levels[0]
+        try:
+            target = self.spec.validate(target)
+        except ValueError:
+            return
         self.show_value(target, force=True)
         self.set_value(target)
 
@@ -205,6 +226,7 @@ class PowerLevels(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.chips)
         proxy.subscribe(key, lambda _v: self._show())
+        proxy.state_changed.connect(lambda _s: self._show())
         self.set_levels(levels)
 
     @property
@@ -221,19 +243,24 @@ class PowerLevels(QWidget):
         self._show()
 
     def _show(self) -> None:
+        if sip.isdeleted(self):
+            return
+        on = self.proxy.is_connected
         cur = self.proxy.value(self.key)
         i = next((k for k, v in enumerate(self._levels)
-                  if isinstance(cur, (int, float)) and abs(v - cur) < 1e-6), -1)
+                  if isinstance(cur, (int, float)) and abs(v - cur) < 1e-6), -1) if on else -1
         self.chips.set_checked(i)
+        for b in self.chips.buttons():
+            b.setEnabled(on)
 
     def _clicked(self, index: int) -> None:
-        if 0 <= index < len(self._levels):
+        if self.proxy.is_connected and 0 <= index < len(self._levels):
             self.proxy.set(self.key, self._levels[index])
         self._show()
 
     def step(self, steps: int) -> None:
         """Соседний уровень (← →): от выбранного, а если текущая мощность не из списка - ближайший."""
-        if not self._levels:
+        if not self.proxy.is_connected or not self._levels:
             return
         cur = self.proxy.value(self.key)
         if not isinstance(cur, (int, float)):
@@ -400,17 +427,17 @@ class InstrumentWindow(Window):
         self.init_button = CustomInitButton()
         self.init_button.setToolTip("Reset (*RST) and restore saved values")
         self.init_button.clicked.connect(self._init)
-        # вместо адреса - что это за прибор (VNA, PM...), адрес - в подсказке (Алексей 2026-11-14)
+        # ответ *IDN? прибора занимает всё место между левыми и правыми кнопками заголовка (не кликабелен)
         self.address = AddressLabel(COORD.display_name(proxy))
         self._update_name()
         self.error_indicator = ErrorIndicator()
         # ход записи виден по цвету рамки самого поля; в заголовке остаётся только индикатор ошибок -
         # рядом с переключателем связи (Алексей)
-        for i, w in enumerate((self.on_button, self.error_indicator, self.sync_button, self.init_button,
-                               self.address)):
+        for i, w in enumerate((self.on_button, self.error_indicator, self.sync_button, self.init_button)):
             bar.insert_widget(w, i)
+        bar.insert_widget(self.address, 4, stretch=1)
         bar.hBoxLayout.setAlignment(self.on_button, Qt.AlignmentFlag.AlignVCenter)   # он ниже кнопок
-        bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает имя прибора
+        bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает *IDN? прибора
         self.expand_button = CustomExpandButton()
         self.expand_button.setToolTip("Show / hide all parameters")
         self.expand_button.clicked.connect(lambda: self.set_expanded(not self.expand_button.expanded))
@@ -438,6 +465,13 @@ class InstrumentWindow(Window):
             self.pages.append(table)
             self._page_states.append(tuple(states))
             self.tabs.addTab(title_)
+        # отдельная вкладка настроек подключения (драйвер, модель, адрес, пауза)
+        self.connection_page = self._build_connection_page()
+        self._settings_tab_index = len(self.pages)
+        self.pages.append(self.connection_page)
+        self._page_states.append(())
+        self.tabs.addTab("SET")
+        self.tabs.setTabToolTip(self._settings_tab_index, "Connection settings: driver, model, address, command delay")
         self.tabs.currentChanged.connect(self.set_page)
         self.tabs.tabBarClicked.connect(self._on_tab_clicked)
         body = QWidget()
@@ -449,14 +483,12 @@ class InstrumentWindow(Window):
             bl.addWidget(page)
         self.error_page = self._build_error_page()
         bl.addWidget(self.error_page)
-        self.connection_page = self._build_connection_page()
-        bl.addWidget(self.connection_page)
         self.parameter_panel = Panel(body)
         label_w = 0
         for page in self.pages:
             page.build(UI_COLUMN_WIDTH_PX)
             label_w = max([label_w, *(ln.label_hint() for ln in page.lines)])
-        for page in (*self.pages, self.connection_page):
+        for page in self.pages:
             for ln in page.lines:
                 ln.set_label_width(label_w)
 
@@ -484,8 +516,8 @@ class InstrumentWindow(Window):
         self.tracker.changed.connect(self.error_indicator.set_items)
         self.tracker.changed.connect(lambda *_a: WINDOW_EVENTS.changed.emit(self.proxy))
         self.error_indicator.clicked.connect(self.show_errors)
-        self.address.double_clicked.connect(self.show_connection)
         COORD.links.changed.connect(self._update_name)       # второй прибор того же класса - GEN2
+        proxy.identified.connect(lambda _idn: self._update_name())
         proxy.param_status.connect(self._log_status)
         proxy.instrument_error.connect(self._log_instrument_error)
         proxy.state_changed.connect(self._on_state)
@@ -497,14 +529,25 @@ class InstrumentWindow(Window):
         proxy.refused.connect(self._on_refused)
         self._on_state(proxy.state)
 
-        self.address.setMinimumWidth(self.address.sizeHint().width())
-        self.setMinimumWidth(max(self.titleBar.sizeHint().width(), lay.minimumSize().width()))
+        self.setMinimumWidth(max(self.titleBar.minimumSizeHint().width(), lay.minimumSize().width()))
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.recall_size(QSize(self.minimumWidth(), 0))
         self.set_page(settings.value(f"{self._prefix}/TAB", 0, type=int), fit=False)
         self.set_expanded(settings.value(f"{self._prefix}/EXPANDED", False, type=bool))
         self._update_tabs()
         WINDOW_EVENTS.changed.emit(proxy)
+
+    def cleanup(self) -> None:
+        """Отключить глобальные сигналы и закрыть дочерние окна перед заменой/удалением."""
+        mw = getattr(self, "model_window", None)
+        if mw is not None and not sip.isdeleted(mw):
+            mw.close()
+            mw.deleteLater()
+            self.model_window = None
+        try:
+            COORD.links.changed.disconnect(self._update_name)
+        except (TypeError, RuntimeError):
+            pass
 
     def bound_widgets(self) -> list:
         """Все виджеты, привязанные к ключам (для журнала ошибок)."""
@@ -605,20 +648,26 @@ class InstrumentWindow(Window):
         for i, page in enumerate(self.pages):
             page.setVisible(self._expanded and overlay is None and i == self.tabs.currentIndex())
         self.error_page.setVisible(overlay == "errors")
-        self.connection_page.setVisible(overlay == "connection")
         self.tabs.show_selection = self._expanded and overlay is None
         self.tabs.update()
 
     def _on_tab_clicked(self, index: int) -> None:
-        """Клик по вкладке: из журнала / подключения - обратно к таблице; в свёрнутом окне - развернуть."""
+        """Клик по вкладке: из журнала - обратно к таблице; в свёрнутом окне - развернуть;
+        повторный клик по уже открытой вкладке - свернуть."""
         if index < 0:
             return
         if self._overlay:
             self._overlay = None
             self.set_page(index, fit=self._expanded)
+            if not self._expanded:
+                self.set_expanded(True)
+            return
         if not self._expanded:
             self.set_page(index, fit=False)
             self.set_expanded(True)
+            return
+        if index == self.tabs.currentIndex():
+            self.set_expanded(False)
 
     def _show_overlay(self, name: str) -> None:
         self._overlay = name
@@ -663,7 +712,8 @@ class InstrumentWindow(Window):
             QTimer.singleShot(0, self._fit_height_again)   # связанный метод: не сработает после удаления окна
 
     def _fit_height_again(self) -> None:
-        self._fit_height(False)
+        if not sip.isdeleted(self):
+            self._fit_height(False)
 
     def set_page(self, index: int, fit: bool = True) -> None:
         """Показать вкладку таблицы."""
@@ -697,7 +747,7 @@ class InstrumentWindow(Window):
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
         """← → - применить соседний пресет."""
-        if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right) and self.presets.data:
+        if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right) and self.presets.data and self.proxy.is_connected:
             i = self.presets.checked_index()
             step = -1 if e.key() == Qt.Key.Key_Left else 1
             j = 0 if i < 0 else min(max(i + step, 0), len(self.presets.data) - 1)
@@ -736,8 +786,11 @@ class InstrumentWindow(Window):
         return page
 
     def _log(self, name: str, detail: str) -> None:
-        detail = (detail or "error").strip().splitlines()[0] if detail else "error"
-        self.error_log.appendPlainText(f"{time.strftime('%H:%M:%S')}  {name}: {detail}")
+        if sip.isdeleted(self):
+            return
+        lines = (detail or "").strip().splitlines()
+        line = lines[0] if lines else "error"
+        self.error_log.appendPlainText(f"{time.strftime('%H:%M:%S')}  {name}: {line}")
 
     def _log_status(self, key: str, status: PStatus, message: str) -> None:
         if key in self.tracker.keys and status in (PStatus.ERROR, PStatus.INVALID):
@@ -768,9 +821,10 @@ class InstrumentWindow(Window):
         if sip.isdeleted(self) or sip.isdeleted(self.proxy):
             return
         name = COORD.display_name(self.proxy)
-        self.address.setText(name)
-        self.address.setToolTip(f"{name}: {self.proxy.name}\n{self.proxy.address}\n"
-                                "Double-click - driver, model, address")
+        idn = (getattr(self.proxy, "idn", "") or "").strip()
+        self.address.setText(idn or name)
+        detail = idn or self.proxy.name
+        self.address.setToolTip(f"{name}: {detail}\n{self.proxy.address}")
 
     def show_errors(self) -> None:
         """Клик по индикатору ошибок: вместо таблицы - журнал (выход - вкладка или CLEAR)."""
@@ -828,16 +882,25 @@ class InstrumentWindow(Window):
 
     def new_model(self) -> None:
         """Окно создания модели; после SAVE модель появляется в списке MDL и выбирается."""
+        prev = getattr(self, "model_window", None)
+        if prev is not None and not sip.isdeleted(prev):
+            prev.close()
+            prev.deleteLater()
         kind = self.driver_choice.value or self._driver_kind()
         template = all_models(self.settings, kind).get(self.model_choice.value or "")
         self.model_window = ModelWindow(self.settings, kind, template)
-        self.model_window.saved.connect(lambda name: self._fill_models(kind, name))
+        self.model_window.saved.connect(lambda name, k=kind: (not sip.isdeleted(self)) and self._fill_models(k, name))
         self.model_window.move(self.pos() + self.rect().center() - self.model_window.rect().center())
         self.model_window.show()
 
     def show_connection(self) -> None:
-        """Клик по адресу: вместо таблицы - драйвер / модель / адрес (выход - вкладка или APPLY)."""
-        self._show_overlay("connection")
+        """Открыть вкладку настроек подключения (SET)."""
+        self._overlay = None
+        if self._expanded:
+            self.set_page(self._settings_tab_index, fit=True)
+        else:
+            self.set_page(self._settings_tab_index, fit=False)
+            self.set_expanded(True)
 
     def _show_delay(self) -> None:
         saved = saved_delay(self.settings, self.CONNECTION_GROUP)
@@ -854,10 +917,16 @@ class InstrumentWindow(Window):
         text = self.delay_edit.text().strip()
         if not text:
             self.settings.remove(f"{self.CONNECTION_GROUP}/DELAY")
-            self.proxy.set_command_delay(COORD.default_delay(self._driver_kind()))
+            try:
+                default = COORD.default_delay(self._driver_kind())
+            except KeyError:
+                default = 0.0
+            self.proxy.set_command_delay(default)
             return True
         try:
-            value = max(0.0, si_parse(text, "s"))
+            value = si_parse(text, "s")
+            if not math.isfinite(value) or value < 0 or value > 60.0:
+                raise ValueError("out of range")
         except ValueError:
             self._show_delay()
             return False
@@ -874,7 +943,6 @@ class InstrumentWindow(Window):
         for k, v in (("DRIVER", driver), ("ADDRESS", address), ("MODEL", model)):
             self.settings.setValue(f"{self.CONNECTION_GROUP}/{k}", v)
         self.settings.sync()
-        self._close_overlay()
         self.reconnect_requested.emit(driver, address, model)
 
     # ------------------------------------------------------------ пресеты
@@ -938,7 +1006,7 @@ class InstrumentWindow(Window):
                 continue
             try:
                 value = w.spec.validate(str(raw).replace(",", ".") if isinstance(raw, str) else raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             w.set_value(value)
 
@@ -962,28 +1030,37 @@ class InstrumentWindow(Window):
 
     # ------------------------------------------------------------ события
     def _on_state(self, state: ConnectionState) -> None:
+        if sip.isdeleted(self):
+            return
         status = {ConnectionState.CONNECTED: ON, ConnectionState.CONNECTING: "process",
                   ConnectionState.ERROR: "retry" if self.proxy.reconnecting else "error"}.get(state, OFF)
         self.on_button.set_status(status)
         self.on_button.setToolTip("No connection: reconnecting by itself when the instrument answers. "
                                   "Click - stop" if status == "retry" else "Connect / disconnect")
         on = state is ConnectionState.CONNECTED
-        self.sync_button.setEnabled(on)
-        self.init_button.setEnabled(on)
         if not on:
             self._resetting = False
             self.sync_button.set_status("ok")
             self.init_button.set_status("ok")
+        self.sync_button.setEnabled(on)
+        self.init_button.setEnabled(on)
+        if on:
+            self._update_name()
 
     def _on_reconnect(self, _seconds: float) -> None:
-        self._on_state(self.proxy.state)
+        if not sip.isdeleted(self):
+            self._on_state(self.proxy.state)
 
     def _on_comm_error(self, msg: str) -> None:
+        if sip.isdeleted(self):
+            return
         self._log("CONNECTION", msg)
         self._release_buttons()
 
     def _on_refused(self, msg: str) -> None:
         """Прибор ведёт сценарий координатора: запрос окна не отправлен."""
+        if sip.isdeleted(self):
+            return
         self._log("BUSY", msg)
         self._release_buttons()
 
@@ -992,17 +1069,26 @@ class InstrumentWindow(Window):
         for b in (self.sync_button, self.init_button):
             if b.status() == "process":
                 b.set_status("ok")
+                b.setEnabled(self.proxy.is_connected)
 
     def _on_sync_done(self) -> None:
-        self.sync_button.set_status("ok")
+        if not sip.isdeleted(self):
+            self.sync_button.set_status("ok")
+            self.sync_button.setEnabled(self.proxy.is_connected)
 
     def _on_action_done(self, name: str, _result) -> None:
+        if sip.isdeleted(self):
+            return
         if name == "reset":
             self.init_button.set_status("ok")
+            self.init_button.setEnabled(self.proxy.is_connected)
             self._resetting = False
             self.restore()
 
     def closeEvent(self, event):  # noqa: N802 - Qt
+        mw = getattr(self, "model_window", None)
+        if mw is not None and not sip.isdeleted(mw):
+            mw.close()
         self.presets.save()
         self.settings.sync()
         super().closeEvent(event)

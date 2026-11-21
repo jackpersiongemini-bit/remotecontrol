@@ -78,17 +78,45 @@ class FrequencyFollow(QObject):
             return self._last
         return self.coord.find_for("signal_generator")
 
+    def stop(self) -> None:
+        """Отключиться от реестра и приборов."""
+        try:
+            self.coord.links.changed.disconnect(self._sync)
+        except (TypeError, RuntimeError):
+            pass
+        for inst in list(self._conns):
+            conns = self._conns.pop(inst, ())
+            if not sip.isdeleted(inst):
+                for sig, slot in conns:
+                    try:
+                        sig.disconnect(slot)
+                    except (TypeError, RuntimeError):
+                        pass
+        self._sources.clear()
+        self._last = None
+
     # ------------------------------------------------------------ приборы
     def _sync(self) -> None:
+        if sip.isdeleted(self):
+            return
         current = self.coord.links.proxies()
+        affected: list[Any] = []
         for inst in [i for i in self._conns if i not in current]:
-            for sig, slot in self._conns.pop(inst):
-                try:
-                    sig.disconnect(slot)
-                except (TypeError, RuntimeError):
-                    pass
+            conns = self._conns.pop(inst)
+            if not sip.isdeleted(inst):
+                for sig, slot in conns:
+                    try:
+                        sig.disconnect(slot)
+                    except (TypeError, RuntimeError):
+                        pass
             self._enabled.pop(inst, None)
             self._sources.pop(inst, None)
+            if self._last is inst:
+                self._last = None
+            for pm, src in list(self._sources.items()):
+                if src is inst:
+                    self._sources.pop(pm, None)
+                    affected.append(pm)
         for inst in current:
             if inst in self._conns:
                 continue
@@ -103,12 +131,22 @@ class FrequencyFollow(QObject):
                 inst.sync_done.connect(slot)
                 conns.append((inst.sync_done, slot))
             self._conns[inst] = tuple(conns)
+        for pm in affected:
+            if not sip.isdeleted(pm):
+                self.changed.emit(pm)
 
     def _on_source(self, src, key: str) -> None:
-        if sip.isdeleted(self) or key not in _SOURCE_KEYS.get(profile_name(src), ()):
+        if sip.isdeleted(self) or sip.isdeleted(src) or key not in _SOURCE_KEYS.get(profile_name(src), ()):
             return
         f = source_frequency(src)
         if f is None:
+            if self._last is src:
+                self._last = None
+            for pm, cur_src in list(self._sources.items()):
+                if cur_src is src:
+                    self._sources.pop(pm, None)
+                    if not sip.isdeleted(pm):
+                        self.changed.emit(pm)
             return
         self._last = src
         for pm in self.coord.links.proxies():

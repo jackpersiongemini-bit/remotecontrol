@@ -431,3 +431,56 @@ def test_main_window_panel_close_reorder_and_layout(qtbot, lab, tmp_path):
     vna.set("gen.port", 2)
     vna.set("gen.state", True)
     qtbot.waitUntil(lambda: "CW P2" in win2.panels[vna].source.text(), timeout=5000)
+
+
+def test_live_plot_decimation_cache_and_cursor(qtbot):
+    from PyQt6.QtCore import QPointF, QRectF
+    from visalab.front.live_plot import LivePlot, decimate_trace_polygon, nearest_index
+
+    y = [-80.0] * 10000 + [-5.0] + [-80.0] * 10000 + [-95.0] + [-80.0] * 11999
+    tr = Trace.linear(1e9, 10e9, y)
+    rect = QRectF(6, 20, 400, 200)
+    poly = decimate_trace_polygon(tr, 1e9, 10e9, -100.0, 0.0, rect)
+    assert 0 < len(poly) <= 2 * 200
+    ys_px = [pt.y() for pt in poly]
+    # пик -5 dBm и провал -95 dBm сохранились в огибающей
+    assert min(ys_px) == pytest.approx(rect.bottom() - (-5.0 - (-100.0)) / 100.0 * rect.height())
+    assert max(ys_px) == pytest.approx(rect.bottom() - (-95.0 - (-100.0)) / 100.0 * rect.height())
+
+    # нелинейная ось X с NaN
+    non_uni = Trace((0.0, 1.0, 2.0, 4.0, 8.0, 10.0), (-50.0, float("nan"), -10.0, -60.0, -20.0, -40.0))
+    assert nearest_index(tr, 5.5e9) == 16000
+    assert nearest_index(non_uni, 3.9) == 3
+
+    plot = LivePlot()
+    qtbot.addWidget(plot)
+    plot.resize(500, 260)
+    plot.set_traces([("S21", tr)])
+    plot.grab()
+    cache_obj = plot._cache
+    assert cache_obj is not None
+    # движение мыши не перестраивает базовый кэш
+    plot._mouse = QPointF(200, 100)
+    plot.grab()
+    assert plot._cache is cache_obj
+    # повторный set_traces с тем же объектом Trace ничего не сбрасывает
+    plot.set_traces([("S21", tr)])
+    assert plot._cache is cache_obj
+    # смена маркера перестраивает кэш
+    plot.set_marker(5.5e9, -5.0)
+    plot.grab()
+    assert plot._cache is not cache_obj
+
+
+def test_activity_fast_vna_signal_matches_reference():
+    from visalab.coord.activity import _trace_has_signal
+    cplx_thru = Trace.linear(1e9, 2e9, [0.01, 0.5, 0.01], im=[0.0, 0.0, 0.0], meta={"format": "SMITH"})
+    assert _trace_has_signal(cplx_thru, "S21", -40.0, -3.0) is True
+    assert _trace_has_signal(cplx_thru, "S21", -3.0, -3.0) is False
+    cplx_zero = Trace.linear(1e9, 2e9, [0.0, 0.0], im=[0.0, 0.0], meta={"format": "SDATA"})
+    assert _trace_has_signal(cplx_zero, "S11", -40.0, -300.0) is True
+    assert _trace_has_signal(cplx_zero, "S11", -40.0, -301.0) is False
+    lin = Trace.linear(1e9, 2e9, [0.001, 0.1], meta={"format": "LIN_MAG"})
+    assert _trace_has_signal(lin, "S21", -25.0, -3.0) is True
+    assert _trace_has_signal(lin, "S21", -15.0, -3.0) is False
+    assert _trace_has_signal(lin, "S11", -40.0, -50.0) is True

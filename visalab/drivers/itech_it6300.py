@@ -127,8 +127,9 @@ class ItechIT6300(VISAInstrument):
 
     def read_param_raw(self, spec: Param) -> Any:
         if spec.key == "combine":
+            from ..core.units import parse_bool
             for mode in ("SER", "PAR", "TRAC"):
-                if self.query_int(f"OUTP:{mode}?"):
+                if parse_bool(self.query(f"OUTP:{mode}?")):
                     return mode
             return "NONE"
         return super().read_param_raw(spec)
@@ -158,9 +159,13 @@ class ItechIT6300(VISAInstrument):
             self._read_keys(["output_all", *(f"ch{n}.output" for n in range(1, len(self.model.ratings) + 1))])
             return None
         if name == "clear_ovp":
-            channels = args or range(1, len(self.model.ratings) + 1)
+            n_ch = len(self.model.ratings)
+            channels = [int(n) for n in args] if args else list(range(1, n_ch + 1))
             for n in channels:
-                self.select_channel(int(n))
+                if not 1 <= n <= n_ch:
+                    raise ValueError(f"канал 1..{n_ch}, получено {n}")
+            for n in channels:
+                self.select_channel(n)
                 self.write("VOLT:PROT:CLE")
             self._read_keys([f"ch{n}.ovp_tripped" for n in channels])
             return None

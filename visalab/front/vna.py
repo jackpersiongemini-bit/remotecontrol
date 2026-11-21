@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from PyQt6 import sip
 from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
@@ -480,27 +481,45 @@ class MarkerPanel(QWidget):
         self.value = QLabel("")
         self.value.setObjectName("lineName")
         self.value.setToolTip("Value of the selected marker on the selected trace")
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(40)
+        self._refresh_timer.timeout.connect(self._do_refresh)
         proxy.subscribe("mark.n", lambda _v: self._show())
         proxy.subscribe("mark.y", lambda _v: self._show())
         for key in ("trace.sel", "mark.state", "mark.x"):
-            proxy.subscribe(key, lambda _v: self.refresh())
+            proxy.subscribe(key, lambda _v: self._schedule_refresh())
         proxy.action_done.connect(self._on_action)
         self._show()
 
-    def refresh(self) -> None:
-        if self.proxy.is_connected and "mark_table" in self.proxy.actions:
+    def _schedule_refresh(self) -> None:
+        if not sip.isdeleted(self):
+            self._show()
+            self._refresh_timer.start()
+
+    def _do_refresh(self) -> None:
+        if not sip.isdeleted(self) and self.proxy.is_connected and "mark_table" in self.proxy.actions:
             self.proxy.action("mark_table")
+
+    def refresh(self) -> None:
+        self._refresh_timer.stop()
+        self._do_refresh()
 
     def unit(self) -> str:
         row = self.trace_row() if self.trace_row is not None else None
         return FORMAT_UNITS.get(row[3], "") if row is not None else ""
 
     def _on_action(self, name: str, result) -> None:
+        if sip.isdeleted(self):
+            return
         if name in ("mark_table", "mark_peak", "mark_min", "mark_aoff") and isinstance(result, (list, tuple)):
+            self._refresh_timer.stop()
             self.table = {int(n): (x, y) for n, x, y in result}
             self._show()
 
     def _show(self) -> None:
+        if sip.isdeleted(self):
+            return
         n = self.proxy.value("mark.n")
         self.chips.set_checked(n - 1 if isinstance(n, int) and 1 <= n <= self.MARKS else -1)
         for b in self.chips.buttons():
@@ -660,12 +679,14 @@ class CalWizard(QWidget):
         self.name_edit.setToolTip("Name of the new cal set (letters, digits, _ and -)")
         self.save_button = self._button("SAVE", "Save the calibration to the cal set NAME and apply it", self.save)
         proxy.action_done.connect(self._on_action)
+        proxy.comm_error.connect(self._on_comm_error)
+        proxy.refused.connect(self._on_refused)
         proxy.subscribe("cal.busy", self._on_busy)
         proxy.subscribe("gen.state", lambda _v: self._show())
         proxy.subscribe("trace.sel", lambda _v: self._show())
         self.run_lines: list[QWidget] = []                 # строки шагов и имени - только во время калибровки
         self.relayout = None                               # окно: подогнать высоту (шаги появились / исчезли)
-        proxy.state_changed.connect(lambda _s: self._show())
+        proxy.state_changed.connect(self._on_state)
         self._show()
 
     @staticmethod
@@ -747,12 +768,34 @@ class CalWizard(QWidget):
     def default_name(self) -> str:
         return f"CAL_CH{self.proxy.value('stim.channel') or 1}_{time.strftime('%Y%m%d_%H%M')}"
 
+    def _on_state(self, _state) -> None:
+        if sip.isdeleted(self):
+            return
+        if not self.proxy.is_connected:
+            self._kits_pending.clear()
+        self._show()
+
+    def _on_comm_error(self, *_args) -> None:
+        if sip.isdeleted(self):
+            return
+        self._kits_pending.clear()
+
+    def _on_refused(self, op: str, _reason: str) -> None:
+        if sip.isdeleted(self):
+            return
+        if op == "cal_kits" and self._kits_pending:
+            self._kits_pending.pop(0)
+
     def _on_busy(self, busy) -> None:
+        if sip.isdeleted(self):
+            return
         if busy is False and self.steps:
             self.proxy.action("cal_status")
         self._show()
 
     def _on_action(self, name: str, result) -> None:
+        if sip.isdeleted(self):
+            return
         if name == "cal_conns" and isinstance(result, (list, tuple)):
             self.conns = [str(c) for c in result]
             for p in (1, 2):
@@ -791,6 +834,8 @@ class CalWizard(QWidget):
         return [self.steps_layout.itemAt(i).widget() for i in range(self.steps_layout.count())]
 
     def _show(self) -> None:
+        if sip.isdeleted(self):
+            return
         on = self.proxy.is_connected
         running = bool(self.steps)
         busy = self.proxy.value("cal.busy") is True
@@ -887,7 +932,8 @@ class CalWindow(Window):
             QTimer.singleShot(0, self._fit_again)
 
     def _fit_again(self) -> None:
-        self.fit_height(False)
+        if not sip.isdeleted(self):
+            self.fit_height(False)
 
     def open(self) -> None:
         self.wizard.refresh()
@@ -1173,8 +1219,11 @@ class VNAWindow(InstrumentWindow):
                 b.setToolTip("Save S11 S21 S12 S22 of the selected trace channel to a Touchstone .s2p file\n"
                              "(one fresh sweep; folder and name - PC / NAME)")
                 b.clicked.connect(self.save_s2p)
-                for sig in (proxy.comm_error, proxy.instrument_error):     # snp_read не прошёл
-                    sig.connect(lambda *_a: self.s2p_button.text() == "…" and self._flash("ERROR", self.s2p_button))
+                for sig in (proxy.comm_error, proxy.instrument_error, proxy.refused):     # snp_read не прошёл
+                    sig.connect(lambda *_a: (not sip.isdeleted(self)) and self.s2p_button.text() == "…"
+                                and self._flash("ERROR", self.s2p_button))
+                proxy.state_changed.connect(self._on_s2p_state)
+                b.setEnabled(proxy.is_connected)
                 save.append(PanelLine("S2P", b))
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
@@ -1185,8 +1234,23 @@ class VNAWindow(InstrumentWindow):
             w.move(self.pos() + QPoint(self.width() + 8, 0))
         w.open()
 
+    def _on_s2p_state(self, _s) -> None:
+        if sip.isdeleted(self) or not hasattr(self, "s2p_button"):
+            return
+        if not self.proxy.is_connected and self.s2p_button.text() == "…":
+            self.s2p_button.setText("SAVE")
+        self.s2p_button.setEnabled(self.proxy.is_connected and self.s2p_button.text() != "…")
+
+    def cleanup(self) -> None:
+        cw = getattr(self, "cal_window", None)
+        if cw is not None and not sip.isdeleted(cw):
+            cw.close()
+            cw.deleteLater()
+            self.cal_window = None
+        super().cleanup()
+
     def closeEvent(self, event):  # noqa: N802 - Qt
-        if getattr(self, "cal_window", None) is not None:
+        if getattr(self, "cal_window", None) is not None and not sip.isdeleted(self.cal_window):
             self.cal_window.close()
         super().closeEvent(event)
 
@@ -1300,8 +1364,9 @@ class VNAWindow(InstrumentWindow):
 
     def save_s2p(self) -> None:
         """S2P SAVE: прибор читает S-параметры канала (snp_read), файл пишется по ответу."""
-        if self.proxy.is_connected:
+        if self.proxy.is_connected and self.s2p_button.text() != "…":
             self.s2p_button.setText("…")
+            self.s2p_button.setEnabled(False)
             self.proxy.action("snp_read", "1,2")
 
     def _write_s2p(self, sparams: dict) -> Path | None:
@@ -1369,8 +1434,14 @@ class VNAWindow(InstrumentWindow):
         self.proxy.action("state_recall", preset[0])
 
     def _on_action(self, name: str, result) -> None:
-        if name == "snp_read" and isinstance(result, dict) and result and hasattr(self, "s2p_button"):
-            self._write_s2p(result)
+        if sip.isdeleted(self):
+            return
+        if name == "snp_read" and hasattr(self, "s2p_button"):
+            self.s2p_button.setEnabled(self.proxy.is_connected)
+            if isinstance(result, dict) and result:
+                self._write_s2p(result)
+            elif self.s2p_button.text() == "…":
+                self._flash("ERROR", self.s2p_button)
         elif name == "state_dirs" and self._dirs_asked and isinstance(result, (list, tuple)) and len(result) == 2:
             self._dirs_asked = False
             self._dirs_menu(str(result[0]), [str(d) for d in result[1]])

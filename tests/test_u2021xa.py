@@ -168,3 +168,20 @@ def test_time_domain_trace(pm):
     assert setp(drv, rec, "detector", "AVERAGE") is PStatus.WRITTEN   # трасса выключается сама
     assert rec.values["trace.state"] is False and sim.cfg["trac"] is False
     assert not rec.errors
+
+
+def test_level_mode_stops_free_run_and_disables_auto_level(pm):
+    """Переход FREE RUN -> LEVEL сначала выключает INIT:CONT; запись trig.level выключает TRIG:LEV:AUTO."""
+    drv, sim, rec = pm
+    sim.cfg["tlev_auto"] = True
+    del sim.history[:]
+    assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
+    i_off = sim.history.index("INIT:CONT OFF")
+    i_src = sim.history.index("TRIG:SOUR INT")
+    assert i_off < i_src and not rec.errors
+    del sim.history[:]
+    assert setp(drv, rec, "trig.level", -12.0) is PStatus.WRITTEN
+    i_auto = sim.history.index("TRIG:LEV:AUTO OFF")
+    i_lev = next(i for i, c in enumerate(sim.history) if c.startswith("TRIG:LEV "))
+    assert i_auto < i_lev and rec.values["trig.level"] == pytest.approx(-12.0)
+    assert rec.values["trig.level_auto"] is False and not rec.errors

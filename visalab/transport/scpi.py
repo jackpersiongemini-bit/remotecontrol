@@ -91,7 +91,11 @@ def compile_pattern(pattern: str) -> re.Pattern:
             k = 0
             while k < len(word) and (word[k].isupper() or word[k] in "*_" or word[k].isdigit()):
                 k += 1
-            short, full = word[:k].upper(), word.upper()
+            tail = len(word)
+            while tail > k and word[tail - 1].isdigit():
+                tail -= 1
+            suffix_digits = word[tail:]
+            short, full = (word[:k] + suffix_digits).upper(), word.upper()
             out.append(re.escape(full) if short == full else f"(?:{re.escape(full)}|{re.escape(short)})")
             if capture:
                 out.append(r"(\d+)")

@@ -53,13 +53,25 @@ def float_block(values) -> str:
 
 
 def parse_float_block(raw: bytes) -> list[float]:
-    """Разобрать IEEE 488.2 блок float32 big-endian (``#3400....``)."""
+    """Разобрать IEEE 488.2 блок float32 big-endian (``#3400....`` или ``#0....\\n``)."""
     start = raw.find(b"#")
     if start < 0 or len(raw) < start + 2:
         raise TransportError("нет двоичного блока в ответе")
-    ndig = int(raw[start + 1:start + 2])
-    size = int(raw[start + 2:start + 2 + ndig])
-    data = raw[start + 2 + ndig:start + 2 + ndig + size]
+    digit = raw[start + 1:start + 2]
+    if not digit.isdigit():
+        raise TransportError(f"некорректный заголовок двоичного блока: {digit!r}")
+    ndig = int(digit)
+    if ndig == 0:
+        data = raw[start + 2:].rstrip(b"\r\n")
+        size = len(data)
+    else:
+        if len(raw) < start + 2 + ndig:
+            raise TransportError("обрывок заголовка двоичного блока")
+        size_bytes = raw[start + 2:start + 2 + ndig]
+        if not size_bytes.isdigit():
+            raise TransportError(f"некорректная длина двоичного блока: {size_bytes!r}")
+        size = int(size_bytes)
+        data = raw[start + 2 + ndig:start + 2 + ndig + size]
     if len(data) != size or size % 4:
         raise TransportError(f"двоичный блок: ждали {size} байт, пришло {len(data)}")
     return list(struct.unpack(f">{size // 4}f", data))
@@ -94,20 +106,29 @@ def lan_endpoint(address: str) -> tuple[str, int] | None:
 
     ``TCPIP0::192.168.0.3::INSTR`` / ``...::inst0::INSTR`` -> 111 (VXI-11: portmapper),
     ``TCPIP0::host::hislip0::INSTR`` -> 4880, ``TCPIP0::host::5025::SOCKET`` -> 5025."""
-    parts = [s.strip() for s in str(address).split("::")]
+    raw = str(address).strip()
+    m_v6 = re.match(r"^(TCPIP\d*)::\[([^\]]+)\](?:::(.*))?$", raw, re.IGNORECASE)
+    if m_v6:
+        rest = [s.strip() for s in m_v6.group(3).split("::")] if m_v6.group(3) else []
+        parts = [m_v6.group(1), m_v6.group(2), *rest]
+    else:
+        parts = [s.strip() for s in raw.split("::")]
     if len(parts) < 2 or not parts[0].upper().startswith("TCPIP") or not parts[1]:
         return None
     host = parts[1]
+    port = 111
     if parts[-1].upper() == "SOCKET" and len(parts) >= 4:
         try:
-            return host, int(parts[2])
+            port = int(parts[2])
         except ValueError:
             return None
-    if len(parts) >= 3:
+    elif len(parts) >= 3:
         m = _HISLIP_RE.match(parts[2])
         if m:
-            return host, int(m.group(1) or 4880)
-    return host, 111
+            port = int(m.group(1) or 4880)
+    if not (1 <= port <= 65535):
+        return None
+    return host, port
 
 
 class Transport(ABC):
@@ -151,15 +172,18 @@ class Transport(ABC):
         """Выбросить ответы, пришедшие с опозданием (после таймаута): читать, пока прибор молчит
         ``wait_ms``. Таймаут транспорта возвращается прежним."""
         old = self.timeout_ms
-        self.timeout_ms = wait_ms
         try:
+            self.timeout_ms = wait_ms
             for _ in range(max_reads):
                 try:
                     self.read()
                 except TransportTimeout:
                     break
         finally:
-            self.timeout_ms = old
+            try:
+                self.timeout_ms = old
+            except TransportError:
+                pass
 
     @abstractmethod
     def read_stb(self) -> int: ...
@@ -199,6 +223,8 @@ class PyVisaTransport(Transport):
     def open(self) -> None:
         import pyvisa
         from pyvisa import constants
+        if self._res is not None:
+            self.close()
         try:
             self._rm = pyvisa.ResourceManager(self._backend)
             _log_visa_library(self._rm)
@@ -209,21 +235,21 @@ class PyVisaTransport(Transport):
                 timeout=self._timeout_ms,
                 **self._open_kwargs,
             )
+            try:
+                # pyvisa по умолчанию декодирует ascii: любой байт > 127 (имя файла, мусор после сбоя) ронял
+                # чтение UnicodeDecodeError мимо обработки ошибок связи. latin-1 декодирует любой байт.
+                self._res.encoding = "latin-1"
+            except AttributeError:
+                pass
+            itype = getattr(self._res, "interface_type", None)
+            rclass = getattr(self._res, "resource_class", "")
+            self.supports_serial_poll = (
+                itype in (constants.InterfaceType.usb, constants.InterfaceType.gpib, constants.InterfaceType.tcpip)
+                and rclass == "INSTR"
+            )
         except Exception as exc:  # pyvisa.Error, OSError, ValueError ...
             self.close()
             raise TransportError(f"{self.address}: не удалось открыть: {exc}") from exc
-        try:
-            # pyvisa по умолчанию декодирует ascii: любой байт > 127 (имя файла, мусор после сбоя) ронял
-            # чтение UnicodeDecodeError мимо обработки ошибок связи. latin-1 декодирует любой байт.
-            self._res.encoding = "latin-1"
-        except AttributeError:
-            pass
-        itype = getattr(self._res, "interface_type", None)
-        rclass = getattr(self._res, "resource_class", "")
-        self.supports_serial_poll = (
-            itype in (constants.InterfaceType.usb, constants.InterfaceType.gpib, constants.InterfaceType.tcpip)
-            and rclass == "INSTR"
-        )
 
     def close(self) -> None:
         """Закрыть только свой ресурс. ResourceManager у pyvisa ОДИН на процесс (на библиотеку VISA):
@@ -272,35 +298,47 @@ class PyVisaTransport(Transport):
             if exc.error_code == pyvisa.constants.StatusCode.error_nonsupported_operation:
                 raise TransportNotSupported(f"{self.address}: {exc}") from exc
             raise TransportError(f"{self.address}: {exc}") from exc
-        except (pyvisa.Error, OSError, UnicodeDecodeError) as exc:
+        except TransportError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - pyvisa / USB / TCP backend errors
             raise TransportError(f"{self.address}: {exc}") from exc
 
+    def _call_res(self, method: str, *args):
+        if self._res is None:
+            raise TransportError(f"{self.address}: ресурс не открыт")
+        return self._call(getattr(self._res, method), *args)
+
     def write(self, message: str) -> None:
-        self._call(self._res.write, message)
+        self._call_res("write", message)
 
     def read(self) -> str:
-        return self._call(self._res.read).strip()
+        return self._call_res("read").strip()
 
     def query_float_block(self, message: str) -> list[float]:
+        if self._res is None:
+            raise TransportError(f"{self.address}: ресурс не открыт")
         return list(self._call(lambda: self._res.query_binary_values(message, datatype="f", is_big_endian=True)))
 
     def read_stb(self) -> int:
-        return int(self._call(self._res.read_stb))
+        return int(self._call_res("read_stb"))
 
     def discard_input(self, wait_ms: int = 200, max_reads: int = 50) -> None:
         old = self._timeout_ms
-        self.timeout_ms = wait_ms
         try:
+            self.timeout_ms = wait_ms
             for _ in range(max_reads):
                 try:
-                    self._call(self._res.read_raw)      # байты как есть, без декодирования
+                    self._call_res("read_raw")          # байты как есть, без декодирования
                 except TransportTimeout:
                     break
         finally:
-            self.timeout_ms = old
+            try:
+                self.timeout_ms = old
+            except TransportError:
+                pass
 
     def clear(self) -> None:
-        self._call(self._res.clear)
+        self._call_res("clear")
 
     @property
     def timeout_ms(self) -> int:
@@ -308,9 +346,10 @@ class PyVisaTransport(Transport):
 
     @timeout_ms.setter
     def timeout_ms(self, value: int) -> None:
-        self._timeout_ms = int(value)
+        new_ms = int(value)
         if self._res is not None:
-            self._res.timeout = self._timeout_ms
+            self._call(setattr, self._res, "timeout", new_ms)
+        self._timeout_ms = new_ms
 
 
 class SimTransport(Transport):

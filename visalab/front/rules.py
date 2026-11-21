@@ -43,11 +43,14 @@ class Term:
     want_on: bool = True              # для OUT
 
     def check(self, get: Callable[[int, str], object]) -> bool:
+        import math
         v = get(self.ch, self.quantity)
         if v is None:
             return True               # неизвестно - считаем условие выполненным (см. модуль)
         if self.quantity == "OUT":
             return bool(v) == self.want_on
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and not math.isfinite(v):
+            return True               # NaN/Inf - fail-safe как неизвестное измерение
         return OPS[self.op](v, self.value)
 
 

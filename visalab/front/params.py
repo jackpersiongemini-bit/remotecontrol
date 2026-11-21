@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFr
 from ..core.params import ConnectionState, Kind, PStatus
 from ..coord import Instrument
 from ..core.units import SI_PREFIXES, si_format, si_parse
-from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INDICATOR_FRAME, UI_COLOR_INVERT,
+from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INDICATOR, UI_COLOR_INDICATOR_FRAME, UI_COLOR_INVERT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_CONTROL_HEIGHT_PX, render_qss, scrollbar_qss)
 from .help import param_help
@@ -421,7 +421,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         text = f"{v:.9f}".rstrip("0").rstrip(".")
         text = "0" if text in ("", "-0") else text
         step = self._shown_step()
-        if step is not None and step < 1:            # знаков - не меньше, чем у шага: «1.30» при шаге 0.01
+        if step is not None and math.isfinite(step) and 0 < step < 1:  # знаков - не меньше, чем у шага
             need = min(9, max(0, round(-math.log10(step))))
             whole, _, frac = text.partition(".")
             if len(frac) < need:
@@ -473,7 +473,8 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         pos = le.cursorPosition()
         dot = text.find(".")
         dot = len(text) if dot < 0 else dot
-        pos = max(pos, 1)
+        min_pos = 2 if text.startswith("-") and len(text) > 1 else 1
+        pos = max(pos, min_pos)
         exp = dot - pos if pos <= dot else dot - pos + 1
         return 10.0 ** exp
 
@@ -483,7 +484,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         if not text or not self.isEnabled():
             return -1
         step = self._digit_step()
-        if step <= 0:
+        if not math.isfinite(step) or step <= 0:
             return -1
         exp = round(math.log10(step))
         dot = text.find(".")
@@ -547,7 +548,12 @@ class PSpinBox(QDoubleSpinBox, _Bound):
 
     def set_step(self, step: float | None, emit: bool = True) -> None:
         """Постоянный шаг (единицы параметра) или None - AUTO."""
-        step = float(step) if step else None
+        if step is not None:
+            try:
+                f = float(step)
+                step = f if (math.isfinite(f) and f > 0) else None
+            except (TypeError, ValueError):
+                step = None
         changed = step != self.step_setting
         self.step_setting = step
         self._step_lock = None
@@ -602,7 +608,7 @@ class PNLabel(PLineEdit):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
 
-def paint_indicator(p: QPainter, rect: QRectF, bar: str = UI_COLOR_TEXT_MUTED) -> None:
+def paint_indicator(p: QPainter, rect: QRectF, bar: str = UI_COLOR_INDICATOR) -> None:
     """Индикатор «включено/выбрано»: тонкая рамка и толстая нижняя граница по скруглению.
 
     Рисуется вручную: QSS с разной толщиной границ даёт кривые углы на скруглениях.
@@ -801,8 +807,11 @@ class PBGroup(QWidget):
             r, c = divmod(i, self.columns) if self.columns else (0, i)
             self.group_layout.addWidget(b, r, c)
 
+    def _make_button(self, name: str) -> QPushButton:
+        return QPushButton(name)
+
     def add_button(self, name: str) -> QPushButton:
-        b = QPushButton(name)                  # выбор (не включение) - инверсия, как у вкладки
+        b = self._make_button(name)            # выбор (не включение) - инверсия, как у вкладки
         b.setObjectName("chip")
         b.setCheckable(True)
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -943,7 +952,7 @@ class PTabBar(QTabBar):
                 p.setBrush(QColor(bg))
                 p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
             if on and not selected:       # режим включён (у выбранной видно по STAT): рамка + толстая граница
-                paint_indicator(p, rect, UI_COLOR_TEXT_INVERSE if hover else UI_COLOR_TEXT_MUTED)
+                paint_indicator(p, rect, UI_COLOR_TEXT_INVERSE if hover else UI_COLOR_INDICATOR)
             fg = UI_COLOR_TEXT_INVERSE if (hover or selected) else \
                 UI_COLOR_TEXT_MUTED if on else UI_COLOR_BORDER_LIGHT
             font = QFont(self.font())

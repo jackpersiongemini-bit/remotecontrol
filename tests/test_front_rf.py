@@ -28,7 +28,7 @@ def _wait(qtbot, proxy, key, pred):
 
 def test_layout_tabs_and_favourites(qtbot, rf):
     _proxy, win, _s = rf
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["RF", "AM", "FM", "PM", "PULS"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["RF", "AM", "FM", "PM", "PULS", "SET"]
     assert [ln.name for ln in win.preset_panel.table.lines][:3] == ["OUT", "POW", "FREQ"]
     assert [ln.name for ln in win.pages[0].lines][:4] == ["OUT", "FREQ", "POW", "PRST"]      # чипы - на вкладке RF
     assert win.freq_spin.key == "rf.frequency"

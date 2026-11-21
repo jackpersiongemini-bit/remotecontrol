@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import time
 import traceback
 from typing import Any, Callable, Iterable
@@ -77,7 +78,11 @@ def guarded(fn: Callable) -> Callable:
         try:
             return fn(self, *args, **kwargs)
         except TransportError as exc:
-            self._on_transport_error(exc)
+            try:
+                self._on_transport_error(exc)
+            except Exception as err:  # noqa: BLE001 - ошибка при обработке обрыва не должна ронять поток
+                log.exception("%s: ошибка при обработке обрыва в %s", self.NAME, fn.__name__)
+                self.comm_error.emit(f"{fn.__name__}: {err}")
         except Exception as exc:  # noqa: BLE001 - последний рубеж
             log.exception("%s: ошибка в %s", self.NAME, fn.__name__)
             self.comm_error.emit(f"{fn.__name__}: {exc}\n{traceback.format_exc(limit=3)}")
@@ -161,6 +166,7 @@ class VISAInstrument(QObject):
         #: ключи, которые при последнем чтении не прочитались (нет ответа, ответ не распознан)
         self._read_failed: set[str] = set()
         self._resyncing = False
+        self._stopping = False         # кооперативный флаг остановки потока (устанавливает InstrumentProxy)
         self._timer = QTimer(self)     # переедет в поток вместе с self
         self._timer.setInterval(self.POLL_INTERVAL_MS)
         self._timer.timeout.connect(self._on_poll)
@@ -350,7 +356,9 @@ class VISAInstrument(QObject):
 
     def _connect(self) -> None:
         self._no_answer.clear()
+        self._read_failed.clear()
         self._opc_pending = False
+        self.opc_latched = False
         self.transport.timeout_ms = self.TIMEOUT_MS
         self.transport.open()
         try:
@@ -420,8 +428,12 @@ class VISAInstrument(QObject):
         self._timer.setInterval(max(50, int(ms)))
 
     @pyqtSlot(float)
+    @guarded
     def set_command_delay(self, seconds: float) -> None:
-        self.command_delay_s = max(0.0, float(seconds))
+        val = float(seconds)
+        if not math.isfinite(val):
+            raise ValueError(f"недопустимая пауза: {seconds!r}")
+        self.command_delay_s = max(0.0, val)
 
     @pyqtSlot(bool)
     def set_log_polling(self, on: bool) -> None:
@@ -461,16 +473,29 @@ class VISAInstrument(QObject):
         if self._state is not ConnectionState.CONNECTED:
             raise TransportError(f"{self.NAME}: прибор не подключён")
 
+    def on_closed(self) -> None:
+        """Хук после любого закрытия (включая обрыв связи) — сбросить летучие флаги драйвера."""
+
     def _close(self, state: ConnectionState, graceful: bool) -> None:
         self._timer.stop()
         self._pending.clear()
         if graceful and self.transport.is_open and self._state is ConnectionState.CONNECTED:
             try:
                 self.on_disconnecting()
-            except TransportError:
+            except Exception:  # noqa: BLE001 - отключение не должно падать при выключенном приборе
                 pass
-        self.transport.close()
-        for key in self._values:
+        try:
+            self.transport.close()
+        except Exception:  # noqa: BLE001
+            log.debug("%s: ошибка при закрытии транспорта", self.NAME, exc_info=True)
+        self._opc_pending = False
+        self.opc_latched = False
+        self._read_failed.clear()
+        try:
+            self.on_closed()
+        except Exception:  # noqa: BLE001
+            pass
+        for key in list(self._values):
             self.param_status.emit(key, PStatus.UNKNOWN, "")
         self._values.clear()
         self._set_state(state)
@@ -513,7 +538,7 @@ class VISAInstrument(QObject):
 
     @pyqtSlot()
     def _retry(self) -> None:
-        if not self._want_connected or self._state is ConnectionState.CONNECTED:
+        if self._stopping or not self._want_connected or self._state is ConnectionState.CONNECTED:
             return
         try:
             reachable = self.transport.reachable()
@@ -526,6 +551,9 @@ class VISAInstrument(QObject):
         self._auto_attempt = True
         try:
             self.open_connection()
+        except Exception:  # noqa: BLE001 - последняя защита слота таймера
+            log.exception("%s: ошибка при автопереподключении", self.NAME)
+            self._schedule_reconnect()
         finally:
             self._auto_attempt = False
 
@@ -538,16 +566,18 @@ class VISAInstrument(QObject):
     def _try_resync(self) -> bool:
         """Выбросить опоздавшие ответы и убедиться по ``*IDN?``, что обмен снова верный.
         ``*IDN?`` (а не ``*OPC?``) - потому что ``*OPC?`` ждёт конца идущей развёртки."""
-        if self._resyncing:
+        if self._resyncing or self._stopping:
             return False
         self._resyncing = True
         quiet, self._quiet = self._quiet, True
         try:
             for attempt in range(self.RESYNC_ATTEMPTS):
+                if self._stopping:
+                    return False
                 if attempt == 1:                       # не помогло - device clear (сбрасывает буферы прибора)
                     try:
                         self.transport.clear()
-                    except TransportNotSupported:
+                    except TransportError:
                         pass
                 self.transport.discard_input()
                 try:
@@ -559,7 +589,7 @@ class VISAInstrument(QObject):
                     self.after_resync(cleared=attempt >= 1)
                     return True
             return False
-        except TransportError as exc:
+        except Exception as exc:  # noqa: BLE001 - любая ошибка VISA/ОС при выключении прибора -> обрыв, не краш
             log.warning("%s: восстановить обмен не удалось: %s", self.transport.address, exc)
             return False
         finally:
@@ -583,12 +613,25 @@ class VISAInstrument(QObject):
         """Читает набор ключей: каждая группа запрашивается один раз."""
         groups_done: set[str] = set()
         for key in keys:
+            if self._stopping:
+                return
             spec = self._params[key]
             if spec.group:
                 if spec.group in groups_done:
                     continue
                 groups_done.add(spec.group)
-                result = self.read_group(spec.group)
+                try:
+                    result = self.read_group(spec.group)
+                except ValueError as exc:
+                    for k, p in self._params.items():
+                        if p.group == spec.group:
+                            self._read_failed.add(k)
+                            self.param_status.emit(k, PStatus.ERROR, f"ответ не распознан: {exc}")
+                    continue
+                except TransportTimeout as exc:
+                    self._read_failed.add(key)
+                    self._no_reply(key, exc)
+                    continue
                 for k, p in self._params.items():
                     if p.group != spec.group:
                         continue
@@ -630,11 +673,11 @@ class VISAInstrument(QObject):
         try:
             self._require_connected()
         except TransportError as exc:
-            for key in self._pending:
+            for key in list(self._pending):
                 self.param_status.emit(key, PStatus.ERROR, str(exc))
             self._pending.clear()
             return
-        while self._pending:
+        while self._pending and not self._stopping:
             key = next(iter(self._pending))          # в порядке запросов (форма до частоты и т.п.)
             value = self._pending.pop(key)
             try:
@@ -644,7 +687,11 @@ class VISAInstrument(QObject):
                 # координатора ждёт его до таймаута); остальные записи - дальше, если связь восстановлена
                 self.param_status.emit(key, PStatus.ERROR, str(exc))
                 rest = list(self._pending)
-                self._on_transport_error(exc)
+                try:
+                    self._on_transport_error(exc)
+                except Exception as err:  # noqa: BLE001
+                    log.exception("%s: ошибка при обработке обрыва на записи %s", self.NAME, key)
+                    self.comm_error.emit(f"запись {key}: {err}")
                 if self._state is not ConnectionState.CONNECTED:
                     for k in rest:
                         self.param_status.emit(k, PStatus.ERROR, str(exc))
@@ -716,7 +763,9 @@ class VISAInstrument(QObject):
     # спрашивает opc_done(). Так ожидание запуска/развёртки сколь угодно долгое и не
     # приводит к таймауту и обрыву связи.
     def arm_opc(self, *commands: str) -> None:
-        self.read_esr()               # сбросить старый OPC
+        esr = self.read_esr()               # сбросить старый OPC (не потеряв ошибки ESR)
+        if esr & self.ESE_MASK:
+            self._check_errors(context="arm_opc", esr=esr)
         self.opc_latched = False
         for c in commands:
             self.write(c)
@@ -733,14 +782,15 @@ class VISAInstrument(QObject):
             return True
         return False
 
-    def _check_errors(self, context: str = "", esr: int | None = None) -> list[tuple[int, str]]:
+    def _check_errors(self, context: str = "", esr: int | None = None,
+                      force_queue: bool = False) -> list[tuple[int, str]]:
         """*ESR? -> очередь ошибок. Возвращает и публикует найденные ошибки."""
         if esr is None:
             esr = self.read_esr()
-        if not esr & self.ESE_MASK:
+        if not (esr & self.ESE_MASK) and not force_queue:
             return []
         errors = self.read_error_queue()
-        if not errors:   # у прибора нет очереди ошибок - расшифровываем ESR
+        if not errors and (esr & self.ESE_MASK):   # у прибора нет очереди ошибок - расшифровываем ESR
             errors = [(-bit, desc) for bit, (_, desc) in ESR_BITS.items()
                       if esr & self.ESE_MASK & (1 << bit)]
         for code, msg in errors:
@@ -764,27 +814,31 @@ class VISAInstrument(QObject):
 
     @pyqtSlot()
     def _on_poll(self) -> None:
-        if self._state is not ConnectionState.CONNECTED or self._pending:
+        if self._stopping or self._state is not ConnectionState.CONNECTED or self._pending:
             return
         self._quiet = not self.log_polling
         try:
-            stb = self._read_status_byte()
-            if stb & (STB_ESB | STB_EAV):
-                self._check_errors(context="опрос")
-            self.poll()
-            self._poll_failures = 0
-        except TransportTimeout as exc:
-            # Не ответил на опрос: восстановить обмен (опоздавший ответ сдвинул бы все следующие).
-            # Связь рвётся, если прибор молчит и после этого или не отвечает MAX_POLL_FAILURES опросов подряд.
-            self._poll_failures += 1
-            if self._poll_failures >= self.MAX_POLL_FAILURES or not self._try_resync():
-                self._on_transport_error(exc, recover=False)
-            else:
-                log.warning("%s: опрос: %s", self.transport.address, exc)
-                self.after_poll_timeout()
-        except TransportError as exc:
-            self._on_transport_error(exc)
-        except Exception as exc:  # noqa: BLE001
+            try:
+                stb = self._read_status_byte()
+                if stb & (STB_ESB | STB_EAV):
+                    self._check_errors(context="опрос", force_queue=bool(stb & STB_EAV))
+                self.poll()
+                self._poll_failures = 0
+            except TransportTimeout as exc:
+                # Не ответил на опрос: восстановить обмен (опоздавший ответ сдвинул бы все следующие).
+                # Связь рвётся, если прибор молчит и после этого или не отвечает MAX_POLL_FAILURES опросов подряд.
+                self._poll_failures += 1
+                if self._poll_failures >= self.MAX_POLL_FAILURES or not self._try_resync():
+                    self._on_transport_error(exc, recover=False)
+                else:
+                    log.warning("%s: опрос: %s", self.transport.address, exc)
+                    try:
+                        self.after_poll_timeout()
+                    except TransportError as err:
+                        self._on_transport_error(err, recover=False)
+            except TransportError as exc:
+                self._on_transport_error(exc)
+        except Exception as exc:  # noqa: BLE001 - ни одно исключение не должно уходить в Qt
             log.exception("%s: опрос", self.NAME)
             self.comm_error.emit(f"опрос: {exc}")
         finally:

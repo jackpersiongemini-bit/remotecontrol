@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .base import VISAInstrument
-from ..core.params import Action, Kind, Param
+from ..core.params import Action, ConnectionState, Kind, Param
 from ..core.units import parse_number
 from ..core.trace import Trace
 from ..profiles import SPECTRUM_ANALYZER
@@ -125,7 +125,8 @@ class AgilentPSA(VISAInstrument):
                   write="POW:ATT:AUTO {value}", also_read=("atten",)),
             Param("detector", "Детектор", E, section=amp, query="DET?", write="DET {value}",
                   choices=("NORMAL", "PEAK", "NEG_PEAK", "SAMPLE", "AVERAGE", "RMS", "QPEAK"),
-                  enum_map=(("NORMAL", "NORM"), ("PEAK", "POS"), ("NEG_PEAK", "NEG"), ("SAMPLE", "SAMP"),
+                  enum_map=(("NORMAL", "NORM"), ("PEAK", "POS"), ("PEAK", "POSITIVE"),
+                            ("NEG_PEAK", "NEG"), ("NEG_PEAK", "NEGATIVE"), ("SAMPLE", "SAMP"),
                             ("AVERAGE", "AVER"), ("QPEAK", "QPE")),
                   also_read=("sweep.time",)),
             Param("sweep.time", "Время развёртки", F, "s", section=sw, query="SWE:TIME?",
@@ -139,25 +140,29 @@ class AgilentPSA(VISAInstrument):
             Param("avg.count", "Усреднений", I, section=sw, query="AVER:COUN?", write="AVER:COUN {value}",
                   minimum=1, maximum=8192),
             Param("ref.source", "Опора 10 МГц", E, section="Анализ/Опора", query="ROSC:SOUR?",
-                  write="ROSC:SOUR {value}", choices=("INT", "EXT")),
+                  write="ROSC:SOUR {value}", choices=("INT", "EXT"),
+                  enum_map=(("INT", "INT"), ("INT", "INTERNAL"), ("EXT", "EXT"), ("EXT", "EXTERNAL"))),
             Param("ref_offset", "Смещение опорного уровня", F, "dB", section=amp,
                   query="DISP:WIND:TRAC:Y:RLEV:OFFS?", write="DISP:WIND:TRAC:Y:RLEV:OFFS {value}",
                   minimum=-327.0, maximum=327.0, tolerance=1e-3),
             Param("preamp", "Предусилитель", B, section=amp, query="POW:GAIN?", write="POW:GAIN {value}",
                   also_read=("atten",)),
             Param("sweep.type", "Тип развёртки", E, section=sw, query="SWE:TYPE?", write="SWE:TYPE {value}",
-                  choices=("AUTO", "SWEPT", "FFT"), enum_map=(("SWEPT", "SWE"),), also_read=("sweep.time",)),
+                  choices=("AUTO", "SWEPT", "FFT"), enum_map=(("SWEPT", "SWE"), ("SWEPT", "SWEEP")),
+                  also_read=("sweep.time",)),
             Param("trace.mode", "Режим трассы", E, section="Спектр/Трасса", query="TRAC:MODE?",
                   write="TRAC:MODE {value}", choices=("WRITE", "MAXHOLD", "MINHOLD", "VIEW", "BLANK"),
                   enum_map=(("WRITE", "WRIT"), ("MAXHOLD", "MAXH"), ("MINHOLD", "MINH"), ("BLANK", "BLAN"))),
             Param("trig.source", "Запуск", E, section="Анализ/Запуск", query="TRIG:SOUR?",
                   write="TRIG:SOUR {value}", choices=("FREE", "VIDEO", "EXT", "LINE"),
-                  enum_map=(("FREE", "IMM"), ("VIDEO", "VID"), ("EXT", "EXT1"))),
+                  enum_map=(("FREE", "IMM"), ("FREE", "IMMEDIATE"), ("VIDEO", "VID"),
+                            ("EXT", "EXT1"), ("EXT", "EXT2"), ("EXT", "EXTERNAL1"), ("EXT", "EXTERNAL2"))),
             Param("trig.level", "Уровень видеозапуска", F, "dBm", section="Анализ/Запуск",
                   query="TRIG:VID:LEV?", write="TRIG:VID:LEV {value}", minimum=-170.0, maximum=30.0,
                   tolerance=1e-3),
             Param("trig.slope", "Фронт запуска", E, section="Анализ/Запуск", query="TRIG:SLOP?",
-                  write="TRIG:SLOP {value}", choices=("POS", "NEG")),
+                  write="TRIG:SLOP {value}", choices=("POS", "NEG"),
+                  enum_map=(("POS", "POS"), ("POS", "POSITIVE"), ("NEG", "NEG"), ("NEG", "NEGATIVE"))),
             Param("trig.delay", "Задержка запуска", F, "s", section="Анализ/Запуск", query="TRIG:DEL?",
                   write="TRIG:DEL {value}", minimum=-0.15, maximum=0.5, tolerance=1e-9),
             Param("trig.delay_state", "Задержка запуска вкл", B, section="Анализ/Запуск",
@@ -190,6 +195,10 @@ class AgilentPSA(VISAInstrument):
             self.write("ABOR")
             self._armed = False
 
+    def on_closed(self) -> None:
+        self._armed = False
+        self._trace = None
+
     def write_param(self, spec: Param, value: Any) -> None:
         if spec.key == "meas.continuous":
             self._continuous = bool(value)
@@ -211,12 +220,12 @@ class AgilentPSA(VISAInstrument):
             return self._continuous
         if key == "meas.armed":
             return self._armed
-        if key == "marker.level":
-            if not self._values.get("marker.state"):
+        if key in ("marker.level", "marker.freq"):
+            if self.query("CALC:MARK1:STAT?").strip() not in ("1", "ON"):
                 return None
-            return self.query_float("CALC:MARK1:Y?")
-        if key == "marker.freq" and not self._values.get("marker.state"):
-            return None
+            if key == "marker.level":
+                return self.query_float("CALC:MARK1:Y?")
+            return spec.from_scpi(self.query("CALC:MARK1:X?"))
         return super().read_param_raw(spec)
 
     def read_group(self, group: str) -> dict[str, Any]:
@@ -241,6 +250,8 @@ class AgilentPSA(VISAInstrument):
         if self._armed:
             self.write("ABOR")
             self._set_armed(False)
+        self._opc_pending = False
+        self.opc_latched = False
 
     def _read_trace(self) -> None:
         # Ось - по прибору, а не по кэшу: частоты могли поменять с передней панели (Local) или другой
@@ -253,6 +264,8 @@ class AgilentPSA(VISAInstrument):
         if start is None or stop is None:
             start, stop = self.query_float("FREQ:STAR?"), self.query_float("FREQ:STOP?")
         y = [parse_number(t) for t in self.query("TRAC:DATA? TRACE1").split(",") if t.strip()]
+        if not y:
+            return
         span, swt = self._values.get("freq.span"), self._values.get("sweep.time")
         zero_span = span == 0 and swt is not None
         meta = {k: self._values.get(k) for k in ("bw.res", "bw.video", "detector", "ref_level", "atten",
@@ -273,8 +286,13 @@ class AgilentPSA(VISAInstrument):
     def poll(self) -> None:
         if self._armed and self.opc_done("развёртка"):
             self._set_armed(False)
-            self._read_trace()
-            if self._continuous:
+            try:
+                self._read_trace()
+            except ValueError:
+                if self._continuous and self._state is ConnectionState.CONNECTED:
+                    self._start_sweep()
+                raise
+            if self._continuous and self._state is ConnectionState.CONNECTED:
                 self._start_sweep()
 
     def run_custom_action(self, name: str, args: tuple) -> Any:
@@ -285,6 +303,8 @@ class AgilentPSA(VISAInstrument):
             self._start_sweep()
             return None
         if name == "abort":
+            self._continuous = False
+            self._publish("meas.continuous", False)
             self._abort()
             self.write("ABOR")
             return None
@@ -334,18 +354,27 @@ class AgilentPSA(VISAInstrument):
             return None
         was_armed = self._armed
         self._abort()
-        if name == "state_save":
-            if state in self._state_list():                      # запись поверх: старый файл сначала удалить
-                self.write(f"MMEM:DEL {path}")
-            self.write(f"MMEM:STOR:STAT 1,{path}")
-            self._check_errors(context=name)
-            if was_armed or self._continuous:
+        try:
+            if name == "state_save":
+                if state in self._state_list():                      # запись поверх: старый файл сначала удалить
+                    self.write(f"MMEM:DEL {path}")
+                self.write(f"MMEM:STOR:STAT 1,{path}")
+                self.query("*OPC?")
+                self._check_errors(context=name)
+                return state
+            old = self.transport.timeout_ms
+            self.transport.timeout_ms = max(old, SWEEP_TIMEOUT_MS)
+            try:
+                self.write(f"MMEM:LOAD:STAT 1,{path}")               # state_recall
+                self.query("*OPC?")
+            finally:
+                self.transport.timeout_ms = old
+            errors = self._check_errors(context=name)
+            if errors:
+                return None
+            self.write("FORM ASC")
+            self._sync_all()                                        # значения прибора изменились; развёртка - как была
+            return None
+        finally:
+            if (was_armed or self._continuous) and not self._armed:
                 self._start_sweep()
-            return state
-        self.write(f"MMEM:LOAD:STAT 1,{path}")                   # state_recall
-        self._check_errors(context=name)
-        self.write("FORM ASC")
-        self._sync_all()                                        # значения прибора изменились; развёртка - как была
-        if was_armed and not self._armed:
-            self._start_sweep()
-        return None

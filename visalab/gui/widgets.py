@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QPointF, Qt
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import QComboBox, QLabel, QLineEdit, QPushButton, QSizePolicy, QWidget
 
 from ..core.params import Kind, Param, PStatus
 from ..coord import Instrument
 from ..core.units import si_format, si_parse
+from ..front.live_plot import decimate_trace_polygon
 
 STYLE = """
 QLineEdit[pstatus="writing"], QComboBox[pstatus="writing"], QPushButton[pstatus="writing"] { border: 1px solid #c9a227; }
@@ -174,6 +175,8 @@ class TracePlot(QWidget, ParamWidget):
         super().__init__(parent)
         self.bind(proxy, spec)
         self.trace = None
+        self._cache: QPixmap | None = None
+        self._cache_key: tuple | None = None
         for key in ("marker.level", "marker.value", "marker.state", "ref_level", "scale_div"):
             if proxy.supports(key):
                 proxy.subscribe(key, lambda _v: self.update())
@@ -181,6 +184,8 @@ class TracePlot(QWidget, ParamWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def show_value(self, value):
+        if value is self.trace:
+            return
         self.trace = value
         self.update()
 
@@ -192,44 +197,76 @@ class TracePlot(QWidget, ParamWidget):
         lo, hi = min(ys), max(ys)
         return (lo - 1, hi + 1) if hi - lo < 1e-9 else (lo, hi)
 
-    def paintEvent(self, event):  # noqa: N802 - Qt
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def _render_base(self, y0: float | None, y1: float | None) -> QPixmap:
+        dpr = self.devicePixelRatioF() or 1.0
+        pm = QPixmap(max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        p = QPainter(pm)
+        if not p.isActive():
+            return pm
         pal = self.palette()
         p.fillRect(self.rect(), pal.base())
         left, top, right, bottom = 64, 10, self.width() - 12, self.height() - 26
         w, h = max(1, right - left), max(1, bottom - top)
-        grid = QPen(QColor(128, 128, 128, 70))
-        p.setPen(grid)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setPen(QPen(QColor(128, 128, 128, 70)))
         for i in range(11):
             y = top + h * i / 10
             p.drawLine(QPointF(left, y), QPointF(right, y))
             x = left + w * i / 10
             p.drawLine(QPointF(x, top), QPointF(x, bottom))
         p.setPen(pal.text().color())
-        if not self.trace or len(self.trace) < 2:
+        if not self.trace or len(self.trace) < 2 or y0 is None or y1 is None:
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "нет трассы")
-            return
+            p.end()
+            return pm
         t = self.trace
-        y0, y1 = self._y_range()
         x0, x1 = t.x[0], t.x[-1]
-        sx = w / (x1 - x0) if x1 != x0 else 0.0
-        path = QPainterPath()
-        for i, (xv, yv) in enumerate(zip(t.x, t.y)):
-            px = left + (xv - x0) * sx if sx else left + w * i / (len(t) - 1)
-            py = top + h * (y1 - min(max(yv, y0), y1)) / (y1 - y0)
-            path.moveTo(px, py) if i == 0 else path.lineTo(px, py)
+        r = QRectF(left, top, w, h)
+        if x1 != x0:
+            poly = decimate_trace_polygon(t, x0, x1, y0, y1, r)
+        else:
+            poly = QPolygonF([QPointF(left + w * i / (len(t) - 1),
+                                      top + h * (y1 - min(max(yv, y0), y1)) / (y1 - y0))
+                              for i, yv in enumerate(t.y)])
         p.drawText(QPointF(4, top + 10), f"{y1:.1f}")
         p.drawText(QPointF(4, bottom), f"{y0:.1f}")
         p.drawText(QPointF(left, self.height() - 6), si_format(x0, t.x_unit))
         txt = si_format(x1, t.x_unit)
         p.drawText(QPointF(right - p.fontMetrics().horizontalAdvance(txt), self.height() - 6), txt)
         p.drawText(QPointF(4, top + h / 2), t.y_unit)
-        p.setPen(QPen(QColor("#e0a020"), 1.4))
-        p.drawPath(path)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor("#e0a020"), 1)
+        pen.setCosmetic(True)
+        p.setPen(pen)
+        p.drawPolyline(poly)
+        p.end()
+        return pm
+
+    def paintEvent(self, event):  # noqa: N802 - Qt
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        has_trace = bool(self.trace and len(self.trace) >= 2)
+        y0, y1 = self._y_range() if has_trace else (None, None)
+        key = (self.width(), self.height(), self.devicePixelRatioF(), id(self.trace) if has_trace else None, y0, y1)
+        if self._cache is None or self._cache_key != key:
+            self._cache = self._render_base(y0, y1)
+            self._cache_key = key
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.drawPixmap(0, 0, self._cache)
+        if not has_trace or y0 is None or y1 is None:
+            return
+        t = self.trace
+        left, top, right, bottom = 64, 10, self.width() - 12, self.height() - 26
+        w, h = max(1, right - left), max(1, bottom - top)
+        x0, x1 = t.x[0], t.x[-1]
+        sx = w / (x1 - x0) if x1 != x0 else 0.0
         mx = self.proxy.value("marker.freq")
         my = self.proxy.value("marker.level", self.proxy.value("marker.value"))
         if self.proxy.value("marker.state") and mx is not None and my is not None and sx:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             px, py = left + (mx - x0) * sx, top + h * (y1 - min(max(my, y0), y1)) / (y1 - y0)
             p.setPen(QPen(QColor("#d64545"), 2))
             p.drawLine(QPointF(px - 6, py - 10), QPointF(px, py))

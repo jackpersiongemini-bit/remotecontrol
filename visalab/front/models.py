@@ -109,20 +109,29 @@ class _Field:
         return str(value)
 
     def value(self):
+        import math
         if self.typ is bool:
             return self.widget.isChecked()
         text = self.widget.text().strip()
         if self.typ is str:
             if not text:
                 raise ValueError(f"{self.label}: empty")
+            if self.name == "name" and ("/" in text or "\\" in text):
+                raise ValueError(f"{self.label}: '/' and '\\' are not allowed")
             return text
         if self.typ is int:
-            return int(float(text))
+            fv = float(text)
+            if not math.isfinite(fv):
+                raise ValueError(f"{self.label}: invalid number")
+            return int(fv)
         if self.typ is float:
             try:
-                return float(text.replace(",", "."))
+                fv = float(text.replace(",", "."))
             except ValueError:
-                return si_parse(text, self.unit)
+                fv = si_parse(text, self.unit)
+            if not math.isfinite(fv):
+                raise ValueError(f"{self.label}: invalid number")
+            return fv
         return _to_tuple(json.loads(text))     # кортежи (например, номиналы по каналам)
 
 
@@ -192,8 +201,9 @@ class ModelWindow(Window):
     def save(self) -> bool:
         try:
             model = self.model()
-        except (ValueError, TypeError) as exc:
-            self.status.setText(str(exc).splitlines()[0][:40])
+        except (ValueError, TypeError, OverflowError) as exc:
+            lines = str(exc).splitlines()
+            self.status.setText((lines[0] if lines else "invalid value")[:40])
             self.status.setToolTip(str(exc))
             return False
         if model.name in COORD.models(self.kind):

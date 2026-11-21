@@ -11,6 +11,7 @@ import logging
 import sys
 from pathlib import Path
 
+from PyQt6 import sip
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
@@ -31,8 +32,12 @@ def lab_entry(path: str, key: str) -> dict:
     p = Path(path)
     if not p.is_file():
         return {}
-    data = json.loads(p.read_text(encoding="utf-8"))
-    entry = data.get(key, {})
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logging.getLogger("visalab").warning("не удалось прочитать %s: %s", p, exc)
+        return {}
+    entry = data.get(key, {}) if isinstance(data, dict) else {}
     return entry if isinstance(entry, dict) else {}
 
 
@@ -96,10 +101,13 @@ def remember_windows(opened: list[dict], settings: QSettings) -> None:
     """Запомнить, какие окна приборов открыты, и их размеры (вызывать ДО выхода: quit закрывает окна
     без closeEvent - размеры иначе не сохранились бы)."""
     for cur in opened:
-        key, visible = f"WINDOWS/{cur['lab_key']}/VISIBLE", bool(cur["win"].isVisible())
+        win = cur.get("win")
+        if win is None or sip.isdeleted(win):
+            continue
+        key, visible = f"WINDOWS/{cur['lab_key']}/VISIBLE", bool(win.isVisible())
         if settings.value(key, None, type=bool) != visible or settings.value(key) is None:
             settings.setValue(key, visible)
-        cur["win"].save_size()
+        win.save_size()
     settings.sync()
 
 
@@ -147,12 +155,23 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
             proxy.open()
 
     def reconnect(kind: str, address: str, model: str) -> None:
+        nonlocal delay
         old_proxy, old_win = current["proxy"], current["win"]
         pos, visible = old_win.pos(), old_win.isVisible()
+        old_win.save_size()
+        old_win.presets.save()
         old_win.hide()
+        if hasattr(old_win, "cleanup"):
+            old_win.cleanup()
         COORD.close_instrument(old_proxy)
         old_win.deleteLater()
-        build(kind, address, model or None, pos, visible)
+        delay = saved_delay(settings, window_cls.CONNECTION_GROUP)
+        try:
+            build(kind, address, model or None, pos, visible)
+        except Exception:  # noqa: BLE001 - не оставлять в current удалённое окно
+            current["win"] = None
+            logging.getLogger("visalab").exception("ошибка пересоздания окна %s", window_cls.__name__)
+            raise
 
     build(kind, address, model, None, show)
     return current

@@ -18,11 +18,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 
 from ..core.units import si_format
 from .calibration import fit_gain_table, save_csv
-from .scenario import MEASURE_TIMEOUT_S, Device, Run, Scenario, ScenarioError
+from .scenario import MEASURE_TIMEOUT_S, Device, Run, Scenario, ScenarioError, Stopped
 
 __all__ = ["frequency_points", "FrequencySweep", "AutoCalibration", "AcalResult", "acal_file_name"]
 
@@ -30,10 +31,11 @@ __all__ = ["frequency_points", "FrequencySweep", "AutoCalibration", "AcalResult"
 def frequency_points(start: float, stop: float, points: int) -> list[float]:
     """Равномерная сетка частот, края включены."""
     points = int(points)
-    if points < 2 or not float(stop) > float(start):
+    start_f, stop_f = float(start), float(stop)
+    if points < 2 or not (math.isfinite(start_f) and math.isfinite(stop_f)) or not stop_f > start_f:
         raise ValueError("need START < STOP and PTS >= 2")
-    step = (float(stop) - float(start)) / (points - 1)
-    return [float(start) + i * step for i in range(points - 1)] + [float(stop)]
+    step = (stop_f - start_f) / (points - 1)
+    return [start_f + i * step for i in range(points - 1)] + [stop_f]
 
 
 def _compact(freq: float) -> str:
@@ -102,7 +104,12 @@ class FrequencySweep(Scenario):
                 if self.settle_s > 0:
                     yield run.sleep(self.settle_s)
                 power = yield from self.reading(run, pm, f)
-                level = float(gen.value("rf.power"))
+                if not gen.connected:
+                    raise ScenarioError(f"{gen.name}: connection lost during {self.NAME}")
+                raw_level = gen.value("rf.power")
+                if raw_level is None:
+                    raise ScenarioError(f"{gen.name}: level (rf.power) lost during {self.NAME}")
+                level = float(raw_level)
                 self.check_point(gen, pm, f, power, level, confirmed)
                 self.points.append((f, power, level))
                 run.add_point({"freq": f, "power": power, "level": level, "index": i, "total": n})
@@ -132,9 +139,11 @@ class FrequencySweep(Scenario):
                     confirmed=()) -> None:
         """Сигнал на датчике есть; выход генератора включён и частоты те, что приборы подтвердили на этой
         точке (``confirmed`` - [((прибор, ключ), значение)]): никто не поменял их руками во время сценария."""
-        if power < self.min_signal_dbm:
+        if not math.isfinite(power) or power < self.min_signal_dbm:
             raise ScenarioError(f"no signal at {pm.name}: {power:.1f} dBm at {si_format(f, 'Hz', 6)} "
                                 f"({gen.name} {level:+.1f} dBm) - check the cable and the generator output")
+        if not gen.connected:
+            raise ScenarioError(f"{gen.name}: connection lost during {self.NAME}")
         if gen.value("rf.output") is False:
             raise ScenarioError(f"{gen.name} RF output was switched off during {self.NAME}")
         for (dev, key), expected in confirmed:
@@ -167,6 +176,11 @@ class FrequencySweep(Scenario):
     def change(self, saved: list, dev: Device, key: str, value):
         """Поставить значение на время сценария (если оно другое) и запомнить, что вернуть."""
         old = dev.value(key)
+        if old is None and dev.connected and dev.supports(key):
+            try:
+                old = yield dev.read(key)
+            except ScenarioError:
+                old = False if key.endswith("output") and value is True else None
         spec = dev.spec(key)
         if old is not None and spec.same(spec.validate(value), old):
             return
@@ -196,6 +210,15 @@ class FrequencySweep(Scenario):
                 continue
             try:
                 yield dev.set(key, value)
+            except Stopped:
+                # Безопасность: не бросать выключение RF при повторной остановке в середине restore
+                if value is False and key.endswith("output"):
+                    if dev.connected:
+                        dev.proxy.set(dev.k(key), False)
+                    else:
+                        later(dev, key, value)
+                else:
+                    run.log(f"restore interrupted before {dev.name} {key}")
             except ScenarioError as exc:
                 if dev.connected:
                     run.log(f"could not restore {dev.name} {key}: {exc}")

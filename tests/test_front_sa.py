@@ -39,11 +39,27 @@ def _wait(qtbot, proxy, key, pred):
 
 def test_layout_settings_only(qtbot, sa):
     proxy, win, _s = sa
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["FREQ", "BW", "AMPL", "SWP", "TRAC", "TRIG"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["FREQ", "BW", "AMPL", "SWP", "TRAC", "TRIG", "SET"]
     assert len(win.preset_panel.table.lines) == 1 and win.preset_panel.table.lines[0].name == "PRST"
-    names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages for ln in p.lines}
+    names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages if p is not win.connection_page for ln in p.lines}
     assert names["RBW"] == ["bw.res", "bw.res_auto"] and names["CENT"] == ["freq.center"]
     assert not any(k == "trace" or k.startswith("marker") for ks in names.values() for k in ks)   # вывода информации нет
+
+
+def test_prst_chips_full_height(qtbot, sa):
+    from visalab.front.instrument_window import PRESET_HEIGHT
+    proxy, win, _s = sa
+    win.show()
+    qtbot.waitExposed(win)
+    proxy.set("freq.center", 2.4e9)
+    proxy.set("freq.span", 100e6)
+    _wait(qtbot, proxy, "freq.span", lambda v: v == pytest.approx(100e6))
+    win.add_button.click()
+    qtbot.waitUntil(lambda: len(win.presets.buttons()) == 1, timeout=5000)
+    qtbot.wait(30)
+    chip = win.presets.buttons()[0]
+    assert chip.height() == PRESET_HEIGHT
+    assert win.preset_scroll.height() == PRESET_HEIGHT
 
 
 def test_edit_settings_and_auto_pair(qtbot, sa):
@@ -124,7 +140,7 @@ def test_sa_launcher(qtbot, tmp_path, monkeypatch):
 
 def test_zero_span_button_and_trigger_tabs(qtbot, sa):
     proxy, win, settings = sa
-    names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages for ln in p.lines}
+    names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages if p is not win.connection_page for ln in p.lines}
     assert names["MODE"][:1] == ["trace.mode"] and names["DLY"] == ["trig.delay", "trig.delay_state"]
     assert names["SRC"] == ["trig.source"] and names["TYPE"] == ["sweep.type"] and names["PRE"] == ["preamp"]
     win.widgets["freq.center"].set_value(1e9)

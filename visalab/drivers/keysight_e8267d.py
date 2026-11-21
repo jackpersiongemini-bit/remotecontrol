@@ -26,7 +26,9 @@ E8267D_MODELS = {
     "E8267D-544": RFGenModel("E8267D-544", 250e3, 44e9, -135.0, 25.0),
 }
 
-_EXT = {"enum_map": (("EXT", "EXT1"), ("EXT", "EXT2"))}
+_SRC = {"enum_map": (("INT", "INT"), ("INT", "INT1"), ("INT", "INT2"), ("INT", "INTERNAL"),
+                     ("EXT", "EXT1"), ("EXT", "EXT2"), ("EXT", "EXT"), ("EXT", "EXTERNAL"))}
+_REF = {"enum_map": (("INT", "INT"), ("INT", "INTERNAL"), ("EXT", "EXT"), ("EXT", "EXTERNAL"))}
 
 
 class KeysightE8267D(RFSignalGenerator):
@@ -37,22 +39,22 @@ class KeysightE8267D(RFSignalGenerator):
         "rf.frequency": (":FREQ {value}", ":FREQ?", {}),
         "rf.power": (":POW {value}", ":POW?", {}),
         "rf.alc": (":POW:ALC {value}", ":POW:ALC?", {}),
-        "ref.source": (None, ":ROSC:SOUR?", {}),
+        "ref.source": (None, ":ROSC:SOUR?", _REF),
         "mod.output": (":OUTP:MOD {value}", ":OUTP:MOD?", {}),
         "am.state": (":AM:STAT {value}", ":AM:STAT?", {}),
         "am.depth": (":AM:DEPT {value}", ":AM:DEPT?", {}),
-        "am.source": (":AM:SOUR {value}", ":AM:SOUR?", _EXT),
+        "am.source": (":AM:SOUR {value}", ":AM:SOUR?", _SRC),
         "am.freq": (":AM:INT:FREQ {value}", ":AM:INT:FREQ?", {}),
         "fm.state": (":FM:STAT {value}", ":FM:STAT?", {"also_read": ("pm.state",)}),
         "fm.deviation": (":FM:DEV {value}", ":FM:DEV?", {}),
-        "fm.source": (":FM:SOUR {value}", ":FM:SOUR?", _EXT),
+        "fm.source": (":FM:SOUR {value}", ":FM:SOUR?", _SRC),
         "fm.freq": (":FM:INT:FREQ {value}", ":FM:INT:FREQ?", {}),
         "pm.state": (":PM:STAT {value}", ":PM:STAT?", {"also_read": ("fm.state",)}),
         "pm.deviation": (":PM:DEV {value}", ":PM:DEV?", {}),
-        "pm.source": (":PM:SOUR {value}", ":PM:SOUR?", _EXT),
+        "pm.source": (":PM:SOUR {value}", ":PM:SOUR?", _SRC),
         "pm.freq": (":PM:INT:FREQ {value}", ":PM:INT:FREQ?", {}),
         "pulse.state": (":PULM:STAT {value}", ":PULM:STAT?", {}),
-        "pulse.source": (":PULM:SOUR {value}", ":PULM:SOUR?", {}),
+        "pulse.source": (":PULM:SOUR {value}", ":PULM:SOUR?", _REF),
         "pulse.period": (":PULM:INT:PER {value}", ":PULM:INT:PER?", {}),
         "pulse.width": (":PULM:INT:PWID {value}", ":PULM:INT:PWID?", {}),
     }

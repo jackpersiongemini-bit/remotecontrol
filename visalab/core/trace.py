@@ -24,6 +24,8 @@ class Trace:
     meta: dict = field(default_factory=dict, compare=False, hash=False)
     #: мнимая часть для комплексной трассы (S-параметры): тогда ``y`` - вещественная часть
     im: tuple[float, ...] | None = None
+    #: ось X построена равномерно с шагом (start..stop) - ускоряет децимацию и поиск под курсором
+    uniform: bool = field(default=False, compare=False, hash=False, repr=False)
 
     def __post_init__(self):
         if len(self.x) != len(self.y):
@@ -50,9 +52,18 @@ class Trace:
             kw["im"] = tuple(float(v) for v in kw["im"])
         n = len(y)
         step = (stop - start) / (n - 1) if n > 1 else 0.0
+        kw.setdefault("uniform", True)
         return cls(tuple(start + i * step for i in range(n)), y, **kw)
 
     def peak(self) -> tuple[float, float]:
-        """(x, y) максимума."""
-        i = max(range(len(self.y)), key=self.y.__getitem__)
+        """(x, y) максимума (игнорирует NaN)."""
+        if not self.y:
+            raise ValueError("пустая трасса")
+        m = max(self.y)
+        if m == m:
+            return self.x[self.y.index(m)], m
+        valid = [i for i, v in enumerate(self.y) if v == v]
+        if not valid:
+            raise ValueError("трасса состоит только из NaN")
+        i = max(valid, key=self.y.__getitem__)
         return self.x[i], self.y[i]

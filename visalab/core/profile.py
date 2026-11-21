@@ -92,6 +92,8 @@ class Profile:
         """Список нарушений контракта (пустой - драйвер соответствует профилю)."""
         slots = self.expand(channels)
         out: list[str] = []
+        if channels < 1 and (any("{n}" in s.key for s in self.slots) or any("{n}" in a.name for a in self.actions)):
+            out.append(f"профиль {self.name} требует channels >= 1, получено {channels}")
         for key, p in params.items():
             if key.startswith(EXT_PREFIX):
                 continue
@@ -107,9 +109,12 @@ class Profile:
                 out.append(f"{key}: {'только чтение' if p.readonly else 'запись'}, "
                            f"по профилю {'только чтение' if s.readonly else 'запись'}")
             if s.kind is Kind.ENUM and s.choices:
-                extra = {c.upper() for c in p.choices} - {c.upper() for c in s.choices}
-                if extra:
-                    out.append(f"{key}: токены {sorted(extra)} не из профиля {s.choices}")
+                if not p.choices:
+                    out.append(f"{key}: список choices пуст, по профилю {s.choices}")
+                else:
+                    extra = {c.upper() for c in p.choices} - {c.upper() for c in s.choices}
+                    if extra:
+                        out.append(f"{key}: токены {sorted(extra)} не из профиля {s.choices}")
         for key, s in slots.items():
             if s.required and key not in params:
                 out.append(f"{key}: обязательный параметр профиля {self.name} отсутствует")

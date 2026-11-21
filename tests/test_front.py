@@ -201,7 +201,7 @@ def test_unit_dropdown_value_left(qtbot, opened):
 def test_mode_tabs_and_switch(qtbot, opened):
     from visalab.front.theme import ON
     sim, proxy, win = opened
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "MOD", "SWP", "BRST"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "MOD", "SWP", "BRST", "SET"]
     win.set_expanded(True)
     win.set_page(3)
     assert win.pages[3].isVisibleTo(win) and not win.pages[0].isVisibleTo(win)
@@ -212,6 +212,52 @@ def test_mode_tabs_and_switch(qtbot, opened):
     win.tabs.setCurrentIndex(1)                            # клик по вкладке
     assert win.pages[1].isVisibleTo(win)
     assert win.on_button.status() == ON and win.on_button.isChecked()
+
+
+def test_second_click_on_open_tab_closes_it(qtbot, opened):
+    from PyQt6.QtCore import Qt
+    _sim, _proxy, win = opened
+    win.show()
+    qtbot.waitExposed(win)
+    assert not win._expanded
+    # первый клик по вкладке разворачивает её
+    qtbot.mouseClick(win.tabs, Qt.MouseButton.LeftButton, pos=win.tabs.tabRect(1).center())
+    assert win._expanded and win.tabs.currentIndex() == 1 and win.pages[1].isVisible()
+    # клик по другой вкладке переключает на неё
+    qtbot.mouseClick(win.tabs, Qt.MouseButton.LeftButton, pos=win.tabs.tabRect(2).center())
+    assert win._expanded and win.tabs.currentIndex() == 2 and win.pages[2].isVisible()
+    # повторный клик по уже открытой вкладке сворачивает панель
+    qtbot.mouseClick(win.tabs, Qt.MouseButton.LeftButton, pos=win.tabs.tabRect(2).center())
+    assert not win._expanded and not win.pages[2].isVisible()
+    # повторный клик снова разворачивает её
+    qtbot.mouseClick(win.tabs, Qt.MouseButton.LeftButton, pos=win.tabs.tabRect(2).center())
+    assert win._expanded and win.tabs.currentIndex() == 2 and win.pages[2].isVisible()
+
+
+def test_window_stays_resizable_after_expand_collapse_and_hide(qtbot, opened):
+    from visalab.front.window import QWIDGETSIZE_MAX
+    _sim, _proxy, win = opened
+    win.show()
+    qtbot.waitExposed(win)
+    for exp in (True, False, True):
+        win.set_expanded(exp)
+        qtbot.wait(20)
+        assert win.maximumHeight() == QWIDGETSIZE_MAX
+        assert win.maximumWidth() == QWIDGETSIZE_MAX
+        if hasattr(win, "isResizeEnabled"):
+            assert win.isResizeEnabled()
+    win.hide()
+    win.show()
+    qtbot.waitExposed(win)
+    assert win.maximumHeight() == QWIDGETSIZE_MAX and win.maximumWidth() == QWIDGETSIZE_MAX
+
+
+def test_indicator_colors_are_toned_down():
+    from PyQt6.QtGui import QColor
+    from visalab.front.theme import UI_COLOR_INDICATOR, UI_COLOR_INVERT, UI_COLOR_TEXT_MUTED
+    # Индикатор включённого прибора и инверсия должны быть заметно темнее почти-белого текста
+    assert QColor(UI_COLOR_INDICATOR).lightness() < QColor(UI_COLOR_TEXT_MUTED).lightness() - 50
+    assert QColor(UI_COLOR_INVERT).lightness() < 165
 
 
 def test_clickable_widgets_have_pointer_cursor(qtbot, opened):
@@ -275,31 +321,40 @@ def test_error_log_opens_from_indicator(qtbot, opened):
 
 
 def test_connection_page_from_address(qtbot, opened, settings):
-    _sim, _proxy, win = opened
+    _sim, proxy, win = opened
     win.show()
     qtbot.waitExposed(win)
     from PyQt6.QtCore import Qt
-    bar = win.titleBar.hBoxLayout                            # переключатель, рядом ошибки, ..., имя прибора
+    bar = win.titleBar.hBoxLayout                            # переключатель, рядом ошибки, ..., *IDN? прибора
     order = [bar.itemAt(i).widget() for i in range(bar.count()) if bar.itemAt(i).widget() is not None]
     assert order[:5] == [win.on_button, win.error_indicator, win.sync_button, win.init_button, win.address]
-    assert win.address.text().startswith("PULSE") and win.proxy.address in win.address.toolTip()
+    # В заголовке отображается ответ *IDN?, занимает оставшееся место и не кликабелен
+    assert win.address.text() == proxy.idn and win.proxy.address in win.address.toolTip()
+    assert win.address.cursor().shape() != Qt.CursorShape.PointingHandCursor
+    assert bar.stretch(bar.indexOf(win.address)) > 0
+    assert win.address.width() >= win.width() - 260
     assert win.on_button.height() < win.sync_button.height()      # переключатель ниже кнопок
     qtbot.mouseClick(win.address, Qt.MouseButton.LeftButton)      # один клик - ничего
     assert not win.connection_page.isVisible()
-    qtbot.mouseDClick(win.address, Qt.MouseButton.LeftButton)     # двойной - настройки подключения
+    qtbot.mouseDClick(win.address, Qt.MouseButton.LeftButton)     # двойной клик - тоже ничего (не кликабелен)
+    assert not win.connection_page.isVisible()
+    # Настройки подключения открываются специальной вкладкой SET
+    set_idx = win.tabs.count() - 1
+    assert win.tabs.tabText(set_idx) == "SET"
+    qtbot.mouseClick(win.tabs, Qt.MouseButton.LeftButton, pos=win.tabs.tabRect(set_idx).center())
     assert win._expanded and win.connection_page.isVisible()
-    assert not win.error_page.isVisible() and not any(p.isVisible() for p in win.pages)
+    assert not win.error_page.isVisible()
     assert win.driver_choice.value == "sdg"
     assert "SDG2042X" in win.model_choice._data
-    win._on_tab_clicked(0)                                   # вкладка - выход без изменений
+    qtbot.mouseClick(win.tabs, Qt.MouseButton.LeftButton, pos=win.tabs.tabRect(0).center())
     assert not win.connection_page.isVisible() and win.pages[0].isVisible()
     win.show_connection()
+    assert win.connection_page.isVisible()
     win.model_choice.set_value("SDG2042X")
     win.address_edit.setText("192.168.0.5")
     with qtbot.waitSignal(win.reconnect_requested) as sig:
         win.apply_button.click()
     assert sig.args == ["sdg", "192.168.0.5", "SDG2042X"]
-    assert not win.connection_page.isVisible()
     from visalab.front.pulse_gen import saved_connection
     assert saved_connection(settings) == {"driver": "sdg", "address": "192.168.0.5", "model": "SDG2042X"}
 

@@ -30,7 +30,7 @@ from typing import Any
 
 from PyQt6 import sip
 from PyQt6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
                              QVBoxLayout, QWidget)
 
@@ -40,6 +40,7 @@ from ..core.units import SI_PREFIXES, si_format, si_parse
 from ..core.trace import Trace
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
+from .live_plot import decimate_trace_polygon, nearest_index
 from .params import IndicatorButton, PChoice, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
                     UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
@@ -61,7 +62,9 @@ def saved_connection(settings: QSettings) -> dict[str, str]:
 
 
 def _dbm_to_w(dbm: float) -> float:
-    return 10 ** ((dbm - 30.0) / 10.0)
+    if not math.isfinite(dbm) or abs(dbm) > 300.0:
+        return math.nan
+    return 10.0 ** ((dbm - 30.0) / 10.0)
 
 
 def _auto(proxy: Instrument, key: str):
@@ -170,7 +173,11 @@ class LNumber(QLineEdit):
         self.show_value(None)
 
     def set_value(self, value: float, emit: bool = True) -> None:
-        value = min(max(float(value), self.minimum), self.maximum)
+        v = float(value)
+        if not math.isfinite(v):
+            self.show_value(self._value)
+            return
+        value = min(max(v, self.minimum), self.maximum)
         changed = value != self._value
         self._value = value
         self.show_value(value)
@@ -212,12 +219,16 @@ class LNumber(QLineEdit):
     def parse(self, text: str) -> float | None:
         text = text.strip().replace(",", ".").removesuffix(self.unit).strip()
         try:
-            return float(text) * self.scale
+            v = float(text) * self.scale
+            if math.isfinite(v):
+                return v
         except ValueError:
             pass
         if self.si_unit:
             try:
-                return si_parse(text, self.si_unit)
+                v = si_parse(text, self.si_unit)
+                if math.isfinite(v):
+                    return v
             except (TypeError, ValueError):
                 pass
         return None
@@ -239,10 +250,23 @@ class ActionButton(QPushButton):
         self._timer.timeout.connect(self._disarm)
         self.clicked.connect(self._click)
         proxy.action_done.connect(self._done)
-        proxy.comm_error.connect(lambda _m: self._set_state(""))
-        proxy.refused.connect(lambda _m: self._set_state(""))          # прибор ведёт сценарий: не отправлено
-        proxy.state_changed.connect(lambda _s: self.setEnabled(proxy.is_connected))
+        proxy.comm_error.connect(self._clear_state)
+        proxy.refused.connect(self._clear_state)          # прибор ведёт сценарий: не отправлено
+        proxy.state_changed.connect(self._on_state)
         self.setEnabled(proxy.is_connected)
+
+    def _clear_state(self, *_a) -> None:
+        if not sip.isdeleted(self):
+            self._set_state("")
+
+    def _on_state(self, _s) -> None:
+        if sip.isdeleted(self):
+            return
+        if not self.proxy.is_connected:
+            self._timer.stop()
+            self._disarm()
+            self._set_state("")
+        self.setEnabled(self.proxy.is_connected)
 
     def _set_state(self, state: str) -> None:
         self.setProperty("wstate", state)
@@ -264,7 +288,7 @@ class ActionButton(QPushButton):
         self.proxy.action(self.name)
 
     def _done(self, name: str, _result) -> None:
-        if name == self.name:
+        if not sip.isdeleted(self) and name == self.name:
             self._set_state("")
 
 
@@ -352,13 +376,16 @@ class PowerReadout(QFrame):
 
     def refresh(self) -> None:
         v = self.values
-        power = v.get("power")
+        raw_power = v.get("power")
+        power = raw_power if (isinstance(raw_power, (int, float)) and not isinstance(raw_power, bool)
+                              and math.isfinite(raw_power) and abs(raw_power) <= 300.0) else None
         if self.main_unit == "W":                      # «13.74 µW»: число крупно, единица с префиксом
             num, unit = "---", "W"
             if power is not None:
                 w = _dbm_to_w(power)
-                unit = si_format(w, "W", 4).partition(" ")[2] or "W"        # префикс: µW, mW...
-                num = f"{w / SI_PREFIXES.get(unit[:-1], 1.0) if unit[:-1] else w:#.4g}".rstrip(".")
+                if math.isfinite(w):
+                    unit = si_format(w, "W", 4).partition(" ")[2] or "W"        # префикс: µW, mW...
+                    num = f"{w / SI_PREFIXES.get(unit[:-1], 1.0) if unit[:-1] else w:#.4g}".rstrip(".")
             self.main.setText(num)
             self.unit.setText(unit or "W")
         else:
@@ -368,7 +395,8 @@ class PowerReadout(QFrame):
             if self.main_unit == "W":
                 sec = "--- dBm" if power is None else f"{power:.2f} dBm"
             else:
-                sec = "--- W" if power is None else si_format(_dbm_to_w(power), "W", 4)
+                w = _dbm_to_w(power) if power is not None else math.nan
+                sec = "--- W" if not math.isfinite(w) else si_format(w, "W", 4)
         elif self.secondary == "PEAK":
             peak = v.get("peak")
             sec = "PEAK " + ("---" if peak is None else f"{peak:.2f} dBm")
@@ -410,18 +438,28 @@ class TracePlot(QWidget):
         self.ref: float | None = None
         self.per_div: float | None = None
         self._mouse: QPointF | None = None
+        self._cache: QPixmap | None = None
+        self._cache_key: tuple | None = None
+        self._font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
+        self._font.setPointSizeF(8)
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
         mark_growing(self)                        # растянули окно - график выше
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def set_trace(self, trace: Trace | None) -> None:
-        self.trace = trace if isinstance(trace, Trace) and len(trace) > 1 else None
+        nxt = trace if isinstance(trace, Trace) and len(trace) > 1 else None
+        if nxt is self.trace:
+            return
+        self.trace = nxt
         self.update()
 
     def set_gate(self, start, length) -> None:
-        self.gate = (float(start), float(length)) if isinstance(start, (int, float)) and \
+        gate = (float(start), float(length)) if isinstance(start, (int, float)) and \
             isinstance(length, (int, float)) and length > 0 else None
+        if gate == self.gate:
+            return
+        self.gate = gate
         self.update()
 
     def marker(self) -> float | None:
@@ -439,7 +477,7 @@ class TracePlot(QWidget):
     def ys(self) -> list[float]:
         """Значения трассы в единице шкалы (W - из dBm)."""
         if self.unit == "W" and self.trace is not None and self.trace.y_unit == "dBm":
-            return [10.0 ** ((y - 30.0) / 10.0) for y in self.trace.y]
+            return [_dbm_to_w(y) for y in self.trace.y]
         return list(self.trace.y) if self.trace is not None else []
 
     def y_unit(self) -> str:
@@ -449,14 +487,19 @@ class TracePlot(QWidget):
     def auto_range(self) -> tuple[float, float]:
         """AUTO: dBm - сверху максимум, округлённый вверх до 10 dB, 10 dB / дел; W - от 0 до максимума
         с круглой ценой деления (1, 2, 5)."""
-        ys = self.ys()
+        t = self.trace
+        finite = [y for y in t.y if math.isfinite(y) and abs(y) <= 300.0] if (t is not None and len(t.y)) else []
+        top_raw = max(finite) if finite else None
         if self.y_unit() == "W":
-            top = max(ys) if ys else 1e-3
-            raw = top / self.DIVS_Y if top > 0 else 1e-3
+            top = (_dbm_to_w(top_raw) if self.unit == "W" and t is not None and t.y_unit == "dBm" else top_raw) \
+                if top_raw is not None else 1e-3
+            if not math.isfinite(top) or top <= 0:
+                top = 1e-3
+            raw = top / self.DIVS_Y
             mag = 10.0 ** math.floor(math.log10(raw))
             step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw * (1 - 1e-9))
             return 0.0, step * self.DIVS_Y
-        top = math.ceil(max(ys) / 10.0) * 10.0 if ys else 0.0
+        top = math.ceil(top_raw / 10.0) * 10.0 if top_raw is not None else 0.0
         return top - self.DIVS_Y * self.DB_PER_DIV, top
 
     def y_range(self) -> tuple[float, float]:
@@ -478,18 +521,24 @@ class TracePlot(QWidget):
         self._mouse = None
         self.update()
 
-    def paintEvent(self, e):  # noqa: N802 - Qt
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def _render_base(self, mk: float | None) -> QPixmap:
+        dpr = self.devicePixelRatioF() or 1.0
+        pm = QPixmap(max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        if not p.isActive():
+            return pm
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(UI_COLOR_BACKGROUND))
         p.drawRoundedRect(QRectF(self.rect()), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
         r = self._plot_rect()
-        font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
-        font.setPointSizeF(8)
-        p.setFont(font)
-        grid = QPen(QColor(UI_COLOR_BORDER), 1)
-        p.setPen(grid)
+        p.setFont(self._font)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        grid_pen = QPen(QColor(UI_COLOR_BORDER), 1)
+        grid_pen.setCosmetic(True)
+        p.setPen(grid_pen)
         for i in range(self.DIVS_X + 1):
             x = r.left() + r.width() * i / self.DIVS_X
             p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
@@ -501,15 +550,13 @@ class TracePlot(QWidget):
         if t is None:
             p.setPen(muted)
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, "NO TRACE")
-            return
+            p.end()
+            return pm
         x0, x1 = t.x[0], t.x[-1]
         lo, hi = self.y_range()
 
         def px(x):
             return r.left() + (x - x0) / (x1 - x0) * r.width() if x1 != x0 else r.left()
-
-        def py(y):
-            return r.bottom() - (min(max(y, lo), hi) - lo) / (hi - lo) * r.height()
 
         if self.gate:                                  # строб
             g0, g1 = max(px(self.gate[0]), r.left()), min(px(self.gate[0] + self.gate[1]), r.right())
@@ -520,13 +567,18 @@ class TracePlot(QWidget):
                 p.setBrush(band)
                 p.drawRect(QRectF(g0, r.top(), g1 - g0, r.height()))
                 p.setBrush(Qt.BrushStyle.NoBrush)
-        ys = self.ys()
-        path = QPainterPath(QPointF(px(t.x[0]), py(ys[0])))
-        for x, y in zip(t.x[1:], ys[1:]):
-            path.lineTo(px(x), py(y))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
-        p.drawPath(path)
+        y_transform = _dbm_to_w if (self.unit == "W" and t.y_unit == "dBm") else None
+        poly = decimate_trace_polygon(t, x0, x1, lo, hi, r, y_transform=y_transform)
+        if len(poly) > 1:
+            p.save()
+            p.setClipRect(r.adjusted(-2, -2, 2, 2))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            pen = QPen(QColor(UI_COLOR_TEXT), 1)
+            pen.setCosmetic(True)
+            p.setPen(pen)
+            p.drawPolyline(poly)
+            p.restore()
         # подписи: верх шкалы и дБ/дел слева сверху, X по краям снизу
         xu, yu = t.x_unit, t.y_unit
         p.setPen(muted)
@@ -538,23 +590,51 @@ class TracePlot(QWidget):
         p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, xu, 4))
         p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, xu, 3)}/div")
         p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, xu, 4))
-        mk = self.marker()
         if mk is not None and x0 <= mk <= x1:            # метка: частота датчика
             p.setPen(QPen(QColor(UI_COLOR_INVERT), 1))
             p.drawLine(QPointF(px(mk), r.top()), QPointF(px(mk), r.bottom()))
-        m = self._mouse
-        if m is not None and r.contains(m):              # курсор: точка трассы под мышью
-            i = min(range(len(t)), key=lambda k: abs(px(t.x[k]) - m.x()))
-            cx, cy = px(t.x[i]), py(ys[i])
+        p.end()
+        return pm
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        mk = self.marker()
+        key = (self.width(), self.height(), self.devicePixelRatioF(), id(self.trace),
+               self.gate, self.unit, self.auto, self.ref, self.per_div, mk)
+        if self._cache is None or self._cache_key != key:
+            self._cache = self._render_base(mk)
+            self._cache_key = key
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.drawPixmap(0, 0, self._cache)
+        t, m = self.trace, self._mouse
+        if t is None or m is None:
+            return
+        r = self._plot_rect()
+        if r.contains(m):                              # курсор: точка трассы под мышью
+            x0, x1 = t.x[0], t.x[-1]
+            lo, hi = self.y_range()
+            x_target = x0 + (m.x() - r.left()) / r.width() * (x1 - x0) if x1 != x0 and r.width() > 0 else x0
+            i = nearest_index(t, x_target)
+            yv = _dbm_to_w(t.y[i]) if (self.unit == "W" and t.y_unit == "dBm") else t.y[i]
+            if not math.isfinite(yv):
+                return
+            cx = r.left() + (t.x[i] - x0) / (x1 - x0) * r.width() if x1 != x0 else r.left()
+            cy = r.bottom() - (min(max(yv, lo), hi) - lo) / (hi - lo) * r.height()
+            muted = QColor(UI_COLOR_BORDER_LIGHT)
+            p.setFont(self._font)
             p.setPen(QPen(muted, 1, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(cx, r.top()), QPointF(cx, r.bottom()))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(UI_COLOR_TEXT))
             p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
             p.setPen(QColor(UI_COLOR_TEXT))
             p.drawText(QRectF(r.left(), r.top() + 1, r.width() - 3, 14), Qt.AlignmentFlag.AlignRight,
-                       f"{si_format(t.x[i], xu, 4)}  " + (si_format(ys[i], "W", 4) if self.y_unit() == "W"
-                                                          else f"{ys[i]:.2f} {yu}"))
+                       f"{si_format(t.x[i], t.x_unit, 4)}  " + (si_format(yv, "W", 4) if self.y_unit() == "W"
+                                                                else f"{yv:.2f} {t.y_unit}"))
 
 
 class CalPlot(TracePlot):
@@ -581,7 +661,12 @@ class CalPlot(TracePlot):
 
     def y_range(self) -> tuple[float, float]:
         """Шкала по данным: шаг 0.1 / 0.2 / 0.5 / 1 / 2 / 5... dB на деление."""
-        lo, hi = min(self.trace.y), max(self.trace.y)
+        if self.trace is None or not len(self.trace.y):
+            return 0.0, float(self.DIVS_Y)
+        finite = [y for y in self.trace.y if math.isfinite(y)]
+        if not finite:
+            return 0.0, float(self.DIVS_Y)
+        lo, hi = min(finite), max(finite)
         for step in (st * 10 ** e for e in range(-1, 4) for st in (1, 2, 5)):
             full = step * self.DIVS_Y
             if full < (hi - lo) * 1.1:
@@ -659,11 +744,8 @@ class PowerMeterWindow(InstrumentWindow):
                     lines.append(PanelLine(t, *ws))
             return lines
 
-        # MAIN
-        trig = lambda p, k: PSButton(p, k, [("FREE", "IMM"), ("LEVEL", "INT"), ("EXT", "EXT")])   # noqa: E731
+        # MAIN: частота, усреднение, режим детектора, видеополоса, непрерывный счёт
         main = add((("FREQ", "freq", lambda p, k: PSpinBox(p, k, ("k", "M", "G"))),
-                    ("TRIG", "trig.source", trig), ("TLVL", "trig.level", None), ("TAUT", "trig.level_auto", None),
-                    ("SLOP", "trig.slope", None),
                     ("AVG", "avg.state", None, ("avg.count", None),         # усреднение: вкл, число, авто
                      ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)]))),
                     ("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
@@ -680,6 +762,36 @@ class PowerMeterWindow(InstrumentWindow):
             if ln.name == "FREQ":
                 ln.add_widget(self.follow_button)
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
+
+        # TRIG: настройка запуска (источник, уровень, фронт, задержка, блокировка) и строба (Gate)
+        trig_src = lambda p, k: PSButton(p, k, [("FREE", "IMM"), ("LEVEL", "INT"), ("EXT", "EXT"), ("BUS", "BUS")])  # noqa: E731
+        trig_auto = lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)])  # noqa: E731
+        trig_lines = add((
+            ("SRC", "trig.source", trig_src),
+            ("LVL", "trig.level", lambda p, k: PSpinBox(p, k, ("",)), ("trig.level_auto", trig_auto)),
+            ("SLOP", "trig.slope", None),
+            ("DLY", "trig.delay", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
+            ("HOLD", "trig.holdoff", lambda p, k: PSpinBox(p, k, ("µ", "m", ""))),
+            ("GSTR", "gate.start", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
+            ("GLEN", "gate.length", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
+        ))
+        if "trigger" in proxy.actions:
+            self.trig_bus_button = ActionButton(proxy, "trigger", "TRIG", "Software trigger (*TRG for BUS mode)")
+            for ln in trig_lines:
+                if ln.name == "SRC":
+                    ln.add_widget(self.trig_bus_button)
+                    break
+        trig_acts = []
+        if "single" in proxy.actions:
+            self.single_button = ActionButton(proxy, "single", "SING", "Arm / run a single triggered measurement")
+            trig_acts.append(self.single_button)
+        if "abort" in proxy.actions:
+            self.abort_button = ActionButton(proxy, "abort", "STOP", "Abort waiting for trigger")
+            trig_acts.append(self.abort_button)
+        if trig_acts:
+            trig_lines.append(PanelLine("RUN", *trig_acts))
+        if trig_lines:
+            self.page_specs.append(("TRIG", (), PanelTable(*trig_lines)))
 
         # CAL: график поправки, выбор таблицы (CSV), автокалибровка, GAIN, DUTY, итог, датчик
         self.cal_dir = Path(s.fileName()).resolve().parent / "calibrations"
@@ -698,7 +810,10 @@ class PowerMeterWindow(InstrumentWindow):
         for w, name in ((self.acal_start, "ACAL_START"), (self.acal_stop, "ACAL_STOP"), (self.acal_points, "ACAL_PTS")):
             v = s.value(f"{pre}/{name}")
             if v not in (None, ""):
-                w.set_value(float(v), emit=False)
+                try:
+                    w.set_value(float(v), emit=False)
+                except (TypeError, ValueError):
+                    pass
             w.changed.connect(lambda v, n=name: s.setValue(f"{pre}/{n}", v))
             w.setMinimumWidth(0)
         self.acal_start.setToolTip("ACAL start frequency (the generator starts here)")
@@ -740,10 +855,9 @@ class PowerMeterWindow(InstrumentWindow):
         self.page_specs.append(("CAL", ("offset.state",) if sup("offset.state") else (), PanelTable(*cal)))
 
         # TIME: режим временной области (график - в избранном, пока TRAC ON) и его настройки
-        # DET - на MAIN: во временном режиме датчик всегда NORMAL (Алексей 2026-11-14: «зачем DET в TIME»)
+        # Запуск и строб вынесены на отдельную вкладку TRIG.
         time_ = add((("TRAC", "trace.state", None), ("TLEN", "trace.time", None), ("TOFS", "trace.offset", None),
-                     ("DLY", "trig.delay", None), ("GSTR", "gate.start", None), ("GLEN", "gate.length", None),
-                     ("HOLD", "trig.holdoff", None), ("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
+                     ("PEAK", "meas.peak", PNLabel), ("PTAV", "meas.ptav", PNLabel)))
         time_ += self._time_scale_lines()
         self.page_specs.append(("TIME", ("trace.state",) if sup("trace.state") else (),
                                 PanelTable(*time_)))
@@ -773,7 +887,15 @@ class PowerMeterWindow(InstrumentWindow):
         tag = "W" if unit == "W" else "DBM"
         ref = self.settings.value(f"{self._prefix}/TIME_REF_{tag}", None)
         div = self.settings.value(f"{self._prefix}/TIME_DIV_{tag}", None)
-        return unit, (float(ref) if ref not in (None, "") else None), (float(div) if div not in (None, "") else None)
+        def _f(v, positive: bool = False) -> float | None:
+            if v in (None, ""):
+                return None
+            try:
+                f = float(v)
+                return f if (math.isfinite(f) and (not positive or f > 0)) else None
+            except (TypeError, ValueError):
+                return None
+        return unit, _f(ref), _f(div, positive=True)
 
     def _apply_scale(self) -> None:
         """Шкала - в график, поля REF / DIV - в единице шкалы (в AUTO показывают текущую шкалу)."""
@@ -816,6 +938,26 @@ class PowerMeterWindow(InstrumentWindow):
     def restore_rank(self, key: str) -> int:
         return RESTORE_RANK.get(key, 2)
 
+    def _tab_index(self, title: str) -> int:
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == title:
+                return i
+        return -1
+
+    def _update_tabs(self) -> None:
+        super()._update_tabs()
+        idx = self._tab_index("TRIG")
+        if idx >= 0:
+            src = self.proxy.value("trig.source")
+            self.tabs.set_on(idx, src is not None and src != "IMM")
+
+    def _update_trig_enabled(self) -> None:
+        slope = self.widgets.get("trig.slope")
+        if slope is not None:
+            src = self.proxy.value("trig.source")
+            slope.setEnabled(self.proxy.is_connected and src in ("INT", "EXT")
+                             and self.proxy.value("trig.slope") is not None)
+
     # ------------------------------------------------------------ вкладки
     def on_param(self, key: str, value: Any) -> None:
         if key == "trace":
@@ -829,6 +971,9 @@ class PowerMeterWindow(InstrumentWindow):
         elif key == "freq":
             self.cal_plot.set_freq(value)
             self.apply_correction()
+        elif key in ("trig.source", "trig.slope"):
+            self._update_tabs()
+            self._update_trig_enabled()
 
     # ------------------------------------------------------------ таблицы калибровки (CSV)
     def table_files(self) -> list[str]:
@@ -878,9 +1023,13 @@ class PowerMeterWindow(InstrumentWindow):
         self._acal_curve = []
         run.progress.connect(self._acal_progress)
         run.point.connect(self._acal_point)
-        run.message.connect(lambda text: self._log("ACAL", text))
+        run.message.connect(self._acal_message)
         run.ended.connect(self._acal_ended)
         self._acal_ui(True)
+
+    def _acal_message(self, text: str) -> None:
+        if not sip.isdeleted(self):
+            self._log("ACAL", text)
 
     def _acal_ui(self, running: bool) -> None:
         self.acal_run.setText("■" if running else "▶")
@@ -900,6 +1049,8 @@ class PowerMeterWindow(InstrumentWindow):
 
     def _acal_ended(self, run) -> None:
         self._acal = None
+        if sip.isdeleted(self):
+            return
         self._acal_ui(False)
         result = run.result if run.state == run.DONE else None
         if result is not None and result.path is not None:
@@ -915,6 +1066,8 @@ class PowerMeterWindow(InstrumentWindow):
 
     def _on_run_ended(self, run) -> None:
         """Сценарий с этим ваттметром закончился - вернуть прибору поправку окна."""
+        if sip.isdeleted(self):
+            return
         if self.proxy in run.instruments():
             self.apply_correction()
 
@@ -927,15 +1080,20 @@ class PowerMeterWindow(InstrumentWindow):
         self._fit_height()
 
     def show_cal(self) -> None:
-        self.set_page(1, fit=False)
+        idx = self._tab_index("CAL")
+        self.set_page(idx if idx >= 0 else 0, fit=False)
         self.set_expanded(True)
 
     # ------------------------------------------------------------ индикатор
     def _on_meas(self, key: str, _value: Any) -> None:
+        if sip.isdeleted(self):
+            return
         if key.startswith("meas.") or key.startswith("trig."):
             self._refresh_readout()
 
     def _refresh_readout(self) -> None:
+        if sip.isdeleted(self):
+            return
         v = self.proxy.value
         run = self._acal
         self.readout.update_values(power=v("meas.power"), peak=v("meas.peak"), ptav=v("meas.ptav"),
@@ -947,8 +1105,9 @@ class PowerMeterWindow(InstrumentWindow):
 
     def _on_state(self, state: ConnectionState) -> None:
         super()._on_state(state)
-        if hasattr(self, "readout"):
+        if not sip.isdeleted(self) and hasattr(self, "readout"):
             self._refresh_readout()
+            self._update_trig_enabled()
 
     def toggle_trigger(self) -> None:
         """Клик по запуску в индикаторе: FREE RUN -> LEVEL -> EXT -> FREE RUN."""
@@ -989,6 +1148,8 @@ class PowerMeterWindow(InstrumentWindow):
 
     def apply_correction(self) -> None:
         """Записать итоговую поправку в прибор (offset), если она изменилась."""
+        if sip.isdeleted(self):
+            return
         if self.duty_src.value in ("CH1", "CH2"):
             self.duty.setReadOnly(True)
             duty = self.duty_value()
@@ -1031,13 +1192,15 @@ class PowerMeterWindow(InstrumentWindow):
             + "a new generator frequency (GEN, or VNA in CW) is set on the sensor.\nClick - on / off")
 
     def _relink(self) -> None:
+        if sip.isdeleted(self):
+            return
         sdg = COORD.find("function_generator") if self.duty_src.value in ("CH1", "CH2") else None
         if sdg is self._sdg:
             return
-        if self._sdg is not None:
+        if self._sdg is not None and not sip.isdeleted(self._sdg):
             try:
                 self._sdg.param_updated.disconnect(self._on_sdg_param)
-            except TypeError:
+            except (TypeError, RuntimeError):
                 pass
         self._sdg = sdg
         if sdg is not None:
@@ -1045,19 +1208,32 @@ class PowerMeterWindow(InstrumentWindow):
         self.apply_correction()
 
     def _on_sdg_param(self, key: str, _value: Any) -> None:
-        if key.endswith(".duty"):
+        if not sip.isdeleted(self) and key.endswith(".duty"):
             self.apply_correction()
 
-    def closeEvent(self, event):  # noqa: N802 - Qt
-        for signal, slot in ((COORD.links.changed, self._relink), (COORD.run_ended, self._on_run_ended)):
+    def cleanup(self) -> None:
+        if self._acal is not None:
+            for sig, slot in ((self._acal.progress, self._acal_progress), (self._acal.point, self._acal_point),
+                              (self._acal.message, self._acal_message), (self._acal.ended, self._acal_ended)):
+                try:
+                    sig.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
+            self._acal = None
+        for signal, slot in ((COORD.links.changed, self._relink), (COORD.run_ended, self._on_run_ended),
+                             (COORD.follow.changed, self._show_follow)):
             try:
                 signal.disconnect(slot)
-            except TypeError:
+            except (TypeError, RuntimeError):
                 pass
-        if self._sdg is not None:
+        if self._sdg is not None and not sip.isdeleted(self._sdg):
             try:
                 self._sdg.param_updated.disconnect(self._on_sdg_param)
-            except TypeError:
+            except (TypeError, RuntimeError):
                 pass
-            self._sdg = None
+        self._sdg = None
+        super().cleanup()
+
+    def closeEvent(self, event):  # noqa: N802 - Qt
+        # Не вызывать cleanup() при скрытии окна из MainWindow — окно переиспользуется при повторном открытии.
         super().closeEvent(event)

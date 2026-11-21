@@ -136,7 +136,7 @@ def test_rules_edit_save_and_errors(qtbot, psu):
 
 def test_off_all_and_tabs(qtbot, psu):
     proxy, win, _s = psu
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["PROT", "OUT", "RULES"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["PROT", "OUT", "RULES", "SET"]
     for n in (2, 3):
         proxy.set(f"ch{n}.output", True)
     _wait(qtbot, proxy, "ch3.output", lambda v: v is True)

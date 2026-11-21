@@ -77,15 +77,22 @@ class Step:
 
     def start(self, done: Callable[[Any], None], fail: Callable[[str], None]) -> None:
         self._done, self._fail, self.active = done, fail, True
-        if self.timeout_s:
-            self._timer = QTimer()
-            self._timer.setSingleShot(True)
-            self._timer.timeout.connect(lambda: self.fail(f"{self.describe()}: no reply in {self.timeout_s:g} s"))
-            self._timer.start(int(self.timeout_s * 1000))
         try:
+            if self.timeout_s is not None:
+                import math
+                t = float(self.timeout_s)
+                if not math.isfinite(t) or t < 0:
+                    raise ScenarioError(f"{self.describe()}: invalid timeout {self.timeout_s!r}")
+                self._timer = QTimer()
+                self._timer.setSingleShot(True)
+                self._timer.timeout.connect(lambda: self.fail(f"{self.describe()}: no reply in {t:g} s"))
+                self._timer.start(int(t * 1000))
             self.begin()
         except ScenarioError as exc:
             self.fail(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.cancel()
+            raise exc
 
     def begin(self) -> None:
         raise NotImplementedError
@@ -123,7 +130,11 @@ class Step:
 class SleepStep(Step):
     def __init__(self, seconds: float):
         super().__init__()
-        self.seconds = max(0.0, float(seconds))
+        import math
+        s = float(seconds)
+        if not math.isfinite(s):
+            raise ScenarioError(f"invalid sleep duration: {seconds!r}")
+        self.seconds = max(0.0, s)
 
     def describe(self) -> str:
         return f"pause {self.seconds:g} s"
@@ -138,6 +149,7 @@ class SleepStep(Step):
         sleep = getattr(self, "_sleep", None)
         if sleep is not None:
             sleep.stop()
+            self._sleep = None
         super().cancel()
 
 
@@ -147,6 +159,9 @@ class AllStep(Step):
     def __init__(self, steps: Iterable[Step]):
         super().__init__()
         self.steps = list(steps)
+        for s in self.steps:
+            if not isinstance(s, Step):
+                raise ScenarioError(f"AllStep: not a Step: {s!r}")
 
     def describe(self) -> str:
         return " + ".join(s.describe() for s in self.steps)
@@ -309,11 +324,15 @@ class ActionStep(DeviceStep):
         if self.name not in self.proxy.actions:
             raise ScenarioError(f"{self.device.name}: no action {self.name}")
         self.connect(self.proxy.action_done, self._on_done)
+        self.connect(self.proxy.comm_error, self._on_comm_error)
         self.proxy.action(self.name, *self.args)
 
     def _on_done(self, name: str, result: Any) -> None:
         if name == self.name:
             self.finish(result)
+
+    def _on_comm_error(self, message: str) -> None:
+        self.fail(f"{self.describe()}: {message or 'action error'}")
 
 
 # ===================================================================== прибор
@@ -561,7 +580,11 @@ class Run(QObject):
             self._end(self.FAILED, f"{type(e).__name__}: {e}")
             return
         if isinstance(step, (tuple, list)):
-            step = AllStep(step)
+            try:
+                step = AllStep(step)
+            except ScenarioError as exc:
+                self._interrupt(exc)
+                return
         if step is None:
             self._schedule()
             return
@@ -569,7 +592,12 @@ class Run(QObject):
             self._interrupt(ScenarioError(f"{self.name}: not a step: {step!r}"))
             return
         self._step = step
-        step.start(lambda v, s=step: self._step_done(s, v), lambda m, s=step: self._step_failed(s, m))
+        try:
+            step.start(lambda v, s=step: self._step_done(s, v), lambda m, s=step: self._step_failed(s, m))
+        except Exception as exc:  # noqa: BLE001 - никогда не оставлять приборы заблокированными
+            log.exception("%s: ошибка запуска шага", self.name)
+            self._cancel_step()
+            self._end(self.FAILED, f"{type(exc).__name__}: {exc}")
 
     def _step_done(self, step: Step, value: Any) -> None:
         if step is self._step:

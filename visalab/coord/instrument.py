@@ -68,10 +68,15 @@ class Instrument(QObject):
         self.capabilities: frozenset[str] = proxy.capabilities
         self._subs: dict[str, list[Callable]] = defaultdict(list)
         self._status_subs: dict[str, list[Callable]] = defaultdict(list)
+        self._conns: list[tuple[Any, Any]] = []
         for name in self._FORWARDED:
-            getattr(proxy, name).connect(getattr(self, name))
+            sig, slot = getattr(proxy, name), getattr(self, name)
+            sig.connect(slot)
+            self._conns.append((sig, slot))
         proxy.param_updated.connect(self._on_value)
         proxy.param_status.connect(self._on_status)
+        self._conns.append((proxy.param_updated, self._on_value))
+        self._conns.append((proxy.param_status, self._on_status))
 
     def __repr__(self) -> str:
         return f"<Instrument {self.name} {self.address}>"
@@ -111,6 +116,24 @@ class Instrument(QObject):
         self._subs[key].append(on_value)
         if on_status:
             self._status_subs[key].append(on_status)
+
+    def unsubscribe(self, key: str, on_value: Callable[[Any], None] | None = None,
+                    on_status: Callable[[PStatus, str], None] | None = None) -> None:
+        if on_value is not None and key in self._subs:
+            self._subs[key] = [cb for cb in self._subs[key] if cb != on_value]
+        if on_status is not None and key in self._status_subs:
+            self._status_subs[key] = [cb for cb in self._status_subs[key] if cb != on_status]
+
+    def detach(self) -> None:
+        """Отключиться от нижнего прокси и очистить подписки окон (при закрытии / переподключении)."""
+        for sig, slot in self._conns:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._conns.clear()
+        self._subs.clear()
+        self._status_subs.clear()
 
     # ------------------------------------------------------------ арбитраж
     def holder(self):
@@ -185,15 +208,32 @@ class Instrument(QObject):
         if self._owner is not None:
             self._owner.close_instrument(self, timeout_ms)
         else:
+            self.detach()
             self._proxy.shutdown(timeout_ms)
 
     # ------------------------------------------------------------ события прибора
     def _on_value(self, key: str, value: Any) -> None:
-        for cb in self._subs.get(key, ()):
-            cb(value)
+        dead: list[Callable] = []
+        for cb in list(self._subs.get(key, ())):
+            try:
+                cb(value)
+            except RuntimeError:
+                dead.append(cb)
+            except Exception:  # noqa: BLE001
+                log.exception("%s: ошибка в подписчике %s", self.name, key)
+        if dead and key in self._subs:
+            self._subs[key] = [cb for cb in self._subs[key] if cb not in dead]
         self.param_updated.emit(key, value)
 
     def _on_status(self, key: str, status: PStatus, message: str) -> None:
-        for cb in self._status_subs.get(key, ()):
-            cb(status, message)
+        dead: list[Callable] = []
+        for cb in list(self._status_subs.get(key, ())):
+            try:
+                cb(status, message)
+            except RuntimeError:
+                dead.append(cb)
+            except Exception:  # noqa: BLE001
+                log.exception("%s: ошибка в подписчике статуса %s", self.name, key)
+        if dead and key in self._status_subs:
+            self._status_subs[key] = [cb for cb in self._status_subs[key] if cb not in dead]
         self.param_status.emit(key, status, message)

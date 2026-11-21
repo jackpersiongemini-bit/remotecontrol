@@ -22,14 +22,22 @@ SI_PREFIXES = {
 }
 
 #: Единицы, которые приборы дописывают к числам в ответах (сравнение без учёта регистра).
-_KNOWN_UNITS = ("VRMS", "VPP", "DBM", "OHM", "HZ", "V", "A", "W", "S", "%", "°", "PPM")
+_KNOWN_UNITS = ("VRMS", "VPP", "DBM", "OHM", "DEG", "RAD", "HZ", "DB", "V", "A", "W", "S", "%", "°", "PPM")
+
+#: Единицы, к которым SI-префиксы (m, k, M...) не добавляются.
+_NO_PREFIX_UNITS = frozenset(("%", "°", "deg", "dBm", "dB", "div"))
+
+#: Верхнерегистровые SCPI-префиксы (когда прибор пишет всё КАПСОМ: 50MV, 100US, 10NS, 5MHZ).
+_SCPI_UPPER_PREFIXES = {"P": 1e-12, "N": 1e-9, "U": 1e-6, "K": 1e3, "G": 1e9}
+_SCPI_MEGA_UNITS = frozenset(("HZ", "OHM"))
 
 
 def parse_number(text: str) -> float:
     """Преобразует ответ прибора в float.
 
     Понимает экспоненциальную запись и единицы/префиксы: ``"100HZ"``, ``"2.4e-07S"``,
-    ``"30mA"``, ``"1.5 kHz"``, ``" 4V "``. Бросает ``ValueError`` при мусоре.
+    ``"30mA"``, ``"50MV"``, ``"100NS"``, ``"1.5 kHz"``, ``" 4V "``. Бросает ``ValueError`` при мусоре
+    или переполнении (``NaN``/``Inf``).
     """
     if text is None:
         raise ValueError("пустое значение")
@@ -37,20 +45,37 @@ def parse_number(text: str) -> float:
     if not m:
         raise ValueError(f"не число: {text!r}")
     value = float(m.group(1))
-    suffix = m.group(2)
-    if not suffix:
+    orig_suffix = m.group(2)
+    if not orig_suffix:
+        if not math.isfinite(value):
+            raise ValueError(f"неконечное число: {text!r}")
         return value
+    suffix = orig_suffix
     up = suffix.upper()
+    matched_unit = ""
     for unit in _KNOWN_UNITS:
         if up.endswith(unit):
+            matched_unit = unit
             suffix = suffix[: len(suffix) - len(unit)]
             break
-    if suffix in SI_PREFIXES:
-        return value * SI_PREFIXES[suffix]
-    # SCPI-форма "MA"/"MV" (верхний регистр) означает милли, "MHZ" - мега.
-    if suffix == "M" and up.endswith("HZ"):
-        return value * 1e6
-    raise ValueError(f"неизвестный суффикс {m.group(2)!r} в {text!r}")
+    # SCPI-ответ в верхнем регистре: "50MV"/"30MA"/"10MS" - милли, "10MHZ"/"1MOHM" - мега, "100US"/"50NS" - микро/нано.
+    if matched_unit and orig_suffix == up:
+        if suffix == "":
+            scale = 1.0
+        elif suffix == "M":
+            scale = 1e6 if matched_unit in _SCPI_MEGA_UNITS else 1e-3
+        elif suffix in _SCPI_UPPER_PREFIXES:
+            scale = _SCPI_UPPER_PREFIXES[suffix]
+        else:
+            raise ValueError(f"неизвестный суффикс {orig_suffix!r} в {text!r}")
+    elif suffix in SI_PREFIXES:
+        scale = SI_PREFIXES[suffix]
+    else:
+        raise ValueError(f"неизвестный суффикс {orig_suffix!r} в {text!r}")
+    res = value * scale
+    if not math.isfinite(res):
+        raise ValueError(f"переполнение числа: {text!r}")
+    return res
 
 
 def format_number(value: float) -> str:
@@ -86,7 +111,9 @@ def si_format(value: float | None, unit: str = "", digits: int = 6) -> str:
     if value is None:
         return ""
     value = float(value)
-    if not unit or unit in ("%", "°") or value == 0:
+    if not math.isfinite(value):
+        return f"{value}{(' ' + unit) if unit else ''}"
+    if not unit or unit in _NO_PREFIX_UNITS or value == 0:
         return f"{value:.{digits}g}{(' ' + unit) if unit else ''}"
     power = int(math.floor(math.log10(abs(value)) / 3))
     power = max(-4, min(3, power))
@@ -107,4 +134,7 @@ def si_parse(text: str, unit: str = "") -> float:
         suffix = "µ"
     if suffix not in SI_PREFIXES:
         raise ValueError(f"неизвестный префикс {suffix!r}")
-    return value * SI_PREFIXES[suffix]
+    res = value * SI_PREFIXES[suffix]
+    if not math.isfinite(res):
+        raise ValueError(f"неконечное число: {text!r}")
+    return res

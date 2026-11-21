@@ -34,8 +34,8 @@ from ..core.trace import Trace
 from .instrument_window import WINDOW_EVENTS, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
-from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR, UI_COLOR_TEXT,
-                    UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
+from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
+                    UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, render_qss)
 from .window import CustomFullButton, Window, mark_growing, short_address
 
 __all__ = ["MainWindow", "InstrumentTile", "LivePanel", "ScenarioChip", "PowerTable", "LAYOUT_MODES"]
@@ -126,7 +126,7 @@ class InstrumentTile(IndicatorButton):
         p = QPainter(self)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         if self.window_open:                  # окно открыто - индикатор (при ошибке - красная полоса)
-            paint_indicator(p, rect, UI_COLOR_ERROR if self.error else UI_COLOR_TEXT_MUTED)
+            paint_indicator(p, rect, UI_COLOR_ERROR if self.error else UI_COLOR_INDICATOR)
         if self.error:                        # ошибка - красная рамка поверх
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(QPen(QColor(UI_COLOR_ERROR), 1.5))
@@ -418,7 +418,7 @@ class LivePanel(Panel):
         self._use_plots(1)
         plot.set_traces([("", tr)] if isinstance(tr, Trace) else [])
         present = bool(a.signal)
-        if present and a.level is not None and isinstance(tr, Trace):
+        if present and a.level is not None and isinstance(tr, Trace) and len(tr) > 0:
             x, _y = tr.peak()
             plot.set_marker(x, a.level)
         else:
@@ -618,6 +618,9 @@ class MainWindow(Window):
         return f"{self.monitor.name(proxy)}:{proxy.address}"
 
     def _rebuild(self) -> None:
+        if sip.isdeleted(self):
+            return
+        self._save_splitters()
         proxies = self.monitor.proxies()
         for p in [p for p in self.tiles if p not in proxies]:
             self.tiles.pop(p).deleteLater()
@@ -652,6 +655,8 @@ class MainWindow(Window):
 
     # ------------------------------------------------------------ обновление
     def _on_changed(self, proxy) -> None:
+        if sip.isdeleted(self):
+            return
         self._update_tile(proxy)
         panel = self.panels.get(proxy)
         if panel is None:
@@ -705,6 +710,8 @@ class MainWindow(Window):
         tile.show_state(name, window_open, errors or lost, "\n".join(tip))
 
     def _on_runs(self, *_args) -> None:
+        if sip.isdeleted(self):
+            return
         self.scenario_chip.show_runs(self.coord.runs())
 
     def _open_scenario(self) -> None:
@@ -800,18 +807,18 @@ class MainWindow(Window):
     def _should_show(self, proxy) -> bool:
         return self._is_eligible(proxy) and self._panel_key(proxy) not in self.hidden_panels
 
-    def _splitter_key(self, tag: str) -> str:
-        return f"{self.SETTINGS_GROUP}/SPLITTER_SIZES/{self.layout_mode}/{tag}"
+    def _splitter_key(self, tag: str, count: int) -> str:
+        return f"{self.SETTINGS_GROUP}/SPLITTER_SIZES/{self.layout_mode}/{tag}_{count}"
 
     def _save_splitters(self) -> None:
         for tag, sp in self._splitters:
             if not sip.isdeleted(sp):
                 sizes = sp.sizes()
-                if any(sizes):
-                    self.settings.setValue(self._splitter_key(tag), json.dumps(sizes))
+                if len(sizes) > 1 and any(sizes):
+                    self.settings.setValue(self._splitter_key(tag, len(sizes)), json.dumps(sizes))
 
     def _restore_splitter(self, tag: str, sp: QSplitter) -> None:
-        raw = self.settings.value(self._splitter_key(tag), "", type=str)
+        raw = self.settings.value(self._splitter_key(tag, sp.count()), "", type=str)
         try:
             sizes = json.loads(raw) if raw else []
         except (TypeError, ValueError):
@@ -942,6 +949,20 @@ class MainWindow(Window):
         w.raise_()
         w.activateWindow()
 
+    def cleanup(self) -> None:
+        self._refresh_timer.stop()
+        self._dirty_panels.clear()
+        self.monitor.stop()
+        try:
+            WINDOW_EVENTS.changed.disconnect(self._update_tile)
+        except (TypeError, RuntimeError):
+            pass
+        for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):
+            try:
+                sig.disconnect(self._on_runs)
+            except (TypeError, RuntimeError):
+                pass
+
     def closeEvent(self, event):  # noqa: N802 - Qt
         self._refresh_timer.stop()
         self._dirty_panels.clear()
@@ -951,14 +972,5 @@ class MainWindow(Window):
                 fn()
         super().closeEvent(event)
         if self.quit_on_close:
-            self.monitor.stop()
-            try:
-                WINDOW_EVENTS.changed.disconnect(self._update_tile)
-            except TypeError:
-                pass
-            for sig in (self.coord.run_started, self.coord.run_progress, self.coord.run_ended):
-                try:
-                    sig.disconnect(self._on_runs)
-                except TypeError:
-                    pass
+            self.cleanup()
             QApplication.quit()

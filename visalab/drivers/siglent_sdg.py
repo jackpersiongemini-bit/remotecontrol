@@ -292,6 +292,7 @@ class SiglentSDG(VISAInstrument):
             try:
                 out[key] = spec.from_scpi(raw)
             except ValueError:
+                self._read_failed.add(key)
                 self.param_status.emit(key, PStatus.ERROR, f"ответ не распознан: {raw!r}")
 
         if cmd == "BSWV":
@@ -303,8 +304,7 @@ class SiglentSDG(VISAInstrument):
             put(f"{ch}.load", pairs.get("LOAD"))
             put(f"{ch}.polarity", pairs.get("PLRT"))
         elif cmd == "MDWV":
-            state = pairs.get("STATE", "OFF")
-            out[f"{ch}.mod_state"] = parse_bool(state)
+            put(f"{ch}.mod_state", pairs.get("STATE", "OFF"))
             mod_type = next((p for p in prefixes if p in MOD_TYPES), None)
             if mod_type:
                 out[f"{ch}.mod_type"] = mod_type
@@ -317,7 +317,7 @@ class SiglentSDG(VISAInstrument):
                 out[f"{ch}.mod_type"] = self._values[f"{ch}.mod_type"]  # тип известен с прошлого раза
         elif cmd in ("SWWV", "BTWV"):
             prefix = "sweep" if cmd == "SWWV" else "burst"
-            out[f"{ch}.{prefix}_state"] = parse_bool(pairs.get("STATE", "OFF"))
+            put(f"{ch}.{prefix}_state", pairs.get("STATE", "OFF"))
             table = self._SWWV if cmd == "SWWV" else self._BTWV
             for suffix, *_rest in table:
                 put(f"{ch}.{suffix}", pairs.get(_rest[3]))
@@ -328,10 +328,25 @@ class SiglentSDG(VISAInstrument):
     def read_error_queue(self) -> list[tuple[int, str]]:
         if not self.model.has_cmr:
             return []      # базовый класс расшифрует биты *ESR?
-        code = int(parse_number(self.query("CMR?").split()[-1]))   # "CMR 0"
+        tokens = self.query("CMR?").split()
+        if not tokens:
+            return []
+        try:
+            code = int(parse_number(tokens[-1]))   # "CMR 0"
+        except ValueError:
+            return [(-1, " ".join(tokens))]
         return [(code, CMR_MESSAGES.get(code, f"CMR {code}"))] if code else []
 
     def run_custom_action(self, name: str, args: tuple) -> Any:
+        if name == "reset":
+            for ch in range(1, self.model.channels + 1):
+                self._values.pop(f"ch{ch}.mod_type", None)
+            old = self.transport.timeout_ms
+            self.transport.timeout_ms = max(old, 10000)
+            try:
+                return super().run_custom_action(name, args)
+            finally:
+                self.transport.timeout_ms = old
         if name == "all_off":
             for ch in range(1, self.model.channels + 1):
                 self.write(f"C{ch}:OUTP OFF")

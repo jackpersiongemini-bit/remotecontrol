@@ -235,7 +235,7 @@ class KeysightPNASim(SimInstrument):
         self.on("MMEMory:DELete", self._file_del)
         self.on("MMEMory:CDIRectory", self._cdir, lambda a, g: f'"{self.cdir}"')
         self.on("CALCulate#:MARKer#:FUNCtion:EXECute", self._mk_exec)
-        self.on("CALCulate#:MARKer#:X", self._mk_x, lambda a, g: f"{self._mk(g)['x']:+.11E}")
+        self.on("CALCulate#:MARKer#:X", self._mk_x, self._mk_x_get)
         self.on("CALCulate#:MARKer:AOFF", self._mk_aoff)
         self.on("CALCulate#:MARKer#:Y", get=self._mk_y)
         self.on("CALCulate#:MARKer#[:STATe]", self._mk_state, lambda a, g: "1" if self._mk(g)["on"] else "0")
@@ -576,8 +576,15 @@ class KeysightPNASim(SimInstrument):
 
     def _mk_x(self, a, g):
         mk = self._mk(g)
+        if not mk["on"]:
+            raise SimError(-221, "Settings conflict; marker is off", ESR_EXE)
         mk["x"] = self.num(a, 0, self.F_MAX)
-        mk["on"] = True
+
+    def _mk_x_get(self, a, g):
+        mk = self._mk(g)
+        if not mk["on"]:
+            raise SimError(-221, "Settings conflict; marker is off", ESR_EXE)
+        return f"{mk['x']:+.11E}"
 
     def _mk_y(self, a, g):
         mk = self._mk(g)
@@ -592,6 +599,8 @@ class KeysightPNASim(SimInstrument):
 
     def _mk_exec(self, a, g):
         mk, ch = self._mk(g), self._ch(g)
+        if not mk["on"]:
+            raise SimError(-221, "Settings conflict; marker is off", ESR_EXE)
         data, fs = self.fdata(self._selected(ch)), self.freqs(ch)
         if len(data) == 2 * len(fs):                      # комплексный формат - по модулю
             data = [math.hypot(a, b) for a, b in zip(data[0::2], data[1::2])]

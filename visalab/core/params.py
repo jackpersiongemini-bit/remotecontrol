@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from typing import Any
 
 from .units import format_bool, format_number, parse_bool, parse_number
@@ -95,8 +96,13 @@ class Param:
         """Приводит значение к типу и проверяет диапазон. ``ValueError`` если нельзя."""
         if self.kind is Kind.FLOAT:
             v = float(value)
+            if not math.isfinite(v):
+                raise ValueError(f"{self.label}: недопустимое значение {value!r}")
         elif self.kind is Kind.INT:
-            v = int(round(float(value)))
+            fv = float(value)
+            if not math.isfinite(fv):
+                raise ValueError(f"{self.label}: недопустимое значение {value!r}")
+            v = int(round(fv))
         elif self.kind is Kind.BOOL:
             v = value if isinstance(value, bool) else parse_bool(value)
         elif self.kind is Kind.ENUM:
@@ -104,6 +110,8 @@ class Param:
             if self.choices and v not in (c.upper() for c in self.choices):
                 raise ValueError(f"{self.label}: {value!r} не из {self.choices}")
         else:
+            if value is None:
+                raise ValueError(f"{self.label}: пустое строковое значение")
             v = str(value)
         if self.kind in (Kind.FLOAT, Kind.INT):
             if self.minimum is not None and v < self.minimum:
@@ -119,7 +127,7 @@ class Param:
             return format_bool(value, *self.bool_tokens)
         if self.kind is Kind.ENUM and self.enum_map:
             token = str(value).upper()
-            return next((dev for std, dev in self.enum_map if std == token), str(value))
+            return next((dev for std, dev in self.enum_map if std.upper() == token), str(value))
         return str(value)
 
     def from_scpi(self, raw: str) -> Any:
@@ -127,7 +135,10 @@ class Param:
         if self.kind is Kind.FLOAT:
             return parse_number(raw)
         if self.kind is Kind.INT:
-            return int(round(parse_number(raw)))
+            fv = parse_number(raw)
+            if not math.isfinite(fv):
+                raise ValueError(f"{self.label}: недопустимое значение {raw!r}")
+            return int(round(fv))
         if self.kind is Kind.BOOL:
             return parse_bool(raw)
         if self.kind is Kind.ENUM:

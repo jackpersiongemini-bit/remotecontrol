@@ -62,6 +62,16 @@ def _pyvisa_version() -> str:
         return "-"
 
 
+class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler, не падающий с PermissionError, если файл лога открыт другим процессом на Windows."""
+
+    def doRollover(self) -> None:  # noqa: N802 - logging
+        try:
+            super().doRollover()
+        except PermissionError:
+            pass
+
+
 def setup_logging(path: str | Path | None, level: int = logging.INFO) -> logging.Handler | None:
     """Консоль + файл ``path`` (None - только консоль). Возвращает обработчик файла (закрыть -
     ``close_logging``) или None, если файл не открылся (нет прав и т.п.: программа работает и так)."""
@@ -72,15 +82,14 @@ def setup_logging(path: str | Path | None, level: int = logging.INFO) -> logging
         root.setLevel(level)
     if not path:
         return None
-    path = Path(path).resolve()
-    for h in root.handlers:
-        if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == path:
-            return h
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.handlers.RotatingFileHandler(path, maxBytes=MAX_BYTES, backupCount=BACKUPS,
-                                                       encoding="utf-8")
-    except OSError as exc:
+        resolved = Path(path).resolve()
+        for h in root.handlers:
+            if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == resolved:
+                return h
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        handler = _SafeRotatingFileHandler(resolved, maxBytes=MAX_BYTES, backupCount=BACKUPS, encoding="utf-8")
+    except (OSError, RuntimeError) as exc:
         logging.getLogger("visalab").warning("журнал в файл не открыт (%s): %s", path, exc)
         return None
     handler.setFormatter(logging.Formatter(FORMAT))

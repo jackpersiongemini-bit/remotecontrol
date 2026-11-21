@@ -44,10 +44,14 @@ def test_interpolate():
 
 def test_layout_and_readout(qtbot, pm):
     proxy, win, _s = pm
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "CAL", "TIME"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "TRIG", "CAL", "TIME", "SET"]
     avg = next(ln for ln in win.pages[0].lines if ln.name == "AVG")       # усреднение - одной строкой
     assert [w.key for w in avg.widgets] == ["avg.state", "avg.count", "avg.auto"]
     assert not any(ln.name in ("ACNT", "AAUT") for ln in win.pages[0].lines)
+    # Настройки запуска и строба (Gate) - на отдельной вкладке TRIG
+    trig_names = [ln.name for ln in win.pages[1].lines]
+    for expected in ("SRC", "LVL", "SLOP", "DLY", "HOLD", "GSTR", "GLEN", "RUN"):
+        assert expected in trig_names
     assert len(win.preset_panel.table.lines) == 1 and win.preset_panel.table.lines[0].widgets == [win.readout, win.plot]
     qtbot.waitUntil(lambda: proxy.value("meas.power") is not None, timeout=5000)
     qtbot.waitUntil(lambda: win.readout.main.text() == f"{proxy.value('meas.power'):.2f}", timeout=5000)
@@ -70,9 +74,13 @@ def test_layout_and_readout(qtbot, pm):
 def test_trigger_toggle_from_readout(qtbot, pm):
     proxy, win, _s = pm
     _wait(qtbot, proxy, "trig.source", lambda v: v == "IMM")
+    assert not win.tabs.is_on(1)
+    assert not win.widgets["trig.slope"].isEnabled()               # в FREE RUN фронт недоступен (-221)
     win.readout.trig_button.click()
     _wait(qtbot, proxy, "trig.source", lambda v: v == "INT")
     qtbot.waitUntil(lambda: win.readout.trig_button.text().startswith("LEVEL"), timeout=5000)
+    qtbot.waitUntil(lambda: win.tabs.is_on(1), timeout=5000)       # вкладка TRIG светится при активном запуске
+    assert win.widgets["trig.slope"].isEnabled()
     win.readout.trig_button.click()
     _wait(qtbot, proxy, "trig.source", lambda v: v == "EXT")       # внешний запуск: ждём импульс на TRIG IN
     qtbot.waitUntil(lambda: win.readout.trig_button.text() == "EXT · WAIT", timeout=5000)
@@ -85,6 +93,7 @@ def test_trigger_toggle_from_readout(qtbot, pm):
     assert before is None or before != pytest.approx(-3.0, abs=0.05)
     win.readout.trig_button.click()
     _wait(qtbot, proxy, "trig.source", lambda v: v == "IMM")
+    qtbot.waitUntil(lambda: not win.tabs.is_on(1), timeout=5000)
 
 
 def test_correction_written_as_offset(qtbot, pm):
@@ -182,13 +191,13 @@ def test_time_domain_trace(qtbot, pm):
     t = win.plot.trace
     assert len(t) == 1000 and t.x_unit == "s"
     assert max(t.y) == pytest.approx(-10.0, abs=0.01)    # импульс симулятора -10 dBm
-    qtbot.waitUntil(lambda: win.tabs.is_on(2), timeout=5000)
+    qtbot.waitUntil(lambda: win.tabs.is_on(3), timeout=5000)
     assert not win.plot.isHidden() and win.readout.isHidden()          # график вместо индикатора
     win.plot.resize(400, 200)
     win.plot.grab()                                     # отрисовка без ошибок
     proxy.set("detector", "AVERAGE")                    # трасса только в NORMAL - выключается
     _wait(qtbot, proxy, "trace.state", lambda v: v is False)
-    qtbot.waitUntil(lambda: win.plot.trace is None and not win.tabs.is_on(2), timeout=5000)
+    qtbot.waitUntil(lambda: win.plot.trace is None and not win.tabs.is_on(3), timeout=5000)
     assert win.plot.isHidden() and not win.readout.isHidden()
 
 def test_pm_launcher_with_sdg(qtbot, tmp_path, monkeypatch):
@@ -223,7 +232,7 @@ def test_time_plot_grows_with_window(qtbot, pm):
     qtbot.wait(20)
     assert win.plot.height() == h + 120                         # лишняя высота - графику
     win.set_expanded(True)
-    win.set_page(1)                                             # CAL: два графика делят высоту
+    win.set_page(2)                                             # CAL: два графика делят высоту
     qtbot.wait(20)
     cal = win.cal_plot.height()
     win.resize(win.width(), win.height() + 100)
@@ -235,8 +244,8 @@ def test_time_scale_units_and_det_on_main(qtbot, pm):
     """DET - на MAIN, не в TIME; шкала TIME: AUTO / MAN, dBm / W, REF и DIV (Алексей 2026-11-14)."""
     proxy, win, settings = pm
     names = lambda page: [ln.name for ln in win.pages[page].lines]          # noqa: E731
-    assert "DET" in names(0) and "DET" not in names(2)
-    assert names(2)[-3:] == ["SCAL", "REF", "DIV"]
+    assert "DET" in names(0) and "DET" not in names(3)
+    assert names(3)[-3:] == ["SCAL", "REF", "DIV"]
     proxy.set("trace.state", True)
     _wait(qtbot, proxy, "trace.state", lambda v: v is True)
     qtbot.waitUntil(lambda: win.plot.trace is not None, timeout=5000)

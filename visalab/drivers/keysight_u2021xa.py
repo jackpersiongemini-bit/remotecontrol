@@ -26,10 +26,11 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .base import VISAInstrument
-from ..core.params import Action, Kind, Param
+from ..core.params import Action, ConnectionState, Kind, Param
 from ..core.trace import Trace
 from ..profiles import POWER_METER
 
@@ -73,15 +74,17 @@ class KeysightU2021XA(VISAInstrument):
             Param("trig.source", "Запуск", E, section=trig, query="TRIG:SOUR?", write="TRIG:SOUR {value}",
                   choices=("IMM", "INT", "EXT", "BUS", "HOLD"),
                   labels=("Свободный", "По уровню", "Внешний", "Программный", "Удержание"),
-                  enum_map=(("INT", "INT"), ("INT", "INT1"), ("EXT", "EXT"), ("IMM", "IMM")),
-                  also_read=("detector",)),
+                  enum_map=(("INT", "INT"), ("INT", "INT1"), ("INT", "INTERNAL"),
+                            ("EXT", "EXT"), ("EXT", "EXTERNAL"), ("IMM", "IMM"), ("IMM", "IMMEDIATE")),
+                  also_read=("detector", "trig.level", "trig.level_auto", "trig.slope")),
             Param("trig.level", "Уровень запуска", F, "dBm", section=trig, query="TRIG:LEV?",
                   write="TRIG:LEV {value}", minimum=-40.0, maximum=20.0, tolerance=1e-3,
                   also_read=("trig.level_auto",)),
             Param("trig.level_auto", "Уровень авто", B, section=trig, query="TRIG:LEV:AUTO?",
-                  write="TRIG:LEV:AUTO {value}"),
+                  write="TRIG:LEV:AUTO {value}", also_read=("trig.level",)),
             Param("trig.slope", "Фронт", E, section=trig, query="TRIG:SLOP?", write="TRIG:SLOP {value}",
-                  choices=("POS", "NEG"), labels=("Нарастающий", "Спадающий")),
+                  choices=("POS", "NEG"), labels=("Нарастающий", "Спадающий"),
+                  enum_map=(("POS", "POS"), ("POS", "POSITIVE"), ("NEG", "NEG"), ("NEG", "NEGATIVE"))),
             Param("trig.delay", "Задержка", F, "s", section=trig, query="TRIG:DEL?",
                   write="TRIG:DEL {value}", minimum=-1.0, maximum=1.0, tolerance=1e-4),
             Param("trig.holdoff", "Блокировка", F, "s", section=trig, query="TRIG:HOLD?",
@@ -102,7 +105,7 @@ class KeysightU2021XA(VISAInstrument):
                   enum_map=(("AVERAGE", "AVER"), ("NORMAL", "NORM")),
                   also_read=("trig.source", "trig.delay", *RESULT_KEYS)),
             Param("video_bw", "Видеополоса", E, section=sens, query="BAND:VID?", write="BAND:VID {value}",
-                  choices=("OFF", "LOW", "MED", "HIGH")),
+                  choices=("OFF", "LOW", "MED", "HIGH"), enum_map=(("MED", "MED"), ("MED", "MEDIUM"))),
             Param("avg.state", "Усреднение", B, section=sens, query="AVER?", write="AVER {value}"),
             Param("avg.count", "Число усреднений", I, section=sens, query="AVER:COUN?",
                   write="AVER:COUN {value}", minimum=1, maximum=1024, also_read=("avg.auto",)),
@@ -128,13 +131,21 @@ class KeysightU2021XA(VISAInstrument):
     def on_connected(self) -> None:
         self._armed = False
         self._results = dict.fromkeys(RESULT_KEYS)
+        self.write("INIT:CONT OFF")
+        self.write("ABOR")
         for n in FEEDS:
             self.write(f"UNIT{n}:POW DBM")
         self.write("TRAC:UNIT DBM")
         det = "NORMAL" if self.query("DET:FUNC?").strip().upper().startswith("NORM") else "AVERAGE"
         src = self._params["trig.source"].from_scpi(self.query("TRIG:SOUR?"))
+        self._values["detector"] = det
+        self._values["trig.source"] = src
         self._configure_feeds(det, src)
         self.opc_latched = False
+
+    def on_closed(self) -> None:
+        self._armed = False
+        self._results = dict.fromkeys(RESULT_KEYS)
 
     def on_disconnecting(self) -> None:
         if self._armed:
@@ -163,38 +174,57 @@ class KeysightU2021XA(VISAInstrument):
     def _free_run(self) -> bool:
         return self._values.get("trig.source", "IMM") == "IMM"
 
+    def _stop_acquisition(self) -> tuple[bool, bool]:
+        """Остановить измерение перед записью настройки: (было взведено, был INIT:CONT ON)."""
+        was_armed = self._armed
+        was_cont_free = self._free_run and self._continuous and not self._tracing
+        if was_cont_free:
+            self.write("INIT:CONT OFF")
+        if was_armed or was_cont_free:
+            self.write("ABOR")
+            self._set_armed(False)
+        return was_armed, was_cont_free
+
     def write_param(self, spec: Param, value: Any) -> None:
         key = spec.key
         if key == "meas.continuous":
             self._continuous = bool(value)
             self._apply_run_mode()
             return
-        was_armed = self._armed
-        self._abort()                            # настройки меняем при остановленном измерении
+        was_armed, was_cont_free = self._stop_acquisition()   # настройки меняем при остановленном измерении
         if key in ("trig.source", "detector"):
             self._change_mode(spec, value)
             return
         if key == "trace.state":
             self._set_tracing(bool(value))
             return
-        super().write_param(spec, value)
-        if was_armed:
-            self._arm()
+        try:
+            if key == "trig.level":
+                self.write("TRIG:LEV:AUTO OFF")               # ручной уровень не должен конфликтовать с AUTO
+            super().write_param(spec, value)
+        finally:
+            if was_cont_free:
+                self._apply_run_mode()
+            elif was_armed:
+                self._arm()
 
     def _set_tracing(self, on: bool) -> None:
         """Трасса требует DET NORM и INIT:CONT OFF: режим датчика переключается сам."""
-        if on and not self._normal:
-            self._change_mode(self._params["detector"], "NORMAL")
-            self._publish("detector", "NORMAL")
-        self.write("INIT:CONT OFF")
-        super().write_param(self._params["trace.state"], on)
-        self._values["trace.state"] = on
-        if not on:
-            self._results["trace"] = None
-            self._publish("trace", None)
-        self._apply_run_mode()
+        try:
+            if on and not self._normal:
+                self._change_mode(self._params["detector"], "NORMAL", rearm=False)
+                self._publish("detector", "NORMAL")
+            self.write("INIT:CONT OFF")
+            self._abort()
+            super().write_param(self._params["trace.state"], on)
+            self._values["trace.state"] = on
+            if not on:
+                self._results["trace"] = None
+                self._publish("trace", None)
+        finally:
+            self._apply_run_mode()
 
-    def _change_mode(self, spec: Param, value: Any) -> None:
+    def _change_mode(self, spec: Param, value: Any, rearm: bool = True) -> None:
         """Смена запуска/режима в порядке, при котором прибор не даёт -221:
         INT требует DET NORM; AVER требует запуск не INT; строб в FEED требует INT/EXT."""
         det = self._values.get("detector", "NORMAL")
@@ -205,27 +235,32 @@ class KeysightU2021XA(VISAInstrument):
         else:
             new_src = value
             new_det = "NORMAL" if value == "INT" else det
-        if src in GATED_SOURCES and new_src not in GATED_SOURCES:
-            self._configure_feeds(det, new_src)  # снять строб, пока источник ещё INT/EXT
-        if new_det == "AVERAGE" and self._tracing:   # трасса только в NORMal
-            self.write("TRAC:STAT OFF")
-            self._values["trace.state"] = False
-            self._publish("trace.state", False)
-        if spec.key == "detector" and new_src != src:
-            self.write("TRIG:SOUR IMM")
-        if spec.key == "trig.source" and new_det != det:
-            self.write("DET:FUNC NORM")
-        super().write_param(spec, value)
-        self._values["detector"], self._values["trig.source"] = new_det, new_src
-        self._configure_feeds(new_det, new_src)
-        self._results = dict.fromkeys(RESULT_KEYS)
-        self._apply_run_mode()
+        try:
+            if src in GATED_SOURCES and new_src not in GATED_SOURCES:
+                self._configure_feeds(det, new_src)  # снять строб, пока источник ещё INT/EXT
+            if new_det == "AVERAGE" and self._tracing:   # трасса только в NORMal
+                self.write("TRAC:STAT OFF")
+                self._values["trace.state"] = False
+                self._publish("trace.state", False)
+            if spec.key == "detector" and new_src != src:
+                self.write("TRIG:SOUR IMM")
+            if spec.key == "trig.source" and new_det != det:
+                self.write("DET:FUNC NORM")
+            super().write_param(spec, value)
+            self._values["detector"], self._values["trig.source"] = new_det, new_src
+            self._configure_feeds(new_det, new_src)
+            self._results = dict.fromkeys(RESULT_KEYS)
+        finally:
+            if rearm:
+                self._apply_run_mode()
 
     def read_param_raw(self, spec: Param) -> Any:
         if spec.key == "meas.continuous":
             return self._continuous
         if spec.key == "meas.armed":
             return self._armed
+        if spec.key in ("trace.time", "trace.offset") and not self._normal:
+            return None
         return super().read_param_raw(spec)
 
     def read_group(self, group: str) -> dict[str, Any]:
@@ -256,18 +291,25 @@ class KeysightU2021XA(VISAInstrument):
         if self._armed:
             self.write("ABOR")
             self._set_armed(False)
+        self._opc_pending = False
+        self.opc_latched = False
 
     def _set_armed(self, armed: bool) -> None:
         if armed != self._armed or "meas.armed" not in self._values:
             self._armed = armed
             self._publish("meas.armed", armed)
 
+    @staticmethod
+    def _clean_reading(v: float) -> float | None:
+        """SCPI-сентинелы (9.91E+37) и NaN/Inf не публикуются как валидная мощность."""
+        return v if math.isfinite(v) and abs(v) < 9.9e36 else None
+
     def _fetch(self) -> None:
         keys = RESULT_KEYS if self._normal else RESULT_KEYS[:1]
         out = dict.fromkeys(RESULT_KEYS)
         for n, (key, _) in FEEDS.items():
             if key in keys:
-                out[key] = self.query_float(f"FETC{n}?")
+                out[key] = self._clean_reading(self.query_float(f"FETC{n}?"))
         if self._tracing and self._normal:
             out["trace"] = self._read_trace()
         self._results = out
@@ -278,6 +320,7 @@ class KeysightU2021XA(VISAInstrument):
         y = self.query_float_block(f"TRAC:DATA? {TRACE_RES}")
         if not y:
             return None
+        y = [v if (math.isfinite(v) and abs(v) < 9.9e36) else math.nan for v in y]
         start = float(self._values.get("trace.offset") or 0.0)
         length = float(self._values.get("trace.time") or 100e-6)
         meta = {"trigger": self._values.get("trig.source"), "delay": self._values.get("trig.delay"),
@@ -297,12 +340,19 @@ class KeysightU2021XA(VISAInstrument):
             return
         if self.opc_done():
             self._set_armed(False)
-            self._fetch()
-            if self._continuous:
+            try:
+                self._fetch()
+            except ValueError:
+                if self._continuous and self._state is ConnectionState.CONNECTED:
+                    self._arm()
+                raise
+            if self._continuous and self._state is ConnectionState.CONNECTED:
                 self._arm()
 
     def run_custom_action(self, name: str, args: tuple) -> Any:
         if name == "single":
+            self._continuous = False
+            self._publish("meas.continuous", False)
             self._abort()
             self.write("INIT:CONT OFF")
             if self._free_run:              # IMM: измерение сразу, можно дождаться
@@ -313,14 +363,17 @@ class KeysightU2021XA(VISAInstrument):
                 self._arm()
             return None
         if name == "abort":
+            self._continuous = False
+            self._publish("meas.continuous", False)
             self._abort()
+            self.write("INIT:CONT OFF")
             self.write("ABOR")
             return None
         if name == "trigger":
             self.write("*TRG")
             return None
         if name in ("zero", "calibrate"):
-            self._abort()
+            self._stop_acquisition()
             old = self.transport.timeout_ms
             self.transport.timeout_ms = CAL_TIMEOUT_MS
             try:
@@ -328,7 +381,7 @@ class KeysightU2021XA(VISAInstrument):
                 self.query("*OPC?")
             finally:
                 self.transport.timeout_ms = old
-            self._apply_run_mode()
+                self._apply_run_mode()
             return None
         if name == "reset":
             self._abort()

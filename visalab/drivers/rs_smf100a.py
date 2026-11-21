@@ -33,6 +33,8 @@ SMF100A_MODELS = {
 }
 
 _LFO = ("LFO:FREQ {value}", "LFO:FREQ?")
+_SRC = {"enum_map": (("INT", "INT"), ("INT", "INT1"), ("INT", "INTERNAL"),
+                     ("EXT", "EXT"), ("EXT", "EXT1"), ("EXT", "EXTERNAL"))}
 
 
 class RSSMF100A(RFSignalGenerator):
@@ -43,22 +45,22 @@ class RSSMF100A(RFSignalGenerator):
         "rf.frequency": ("FREQ {value}", "FREQ?", {}),
         "rf.power": ("POW {value}", "POW?", {}),
         "rf.alc": ("POW:ALC {value}", "POW:ALC?", {"bool_tokens": ("ON", "OFF")}),
-        "ref.source": ("ROSC:SOUR {value}", "ROSC:SOUR?", {}),
+        "ref.source": ("ROSC:SOUR {value}", "ROSC:SOUR?", _SRC),
         "mod.output": ("MOD {value}", "MOD?", {}),
         "am.state": ("AM:STAT {value}", "AM:STAT?", {}),
         "am.depth": ("AM:DEPT {value}", "AM:DEPT?", {}),
-        "am.source": ("AM:SOUR {value}", "AM:SOUR?", {}),
+        "am.source": ("AM:SOUR {value}", "AM:SOUR?", _SRC),
         "am.freq": (*_LFO, {"also_read": ("fm.freq", "pm.freq")}),
         "fm.state": ("FM:STAT {value}", "FM:STAT?", {"also_read": ("pm.state",)}),
         "fm.deviation": ("FM:DEV {value}", "FM:DEV?", {}),
-        "fm.source": ("FM:SOUR {value}", "FM:SOUR?", {}),
+        "fm.source": ("FM:SOUR {value}", "FM:SOUR?", _SRC),
         "fm.freq": (*_LFO, {"also_read": ("am.freq", "pm.freq")}),
         "pm.state": ("PM:STAT {value}", "PM:STAT?", {"also_read": ("fm.state",)}),
         "pm.deviation": ("PM:DEV {value}", "PM:DEV?", {}),
-        "pm.source": ("PM:SOUR {value}", "PM:SOUR?", {}),
+        "pm.source": ("PM:SOUR {value}", "PM:SOUR?", _SRC),
         "pm.freq": (*_LFO, {"also_read": ("am.freq", "fm.freq")}),
         "pulse.state": ("PULM:STAT {value}", "PULM:STAT?", {}),
-        "pulse.source": ("PULM:SOUR {value}", "PULM:SOUR?", {}),
+        "pulse.source": ("PULM:SOUR {value}", "PULM:SOUR?", _SRC),
         "pulse.period": ("PULM:PER {value}", "PULM:PER?", {}),
         "pulse.width": ("PULM:WIDT {value}", "PULM:WIDT?", {}),
     }

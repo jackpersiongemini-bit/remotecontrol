@@ -110,13 +110,19 @@ class Coordinator(QObject):
         holding = [run for run in self._runs if any(i in run.instruments() for i in insts)]
         if holding:
             self._stop_runs(holding, CLOSE_SCENARIO_WAIT_MS)
+        alive = []
         for inst in insts:
             self.links.remove(inst)
             for key, value, who in self._forget(inst):
-                log.warning("%s: %s %s = %s не возвращено - прибор закрыт", who, inst.name, key, value)
-            inst._proxy.request_shutdown()
-        for inst in insts:
-            inst._proxy.wait_shutdown(timeout_ms)
+                name = inst.name if not sip.isdeleted(inst) else "<deleted>"
+                log.warning("%s: %s %s = %s не возвращено - прибор закрыт", who, name, key, value)
+            if not sip.isdeleted(inst):
+                inst.detach()
+                inst._proxy.request_shutdown()
+                alive.append(inst)
+        for inst in alive:
+            if not sip.isdeleted(inst):
+                inst._proxy.wait_shutdown(timeout_ms)
 
     def find(self, profile: str) -> Instrument | None:
         """Последний открытый прибор класса (``signal_generator``...) или None."""
@@ -188,7 +194,9 @@ class Coordinator(QObject):
         run = Run(scenario, devices)
         log.info("%s: start (%s)", run.name, ", ".join(f"{d.name} {d.proxy.name} {d.proxy.address}"
                                                       for d in devices.values()))
-        run.progress.connect(lambda *_a, r=run: self.run_progress.emit(r))
+        on_prog = (lambda *_a, r=run: (not sip.isdeleted(self)) and self.run_progress.emit(r))
+        run._coord_prog = on_prog
+        run.progress.connect(on_prog)
         run.ended.connect(self._on_ended)
         self._runs.append(run)
         self.run_started.emit(run)
@@ -196,6 +204,19 @@ class Coordinator(QObject):
         return run
 
     def _on_ended(self, run: Run) -> None:
+        if sip.isdeleted(self):
+            return
+        on_prog = getattr(run, "_coord_prog", None)
+        if on_prog is not None:
+            try:
+                run.progress.disconnect(on_prog)
+            except (TypeError, RuntimeError):
+                pass
+            run._coord_prog = None
+        try:
+            run.ended.disconnect(self._on_ended)
+        except (TypeError, RuntimeError):
+            pass
         if run in self._runs:
             self._runs.remove(run)
         detail = f": {run.error}" if run.error and run.error != run.state else ""
@@ -221,7 +242,7 @@ class Coordinator(QObject):
         self._deferred[inst][0].append((key, value, who))
 
     def _on_reconnected(self, inst, state) -> None:
-        if state is not ConnectionState.CONNECTED:
+        if sip.isdeleted(self) or sip.isdeleted(inst) or state is not ConnectionState.CONNECTED:
             return
         items = self._forget(inst)
         self._apply(inst, items)
@@ -229,7 +250,7 @@ class Coordinator(QObject):
     def _forget(self, inst) -> list:
         """Снять ожидание переподключения прибора; вернуть, что ждало записи."""
         items, slot = self._deferred.pop(inst, ([], None))
-        if slot is not None:
+        if slot is not None and not sip.isdeleted(inst):
             try:
                 inst.state_changed.disconnect(slot)
             except (TypeError, RuntimeError):
@@ -249,7 +270,8 @@ class Coordinator(QObject):
 
     def _stop_runs(self, runs: list[Run], wait_ms: int) -> bool:
         for run in runs:
-            run.stop()
+            if not run.stopping:                 # не вызывать stop() повторно: иначе прервёт restore() (RF OFF!)
+                run.stop()
         clean = self._wait(runs, wait_ms) if wait_ms > 0 else not any(r in self._runs for r in runs)
         for run in [r for r in runs if r in self._runs]:
             log.warning("%s: не успел вернуть приборы за %d мс - прерван", run.name, wait_ms)
@@ -266,8 +288,9 @@ class Coordinator(QObject):
         def going() -> bool:
             return bool(self._runs) if runs is None else any(r in self._runs for r in runs)
         deadline = time.monotonic() + timeout_ms / 1000.0
+        flags = QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
         while going() and time.monotonic() < deadline:
-            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
+            QCoreApplication.processEvents(flags, 50)
             time.sleep(0.005)
         return not going()
 

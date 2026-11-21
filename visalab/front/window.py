@@ -5,14 +5,17 @@
 """
 from __future__ import annotations
 
+import ctypes
 import json
+import sys
 import textwrap
 from contextlib import contextmanager
 from enum import Enum
 
-from PyQt6.QtCore import QEasingCurve, QLineF, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, pyqtProperty, pyqtSignal
+from PyQt6.QtCore import (QEasingCurve, QEvent, QLineF, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, Qt,
+                          pyqtProperty, pyqtSignal)
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QAbstractButton, QLabel, QPushButton, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QAbstractButton, QApplication, QLabel, QPushButton, QSizePolicy, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
 
 from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_CONTROL, UI_COLOR_ERROR,
@@ -91,8 +94,15 @@ class WindowBar(TitleBar):
         self.hBoxLayout.addWidget(self.minimized_button)
         self.hBoxLayout.addWidget(self.close_button)
 
-    def insert_widget(self, widget, index: int = 0) -> None:
-        self.hBoxLayout.insertWidget(index, widget)
+    def insert_widget(self, widget, index: int = 0, stretch: int = 0) -> None:
+        if stretch > 0:
+            # Убрать встроенный пустой stretch TitleBar, чтобы растягивающийся виджет
+            # (строка *IDN? прибора) занимал всё место между левыми и правыми кнопками.
+            for i in range(self.hBoxLayout.count() - 1, -1, -1):
+                item = self.hBoxLayout.itemAt(i)
+                if item is not None and item.widget() is None and item.spacerItem() is not None:
+                    self.hBoxLayout.takeAt(i)
+        self.hBoxLayout.insertWidget(index, widget, stretch)
 
     def insert_control_widget(self, widget, after_minimize: bool = False) -> None:
         """Перед «свернуть»/«закрыть» (или правее «свернуть», перед «закрыть»)."""
@@ -162,6 +172,43 @@ class Window(FramelessWindow):
         finally:
             self._fitting -= 1
 
+    def _ensure_resizable(self) -> None:
+        """Восстановить возможность изменения размера безрамочного окна.
+
+        В Qt6 + qframelesswindow на Windows вызовы setMinimumHeight / setMaximumHeight
+        и скрытие/показ окна могут сбросить флаг WS_THICKFRAME в GWL_STYLE, из-за чего
+        окно перестаёт растягиваться за края. Восстанавливаем стиль, если он пропал.
+        """
+        if hasattr(self, "setResizeEnabled"):
+            self.setResizeEnabled(True)
+        if self.isFullScreen() or self.isMaximized():
+            return
+        if sys.platform == "win32" and self.windowHandle() is not None:
+            try:
+                hwnd = int(self.winId())
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+                if not (style & 0x00040000):  # WS_THICKFRAME
+                    self.windowEffect.addWindowAnimation(self.winId())
+            except Exception:  # noqa: BLE001
+                pass
+        elif sys.platform == "darwin" and QApplication.platformName() == "cocoa":
+            try:
+                if hasattr(self, "_nsWindow") and self._nsWindow is not None:
+                    mask = self._nsWindow.styleMask()
+                    if not (mask & (1 << 3)):  # NSWindowStyleMaskResizable
+                        self._nsWindow.setStyleMask_(mask | (1 << 3))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def showEvent(self, e):  # noqa: N802 - Qt
+        super().showEvent(e)
+        self._ensure_resizable()
+
+    def changeEvent(self, e):  # noqa: N802 - Qt
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.WindowStateChange:
+            self._ensure_resizable()
+
     def fit_to(self, layout, grows: bool = False) -> None:
         """Высота окна - по содержимому ``layout``; растянуть можно всегда (Алексей 2026-11-14: «окна должны
         растягиваться»). ``grows`` - в виде есть график / журнал (``mark_growing``): окно можно и сжать до
@@ -174,11 +221,13 @@ class Window(FramelessWindow):
             self._fit_hint, self._fit_grows = hint, grows
             self.setMinimumHeight(minimum)
             self.setMaximumHeight(QWIDGETSIZE_MAX)
+            self.setMaximumWidth(QWIDGETSIZE_MAX)
             if self.isMaximized() or self.isFullScreen():
                 return
             self._fit_target = want
             if self.height() != want:
                 self.resize(self.width(), want)
+        self._ensure_resizable()
 
     def resizeEvent(self, e):  # noqa: N802 - Qt
         super().resizeEvent(e)
@@ -259,21 +308,35 @@ class StatusIndicator(WriteIndicator):
 
 
 class AddressLabel(QLabel):
-    """Что за прибор (VNA, PM...) в заголовке, адрес - в подсказке; двойной клик открывает настройки
-    подключения (Алексей 2026-11-14: по одному клику открывались случайно)."""
+    """Идентификатор прибора (*IDN? или короткое имя) в заголовке окна.
 
-    double_clicked = pyqtSignal()
+    Занимает всё оставшееся место между кнопками заголовка, не кликабельна
+    (окно можно таскать за неё) и аккуратно обрезает длинный текст многоточием.
+    """
 
     def __init__(self, text: str = "", parent=None):
-        super().__init__(text, parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._full_text = text or ""
+        super().__init__(self._full_text, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(40)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-    def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt
-        if e.button() == Qt.MouseButton.LeftButton:
-            self.double_clicked.emit()
-            e.accept()
-            return
-        super().mouseDoubleClickEvent(e)
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt
+        self._full_text = text or ""
+        self._update_elided()
+
+    def text(self) -> str:  # noqa: N802 - Qt
+        return self._full_text
+
+    def resizeEvent(self, e):  # noqa: N802 - Qt
+        super().resizeEvent(e)
+        self._update_elided()
+
+    def _update_elided(self) -> None:
+        w = self.contentsRect().width()
+        shown = (self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, w)
+                 if w > 0 else self._full_text)
+        super().setText(shown)
 
 
 # ------------------------------------------------------- кнопки-иконки

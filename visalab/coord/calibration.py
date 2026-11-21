@@ -6,25 +6,42 @@
 from __future__ import annotations
 
 import bisect
+import math
 import re
 from pathlib import Path
 
 __all__ = ["load_csv", "save_csv", "interpolate", "fit_gain_table"]
 
 
+def _collapse_duplicates(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Отсортировать по частоте, отбросить NaN/Inf и схлопнуть дубликаты частот (среднее dB)."""
+    by_freq: dict[float, list[float]] = {}
+    for f, db in points:
+        f, db = float(f), float(db)
+        if not (math.isfinite(f) and math.isfinite(db)):
+            continue
+        by_freq.setdefault(f, []).append(db)
+    return [(f, sum(vals) / len(vals)) for f, vals in sorted(by_freq.items())]
+
+
 def load_csv(path) -> list[tuple[float, float]]:
     """Таблица калибровки: строки «частота_Hz, dB» (разделитель , ; или таб; заголовок и
     строки не из двух чисел пропускаются)."""
-    points = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-        parts = [x for x in re.split(r"[,;\t ]+", line.strip()) if x]
-        if len(parts) < 2:
+    points: list[tuple[float, float]] = []
+    for line in Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = [x for x in re.split(r"[,;\t ]+", raw) if x]
+        if len(parts) != 2:
             continue
         try:
-            points.append((float(parts[0]), float(parts[1])))
+            f, db = float(parts[0]), float(parts[1])
         except ValueError:
             continue
-    return sorted(points)
+        if math.isfinite(f) and math.isfinite(db):
+            points.append((f, db))
+    return _collapse_duplicates(points)
 
 
 def save_csv(path, points) -> None:
@@ -35,7 +52,12 @@ def interpolate(table: list[tuple[float, float]], freq: float | None) -> float:
     """Поправка на частоте: линейно между точками, за краями - крайняя точка, пустая таблица - 0."""
     if not table or freq is None:
         return 0.0
-    pts = sorted(table)
+    freq = float(freq)
+    if not math.isfinite(freq):
+        return 0.0
+    pts = _collapse_duplicates(table)
+    if not pts:
+        return 0.0
     xs = [f for f, _ in pts]
     if freq <= xs[0]:
         return pts[0][1]
@@ -51,7 +73,8 @@ def fit_gain_table(response: list[tuple[float, float]]) -> tuple[float, list[tup
 
     GAIN - среднее R (лучшая постоянная), CAL(f) = GAIN − R(f) - неравномерность по частоте.
     Тогда CAL(f) − GAIN = −R(f): исправленное показание равно уровню на входе тракта."""
-    if not response:
+    pts = _collapse_duplicates(response)
+    if not pts:
         raise ValueError("нет точек")
-    gain = sum(r for _f, r in response) / len(response)
-    return gain, [(f, gain - r) for f, r in sorted(response)]
+    gain = sum(r for _f, r in pts) / len(pts)
+    return gain, [(f, gain - r) for f, r in pts]

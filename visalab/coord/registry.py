@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+from PyQt6 import sip
 from PyQt6.QtCore import QObject, pyqtSignal
 
 __all__ = ["ProxyLinks", "LINKS", "profile_name"]
@@ -40,12 +41,13 @@ class ProxyLinks(QObject):
                 pass
 
     def proxies(self) -> list:
-        """Все приборы в порядке открытия."""
+        """Все живые приборы в порядке открытия."""
+        self._proxies = [p for p in self._proxies if not sip.isdeleted(p)]
         return list(self._proxies)
 
     def find(self, profile: str):
         """Последний открытый прибор с этим профилем (``function_generator``...) или None."""
-        for proxy in reversed(self._proxies):
+        for proxy in reversed(self.proxies()):
             if profile_name(proxy) == profile:
                 return proxy
         return None

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -23,12 +24,22 @@ def _head(label: str, unit: str) -> str:
     return f"{label}, {unit}" if unit else label
 
 
+def _comment_lines(comments: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    for line in comments:
+        parts = str(line).splitlines()
+        out.extend(parts or [""])
+    return out
+
+
 def write_traces_csv(path, traces: Sequence[Trace], labels: Sequence[str] | None = None,
                      comments: Iterable[str] = ()) -> Path:
     """Записать трассы в CSV. ``labels`` - подписи столбцов (по умолчанию ``Trace.name``)."""
     if not traces:
         raise ValueError("нет трасс для сохранения")
     labels = list(labels) if labels is not None else [t.name or f"trace{i + 1}" for i, t in enumerate(traces)]
+    if len(labels) != len(traces):
+        raise ValueError(f"число подписей ({len(labels)}) не совпадает с числом трасс ({len(traces)})")
     groups: list[tuple[Trace, list[int]]] = []             # (трасса с осью X, индексы трасс этой оси)
     for i, t in enumerate(traces):
         for first, members in groups:
@@ -55,9 +66,9 @@ def write_traces_csv(path, traces: Sequence[Trace], labels: Sequence[str] | None
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = max(len(c) for c in columns)
     with path.open("w", newline="", encoding="utf-8") as f:
-        for line in comments:
+        for line in _comment_lines(comments):
             f.write(f"# {line}\n")
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(header)
         for r in range(rows):
             w.writerow([f"{c[r]:.10g}" if r < len(c) else "" for c in columns])
@@ -69,19 +80,31 @@ def write_touchstone(path, sparams: dict[str, Trace], comments: Iterable[str] = 
 
     ``sparams`` - комплексные трассы {"S11": ..., "S21": ...} с одной осью частот; число портов - по ним.
     """
-    ports = 2 if len(sparams) > 1 else 1
-    order = TOUCHSTONE_ORDER[ports]
-    missing = [k for k in order if k not in sparams]
-    if missing:
-        raise ValueError(f"нет S-параметров {missing} для s{ports}p")
+    if not math.isfinite(z0) or z0 <= 0:
+        raise ValueError(f"недопустимое опорное сопротивление z0={z0!r}")
+    if len(sparams) == 1 and next(iter(sparams)) in ("S11", "S22"):
+        order = (next(iter(sparams)),)
+    else:
+        ports = 2 if len(sparams) > 1 else 1
+        order = TOUCHSTONE_ORDER[ports]
+        missing = [k for k in order if k not in sparams]
+        if missing:
+            raise ValueError(f"нет S-параметров {missing} для s{ports}p")
     traces = [sparams[k] for k in order]
     freqs = traces[0].x
+    if not freqs:
+        raise ValueError("пустая ось частот для Touchstone")
+    if traces[0].x_unit and traces[0].x_unit.lower() != "hz":
+        raise ValueError(f"Touchstone требует ось частот в Hz, получено {traces[0].x_unit!r}")
     if any(t.x != freqs or not t.is_complex for t in traces):
         raise ValueError("S-параметры должны быть комплексными и с одной осью частот")
+    if any(not math.isfinite(fr) for fr in freqs) or any(
+            not (math.isfinite(v) and math.isfinite(im)) for t in traces for v, im in zip(t.y, t.im)):
+        raise ValueError("данные Touchstone содержат NaN или Inf")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="\n", encoding="utf-8") as f:
-        for line in comments:
+        for line in _comment_lines(comments):
             f.write(f"! {line}\n")
         f.write(f"! columns: freq, {', '.join(f'{k} Re, {k} Im' for k in order)}\n")
         f.write(f"# HZ S RI R {z0:g}\n")

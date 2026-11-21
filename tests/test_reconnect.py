@@ -209,3 +209,34 @@ def test_reachable_probe(monkeypatch):
         raise socket.timeout("timed out")
     monkeypatch.setattr(socket, "create_connection", silent)
     assert not PyVisaTransport("TCPIP0::192.168.0.20::INSTR").reachable()                # узел молчит
+
+
+def test_pyvisa_transport_power_off_errors_do_not_crash():
+    """Обрыв ресурса при смене timeout_ms / discard_input / _res=None даёт TransportError, не краш."""
+    from visalab.transport import TransportError
+
+    class BrokenResource:
+        @property
+        def timeout(self):
+            return 5000
+
+        @timeout.setter
+        def timeout(self, _v):
+            raise RuntimeError("VI_ERROR_CONN_LOST")
+
+        def read_raw(self):
+            raise RuntimeError("VI_ERROR_CONN_LOST")
+
+    tr = PyVisaTransport("TCPIP0::192.168.0.20::INSTR")
+    tr._res = None
+    with pytest.raises(TransportError):
+        tr.write("*IDN?")
+    with pytest.raises(TransportError):
+        tr.read()
+    with pytest.raises(TransportError):
+        tr.read_stb()
+    tr._res = BrokenResource()
+    with pytest.raises(TransportError):
+        tr.timeout_ms = 200
+    with pytest.raises(TransportError):
+        tr.discard_input()

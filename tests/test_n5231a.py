@@ -735,3 +735,40 @@ def test_app_data_dir_uses_appdata_when_set(monkeypatch, tmp_path):
     assert app_data_dir() == tmp_path / "visalab"
     assert default_ini_path() == tmp_path / "visalab" / "visalab_front.ini"
     assert default_log_path(default_ini_path()) == tmp_path / "visalab" / "logs" / "visalab.log"
+
+
+def test_full_scpi_trig_immediate_and_no_oper_bit_still_reads_traces(make):
+    """На реальном PNA TRIG:SOUR? может вернуть 'IMMEDIATE', а STAT:OPER:EVEN? - 0: фоллбэк читает трассу."""
+    sim = KeysightPNASim()
+    sim.on("TRIGger[:SEQuence]:SOURce",
+           sim._tenum("sour", {"IMM": "IMM", "IMMEDIATE": "IMM", "EXT": "EXT", "EXTERNAL": "EXT",
+                               "MAN": "MAN", "MANUAL": "MAN"}),
+           lambda a, g: {"IMM": "IMMEDIATE", "EXT": "EXTERNAL", "MAN": "MANUAL"}[sim.trig["sour"]])
+    sim.on("STATus:OPERation[:EVENt]", get=lambda a, g: "0")
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert rec.values["trig.source"] == "IMM"
+    assert rec.values["m1.trace"] is not None and not rec.errors
+    first = rec.values["m1.trace"]
+    drv._last_cont_read = 0.0
+    drv.poll()
+    assert rec.values["m1.trace"] is not first and not rec.errors
+    assert drv._cont_fallback_s() <= 2.0
+
+
+def test_strict_markers_off_do_not_error(make):
+    """Выключенный маркер не запрашивает :X? (нет -221); mark_x и mark_peak включают его без ошибок."""
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
+    assert rec.values["mark.state"] is False
+    assert rec.values["mark.x"] is None and rec.values["mark.y"] is None
+    assert not rec.errors and not rec.comm
+    assert setp(drv, rec, "mark.n", 2) is PStatus.WRITTEN
+    assert rec.values["mark.state"] is False and rec.values["mark.x"] is None
+    assert not rec.errors
+    assert setp(drv, rec, "mark.x", 2e9) is PStatus.WRITTEN
+    assert rec.values["mark.state"] is True and rec.values["mark.x"] == pytest.approx(2e9)
+    assert not rec.errors
+    drv.run_action("mark_aoff")
+    assert rec.values["mark.state"] is False and rec.values["mark.x"] is None
+    drv.run_action("mark_peak")
+    assert rec.values["mark.state"] is True and rec.values["mark.x"] is not None
+    assert not rec.errors and not rec.comm

@@ -62,8 +62,12 @@ class InstrumentProxy(QObject):
         super().__init__(parent)
         if transport is not None:
             driver = driver(transport, **driver_kwargs)
+        if driver.parent() is not None:
+            driver.setParent(None)
         self._worker = driver
         self.address = driver.address
+        #: базовый таймаут драйвера (неизменная копия для GUI-потока без гонки с воркером)
+        self._base_timeout_ms = max(int(getattr(driver, "TIMEOUT_MS", 2000) or 2000), driver.timeout_ms)
         #: тип драйвера в каталоге (``e8267d``...) - окну настроек подключения
         self.kind = kind or kind_of(driver) or ""
         self._thread = QThread()
@@ -101,15 +105,19 @@ class InstrumentProxy(QObject):
         self._req_shutdown.connect(w.shutdown, _Q)
         self._shut_down = False
         # события воркера -> внутренние обработчики (в GUI-потоке) -> сигналы прокси
-        w.state_changed.connect(self._on_state, _Q)
-        w.identified.connect(self._on_idn, _Q)
-        w.param_updated.connect(self._on_value, _Q)
-        w.param_status.connect(self._on_status, _Q)
-        w.reconnect_pending.connect(self._on_reconnect, _Q)
-        w.instrument_error.connect(self._on_instrument_error, _Q)
-        w.comm_error.connect(self._on_comm_error, _Q)
+        self._worker_conns = [
+            (w.state_changed, self._on_state),
+            (w.identified, self._on_idn),
+            (w.param_updated, self._on_value),
+            (w.param_status, self._on_status),
+            (w.reconnect_pending, self._on_reconnect),
+            (w.instrument_error, self._on_instrument_error),
+            (w.comm_error, self._on_comm_error),
+        ]
         for name in ("scpi_log", "action_done", "sync_done", "raw_response"):
-            getattr(w, name).connect(getattr(self, name), _Q)
+            self._worker_conns.append((getattr(w, name), getattr(self, name)))
+        for sig, slot in self._worker_conns:
+            sig.connect(slot, _Q)
         # Воркер НЕ удаляется через finished -> deleteLater: тогда его (и QTimer) удалял бы поток прибора,
         # которому для этого нужен GIL, а GUI-поток в ~QThread ждёт этот поток, держа GIL, - взаимная
         # блокировка (программа виснет на выходе или при смене адреса). Воркером владеет Python; при закрытии
@@ -174,12 +182,21 @@ class InstrumentProxy(QObject):
         if on_status:
             self._status_subs[key].append(on_status)
 
+    def unsubscribe(self, key: str, on_value: Callable[[Any], None] | None = None,
+                    on_status: Callable[[PStatus, str], None] | None = None) -> None:
+        """Снять подписку виджета на ключ."""
+        if on_value is not None and key in self._subs:
+            self._subs[key] = [cb for cb in self._subs[key] if cb != on_value]
+        if on_status is not None and key in self._status_subs:
+            self._status_subs[key] = [cb for cb in self._status_subs[key] if cb != on_status]
+
     def request_shutdown(self) -> None:
         """Попросить поток прибора закрыть ресурс и завершиться (не ждать). Запросы после этого
         прибору не уходят: воркер вернётся в GUI-поток, и обмен с прибором там заблокировал бы окна."""
         if self._shut_down:
             return
         self._shut_down = True
+        self._worker._stopping = True
         self._req_shutdown.emit()
         for sig, _slot in self._requests:
             try:
@@ -190,11 +207,13 @@ class InstrumentProxy(QObject):
     def shutdown_wait_ms(self) -> int:
         """Сколько ждать поток: он может быть внутри запроса (до таймаута транспорта) и потом ещё
         вернуть прибор (on_disconnecting) - несколько команд."""
-        return max(3000, 3 * self._worker.timeout_ms + 2000)
+        return max(3000, 3 * self._base_timeout_ms + 2000)
 
     def wait_shutdown(self, timeout_ms: int | None = None) -> None:
         """Дождаться завершения потока. ``terminate()`` - только крайний случай: убитый посреди вызова
         VISA поток может оставить библиотеку VISA (и GIL) занятыми - программа падает или виснет на выходе."""
+        if not self._shut_down:
+            self.request_shutdown()
         timeout_ms = self.shutdown_wait_ms() if timeout_ms is None else timeout_ms
         # wait() - без проверки isRunning(): тот в Qt 6 ложен, пока поток ещё завершается (isInFinish), а
         # прокси, удалённый в этот момент, ждал бы поток в ~QThread с захваченным GIL.
@@ -202,7 +221,19 @@ class InstrumentProxy(QObject):
             log.warning("%s: поток не завершился за %d мс, принудительно", self.name, timeout_ms)
             self._thread.terminate()
             self._thread.wait(2000)
-        self.state = ConnectionState.DISCONNECTED   # события из очереди могут прийти позже
+        for sig, slot in self._worker_conns:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._subs.clear()
+        self._status_subs.clear()
+        self.reconnecting = False
+        self._values.clear()
+        self._statuses.clear()
+        if self.state is not ConnectionState.DISCONNECTED:
+            self.state = ConnectionState.DISCONNECTED
+            self.state_changed.emit(ConnectionState.DISCONNECTED)
 
     def shutdown(self, timeout_ms: int | None = None) -> None:
         """Корректно закрыть прибор и дождаться завершения потока."""
@@ -225,44 +256,75 @@ class InstrumentProxy(QObject):
 
     # ------------------------------------------------------ внутреннее
     def _on_state(self, state: ConnectionState) -> None:
+        if self._shut_down and state is not ConnectionState.DISCONNECTED:
+            return
         if state is not self.state:
             log.info("%s %s: %s", self.name, self.address, state.value)
         self.state = state
         if state is not ConnectionState.CONNECTED:
             self._values.clear()
+            self._statuses.clear()
         if state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTED):
             self.reconnecting = False
         self.state_changed.emit(state)
 
     def _on_reconnect(self, seconds: float) -> None:
+        if self._shut_down:
+            return
         self.reconnecting = seconds > 0 and self.state is not ConnectionState.CONNECTED
         self.reconnect_pending.emit(float(seconds))
 
     def _on_idn(self, idn: str) -> None:
+        if self._shut_down:
+            return
         self.idn = idn
         log.info("%s %s: *IDN? %s", self.name, self.address, idn)
         self.identified.emit(idn)
 
     def _on_comm_error(self, message: str) -> None:
+        if self._shut_down:
+            return
         if self._throttle("comm", message):
             log.warning("%s %s: %s", self.name, self.address, message)
         self.comm_error.emit(message)
 
     def _on_instrument_error(self, code: int, message: str) -> None:
+        if self._shut_down:
+            return
         if self._throttle(f"error {code}", message):
             log.warning("%s %s: ошибка прибора %d: %s", self.name, self.address, code, message)
         self.instrument_error.emit(code, message)
 
     def _on_value(self, key: str, value: Any) -> None:
+        if self._shut_down:
+            return
         self._values[key] = value
-        for cb in self._subs.get(key, ()):
-            cb(value)
+        dead: list[Callable] = []
+        for cb in list(self._subs.get(key, ())):
+            try:
+                cb(value)
+            except RuntimeError:
+                dead.append(cb)
+            except Exception:  # noqa: BLE001
+                log.exception("%s: ошибка в обработчике %s", self.name, key)
+        if dead and key in self._subs:
+            self._subs[key] = [cb for cb in self._subs[key] if cb not in dead]
         self.param_updated.emit(key, value)
 
     def _on_status(self, key: str, status: PStatus, message: str) -> None:
+        if self._shut_down:
+            return
         if status in (PStatus.ERROR, PStatus.INVALID) and self._throttle(f"key {key}", message):
             log.warning("%s %s: %s %s: %s", self.name, self.address, key, status.value, message)
         self._statuses[key] = status
-        for cb in self._status_subs.get(key, ()):
-            cb(status, message)
+        dead: list[Callable] = []
+        for cb in list(self._status_subs.get(key, ())):
+            try:
+                cb(status, message)
+            except RuntimeError:
+                dead.append(cb)
+            except Exception:  # noqa: BLE001
+                log.exception("%s: ошибка в обработчике статуса %s", self.name, key)
+        if dead and key in self._status_subs:
+            self._status_subs[key] = [cb for cb in self._status_subs[key] if cb not in dead]
         self.param_status.emit(key, status, message)

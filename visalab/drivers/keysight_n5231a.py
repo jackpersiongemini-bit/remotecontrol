@@ -132,13 +132,18 @@ SCALE_KEYS = ("scale.div", "scale.ref", "scale.rpos", "scale.edel", "smooth.stat
 MARK_KEYS = ("mark.state", "mark.x", "mark.y")
 MARKS = 10
 SWEEP_TYPES = ("LIN", "LOG", "POWER", "CW", "SEGMENT")
-SWEEP_MAP = (("POWER", "POW"), ("SEGMENT", "SEGM"))
+SWEEP_MAP = (("LIN", "LIN"), ("LIN", "LINEAR"), ("LOG", "LOG"), ("LOG", "LOGARITHMIC"),
+             ("POWER", "POW"), ("POWER", "POWER"), ("CW", "CW"), ("SEGMENT", "SEGM"), ("SEGMENT", "SEGMENT"))
 TRIG_SOURCES = ("IMM", "EXT", "MAN")
+TRIG_SOURCE_MAP = (("IMM", "IMM"), ("IMM", "IMMEDIATE"), ("EXT", "EXT"), ("EXT", "EXTERNAL"),
+                   ("MAN", "MAN"), ("MAN", "MANUAL"))
 TRIG_MODES = ("CHANNEL", "SWEEP", "POINT", "TRACE")
 TRIG_MODE_MAP = (("CHANNEL", "CHAN"), ("SWEEP", "SWE"), ("POINT", "POIN"), ("TRACE", "TRAC"))
 _MEAS_KEY = re.compile(r"m(\d+)\.(\w+)")
 SLOT_KEYS = ("channel", "name", "enabled", "sparam", "format", "math")
 MATH = ("NORM", "DIV", "SUBT", "ADD", "MULT")
+MATH_MAP = (("NORM", "NORM"), ("NORM", "NORMAL"), ("DIV", "DIV"), ("DIV", "DIVIDE"),
+            ("SUBT", "SUBT"), ("SUBT", "SUBTRACT"), ("ADD", "ADD"), ("MULT", "MULT"), ("MULT", "MULTIPLY"))
 STATE_EXT = ".csa"
 _STATE_NAME = re.compile(r"[A-Za-z0-9_\-]{1,32}")
 #: бит 4 регистра STATus:OPERation (Measuring / Sweeping: переход 1 -> 0 по NTR = развёртка завершена)
@@ -165,6 +170,7 @@ class KeysightPNA(VISAInstrument):
         self._continuous = True
         self._armed = False
         self._oper_seen = False
+        self._oper_supported = True
         self._last_cont_read = 0.0
         self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
         self._mark_n = 1
@@ -210,7 +216,7 @@ class KeysightPNA(VISAInstrument):
                 Param(f"m{n}.format", f"Формат m{n}", E, section=sec, query="<format>", write="<custom>",
                       choices=FORMATS, enum_map=FORMAT_MAP),
                 Param(f"m{n}.math", f"Математика m{n}", E, section=sec, query="<math>", write="<custom>",
-                      choices=MATH, labels=("Данные", "Д/П", "Д-П", "Д+П", "Д*П")),
+                      choices=MATH, labels=("Данные", "Д/П", "Д-П", "Д+П", "Д*П"), enum_map=MATH_MAP),
                 Param(f"m{n}.trace", f"Трасса m{n}", Kind.TRACE, "", section=sec, group="SWEEP"),
                 Param(f"m{n}.sdata", f"Комплексная трасса m{n}", Kind.TRACE, "", section=sec, group="SWEEP"),
             ]
@@ -295,21 +301,24 @@ class KeysightPNA(VISAInstrument):
             Param("avg.count", "Усреднений", I, section=sw, query="SENS1:AVER:COUN?",
                   write="SENS1:AVER:COUN {value}", minimum=1, maximum=65536),
             Param("trig.source", "Запуск", E, section=tg, query="TRIG:SOUR?", write="TRIG:SOUR {value}",
-                  choices=TRIG_SOURCES, labels=("Внутренний", "Внешний", "Ручной")),
+                  choices=TRIG_SOURCES, labels=("Внутренний", "Внешний", "Ручной"), enum_map=TRIG_SOURCE_MAP),
             Param("trig.scope", "Область запуска", E, section=tg, query="TRIG:SCOP?", write="TRIG:SCOP {value}",
                   choices=("ALL", "CURRENT"), labels=("Все каналы", "Текущий канал"),
-                  enum_map=(("CURRENT", "CURR"),)),
+                  enum_map=(("ALL", "ALL"), ("ALL", "GLOB"), ("ALL", "GLOBAL"),
+                            ("CURRENT", "CURR"), ("CURRENT", "ACT"), ("CURRENT", "ACTIVE"), ("CURRENT", "CHAN"))),
             Param("trig.mode", "Режим запуска канала", E, section=tg, query="SENS1:SWE:TRIG:MODE?",
                   write="SENS1:SWE:TRIG:MODE {value}", choices=TRIG_MODES,
                   labels=("Канал", "Развёртка", "Точка", "Трасса"), enum_map=TRIG_MODE_MAP),
             Param("trig.slope", "Фронт внешнего запуска", E, section=tg, query="TRIG:SLOP?",
-                  write="TRIG:SLOP {value}", choices=("POS", "NEG"), enum_map=(("POS", "POS"), ("NEG", "NEG"))),
+                  write="TRIG:SLOP {value}", choices=("POS", "NEG"),
+                  enum_map=(("POS", "POS"), ("POS", "POSITIVE"), ("NEG", "NEG"), ("NEG", "NEGATIVE"))),
             Param("trig.type", "Тип внешнего запуска", E, section=tg, query="TRIG:TYPE?", write="TRIG:TYPE {value}",
-                  choices=("EDGE", "LEVEL"), labels=("Фронт", "Уровень"), enum_map=(("LEVEL", "LEV"),)),
+                  choices=("EDGE", "LEVEL"), labels=("Фронт", "Уровень"),
+                  enum_map=(("EDGE", "EDGE"), ("LEVEL", "LEV"), ("LEVEL", "LEVEL"))),
             Param("trig.delay", "Задержка запуска", F, "s", section=tg, query="TRIG:DEL?", write="TRIG:DEL {value}",
                   minimum=0.0, maximum=3.0, tolerance=1e-9),
-            Param("marker.state", "Маркер", B, section=mk, query="CALC1:MARK1?", write="CALC1:MARK1 {value}",
-                  also_read=("marker.freq", "marker.value"), **ch),
+            Param("marker.state", "Маркер", B, section=mk, query="CALC1:MARK1:STAT?",
+                  write="CALC1:MARK1:STAT {value}", also_read=("marker.freq", "marker.value"), **ch),
             Param("marker.freq", "Частота маркера", F, "Hz", section=mk, query="CALC1:MARK1:X?",
                   write="CALC1:MARK1:X {value}", minimum=0.0, maximum=m.f_max, tolerance=1e-6,
                   also_read=("marker.value", "marker.state"), **ch),
@@ -364,6 +373,7 @@ class KeysightPNA(VISAInstrument):
         for slot, name in zip(self._slots, cat):               # по умолчанию - канал 1 по порядку, читаем только m1
             slot.name = name
         self._slots[0].enabled = True
+        self._oper_supported = True
         self._setup_oper_sync()
         mode = self.query(f"SENS{self._stim_ch}:SWE:MODE?").strip().upper()
         self._continuous = mode.startswith("CONT")
@@ -382,6 +392,12 @@ class KeysightPNA(VISAInstrument):
             except Exception:                 # отключение не должно срываться
                 pass
 
+    def on_closed(self) -> None:
+        self._armed = False
+        self._cal = None
+        self._gen = None
+        self._sweep = {}
+
     def _catalog(self, channel: int = 1) -> dict[str, str]:
         """{имя измерения: S-параметр} канала."""
         raw = self.query(f"CALC{channel}:PAR:CAT:EXT?").strip().strip('"').strip()
@@ -396,6 +412,10 @@ class KeysightPNA(VISAInstrument):
 
     def select_channel(self, channel: int) -> None:
         """Выбор измерения легаси-ключей (первое измерение канала 1)."""
+        if not self.meas_name:
+            self.meas_name = next(iter(self._catalog(1)), "")
+        if not self.meas_name:
+            raise ValueError("нет измерения на канале 1")
         self.write(f"CALC1:PAR:SEL '{self.meas_name}'")
 
     def _select(self, slot: _Slot) -> None:
@@ -456,9 +476,21 @@ class KeysightPNA(VISAInstrument):
                 raise ValueError(f"маркер 1..{MARKS}, получено {n}")
             self._mark_n = n
             return
-        if spec.key in ("mark.state", "mark.x"):
+        if spec.key == "mark.state":
             cmd = self._mark_cmd()
-            self.write((cmd if spec.key == "mark.state" else cmd + ":X") + " " + spec.to_scpi(value))
+            self.write(f"{cmd}:STAT {spec.to_scpi(value)}")
+            return
+        if spec.key == "mark.x":
+            cmd = self._mark_cmd()
+            if self.query(cmd + ":STAT?").strip() not in ("1", "ON"):
+                self.write(f"{cmd}:STAT 1")
+            self.write(f"{cmd}:X {spec.to_scpi(value)}")
+            return
+        if spec.key == "marker.freq":
+            self.select_channel(1)
+            if self.query("CALC1:MARK1:STAT?").strip() not in ("1", "ON"):
+                self.write("CALC1:MARK1:STAT 1")
+            self.write(f"CALC1:MARK1:X {spec.to_scpi(value)}")
             return
         if spec.key in SCALE_KEYS:
             cmd = self._scale_cmd(spec.key)
@@ -488,7 +520,7 @@ class KeysightPNA(VISAInstrument):
                 if self._cal is None:
                     self._ensure_continuous()
                     self._clear_oper_events()
-                    self._last_cont_read = time.monotonic()
+                    self._last_cont_read = 0.0 if (spec.key.endswith(".enabled") and value) else time.monotonic()
             elif was_armed:
                 self._start_sweep()
 
@@ -500,7 +532,12 @@ class KeysightPNA(VISAInstrument):
         if what == "enabled":
             slot.enabled = bool(value)
         elif what == "channel":
-            slot.channel = int(value)
+            c = int(value)
+            if c not in self._channels():
+                raise ValueError(f"нет канала {c} (каналы: {self._channels()})")
+            slot.channel = c
+            if slot.name and slot.name not in self._catalog(c):
+                slot.name = ""
         elif what == "name":
             name = str(value).strip()
             if name and name not in self._catalog(slot.channel):
@@ -547,12 +584,14 @@ class KeysightPNA(VISAInstrument):
             if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
                 return None
             cmd = self._mark_cmd()
-            on = self.query(cmd + "?").strip() in ("1", "ON")
+            on = self.query(cmd + ":STAT?").strip() in ("1", "ON")
             if key == "mark.state":
                 return on
+            if not on:
+                return None
             if key == "mark.x":
                 return spec.from_scpi(self.query(cmd + ":X?"))
-            return parse_number(self.query(cmd + ":Y?").split(",")[0]) if on else None
+            return parse_number(self.query(cmd + ":Y?").split(",")[0])
         if key in SCALE_KEYS:
             if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
                 return None
@@ -583,11 +622,15 @@ class KeysightPNA(VISAInstrument):
             self._select(slot)
             cmd = "MATH:FUNC" if what == "math" else "FORM"
             return spec.from_scpi(self.query(f"CALC{slot.channel}:{cmd}?"))
-        if key in ("marker.value", "marker.freq") and not self._values.get("marker.state"):
-            return None
-        if key == "marker.value":
+        if key in ("marker.value", "marker.freq"):
+            if not self.meas_name and not self._catalog(1):
+                return None
             self.select_channel(1)
-            return parse_number(self.query("CALC1:MARK1:Y?").split(",")[0])
+            if self.query("CALC1:MARK1:STAT?").strip() not in ("1", "ON"):
+                return None
+            if key == "marker.value":
+                return parse_number(self.query("CALC1:MARK1:Y?").split(",")[0])
+            return spec.from_scpi(self.query("CALC1:MARK1:X?"))
         return super().read_param_raw(spec)
 
     def read_group(self, group: str) -> dict[str, Any]:
@@ -595,6 +638,11 @@ class KeysightPNA(VISAInstrument):
 
     def _sync_all(self) -> None:
         super()._sync_all()
+        if self._cal is None and any(s.enabled and s.name for s in self._slots):
+            try:
+                self._read_trace()
+            except Exception:  # noqa: BLE001 - на приборе может ещё не быть данных
+                pass
         if self._continuous:
             self._ensure_continuous()
             self._clear_oper_events()
@@ -608,9 +656,12 @@ class KeysightPNA(VISAInstrument):
 
     def _setup_oper_sync(self) -> None:
         """Настроить фиксацию окончания развёртки в STAT:OPER:EVEN (переход бита Measuring 1 -> 0)."""
-        self.write("STAT:OPER:PTR 0")
-        self.write(f"STAT:OPER:NTR {OPER_SWEEP_BIT}")
-        self._clear_oper_events()
+        try:
+            self.write("STAT:OPER:PTR 0")
+            self.write(f"STAT:OPER:NTR {OPER_SWEEP_BIT}")
+            self._clear_oper_events()
+        except Exception:  # noqa: BLE001
+            self._oper_supported = False
 
     def _clear_oper_events(self) -> None:
         try:
@@ -642,6 +693,8 @@ class KeysightPNA(VISAInstrument):
             for c in self._armed_channels:
                 self.write(f"SENS{c}:SWE:MODE HOLD")
             self._set_armed(False)
+        self._opc_pending = False
+        self.opc_latched = False
 
     def _stim_spec(self, spec: Param, channel: int | None = None) -> Param:
         """Ключ стимула -> команды для канала ``channel`` (по умолчанию ``stim.channel``)."""
@@ -669,9 +722,11 @@ class KeysightPNA(VISAInstrument):
         out = []
         if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
             return out
+        c, name = self._sel
+        self.write(f"CALC{c}:PAR:SEL '{name}'")
         for n in range(1, MARKS + 1):
-            cmd = self._mark_cmd(n)
-            if self.query(cmd + "?").strip() in ("1", "ON"):
+            cmd = f"CALC{c}:MARK{n}"
+            if self.query(cmd + ":STAT?").strip() in ("1", "ON"):
                 out.append((n, parse_number(self.query(cmd + ":X?")),
                             parse_number(self.query(cmd + ":Y?").split(",")[0])))
         return out
@@ -715,18 +770,26 @@ class KeysightPNA(VISAInstrument):
                     "pow_levels": {p: parse_number(self.query(f"SOUR{c}:POW{p}?")) for p in (1, 2)},
                     "trig_source": self._params["trig.source"].from_scpi(self.query("TRIG:SOUR?")),
                 }
-                self._gen = (c, snap, modes, extra)
-                for ch, mode in modes.items():               # остальные каналы стоят (в т.ч. бывшие CONT)
-                    if ch != c and mode != "HOLD":
-                        self.write(f"SENS{ch}:SWE:MODE HOLD")
-                if extra["trig_source"] != "IMM":
-                    self.write("TRIG:SOUR IMM")
-                if snap.get("cal.state"):                    # без 2-портовой коррекции - источник не скачет по портам
-                    self.write(f"SENS{c}:CORR:STAT 0")
-                self.write(f"SENS{c}:SWE:TYPE CW")
-                self.write(f"SOUR{c}:POW:COUP 0")
-                self.write(f"SOUR{c}:POW{other}:MODE OFF")
-                self.write(f"SOUR{c}:POW{port}:MODE ON")
+                gen_tuple = (c, snap, modes, extra)
+                try:
+                    for ch, mode in modes.items():               # остальные каналы стоят (в т.ч. бывшие CONT)
+                        if ch != c and mode != "HOLD":
+                            self.write(f"SENS{ch}:SWE:MODE HOLD")
+                    if extra["trig_source"] != "IMM":
+                        self.write("TRIG:SOUR IMM")
+                    if snap.get("cal.state"):                    # без 2-портовой коррекции - источник не скачет по портам
+                        self.write(f"SENS{c}:CORR:STAT 0")
+                    self.write(f"SENS{c}:SWE:TYPE CW")
+                    self.write(f"SOUR{c}:POW:COUP 0")
+                    self.write(f"SOUR{c}:POW{other}:MODE OFF")
+                    self.write(f"SOUR{c}:POW{port}:MODE ON")
+                except Exception:
+                    try:
+                        self._gen_restore(*gen_tuple)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise
+                self._gen = gen_tuple
             else:
                 gen, self._gen = self._gen, None
                 self._gen_restore(*gen)
@@ -828,8 +891,14 @@ class KeysightPNA(VISAInstrument):
             fmt = self._params[f"m{n}.format"].from_scpi(self.query(f"CALC{c}:FORM?"))
             math = self._params[f"m{n}.math"].from_scpi(self.query(f"CALC{c}:MATH:FUNC?"))
             y = [parse_number(t) for t in self.query(f"CALC{c}:DATA? FDATA").split(",") if t.strip()]
+            if not y:
+                continue
             meta = {**(stim if c == self._stim_ch else {}), "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
             if fmt in COMPLEX_FORMATS:                         # пары re,im
+                pairs = len(y) // 2
+                if not pairs:
+                    continue
+                y = y[:2 * pairs]
                 out[f"m{n}.trace"] = Trace.linear(start, stop, y[0::2], im=y[1::2], x_unit=x_unit, y_unit="",
                                                   name=sparam, meta=meta)
             else:
@@ -837,8 +906,11 @@ class KeysightPNA(VISAInstrument):
                                                   name=sparam, meta=meta)
             if self._complex:
                 raw = [parse_number(t) for t in self.query(f"CALC{c}:DATA? SDATA").split(",") if t.strip()]
-                out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit=x_unit, y_unit="",
-                                                  name=sparam, meta={**meta, "format": "SDATA", "math": "NORM"})
+                spairs = len(raw) // 2
+                if spairs:
+                    raw = raw[:2 * spairs]
+                    out[f"m{n}.sdata"] = Trace.linear(start, stop, raw[0::2], im=raw[1::2], x_unit=x_unit, y_unit="",
+                                                      name=sparam, meta={**meta, "format": "SDATA", "math": "NORM"})
             count += 1
             for k, v in ((f"m{n}.sparam", sparam), (f"m{n}.format", fmt), (f"m{n}.math", math)):
                 if self._values.get(k) != v:
@@ -862,7 +934,7 @@ class KeysightPNA(VISAInstrument):
 
     def _cont_fallback_s(self) -> float:
         swt = float(self._values.get("sweep.time") or 0.1)
-        return max(1.5, 2.5 * swt)
+        return min(max(0.4, swt), 2.0)
 
     def poll(self) -> None:
         if self._cal is not None:
@@ -872,12 +944,17 @@ class KeysightPNA(VISAInstrument):
                 self._publish("cal.busy", False)
             return
         if self._continuous:
-            even = int(parse_number(self.query("STAT:OPER:EVEN?")))
-            if even & OPER_SWEEP_BIT:
-                self._oper_seen = True
-                self._last_cont_read = time.monotonic()
-                self._read_trace()
-                return
+            if self._oper_supported:
+                try:
+                    even = int(parse_number(self.query("STAT:OPER:EVEN?")))
+                except ValueError:
+                    self._oper_supported = False
+                    even = 0
+                if even & OPER_SWEEP_BIT:
+                    self._oper_seen = True
+                    self._last_cont_read = time.monotonic()
+                    self._read_trace()
+                    return
             trig = self._values.get("trig.source", "IMM")
             if (not self._oper_seen and trig == "IMM"
                     and time.monotonic() - self._last_cont_read >= self._cont_fallback_s()):
@@ -937,16 +1014,20 @@ class KeysightPNA(VISAInstrument):
                 if self._continuous:
                     self._ensure_continuous()
                     self._clear_oper_events()
-                    self._last_cont_read = time.monotonic()
+                    self._last_cont_read = 0.0 if name == "meas_all" else time.monotonic()
                 elif was_armed:
                     self._start_sweep()
             return None
         if name in ("mark_peak", "mark_min"):
             cmd = self._mark_cmd()
+            if self.query(cmd + ":STAT?").strip() not in ("1", "ON"):
+                self.write(f"{cmd}:STAT 1")
             self.write(f"{cmd}:FUNC:EXEC {'MAX' if name == 'mark_peak' else 'MIN'}")
             self._read_keys(MARK_KEYS)
             return self._mark_table()
         if name == "mark_aoff":
+            if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
+                return []
             c = self._sel[0]
             self._mark_cmd()
             self.write(f"CALC{c}:MARK:AOFF")
@@ -956,8 +1037,8 @@ class KeysightPNA(VISAInstrument):
             return self._mark_table()
         if name in ("marker_peak", "marker_min"):
             self.select_channel(1)
-            if not self._values.get("marker.state"):
-                self.write("CALC1:MARK1 ON")
+            if self.query("CALC1:MARK1:STAT?").strip() not in ("1", "ON"):
+                self.write("CALC1:MARK1:STAT 1")
                 self._values["marker.state"] = True
             self.write(f"CALC1:MARK1:FUNC:EXEC {'MAX' if name == 'marker_peak' else 'MIN'}")
             self._read_keys(["marker.state", "marker.freq", "marker.value"])
@@ -1041,7 +1122,6 @@ class KeysightPNA(VISAInstrument):
                 raise ValueError(f"нет cal set {name!r} в памяти анализатора")
             self.write(f'SENS{c}:CORR:CSET:ACT "{name}",{1 if self._cal_stim else 0}')
             self.query("*OPC?")
-        self._check_errors(context="cal.set")
 
     # ------------------------------------------------- S-параметры канала (Touchstone)
     def _snp_read(self, ports) -> dict[str, Trace]:
@@ -1054,6 +1134,9 @@ class KeysightPNA(VISAInstrument):
         c = self._stim_ch
         was_armed = self._armed
         self._abort()
+        old_timeout = self.transport.timeout_ms
+        swt = float(self._values.get("sweep.time") or 0.1)
+        self.transport.timeout_ms = max(old_timeout, int(swt * 2000) + 10000)
         try:
             self.write("MMEM:STOR:TRAC:FORM:SNP RI")
             if self.query("TRIG:SOUR?").strip().upper().startswith("IMM"):   # EXT / MAN - последние данные
@@ -1062,6 +1145,7 @@ class KeysightPNA(VISAInstrument):
             reply = self.query(f'CALC{c}:DATA:SNP:PORT? "{",".join(map(str, plist))}"')
             self._check_errors(context="snp_read")
         finally:
+            self.transport.timeout_ms = old_timeout
             if self._continuous:
                 self._ensure_continuous()
                 self._clear_oper_events()
@@ -1108,34 +1192,60 @@ class KeysightPNA(VISAInstrument):
             for n, conn, kit in ports:
                 if conn and not kit:
                     raise ValueError(f"калибровка: нет набора для порта {n}")
+            was_armed = self._armed
             self._abort()
             c = self._stim_ch
             guid = f"SENS{c}:CORR:COLL:GUID"
-            for n, conn, kit in ports:
-                self.write(f'{guid}:CONN:PORT{n} "{conn or "Not used"}"')
-                if conn:
-                    self.write(f'{guid}:CKIT:PORT{n} "{kit}"')
-            self.write(f"{guid}:INIT")
-            self._check_errors(context=name)
-            steps = int(parse_number(self.query(f"{guid}:STEP?")))
-            self._cal = {"channel": c, "done": set(), "busy": None, "kind": "guided",
-                         "steps": [self.query(f"{guid}:DESC? {k}").strip().strip('"') for k in range(1, steps + 1)]}
-            return self._cal_status()
+            try:
+                for n, conn, kit in ports:
+                    self.write(f'{guid}:CONN:PORT{n} "{conn or "Not used"}"')
+                    if conn:
+                        self.write(f'{guid}:CKIT:PORT{n} "{kit}"')
+                self.write(f"{guid}:INIT")
+                errors = self._check_errors(context=name)
+                if errors:
+                    raise ValueError("; ".join(m for _, m in errors))
+                steps = int(parse_number(self.query(f"{guid}:STEP?")))
+                if steps <= 0:
+                    raise ValueError("калибровка: прибор не вернул шаги")
+                self._cal = {"channel": c, "done": set(), "busy": None, "kind": "guided",
+                             "steps": [self.query(f"{guid}:DESC? {k}").strip().strip('"') for k in range(1, steps + 1)]}
+                return self._cal_status()
+            except Exception:
+                if self._cal is None:
+                    if self._continuous:
+                        self._ensure_continuous()
+                    elif was_armed:
+                        self._start_sweep()
+                raise
         if name == "cal_start_thru":
             if self._gen is not None:
                 raise ValueError("режим генератора: сначала выключите CW")
+            if not self._sel:
+                raise ValueError("трейс не выбран (trace.sel)")
             c, meas = self._sel
             sparam = self._catalog(c).get(meas)
             if sparam not in ("S21", "S12"):
                 raise ValueError(f"калибровка по перемычке - для трейса S21 / S12 (выбран {meas!r}: {sparam})")
+            was_armed = self._armed
             self._abort()
-            self.write(f"CALC{c}:PAR:SEL '{meas}'")
-            self.write(f"SENS{c}:CORR:COLL:METH TRAN1")
-            self._check_errors(context=name)
-            a, b = sparam[1], sparam[2]
-            self._cal = {"channel": c, "done": set(), "busy": None, "kind": "thru", "meas": meas,
-                         "steps": [f"Connect THRU between port {b} and port {a} ({sparam} {meas})"]}
-            return self._cal_status()
+            try:
+                self.write(f"CALC{c}:PAR:SEL '{meas}'")
+                self.write(f"SENS{c}:CORR:COLL:METH TRAN1")
+                errors = self._check_errors(context=name)
+                if errors:
+                    raise ValueError("; ".join(m for _, m in errors))
+                a, b = sparam[1], sparam[2]
+                self._cal = {"channel": c, "done": set(), "busy": None, "kind": "thru", "meas": meas,
+                             "steps": [f"Connect THRU between port {b} and port {a} ({sparam} {meas})"]}
+                return self._cal_status()
+            except Exception:
+                if self._cal is None:
+                    if self._continuous:
+                        self._ensure_continuous()
+                    elif was_armed:
+                        self._start_sweep()
+                raise
         if self._cal is None:
             raise ValueError("калибровка не начата (cal_start)")
         if name == "cal_measure":
@@ -1167,10 +1277,20 @@ class KeysightPNA(VISAInstrument):
             else:
                 self.write(f'{guid}:SAVE:CSET "{cset}"')
             self.query("*OPC?")
-            self._check_errors(context=name)
+            errors = self._check_errors(context=name)
+            if errors:
+                raise ValueError("; ".join(m for _, m in errors))
             self._cal_end()
             return self._cal_list()
         if name == "cal_abort":
+            if self._cal is not None and self._cal["busy"] is not None:
+                try:
+                    self.write("ABOR")
+                    self.write(f"SENS{c}:SWE:MODE HOLD")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._opc_pending = False
+                self.opc_latched = False
             self._cal_end()
             return None
         return super().run_custom_action(name, args)
@@ -1219,17 +1339,33 @@ class KeysightPNA(VISAInstrument):
             return
         was_armed = self._armed
         if name == "state_save":
+            old_timeout = self.transport.timeout_ms
+            self.transport.timeout_ms = max(old_timeout, 30000)
             try:
                 self.write(f"MMEM:STOR {file}")
+                self.query("*OPC?")
                 self._check_errors(context=name)
             finally:
-                if not self._continuous and was_armed:
-                    self._start_sweep()
+                self.transport.timeout_ms = old_timeout
             return
         self._abort()
-        self.write(f"MMEM:LOAD {file}")                          # state_recall
-        self._check_errors(context=name)
-        self.query("*OPC?")
+        old_timeout = self.transport.timeout_ms
+        self.transport.timeout_ms = max(old_timeout, 30000)
+        recalled = False
+        try:
+            self.write(f"MMEM:LOAD {file}")                      # state_recall
+            self.query("*OPC?")
+            errors = self._check_errors(context=name)
+            if errors:
+                raise ValueError("; ".join(m for _, m in errors))
+            recalled = True
+        finally:
+            self.transport.timeout_ms = old_timeout
+            if not recalled:
+                if self._continuous:
+                    self._ensure_continuous()
+                elif was_armed:
+                    self._start_sweep()
         self.on_connected()                                      # измерения и каналы могли смениться
         self._sync_all()                                         # перечитать всё; режим - как в файле состояния
 
@@ -1286,6 +1422,13 @@ class KeysightPNA(VISAInstrument):
                 slot.name, slot.enabled = "", False
         if c == 1 and name == self.meas_name:
             self.meas_name = next(iter(self._catalog(1)), "")
+        if self._sel == (c, name):
+            rem = self._catalog(c)
+            if rem:
+                self._sel = (c, next(iter(rem)))
+            else:
+                first = next(((ch, nm) for ch in self._channels() for nm in self._catalog(ch)), None)
+                self._sel = first
 
     def _meas_move(self, channel, name, new_channel) -> None:
         c, name, nc = int(channel), str(name), int(new_channel)
@@ -1305,3 +1448,5 @@ class KeysightPNA(VISAInstrument):
                 slot.channel, slot.name = nc, new
         if c == 1 and name == self.meas_name:
             self.meas_name = next(iter(self._catalog(1)), "")
+        if self._sel == (c, name):
+            self._sel = (nc, new)

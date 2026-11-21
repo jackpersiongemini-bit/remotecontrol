@@ -88,6 +88,17 @@ class ZeroSpan(IndicatorButton):
         self.last_span = float(settings.value(self._key, self.DEFAULT_SPAN, type=float)) or self.DEFAULT_SPAN
         self.clicked.connect(self.toggle)
         proxy.subscribe("freq.span", self._on_span)
+        proxy.state_changed.connect(self._on_state)
+        self.setEnabled(proxy.is_connected)
+
+    def _on_state(self, _s) -> None:
+        from PyQt6 import sip
+        if sip.isdeleted(self):
+            return
+        if not self.proxy.is_connected:
+            self._span = None
+            self.update()
+        self.setEnabled(self.proxy.is_connected)
 
     def indicated(self) -> bool:
         return self._span == 0

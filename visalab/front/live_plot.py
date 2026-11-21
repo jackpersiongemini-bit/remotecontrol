@@ -5,10 +5,11 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 import math
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import QWidget
 
 from ..core.units import si_format
@@ -16,41 +17,151 @@ from ..core.trace import Trace
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
                     UI_COLOR_TEXT, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS)
 
-__all__ = ["LivePlot", "nice_range"]
+__all__ = ["LivePlot", "nice_range", "decimate_trace_polygon", "nearest_index"]
 
 
 def nice_range(lo: float, hi: float, divs: int) -> tuple[float, float, float]:
     """Шкала по данным: (низ, верх, цена деления) с шагом 1 / 2 / 5 × 10^n."""
-    if not (math.isfinite(lo) and math.isfinite(hi)):
-        return 0.0, float(divs), 1.0
+    if not (math.isfinite(lo) and math.isfinite(hi)) or divs <= 0:
+        return 0.0, float(max(divs, 1)), 1.0
+    if lo > hi:
+        lo, hi = hi, lo
     if hi - lo < 1e-12:
-        lo, hi = lo - 0.5 * max(abs(lo), 1.0) * 0.1, hi + 0.5 * max(abs(hi), 1.0) * 0.1
+        delta = 0.5 * max(abs(lo), 1.0) * 0.1
+        lo, hi = lo - delta, hi + delta
     span = (hi - lo) * 1.1
+    if not math.isfinite(span) or span <= 0:
+        return 0.0, float(divs), 1.0
     e = math.floor(math.log10(span / divs))
     for step in (st * 10.0 ** k for k in (e, e + 1, e + 2) for st in (1, 2, 5)):
+        if not math.isfinite(step) or step <= 0:
+            continue
         # данные посередине; не влезли из-за округления низа - низ по самому нижнему значению
         # (иначе -120..-5 dBm получали 50 dB/дел вместо 20)
         centered = math.floor((lo - (step * divs - (hi - lo)) / 2) / step + 1e-9) * step
         for bottom in (centered, math.floor(lo / step + 1e-9) * step):
-            if bottom + step * divs >= hi and bottom <= lo:
+            if math.isfinite(bottom) and bottom + step * divs >= hi and bottom <= lo:
                 return bottom, bottom + step * divs, step
     return lo, hi, (hi - lo) / divs
 
 
-def _decimate_polyline(pts: list[tuple[float, float]], left: float, width: float) -> list[tuple[float, float]]:
-    """Сжать длинную трассу до min/max-огибающей по пиксельным столбцам."""
-    cols = max(1, int(width) // 2)
-    if cols < 16 or len(pts) <= 2 * cols:
-        return pts
-    out: list[tuple[float, float]] = []
+def nearest_index(trace: Trace, x_target: float) -> int:
+    """Индекс ближайшей точки трассы к ``x_target``: O(1) для равномерной оси, O(log N) для отсортированной."""
+    xs = trace.x
+    n = len(xs)
+    if n <= 1:
+        return 0
+    if trace.uniform and xs[-1] > xs[0]:
+        i = round((x_target - xs[0]) * (n - 1) / (xs[-1] - xs[0]))
+        return 0 if i < 0 else (n - 1 if i >= n else i)
+    if xs[-1] > xs[0]:
+        i = bisect_left(xs, x_target)
+        if i <= 0:
+            return 0
+        if i >= n:
+            return n - 1
+        return i - 1 if abs(xs[i - 1] - x_target) <= abs(xs[i] - x_target) else i
+    return min(range(n), key=lambda k: abs(xs[k] - x_target))
+
+
+def _append_bucket(poly: QPolygonF, px_val: float, mn: float, mx: float, min_first: bool,
+                   lo: float, hi: float, bottom: float, sy: float, y_transform) -> None:
+    if not math.isfinite(px_val):
+        return
+    if y_transform is not None:
+        mn = y_transform(mn)
+        mx = y_transform(mx)
+        if not (math.isfinite(mn) and math.isfinite(mx)):
+            return
+        if mn > mx:
+            mn, mx = mx, mn
+    elif not (math.isfinite(mn) and math.isfinite(mx)):
+        return
+    mn_c = lo if mn < lo else (hi if mn > hi else mn)
+    mx_c = lo if mx < lo else (hi if mx > hi else mx)
+    py_mn = bottom - (mn_c - lo) * sy
+    if mn == mx:
+        poly.append(QPointF(px_val, py_mn))
+    else:
+        py_mx = bottom - (mx_c - lo) * sy
+        if min_first:
+            poly.append(QPointF(px_val, py_mn))
+            poly.append(QPointF(px_val, py_mx))
+        else:
+            poly.append(QPointF(px_val, py_mx))
+            poly.append(QPointF(px_val, py_mn))
+
+
+def decimate_trace_polygon(trace: Trace, x0: float, x1: float, lo: float, hi: float,
+                           rect: QRectF, step_px: float = 2.0, y_transform=None) -> QPolygonF:
+    """Построить QPolygonF из трассы с min/max-огибающей по пиксельным столбцам до расчёта координат."""
+    w, h = rect.width(), rect.height()
+    xs, ys = trace.x, trace.y
+    n = len(ys)
+    poly = QPolygonF()
+    isfinite = math.isfinite
+    if w <= 0 or h <= 0 or n == 0 or hi <= lo or not (isfinite(x0) and isfinite(x1) and isfinite(lo) and isfinite(hi)):
+        return poly
+    left, bottom = rect.left(), rect.bottom()
+    sx = w / (x1 - x0) if x1 != x0 else 0.0
+    sy = h / (hi - lo)
+    center_x = rect.center().x()
+    cols = max(1, int(w / step_px))
+
+    if cols < 16 or n <= 2 * cols or sx == 0.0:
+        for x, y in zip(xs, ys):
+            if not (isfinite(x) and isfinite(y)):
+                continue
+            yv = y_transform(y) if y_transform is not None else y
+            if not isfinite(yv):
+                continue
+            yc = lo if yv < lo else (hi if yv > hi else yv)
+            px_val = left + (x - x0) * sx if sx else center_x
+            poly.append(QPointF(px_val, bottom - (yc - lo) * sy))
+        return poly
+
+    tx0, tx1 = xs[0], xs[-1]
+    if trace.uniform and n > 1 and tx1 > tx0:
+        inv_step = (n - 1) / (tx1 - tx0)
+        col_span = (x1 - x0) / cols
+        prev_i = max(0, min(n, math.ceil((x0 - tx0) * inv_step - 1e-12)))
+        end_lim = tx1 - 1e-12 * (tx1 - tx0)
+        for c in range(cols):
+            if c == cols - 1 and x1 >= end_lim:
+                next_i = n
+            else:
+                next_i = max(prev_i, min(n, math.ceil((x0 + (c + 1) * col_span - tx0) * inv_step - 1e-12)))
+            if next_i <= prev_i:
+                continue
+            chunk = ys[prev_i:next_i]
+            px_val = left + (xs[prev_i] - x0) * sx
+            mn = min(chunk)
+            mx = max(chunk)
+            if isfinite(mn) and isfinite(mx):
+                min_first = True if mn == mx else (chunk.index(mn) <= chunk.index(mx))
+                _append_bucket(poly, px_val, mn, mx, min_first, lo, hi, bottom, sy, y_transform)
+            else:
+                finite = [v for v in chunk if isfinite(v)]
+                if finite:
+                    mn = min(finite)
+                    mx = max(finite)
+                    min_first = True if mn == mx else (finite.index(mn) <= finite.index(mx))
+                    _append_bucket(poly, px_val, mn, mx, min_first, lo, hi, bottom, sy, y_transform)
+            prev_i = next_i
+        return poly
+
+    scale_col = (w / step_px) / (x1 - x0)
     cur_col: int | None = None
     first_x = min_y = max_y = 0.0
     min_first = True
-    for x, y in pts:
-        col = int((x - left) * 0.5)
+    for x, y in zip(xs, ys):
+        if not (isfinite(x) and isfinite(y)):
+            continue
+        col = int((x - x0) * scale_col)
         if col != cur_col:
             if cur_col is not None:
-                _emit_col(out, first_x, min_y, max_y, min_first)
+                _append_bucket(poly, left + (first_x - x0) * sx, min_y, max_y, min_first,
+                               lo, hi, bottom, sy, y_transform)
             cur_col = col
             first_x = x
             min_y = max_y = y
@@ -63,19 +174,9 @@ def _decimate_polyline(pts: list[tuple[float, float]], left: float, width: float
                 max_y = y
                 min_first = True
     if cur_col is not None:
-        _emit_col(out, first_x, min_y, max_y, min_first)
-    return out
-
-
-def _emit_col(out: list[tuple[float, float]], x: float, min_y: float, max_y: float, min_first: bool) -> None:
-    if min_y == max_y:
-        out.append((x, min_y))
-    elif min_first:
-        out.append((x, min_y))
-        out.append((x, max_y))
-    else:
-        out.append((x, max_y))
-        out.append((x, min_y))
+        _append_bucket(poly, left + (first_x - x0) * sx, min_y, max_y, min_first,
+                       lo, hi, bottom, sy, y_transform)
+    return poly
 
 
 class LivePlot(QWidget):
@@ -89,28 +190,56 @@ class LivePlot(QWidget):
         self.x_range: tuple[float, float] | None = None      # фиксированная ось X (время ваттметра)
         self._scale: tuple[float, float, float] | None = None
         self._mouse: QPointF | None = None
+        self._cache: QPixmap | None = None
+        self._cache_key: tuple | None = None
+        self._font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
+        self._font.setPointSizeF(8)
         self.setMouseTracking(True)
         self.setMinimumHeight(min_height)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     # ------------------------------------------------------------ данные
     def set_traces(self, traces, points: bool = False) -> None:
-        self.traces = [(n, t) for n, t in traces if isinstance(t, Trace) and len(t) > 0]
+        cleaned = [(n, t) for n, t in traces if isinstance(t, Trace) and len(t) > 0]
+        points = bool(points)
+        if (points == self.points and len(cleaned) == len(self.traces)
+                and all(n1 == n2 and t1 is t2 for (n1, t1), (n2, t2) in zip(cleaned, self.traces))):
+            return
+        self.traces = cleaned
         self.points = points
         self._rescale()
         self.update()
 
     def set_marker(self, x: float | None, y: float | None = None) -> None:
-        self.marker = (x, y) if x is not None and y is not None else None
+        marker = (x, y) if x is not None and y is not None else None
+        if marker == self.marker:
+            return
+        self.marker = marker
         self.update()
 
     def _rescale(self) -> None:
         """Шкала держится, пока данные в ней и занимают больше четверти; иначе - новая."""
-        ys = [v for _n, t in self.traces for v in t.y if math.isfinite(v)]
-        if not ys:
+        lo = math.inf
+        hi = -math.inf
+        isfinite = math.isfinite
+        for _n, t in self.traces:
+            y = t.y
+            t_lo, t_hi = min(y), max(y)
+            if isfinite(t_lo) and isfinite(t_hi):
+                if t_lo < lo:
+                    lo = t_lo
+                if t_hi > hi:
+                    hi = t_hi
+            else:
+                for v in y:
+                    if isfinite(v):
+                        if v < lo:
+                            lo = v
+                        if v > hi:
+                            hi = v
+        if lo > hi:
             self._scale = None
             return
-        lo, hi = min(ys), max(ys)
         s = self._scale
         if s and s[0] <= lo and hi <= s[1] and (hi - lo) >= (s[1] - s[0]) / 4:
             return
@@ -129,21 +258,31 @@ class LivePlot(QWidget):
     def _plot_rect(self) -> QRectF:
         return QRectF(self.rect()).adjusted(6, 20, -6, -20)
 
-    def paintEvent(self, e):  # noqa: N802 - Qt
-        if self.width() <= 0 or self.height() <= 0:
-            return
-        p = QPainter(self)
+    def _x_bounds(self) -> tuple[float, float]:
+        if self.x_range and math.isfinite(self.x_range[0]) and math.isfinite(self.x_range[1]):
+            return self.x_range
+        xs0 = [t.x[0] for _n, t in self.traces if t.x and math.isfinite(t.x[0])]
+        xs1 = [t.x[-1] for _n, t in self.traces if t.x and math.isfinite(t.x[-1])]
+        return (min(xs0), max(xs1)) if xs0 and xs1 else (0.0, 1.0)
+
+    def _render_base(self) -> QPixmap:
+        dpr = self.devicePixelRatioF() or 1.0
+        pm = QPixmap(max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
         if not p.isActive():
-            return
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            return pm
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(UI_COLOR_BACKGROUND))
         p.drawRoundedRect(QRectF(self.rect()), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
         r = self._plot_rect()
-        font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
-        font.setPointSizeF(8)
-        p.setFont(font)
-        p.setPen(QPen(QColor(UI_COLOR_BORDER), 1))
+        p.setFont(self._font)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        grid_pen = QPen(QColor(UI_COLOR_BORDER), 1)
+        grid_pen.setCosmetic(True)
+        p.setPen(grid_pen)
         for i in range(self.DIVS_X + 1):
             x = r.left() + r.width() * i / self.DIVS_X
             p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
@@ -154,13 +293,10 @@ class LivePlot(QWidget):
         if not self.traces or self._scale is None:
             p.setPen(muted)
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, "NO DATA")
-            return
+            p.end()
+            return pm
         first = self.traces[0][1]
-        if self.x_range:
-            x0, x1 = self.x_range
-        else:
-            x0 = min(t.x[0] for _n, t in self.traces)
-            x1 = max(t.x[-1] for _n, t in self.traces)
+        x0, x1 = self._x_bounds()
         lo, hi, step = self._scale
 
         def px(x):
@@ -171,20 +307,28 @@ class LivePlot(QWidget):
 
         p.save()
         p.setClipRect(r.adjusted(-3, -3, 3, 3))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         for i, (_name, t) in enumerate(self.traces):
             color = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
-            pts = [(px(x), py(y)) for x, y in zip(t.x, t.y) if math.isfinite(y)]
-            draw_pts = pts if self.points else _decimate_polyline(pts, r.left(), r.width())
-            if len(draw_pts) > 1:
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(color, 1.0 if self.points else 1.2))
-                p.drawPolyline(QPolygonF([QPointF(x, y) for x, y in draw_pts]))
-            if self.points or len(pts) == 1:
+            if self.points or len(t) == 1:
+                pts = [QPointF(px(x), py(y)) for x, y in zip(t.x, t.y) if math.isfinite(y)]
+                if len(pts) > 1:
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.setPen(QPen(color, 1.0))
+                    p.drawPolyline(QPolygonF(pts))
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(color)
-                for xy in pts:
-                    p.drawEllipse(QPointF(*xy), 2.2, 2.2)
-        if self.marker:                                   # пик: ромб и уровень
+                for pt in pts:
+                    p.drawEllipse(pt, 2.2, 2.2)
+            else:
+                poly = decimate_trace_polygon(t, x0, x1, lo, hi, r)
+                if len(poly) > 1:
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    pen = QPen(color, 1)
+                    pen.setCosmetic(True)
+                    p.setPen(pen)
+                    p.drawPolyline(poly)
+        if self.marker and math.isfinite(self.marker[0]) and math.isfinite(self.marker[1]):
             mx, my = px(self.marker[0]), py(self.marker[1])
             p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -209,15 +353,45 @@ class LivePlot(QWidget):
         if x1 != x0:
             p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, xu, 3)}/div")
         p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, xu, 4))
+        p.end()
+        return pm
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        key = (self.width(), self.height(), self.devicePixelRatioF(),
+               tuple((n, id(t)) for n, t in self.traces),
+               self.points, self.marker, self.x_range, self._scale)
+        if self._cache is None or self._cache_key != key:
+            self._cache = self._render_base()
+            self._cache_key = key
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.drawPixmap(0, 0, self._cache)
         m = self._mouse
-        if m is not None and r.contains(m) and len(first) > 0:        # курсор: точка первой трассы
-            i = min(range(len(first)), key=lambda k: abs(px(first.x[k]) - m.x()))
-            cx, cy = px(first.x[i]), py(first.y[i])
+        if m is None or not self.traces or self._scale is None:
+            return
+        r = self._plot_rect()
+        first = self.traces[0][1]
+        if r.contains(m) and len(first) > 0:              # курсор: точка первой трассы
+            x0, x1 = self._x_bounds()
+            lo, hi, _step = self._scale
+            x_target = x0 + (m.x() - r.left()) / r.width() * (x1 - x0) if x1 != x0 and r.width() > 0 else x0
+            i = nearest_index(first, x_target)
+            yi = first.y[i]
+            if not math.isfinite(yi):
+                return
+            cx = r.left() + (first.x[i] - x0) / (x1 - x0) * r.width() if x1 != x0 else r.center().x()
+            cy = r.bottom() - (min(max(yi, lo), hi) - lo) / (hi - lo) * r.height()
+            muted = QColor(UI_COLOR_BORDER_LIGHT)
+            p.setFont(self._font)
             p.setPen(QPen(muted, 1, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(cx, r.top()), QPointF(cx, r.bottom()))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(UI_COLOR_TEXT))
             p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
             p.setPen(QColor(UI_COLOR_TEXT))
             p.drawText(QRectF(r.left(), r.top() + 2, r.width() - 4, 14), Qt.AlignmentFlag.AlignRight,
-                       f"{si_format(first.x[i], xu, 5)}  {first.y[i]:.2f} {yu}")
+                       f"{si_format(first.x[i], first.x_unit, 5)}  {yi:.2f} {first.y_unit}")

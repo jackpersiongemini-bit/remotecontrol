@@ -104,7 +104,7 @@ class RFSignalGenerator(VISAInstrument):
         if value is True:
             for other in self.EXCLUSIVE.get(spec.key, ()):
                 o = self._params.get(other)
-                if o is not None and o.write:
+                if o is not None and o.write and other not in self._no_answer and self._values.get(other) is not False:
                     self.write(o.write.format(value=o.to_scpi(False)))
         super().write_param(spec, value)
 
