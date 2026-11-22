@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6 import sip
-from PyQt6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
                              QVBoxLayout, QWidget)
 
@@ -41,8 +41,9 @@ from ..core.units import SI_PREFIXES, si_format, si_parse
 from ..core.trace import Trace
 from . import instrument_window as _iw
 from .instrument_window import WINDOW_EVENTS, InstrumentWindow
-from .live_plot import decimate_trace_polygon, nearest_index
+from .live_plot import decimate_trace_polygon, nearest_index, nice_range
 from .params import IndicatorButton, PChoice, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
+from .plot_tools import ANALYSIS_KEYS, PlotSettingsPopup, analyze_trace, format_analysis, trace_diff
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
                     UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
 from .window import mark_growing
@@ -489,7 +490,7 @@ class PowerReadout(QFrame):
 
 # ---------------------------------------------------------------- график временной области
 class TracePlot(QWidget):
-    """Мощность от времени: сетка, трасса, строб (полупрозрачная полоса), курсор под мышью."""
+    """Мощность от времени: сетка, трасса, строб, курсор, память MEM (2× клик), анализ и настройки шкалы (ПКМ)."""
 
     DIVS_X, DIVS_Y = 10, 6
     DB_PER_DIV = 10.0
@@ -503,6 +504,12 @@ class TracePlot(QWidget):
         self.auto = True
         self.ref: float | None = None
         self.per_div: float | None = None
+        self.show_grid = True
+        self.memory: Trace | None = None
+        self.memory_visible = True
+        self.memory_diff = False
+        self.analysis_metrics: list[str] = []
+        self._popup: PlotSettingsPopup | None = None
         self._mouse: QPointF | None = None
         self._cache: QPixmap | None = None
         self._cache_key: tuple | None = None
@@ -540,6 +547,118 @@ class TracePlot(QWidget):
         self.ref, self.per_div = ref, per_div
         self.update()
 
+    # ------------------------------------------------------------ единый интерфейс PlotSettingsPopup
+    def set_manual_scale(self, ref: float, per_div: float, _divs_y: int | None = None) -> None:
+        if math.isfinite(ref) and math.isfinite(per_div) and per_div > 0:
+            self.set_scale(self.unit, False, float(ref), float(per_div))
+
+    def set_auto_scale(self) -> None:
+        self.set_scale(self.unit, True, self.ref, self.per_div)
+
+    def autoscale_once(self) -> None:
+        t, yt = self._effective_trace()
+        if t is None:
+            return
+        vals = [yt(y) if yt is not None else y for y in t.y if math.isfinite(y)]
+        vals = [v for v in vals if math.isfinite(v)]
+        if not vals:
+            return
+        _lo, hi, step = nice_range(min(vals), max(vals), self.DIVS_Y)
+        self.set_manual_scale(hi, step)
+
+    def set_x_zoom(self, _x0, _x1) -> None:
+        pass
+
+    def reset_view(self) -> None:
+        self.set_auto_scale()
+
+    def set_show_grid(self, on: bool) -> None:
+        self.show_grid = bool(on)
+        self.update()
+
+    def set_show_points(self, _on: bool) -> None:
+        pass
+
+    def store_memory(self) -> bool:
+        if self.trace is None:
+            return False
+        self.memory = self.trace
+        self.memory_visible = True
+        self.update()
+        return True
+
+    def clear_memory(self) -> None:
+        self.memory = None
+        self.memory_diff = False
+        self.update()
+
+    def toggle_memory(self) -> bool:
+        if self.memory is not None:
+            self.clear_memory()
+            return False
+        return self.store_memory()
+
+    def set_memory_visible(self, on: bool) -> None:
+        self.memory_visible = bool(on)
+        self.update()
+
+    def set_memory_diff(self, on: bool) -> None:
+        self.memory_diff = bool(on) and self.memory is not None
+        self.update()
+
+    def set_analysis_metrics(self, metrics: list[str] | tuple[str, ...]) -> None:
+        self.analysis_metrics = [k for k in ANALYSIS_KEYS if k in set(metrics)]
+        self.update()
+
+    def toggle_analysis_metric(self, key: str, on: bool) -> None:
+        cur = set(self.analysis_metrics)
+        if on:
+            cur.add(key)
+        else:
+            cur.discard(key)
+        self.set_analysis_metrics(list(cur))
+
+    def open_settings(self, global_pos: QPoint | None = None) -> PlotSettingsPopup:
+        if self._popup is not None:
+            self._popup.close()
+        self._popup = PlotSettingsPopup(self, self)
+        pos = global_pos if global_pos is not None else self.mapToGlobal(QPoint(self.width() - 280, 20))
+        self._popup.show_at(pos)
+        return self._popup
+
+    def plot_settings_state(self) -> dict:
+        lo, hi = self.y_range()
+        div = (hi - lo) / self.DIVS_Y if hi > lo else self.DB_PER_DIV
+        t, _yt = self._effective_trace()
+        return {
+            "manual_scale": not self.auto,
+            "ref": hi,
+            "div": div,
+            "divs_y": self.DIVS_Y,
+            "y_unit": self.y_unit(),
+            "x_unit": t.x_unit if t is not None else "",
+            "x_bounds": (t.x[0], t.x[-1]) if t is not None and len(t.x) else (0.0, 1.0),
+            "manual_x_range": None,
+            "show_grid": self.show_grid,
+            "show_points": False,
+            "has_memory": self.memory is not None,
+            "memory_count": 1 if self.memory is not None else 0,
+            "memory_visible": self.memory_visible,
+            "memory_diff": self.memory_diff,
+            "analysis_metrics": list(self.analysis_metrics),
+            "supports_divs": False,
+            "supports_x_zoom": False,
+            "supports_points": False,
+        }
+
+    def _effective_trace(self) -> tuple[Trace | None, Any]:
+        if self.trace is None:
+            return None, None
+        yt = _dbm_to_w if (self.unit == "W" and self.trace.y_unit == "dBm") else None
+        if self.memory_diff and self.memory is not None:
+            return trace_diff(self.trace, self.memory, y_transform=yt), None
+        return self.trace, yt
+
     def ys(self) -> list[float]:
         """Значения трассы в единице шкалы (W - из dBm)."""
         if self.unit == "W" and self.trace is not None and self.trace.y_unit == "dBm":
@@ -547,12 +666,22 @@ class TracePlot(QWidget):
         return list(self.trace.y) if self.trace is not None else []
 
     def y_unit(self) -> str:
+        if self.memory_diff and self.memory is not None and self.trace is not None:
+            return "W" if (self.unit == "W" and self.trace.y_unit == "dBm") else (
+                "dB" if self.trace.y_unit in ("dBm", "dB") else self.trace.y_unit
+            )
         return "W" if self.unit == "W" and self.trace is not None and self.trace.y_unit == "dBm" else \
             (self.trace.y_unit if self.trace is not None else "")
 
     def auto_range(self) -> tuple[float, float]:
         """AUTO: dBm - сверху максимум, округлённый вверх до 10 dB, 10 dB / дел; W - от 0 до максимума
         с круглой ценой деления (1, 2, 5)."""
+        t, _yt = self._effective_trace()
+        if self.memory_diff and self.memory is not None and t is not None:
+            vals = [y for y in t.y if math.isfinite(y)]
+            if vals:
+                lo, hi, _step = nice_range(min(vals), max(vals), self.DIVS_Y)
+                return lo, hi
         return _trace_auto_range(self.trace, self.unit, self.DIVS_Y, self.DB_PER_DIV)
 
     def y_range(self) -> tuple[float, float]:
@@ -563,8 +692,39 @@ class TracePlot(QWidget):
     def _y_text(self, v: float, digits: int = 4) -> str:
         return si_format(v, "W", digits) if self.y_unit() == "W" else f"{v:g} {self.y_unit()}"
 
-    def _plot_rect(self) -> QRectF:
-        return QRectF(self.rect()).adjusted(6, 6, -6, -20)
+    def analysis_lines(self) -> list[str]:
+        if not self.analysis_metrics:
+            return []
+        t, yt = self._effective_trace()
+        if t is None:
+            return []
+        stats = analyze_trace(t, y_transform=yt)
+        tokens = format_analysis(stats, self.analysis_metrics, t.x_unit, self.y_unit())
+        if not tokens:
+            return []
+        fm = QFontMetrics(self._font)
+        max_w = max(120, self.width() - 16)
+        lines: list[str] = []
+        cur = ""
+        for tok in tokens:
+            cand = f"{cur}  ·  {tok}" if cur else tok
+            if cur and fm.horizontalAdvance(cand) > max_w:
+                lines.append(cur)
+                cur = tok
+            else:
+                cur = cand
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def _analysis_height(self, lines: list[str] | None = None) -> int:
+        if lines is None:
+            lines = self.analysis_lines()
+        return (len(lines) * 14 + 4) if lines else 0
+
+    def _plot_rect(self, analysis_h: int | None = None) -> QRectF:
+        ah = self._analysis_height() if analysis_h is None else analysis_h
+        return QRectF(self.rect()).adjusted(6, 6, -6, -(20 + ah))
 
     def mouseMoveEvent(self, e):  # noqa: N802 - Qt
         self._mouse = e.position()
@@ -573,6 +733,39 @@ class TracePlot(QWidget):
     def leaveEvent(self, e):  # noqa: N802 - Qt
         self._mouse = None
         self.update()
+
+    def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton:
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.store_memory()
+            else:
+                self.toggle_memory()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def wheelEvent(self, e):  # noqa: N802 - Qt
+        delta = e.angleDelta().y()
+        if delta == 0 or self.trace is None:
+            super().wheelEvent(e)
+            return
+        lo, hi = self.y_range()
+        step = (hi - lo) / self.DIVS_Y
+        if step <= 0:
+            return
+        if e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
+            shift = step * 0.5 * (1 if delta > 0 else -1)
+            self.set_manual_scale(hi + shift, step)
+        else:
+            factor = 0.8 if delta > 0 else 1.25
+            new_step = max(1e-12, step * factor)
+            center = (lo + hi) * 0.5
+            self.set_manual_scale(center + new_step * self.DIVS_Y * 0.5, new_step)
+        e.accept()
+
+    def contextMenuEvent(self, e):  # noqa: N802 - Qt
+        self.open_settings(e.globalPos())
+        e.accept()
 
     def _render_base(self, mk: float | None) -> QPixmap:
         dpr = self.devicePixelRatioF() or 1.0
@@ -586,20 +779,24 @@ class TracePlot(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(UI_COLOR_BACKGROUND))
         p.drawRoundedRect(QRectF(self.rect()), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-        r = self._plot_rect()
+        an_lines = self.analysis_lines()
+        r = self._plot_rect(self._analysis_height(an_lines))
         p.setFont(self._font)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         grid_pen = QPen(QColor(UI_COLOR_BORDER), 1)
         grid_pen.setCosmetic(True)
         p.setPen(grid_pen)
-        for i in range(self.DIVS_X + 1):
-            x = r.left() + r.width() * i / self.DIVS_X
-            p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
-        for i in range(self.DIVS_Y + 1):
-            y = r.top() + r.height() * i / self.DIVS_Y
-            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+        if self.show_grid:
+            for i in range(self.DIVS_X + 1):
+                x = r.left() + r.width() * i / self.DIVS_X
+                p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+            for i in range(self.DIVS_Y + 1):
+                y = r.top() + r.height() * i / self.DIVS_Y
+                p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+        else:
+            p.drawRect(r)
         muted = QColor(UI_COLOR_BORDER_LIGHT)
-        t = self.trace
+        t, y_transform = self._effective_trace()
         if t is None:
             p.setPen(muted)
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, "NO TRACE")
@@ -620,29 +817,47 @@ class TracePlot(QWidget):
                 p.setBrush(band)
                 p.drawRect(QRectF(g0, r.top(), g1 - g0, r.height()))
                 p.setBrush(Qt.BrushStyle.NoBrush)
-        y_transform = _dbm_to_w if (self.unit == "W" and t.y_unit == "dBm") else None
+        p.save()
+        p.setClipRect(r.adjusted(-2, -2, 2, 2))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if self.memory is not None and self.memory_visible and not self.memory_diff:
+            mem_yt = _dbm_to_w if (self.unit == "W" and self.memory.y_unit == "dBm") else None
+            mpoly = decimate_trace_polygon(self.memory, x0, x1, lo, hi, r, y_transform=mem_yt)
+            if len(mpoly) > 1:
+                mc = QColor(UI_COLOR_TEXT)
+                mc.setAlpha(115)
+                mpen = QPen(mc, 1, Qt.PenStyle.DashLine)
+                mpen.setCosmetic(True)
+                p.setPen(mpen)
+                p.drawPolyline(mpoly)
         poly = decimate_trace_polygon(t, x0, x1, lo, hi, r, y_transform=y_transform)
         if len(poly) > 1:
-            p.save()
-            p.setClipRect(r.adjusted(-2, -2, 2, 2))
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            p.setBrush(Qt.BrushStyle.NoBrush)
             pen = QPen(QColor(UI_COLOR_TEXT), 1)
             pen.setCosmetic(True)
             p.setPen(pen)
             p.drawPolyline(poly)
-            p.restore()
+        p.restore()
         # подписи: верх шкалы и дБ/дел слева сверху, X по краям снизу
-        xu, yu = t.x_unit, t.y_unit
+        xu, yu = t.x_unit, self.y_unit()
         p.setPen(muted)
         div = (hi - lo) / self.DIVS_Y
-        div_text = si_format(div, "W", 3) if self.y_unit() == "W" else f"{div:g} {'dB' if yu == 'dBm' else yu}"
+        div_text = si_format(div, "W", 3) if yu == "W" else f"{div:g} {'dB' if yu == 'dBm' else yu}"
+        mem_tag = "  [DATA−MEM]" if (self.memory is not None and self.memory_diff) else (
+            "  [MEM]" if (self.memory is not None and self.memory_visible) else ""
+        )
         p.drawText(QRectF(r.left() + 3, r.top() + 1, r.width(), 14), Qt.AlignmentFlag.AlignLeft,
-                   f"{self._y_text(hi)}  {div_text}/div{'' if self.auto else '  MAN'}")
+                   f"{self._y_text(hi)}  {div_text}/div{'' if self.auto else '  MAN'}{mem_tag}")
         bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 14)
         p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, xu, 4))
         p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, xu, 3)}/div")
         p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, xu, 4))
+        if an_lines:
+            p.setPen(QColor(UI_COLOR_TEXT))
+            y_an = r.bottom() + 19
+            for ln in an_lines:
+                p.drawText(QRectF(r.left() + 2, y_an, r.width() - 4, 14), Qt.AlignmentFlag.AlignLeft, ln)
+                y_an += 14
         if mk is not None and x0 <= mk <= x1:            # метка: частота датчика
             p.setPen(QPen(QColor(UI_COLOR_INVERT), 1))
             p.drawLine(QPointF(px(mk), r.top()), QPointF(px(mk), r.bottom()))
@@ -654,6 +869,8 @@ class TracePlot(QWidget):
             return
         mk = self.marker()
         key = (self.width(), self.height(), self.devicePixelRatioF(), id(self.trace),
+               id(self.memory), self.memory_visible, self.memory_diff, self.show_grid,
+               tuple(self.analysis_metrics),
                self.gate, self.unit, self.auto, self.ref, self.per_div, mk)
         if self._cache is None or self._cache_key != key:
             self._cache = self._render_base(mk)
@@ -662,7 +879,8 @@ class TracePlot(QWidget):
         if not p.isActive():
             return
         p.drawPixmap(0, 0, self._cache)
-        t, m = self.trace, self._mouse
+        t, y_transform = self._effective_trace()
+        m = self._mouse
         if t is None or m is None:
             return
         r = self._plot_rect()
@@ -671,7 +889,7 @@ class TracePlot(QWidget):
             lo, hi = self.y_range()
             x_target = x0 + (m.x() - r.left()) / r.width() * (x1 - x0) if x1 != x0 and r.width() > 0 else x0
             i = nearest_index(t, x_target)
-            yv = _dbm_to_w(t.y[i]) if (self.unit == "W" and t.y_unit == "dBm") else t.y[i]
+            yv = y_transform(t.y[i]) if y_transform is not None else t.y[i]
             if not math.isfinite(yv):
                 return
             cx = r.left() + (t.x[i] - x0) / (x1 - x0) * r.width() if x1 != x0 else r.left()
@@ -687,7 +905,7 @@ class TracePlot(QWidget):
             p.setPen(QColor(UI_COLOR_TEXT))
             p.drawText(QRectF(r.left(), r.top() + 1, r.width() - 3, 14), Qt.AlignmentFlag.AlignRight,
                        f"{si_format(t.x[i], t.x_unit, 4)}  " + (si_format(yv, "W", 4) if self.y_unit() == "W"
-                                                                else f"{yv:.2f} {t.y_unit}"))
+                                                                else f"{yv:.2f} {self.y_unit()}"))
 
 
 class CalPlot(TracePlot):
@@ -713,10 +931,13 @@ class CalPlot(TracePlot):
         return self.freq
 
     def y_range(self) -> tuple[float, float]:
-        """Шкала по данным: шаг 0.1 / 0.2 / 0.5 / 1 / 2 / 5... dB на деление."""
-        if self.trace is None or not len(self.trace.y):
+        """Шкала по данным (или ручная, если пользователь задал MAN через ПКМ)."""
+        if not self.auto and self.ref is not None and self.per_div:
+            return self.ref - self.DIVS_Y * self.per_div, self.ref
+        t, _yt = self._effective_trace()
+        if t is None or not len(t.y):
             return 0.0, float(self.DIVS_Y)
-        finite = [y for y in self.trace.y if math.isfinite(y)]
+        finite = [y for y in t.y if math.isfinite(y)]
         if not finite:
             return 0.0, float(self.DIVS_Y)
         lo, hi = min(finite), max(finite)
