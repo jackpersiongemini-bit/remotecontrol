@@ -315,3 +315,46 @@ def test_trigger_level_above_20dbm_with_cal_offset(qtbot, pm):
     qtbot.waitUntil(lambda: proxy.value("meas.power") is not None
                     and proxy.value("meas.power") == pytest.approx(45.0, abs=0.1), timeout=5000)
     assert "LEVEL 35 dBm" in win.readout.trig_button.text()
+
+
+def test_level_wait_indicator_and_bus_button_gating(qtbot, pm):
+    """В LEVEL без запуска индикатор показывает --- и WAIT; кнопка TRIG (*TRG) активна только в BUS."""
+    proxy, win, _s = pm
+    sim = sim_of(proxy)
+    assert not win.trig_bus_button.isEnabled()
+    sim.set_signal(on_dbm=-10.0, width=None)           # CW -> нет фронта для LEVEL
+    proxy.set("trig.level", -15.0)
+    proxy.set("trig.source", "INT")
+    _wait(qtbot, proxy, "trig.source", lambda v: v == "INT")
+    qtbot.waitUntil(lambda: proxy.value("meas.armed") is True and proxy.value("meas.power") is None, timeout=5000)
+    qtbot.waitUntil(lambda: "WAIT" in win.readout.trig_button.text() and win.readout.main.text() == "---", timeout=5000)
+    assert not win.trig_bus_button.isEnabled()
+
+    # Появились импульсы -> измерение прошло, WAIT пропало
+    sim.set_signal(on_dbm=-5.0, width=200e-6, period=1e-3, off_dbm=-60.0)
+    qtbot.waitUntil(lambda: proxy.value("meas.power") is not None, timeout=5000)
+    qtbot.waitUntil(lambda: "WAIT" not in win.readout.trig_button.text() and win.readout.main.text() != "---", timeout=5000)
+
+    # В режиме BUS кнопка TRIG становится активной
+    proxy.set("trig.source", "BUS")
+    _wait(qtbot, proxy, "trig.source", lambda v: v == "BUS")
+    qtbot.waitUntil(lambda: win.trig_bus_button.isEnabled(), timeout=5000)
+
+
+def test_restore_cal_table_with_freq_and_high_trig_level(qtbot, pm):
+    """restore() применяет CAL(f) для сохранённой частоты до trig.level, чтобы уровень > +20 дБм не отклонялся."""
+    proxy, win, settings = pm
+    win.cal_dir.mkdir(exist_ok=True)
+    save_csv(win.cal_dir / "slope.csv", [(50e6, 0.0), (10e9, 40.0)])
+    win.cal_choice.click()
+    win.cal_choice.set_value("slope.csv")
+    # На 50 МГц поправка 0 дБ, на 10 ГГц поправка +40 дБ; сохраняем частоту 10 ГГц и trig.level = +35 дБм
+    settings.setValue(win._settings_key("freq"), 10e9)
+    settings.setValue(win._settings_key("trig.level_auto"), False)
+    settings.setValue(win._settings_key("trig.level"), 35.0)
+    settings.setValue(win._settings_key("trig.source"), "INT")
+    win.restore()
+    _wait(qtbot, proxy, "freq", lambda v: v is not None and v == pytest.approx(10e9))
+    _wait(qtbot, proxy, "offset", lambda v: v is not None and v == pytest.approx(40.0, abs=1e-2))
+    _wait(qtbot, proxy, "trig.level", lambda v: v is not None and v == pytest.approx(35.0, abs=1e-2))
+    _wait(qtbot, proxy, "trig.source", lambda v: v == "INT")

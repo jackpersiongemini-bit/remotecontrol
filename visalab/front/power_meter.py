@@ -462,13 +462,25 @@ class PowerReadout(QFrame):
             sec = "PTAV " + ("---" if ptav is None else f"{ptav:.2f} dB")
         self.sec_button.setText(sec)
         src, level, auto = v.get("source"), v.get("level"), v.get("level_auto")
+        armed, cont = v.get("armed"), v.get("continuous")
         if src == "IMM":
             trig = "FREE RUN"
         elif src == "INT":
             trig = "LEVEL AUTO" if auto else ("LEVEL" if level is None else f"LEVEL {level:g} dBm")
+            if power is None:
+                if armed is True:
+                    trig += " · WAIT"
+                elif cont is False:
+                    trig += " · STOP"
         else:
             trig = src or "TRIG ---"
         self.trig_button.setText(trig)
+        tip = "Trigger: click to switch FREE RUN / LEVEL / EXT"
+        if src == "INT" and power is None and armed is True:
+            tip += "\nArmed: waiting for an RF pulse edge crossing LVL"
+        elif src == "INT" and power is None and cont is False:
+            tip += "\nStopped (CONT OFF): press SING on TRIG tab or enable CONT"
+        self.trig_button.setToolTip(tip)
         cal, acal = v.get("cal"), v.get("acal")
         self.cal_button.setText(acal or "CAL " + ("---" if cal is None else f"{cal:+.2f} dB"))
 
@@ -718,8 +730,9 @@ class CalPlot(TracePlot):
 
 
 # ---------------------------------------------------------------- окно
-#: порядок восстановления: детектор (меняет запуск) -> запуск -> остальное -> непрерывный счёт
-RESTORE_RANK = {"detector": 0, "trig.source": 1, "trace.state": 3, "meas.continuous": 4}
+#: порядок восстановления: детектор и частота (для CAL(f)) -> запуск -> уровень -> автоуровень -> трасса -> CONT
+RESTORE_RANK = {"detector": 0, "freq": 0, "trig.source": 1, "trig.level": 2, "trig.level_auto": 3,
+                "trace.state": 4, "meas.continuous": 5}
 
 
 class PowerMeterWindow(InstrumentWindow):
@@ -988,9 +1001,29 @@ class PowerMeterWindow(InstrumentWindow):
         return RESTORE_RANK.get(key, 2)
 
     def restore(self) -> None:
-        # поправка (CORR:GAIN2) должна восстановиться до trig.level, чтобы его диапазон уже учитывал калибровку
-        self.apply_correction()
-        super().restore()
+        # поправка (CORR:GAIN2) должна восстановиться до trig.level и с учётом сохранённой частоты,
+        # чтобы диапазон trig.level уже учитывал калибровку на рабочей частоте
+        saved_freq = self.settings.value(self._settings_key("freq"))
+        freq_hint: float | None = None
+        if saved_freq is not None and self.proxy.supports("freq"):
+            try:
+                freq_hint = float(str(saved_freq).replace(",", "."))
+            except (TypeError, ValueError):
+                freq_hint = None
+        self.apply_correction(freq_override=freq_hint)
+        auto_raw = self.settings.value(self._settings_key("trig.level_auto"))
+        auto_on = str(auto_raw).strip().lower() in ("true", "1", "on") if auto_raw is not None else False
+        for w in sorted(self.saved_widgets, key=lambda w: self.restore_rank(w.key)):
+            if w.key == "trig.level" and auto_on:
+                continue
+            raw = self.settings.value(self._settings_key(w.key))
+            if raw is None:
+                continue
+            try:
+                value = w.spec.validate(str(raw).replace(",", ".") if isinstance(raw, str) else raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            w.set_value(value)
 
     def _tab_index(self, title: str) -> int:
         for i in range(self.tabs.count()):
@@ -1006,11 +1039,14 @@ class PowerMeterWindow(InstrumentWindow):
             self.tabs.set_on(idx, src is not None and src != "IMM")
 
     def _update_trig_enabled(self) -> None:
+        src = self.proxy.value("trig.source")
         slope = self.widgets.get("trig.slope")
         if slope is not None:
-            src = self.proxy.value("trig.source")
             slope.setEnabled(self.proxy.is_connected and src in ("INT", "EXT")
                              and self.proxy.value("trig.slope") is not None)
+        bus_btn = getattr(self, "trig_bus_button", None)
+        if bus_btn is not None:
+            bus_btn.setEnabled(self.proxy.is_connected and src == "BUS")
 
     # ------------------------------------------------------------ вкладки
     def on_param(self, key: str, value: Any) -> None:
@@ -1152,7 +1188,8 @@ class PowerMeterWindow(InstrumentWindow):
         run = self._acal
         self.readout.update_values(power=v("meas.power"), peak=v("meas.peak"), ptav=v("meas.ptav"),
                                    source=v("trig.source"), level=v("trig.level"),
-                                   level_auto=v("trig.level_auto"),
+                                   level_auto=v("trig.level_auto"), armed=v("meas.armed"),
+                                   continuous=v("meas.continuous"),
                                    cal=self.total_correction(),
                                    acal=f"ACAL {run.done}/{run.total}" if run is not None else None)
         self.readout.setEnabled(self.proxy.is_connected)
@@ -1189,18 +1226,19 @@ class PowerMeterWindow(InstrumentWindow):
         duty = self._sdg.value(f"{src.lower()}.duty")
         return float(duty) if isinstance(duty, (int, float)) and duty > 0 else None
 
-    def correction_parts(self) -> dict[str, float]:
+    def correction_parts(self, freq_override: float | None = None) -> dict[str, float]:
         """Слагаемые поправки, dB: CAL(f), −GAIN, 10·lg(100 / DUTY)."""
-        cal = interpolate(self.cal_points, self.proxy.value("freq"))
+        freq = self.proxy.value("freq") if freq_override is None else freq_override
+        cal = interpolate(self.cal_points, freq)
         gain = -self.gain.value if self.gain_on.value else 0.0
         duty = self.duty_value()
         return {"cal": cal, "gain": gain, "duty": 10 * math.log10(100.0 / duty) if duty else 0.0}
 
-    def total_correction(self) -> float:
-        total = sum(self.correction_parts().values())
+    def total_correction(self, freq_override: float | None = None) -> float:
+        total = sum(self.correction_parts(freq_override=freq_override).values())
         return min(max(total, -OFFSET_LIMIT), OFFSET_LIMIT)
 
-    def apply_correction(self) -> None:
+    def apply_correction(self, freq_override: float | None = None) -> None:
         """Записать итоговую поправку в прибор (offset), если она изменилась."""
         if sip.isdeleted(self):
             return
@@ -1213,7 +1251,7 @@ class PowerMeterWindow(InstrumentWindow):
             self.duty.setReadOnly(False)
             self.duty.setPlaceholderText("")
             self.duty.show_value(self.duty.value)
-        total = round(self.total_correction(), 3)
+        total = round(self.total_correction(freq_override=freq_override), 3)
         self._refresh_readout()
         p = self.proxy
         if not p.is_connected or self._resetting or COORD.busy(p) is not None:

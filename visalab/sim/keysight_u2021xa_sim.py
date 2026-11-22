@@ -76,6 +76,12 @@ class KeysightU2021XASim(SimInstrument):
             return _lin(s["on_dbm"])
         return _lin(s["on_dbm"] if (t % s["period"]) < s["width"] else s["off_dbm"])
 
+    def _trig_origin(self, triggered: bool) -> float:
+        s, c = self.signal, self.cfg
+        if triggered and c["src"] == "INT" and c["slop"] == "NEG" and s["width"] is not None:
+            return float(s["width"])
+        return 0.0
+
     def _compute(self, triggered: bool) -> dict[str, float]:
         s, c = self.signal, self.cfg
         if c["det"] == "AVER" or not triggered:
@@ -86,7 +92,7 @@ class KeysightU2021XASim(SimInstrument):
                 avg = _lin(s["on_dbm"]) * duty + _lin(s["off_dbm"]) * (1 - duty)
                 peak = _lin(s["on_dbm"])
         else:
-            t0 = c["del"] + c["offs"]
+            t0 = self._trig_origin(triggered) + c["del"] + c["offs"]
             n = 2000
             pts = [self._power_at(t0 + c["swe"] * i / n) for i in range(n + 1)] if c["swe"] > 0 \
                 else [self._power_at(t0)]
@@ -95,14 +101,14 @@ class KeysightU2021XASim(SimInstrument):
         return {"AVER": _db(avg) + off, "PEAK": _db(peak) + off, "PTAV": _db(peak) - _db(avg),
                 "MIN": _db(min(avg, peak)) + off}
 
-    def _trace(self, n: int) -> list[float]:
+    def _trace(self, n: int, triggered: bool = False) -> list[float]:
         c = self.cfg
         off = c["gain2"] if c["gain2_stat"] else 0.0
-        t0, dt = c["del"] + c["trac_offs"], c["trac_time"] / (n - 1)
+        t0, dt = self._trig_origin(triggered) + c["del"] + c["trac_offs"], c["trac_time"] / (n - 1)
         return [_db(self._power_at(t0 + i * dt)) + off for i in range(n)]
 
     def _complete(self, triggered: bool) -> None:
-        self.trace = self._trace(1000) if self.cfg["trac"] else None
+        self.trace = self._trace(1000, triggered=triggered) if self.cfg["trac"] else None
         r = self._compute(triggered)
         self.results = {n: r[self.feeds[n].split(":")[1].split()[0][:4]] for n in self.feeds}
         self.measuring = False
@@ -111,8 +117,18 @@ class KeysightU2021XASim(SimInstrument):
             self.esr |= ESR_OPC
 
     def _edge_available(self) -> bool:
-        s, lev = self.signal, self.cfg["lev"]
-        return s["width"] is not None and s["on_dbm"] >= lev > s["off_dbm"]
+        s = self.signal
+        if s["width"] is None or s["on_dbm"] <= s["off_dbm"]:
+            return False
+        if self.cfg["lev_auto"]:
+            if s["on_dbm"] < -40.0 or (s["on_dbm"] - s["off_dbm"]) < 1.0:
+                return False
+            lo_floor = max(s["off_dbm"], -40.0)
+            auto_lev = max(-40.0, min(20.0, (s["on_dbm"] + lo_floor) / 2.0))
+            self.cfg["lev"] = round(auto_lev, 1)
+            return True
+        lev = self.cfg["lev"]
+        return s["on_dbm"] >= lev > s["off_dbm"]
 
     def _try_trigger(self, event: str) -> None:
         if not self.measuring:

@@ -334,6 +334,7 @@ class ActivityMonitor(QObject):
         if prof == "power_meter" and key == "meas.power":
             v = _num(value)
             if v is None:
+                self._emit(proxy)
                 return
             self.history[proxy].append((now, v))
             self._updated[proxy] = now
@@ -358,7 +359,7 @@ class ActivityMonitor(QObject):
             self._updated[proxy] = now
             self._last_data[proxy] = now
             self._emit(proxy)
-        elif prof == "power_meter" and key == "trace.state":
+        elif prof == "power_meter" and key in ("trace.state", "meas.armed"):
             self._emit(proxy)
         elif prof == "spectrum_analyzer" and key == "trace" and isinstance(value, Trace) and len(value) > 1:
             self._sa[proxy] = spectrum_peak(value, self.th.sa_margin_db)
@@ -526,8 +527,9 @@ class ActivityMonitor(QObject):
             if present and a.measuring and a.signal:
                 a.source = match_source(a.freq, sources, self._tol(a.freq, step))
         elif prof == "power_meter":
+            waiting = proxy.value("meas.power") is None and proxy.value("meas.armed") is True
             hist = self.history.get(proxy)
-            if hist:
+            if hist and not waiting:
                 a.level = hist[-1][1]
             a.freq = _num(proxy.value("freq"))
             if a.measuring and a.signal:
