@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -46,6 +47,8 @@ SHORT_NAMES = {"network_analyzer": "VNA", "power_meter": "PM", "spectrum_analyze
 #: сколько последних показаний ваттметра хранится (точки на графике)
 HISTORY = 2000
 _SOURCE_KEYS = frozenset(("rf.output", "rf.frequency", "rf.power", "gen.state", "freq.cw", "source.power"))
+_PSU_MEAS_I_RE = re.compile(r"^ch(\d+)\.meas_i$")
+_PSU_LIVE_RE = re.compile(r"^ch(\d+)\.(meas_v|meas_p|output|mode|ovp_tripped)$")
 
 
 @dataclass
@@ -224,6 +227,10 @@ class ActivityMonitor(QObject):
         self.history: dict[Any, deque] = {}
         #: ваттметр -> {(частота датчика Hz, мощность источника dBm | None): (время, dBm)}
         self.pm_points: dict[Any, dict[tuple[float, float | None], tuple[float, float]]] = {}
+        #: (источник питания, канал) -> {(частота генератора Hz, мощность генератора dBm | None): (время, ток A)}
+        self.psu_points: dict[tuple[Any, int], dict[tuple[float, float | None], tuple[float, float]]] = {}
+        #: (источник питания, канал) -> выбранный RF-источник (None = AUTO)
+        self.psu_rf_source: dict[tuple[Any, int], Any] = {}
         self._mag_cache: dict[tuple[Any, str], tuple[Trace, Trace]] = {}
         links.changed.connect(self._sync_roster)
         self._timer = QTimer(self)
@@ -238,6 +245,28 @@ class ActivityMonitor(QObject):
 
     def receivers(self) -> list:
         return [p for p in self.proxies() if profile_name(p) in RECEIVERS]
+
+    def power_supplies(self) -> list:
+        return [p for p in self.proxies() if profile_name(p) == "power_supply"]
+
+    def psu_channels(self, proxy=None) -> list[tuple[Any, int, str]]:
+        """Каналы источников питания: ``[(psu_proxy, номер_канала, "PSU CH1"), ...]``."""
+        psus = [proxy] if proxy is not None else self.power_supplies()
+        out: list[tuple[Any, int, str]] = []
+        for p in psus:
+            if profile_name(p) != "power_supply":
+                continue
+            n_ch = max(1, int(getattr(p, "channels", 1) or 1))
+            base = self.name(p)
+            for ch in range(1, n_ch + 1):
+                if hasattr(p, "supports") and not p.supports(f"ch{ch}.meas_i"):
+                    continue
+                out.append((p, ch, f"{base} CH{ch}"))
+        return out
+
+    def rf_source_proxies(self) -> list:
+        """Все открытые приборы, способные быть RF-источником (генераторы и ВАЦ)."""
+        return [p for p in self.proxies() if profile_name(p) in ("signal_generator", "network_analyzer")]
 
     def name(self, proxy) -> str:
         return short_name(proxy, self.proxies())
@@ -271,6 +300,10 @@ class ActivityMonitor(QObject):
             for d in (self._last_data, self._last_signal, self._updated, self._sa, self._measuring,
                       self.history, self.pm_points):
                 d.pop(p, None)
+            for k in [k for k in self.psu_points if k[0] is p]:
+                self.psu_points.pop(k, None)
+            for k in [k for k in self.psu_rf_source if k[0] is p or self.psu_rf_source[k] is p]:
+                self.psu_rf_source.pop(k, None)
             self._purge_mag_cache(p)
         for p in current:
             if p in self._conns:
@@ -318,6 +351,8 @@ class ActivityMonitor(QObject):
             for r in self.receivers():
                 if r is not proxy:
                     self._emit(r)
+            for psu in self.power_supplies():
+                self.changed.emit(psu)
         self._emit(proxy)
 
     def _on_value(self, proxy, key: str, value) -> None:
@@ -328,6 +363,31 @@ class ActivityMonitor(QObject):
             for r in self.receivers():          # источник изменился - подписи у приёмников тоже
                 if r is not proxy:
                     self._emit(r)
+            for psu in self.power_supplies():
+                self.changed.emit(psu)
+        if prof == "power_supply":
+            m_i = _PSU_MEAS_I_RE.match(key)
+            if m_i:
+                ch = int(m_i.group(1))
+                cur = _num(value)
+                self._updated[proxy] = now
+                self._last_data[proxy] = now
+                if cur is not None and proxy.value(f"ch{ch}.output") is not False:
+                    src = self.psu_source(proxy, ch)
+                    if src is not None:
+                        pk = None if src.power is None else round(float(src.power), 3)
+                        points = self.psu_points.setdefault((proxy, ch), {})
+                        pt_key = (float(round(src.freq)), pk)
+                        points.pop(pt_key, None)
+                        points[pt_key] = (now, cur)
+                        while len(points) > HISTORY:
+                            points.pop(next(iter(points)))
+                self.changed.emit(proxy)
+                return
+            if _PSU_LIVE_RE.match(key) or key == "output_all":
+                self.changed.emit(proxy)
+                return
+            return
         if prof not in RECEIVERS and (key in _SOURCE_KEYS or key.endswith("output")):
             self.changed.emit(proxy)            # плитка генератора / источника питания
             return
@@ -571,6 +631,47 @@ class ActivityMonitor(QObject):
 
     def clear_pm_table(self, proxy) -> None:
         self.pm_points.pop(proxy, None)
+        self.changed.emit(proxy)
+
+    # ------------------------------------------------------------ таблицы токов ИП
+    def set_psu_rf_source(self, proxy, channel: int, rf_proxy) -> None:
+        """Выбрать конкретный RF-источник для таблицы тока (None = AUTO)."""
+        key = (proxy, int(channel))
+        if rf_proxy is None:
+            self.psu_rf_source.pop(key, None)
+        else:
+            self.psu_rf_source[key] = rf_proxy
+        self.changed.emit(proxy)
+
+    def psu_source(self, proxy, channel: int) -> Source | None:
+        """Активный RF-источник (частота и мощность генератора) для канала ИП."""
+        sources = self.sources()
+        if not sources:
+            return None
+        preferred = self.psu_rf_source.get((proxy, int(channel)))
+        if preferred is not None:
+            return next((s for s in sources if s.proxy is preferred), None)
+        # AUTO: предпочитаем выделенный СВЧ-генератор, иначе ВАЦ в CW
+        gen = next((s for s in sources if profile_name(s.proxy) == "signal_generator"), None)
+        return gen or sources[0]
+
+    def psu_matrix(self, proxy, channel: int) -> tuple[list[float | None], list[tuple[float, dict[float | None, float]]]]:
+        """Матрица токов канала ИП: ``(columns, rows)``, где ``columns`` - отсортированные уровни
+        выходной мощности генератора (dBm), а ``rows`` - ``[(частота Hz, {мощность: ток A})]``."""
+        pts = self.psu_points.get((proxy, int(channel)), {})
+        if not pts:
+            return [], []
+        num_cols = sorted({p for _f, p in pts if p is not None})
+        cols: list[float | None] = list(num_cols)
+        if any(p is None for _f, p in pts):
+            cols.append(None)
+        by_freq: dict[float, dict[float | None, float]] = {}
+        for (f, p), (_t, v) in pts.items():
+            by_freq.setdefault(f, {})[p] = v
+        return cols, sorted(by_freq.items())
+
+    def clear_psu_table(self, proxy, channel: int) -> None:
+        self.psu_points.pop((proxy, int(channel)), None)
         self.changed.emit(proxy)
 
     def _magnitude_db_cached(self, proxy, slot_key: str, trace: Trace) -> Trace:
