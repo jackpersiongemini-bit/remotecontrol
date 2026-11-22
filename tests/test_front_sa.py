@@ -178,8 +178,8 @@ def test_panel_table_multi_column_grouping(qtbot, sa):
     assert abs(cent.width() - span.width()) <= 2 and cent.y() == span.y()
     ampl = win.pages[2]
     assert [[ln.name for ln in row] for row in ampl._rows] == [["RLEV", "ROFF"], ["SDIV", "DET"], ["ATT", "PRE"]]
-    # Вкладка подключения: DRV | MDL, ADDR, DLY | APPLY
-    assert [[ln.name for ln in row] for row in win.connection_page._rows] == [["DRV", "MDL"], ["ADDR"], ["DLY", ""]]
+    # Вкладка подключения: DRV | MDL, ADDR, DLY | POLL, APPLY
+    assert [[ln.name for ln in row] for row in win.connection_page._rows] == [["DRV", "MDL"], ["ADDR"], ["DLY", "POLL"], [""]]
 
 
 def test_fractional_state_name_fits_psa_8char_limit(qtbot, sa):

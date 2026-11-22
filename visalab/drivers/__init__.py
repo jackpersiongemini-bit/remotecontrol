@@ -98,6 +98,11 @@ def default_delay(kind: str) -> float:
     return float(getattr(DRIVERS[kind][0], "COMMAND_DELAY_S", 0.0) or 0.0)
 
 
+def default_poll_pause(kind: str) -> float:
+    """Пауза между считываниями в непрерывном режиме по умолчанию для драйвера, с."""
+    return max(0.05, float(getattr(DRIVERS[kind][0], "POLL_INTERVAL_MS", 500) or 500) / 1000.0)
+
+
 def models(kind: str) -> dict:
     """Встроенные модели драйвера (пределы и функции): {имя: модель}."""
     return dict(MODELS.get(kind) or {})
@@ -110,20 +115,21 @@ def model_class(kind: str):
 
 
 def create_driver(kind: str, address: str | None, model=None, delay: float | None = None, backend: str = "",
-                  latency: float = 0.0) -> VISAInstrument:
+                  latency: float = 0.0, poll_pause: float | None = None) -> VISAInstrument:
     """Драйвер прибора вместе с его транспортом (ещё не подключён).
 
     ``address`` - VISA-строка, IP, IP:порт или ``sim`` (симулятор); ``model`` - имя встроенной модели,
     готовая модель (своя, из окна) или None (по *IDN?); ``delay`` - пауза между командами, с (None - по
-    умолчанию драйвера)."""
+    умолчанию драйвера); ``poll_pause`` - пауза между считываниями в непрерывном режиме, с."""
     driver_cls, _sim = DRIVERS[kind]
     if isinstance(model, str):
         model = models(kind).get(model)
     return driver_cls(make_transport(kind, address, backend, latency), model=model,
-                      command_delay_s=None if delay is None else float(delay))
+                      command_delay_s=None if delay is None else float(delay),
+                      read_pause_s=None if poll_pause is None else float(poll_pause))
 
 
 __all__ = ["DRIVERS", "MODELS", "make_transport", "normalize_address", "kinds", "profile_of", "kind_of",
-           "default_delay", "models", "model_class", "create_driver", "list_resources", "VISAInstrument",
-           "InstrumentError", "ESR_BITS",
+           "default_delay", "default_poll_pause", "models", "model_class", "create_driver", "list_resources",
+           "VISAInstrument", "InstrumentError", "ESR_BITS",
            "SiglentSDG", "ItechIT6300", "KeysightE8267D", "RSSMF100A", "KeysightU2021XA", "AgilentPSA", "KeysightPNA"]

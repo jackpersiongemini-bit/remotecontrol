@@ -15,15 +15,16 @@ from __future__ import annotations
 from .. import drivers as _drivers
 from .proxy import InstrumentProxy
 
-__all__ = ["InstrumentProxy", "open_instrument", "kinds", "profile_of", "default_delay", "models", "model_class",
-           "list_resources"]
+__all__ = ["InstrumentProxy", "open_instrument", "kinds", "profile_of", "default_delay", "default_poll_pause",
+           "models", "model_class", "list_resources"]
 
 
 def open_instrument(kind: str, address: str | None, model=None, delay: float | None = None, backend: str = "",
-                    latency: float = 0.0) -> InstrumentProxy:
+                    latency: float = 0.0, poll_pause: float | None = None) -> InstrumentProxy:
     """Абстрактный прибор по типу драйвера (``e8267d``...) и адресу (VISA, IP, ``sim``). Ещё не подключён:
     подключение - ``open()``. ``model`` - имя встроенной модели, своя модель или None (по *IDN?)."""
-    driver = _drivers.create_driver(kind, address, model=model, delay=delay, backend=backend, latency=latency)
+    driver = _drivers.create_driver(kind, address, model=model, delay=delay, backend=backend, latency=latency,
+                                    poll_pause=poll_pause)
     return InstrumentProxy(driver, kind=kind)
 
 
@@ -40,6 +41,11 @@ def profile_of(kind: str):
 def default_delay(kind: str) -> float:
     """Пауза между командами по умолчанию для драйвера, с."""
     return _drivers.default_delay(kind)
+
+
+def default_poll_pause(kind: str) -> float:
+    """Пауза между считываниями в непрерывном режиме по умолчанию для драйвера, с."""
+    return _drivers.default_poll_pause(kind)
 
 
 def models(kind: str) -> dict:

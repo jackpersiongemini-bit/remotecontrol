@@ -81,12 +81,12 @@ class AgilentPSA(VISAInstrument):
     TIMEOUT_MS = 5000          # трасса 8192 точки в ASCII - ~100 КБ
 
     def __init__(self, transport, model: PSAModel | None = None, parent=None,
-                 command_delay_s: float | None = None):
+                 command_delay_s: float | None = None, read_pause_s: float | None = None):
         self.model = model or PSA_MODELS["E4446A"]
         self._continuous = True
         self._armed = False
         self._trace: Trace | None = None
-        super().__init__(transport, parent, command_delay_s)
+        super().__init__(transport, parent, command_delay_s, read_pause_s)
 
     # ------------------------------------------------------------ описание
     def build_params(self):
@@ -200,11 +200,18 @@ class AgilentPSA(VISAInstrument):
         self._armed = False
         self._trace = None
 
+    def _is_triggered(self) -> bool:
+        return self._values.get("trig.source", "FREE") != "FREE"
+
+    def is_triggered_mode(self) -> bool:
+        return self._is_triggered() or not self._continuous
+
     def write_param(self, spec: Param, value: Any) -> None:
         if spec.key == "meas.continuous":
             self._continuous = bool(value)
             if self._continuous and not self._armed:
                 self._start_sweep()
+            self._sync_poll_timer()
             return
         # Изменение настройки перезапускает развёртку: текущая трасса уже не про новые условия.
         was_armed = self._armed
@@ -214,6 +221,10 @@ class AgilentPSA(VISAInstrument):
         finally:                                  # отказ записи не должен останавливать развёртки
             if was_armed or self._continuous:
                 self._start_sweep()
+
+    def after_write(self, spec: Param, value: Any) -> None:
+        if spec.key == "trig.source":
+            self._sync_poll_timer()
 
     def read_param_raw(self, spec: Param) -> Any:
         key = spec.key
@@ -236,6 +247,7 @@ class AgilentPSA(VISAInstrument):
         super()._sync_all()
         if self._continuous and not self._armed:
             self._start_sweep()
+        self._sync_poll_timer()
 
     # ------------------------------------------------------- развёртки
     def _set_armed(self, armed: bool) -> None:
@@ -302,12 +314,14 @@ class AgilentPSA(VISAInstrument):
             self._continuous = False
             self._publish("meas.continuous", False)
             self._start_sweep()
+            self._sync_poll_timer()
             return None
         if name == "abort":
             self._continuous = False
             self._publish("meas.continuous", False)
             self._abort()
             self.write("ABOR")
+            self._sync_poll_timer()
             return None
         if name == "restart":
             was_armed = self._armed

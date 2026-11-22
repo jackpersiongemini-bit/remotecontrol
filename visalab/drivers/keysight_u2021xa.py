@@ -57,7 +57,8 @@ class KeysightU2021XA(VISAInstrument):
     PROFILE = POWER_METER
     POLL_INTERVAL_MS = 200
 
-    def __init__(self, transport, model=None, parent=None, command_delay_s: float | None = None):
+    def __init__(self, transport, model=None, parent=None, command_delay_s: float | None = None,
+                 read_pause_s: float | None = None):
         self.model = model
         self._continuous = True
         self._armed = False
@@ -70,7 +71,7 @@ class KeysightU2021XA(VISAInstrument):
         self._bounds_dirty = True
         self._batch_active = False
         self._batch_mode_changed = False
-        super().__init__(transport, parent, command_delay_s)
+        super().__init__(transport, parent, command_delay_s, read_pause_s)
 
     # ------------------------------------------------------------ описание
     def build_params(self):
@@ -202,6 +203,9 @@ class KeysightU2021XA(VISAInstrument):
     @property
     def _free_run(self) -> bool:
         return self._values.get("trig.source", "IMM") == "IMM"
+
+    def is_triggered_mode(self) -> bool:
+        return (not self._free_run) or (not self._continuous)
 
     def _stop_acquisition(self) -> tuple[bool, bool]:
         """Остановить измерение перед записью настройки: (было взведено, был INIT:CONT ON)."""
@@ -419,6 +423,7 @@ class KeysightU2021XA(VISAInstrument):
             self.write("INIT:CONT OFF")
             if self._continuous:
                 self._arm()
+        self._sync_poll_timer()
 
     def _arm(self) -> None:
         self.arm_opc("INIT")
@@ -517,6 +522,7 @@ class KeysightU2021XA(VISAInstrument):
             else:
                 self._clear_results()
                 self._arm()
+            self._sync_poll_timer()
             return None
         if name == "abort":
             self._continuous = False
@@ -525,6 +531,7 @@ class KeysightU2021XA(VISAInstrument):
             self.write("INIT:CONT OFF")
             self.write("ABOR")
             self._clear_results()
+            self._sync_poll_timer()
             return None
         if name == "restart":
             was_armed, was_cont_free = self._stop_acquisition()

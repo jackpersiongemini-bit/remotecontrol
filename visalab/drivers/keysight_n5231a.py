@@ -87,7 +87,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .base import VISAInstrument
-from ..core.params import Action, Kind, Param
+from ..core.params import Action, ConnectionState, Kind, Param
 from ..core.units import parse_number
 from ..core.trace import Trace
 from ..profiles import NETWORK_ANALYZER
@@ -166,7 +166,7 @@ class KeysightPNA(VISAInstrument):
     TIMEOUT_MS = 10000            # трасса 32001 точка в ASCII
 
     def __init__(self, transport, model: PNAModel | None = None, parent=None,
-                 command_delay_s: float | None = None):
+                 command_delay_s: float | None = None, read_pause_s: float | None = None):
         self.model = model or PNA_MODELS["N5231A"]
         self._continuous = True
         self._armed = False
@@ -192,7 +192,7 @@ class KeysightPNA(VISAInstrument):
         #: режим генератора: (канал, снимок GEN_KEYS, {канал: SWE:MODE}, {pow_coup, pow_modes, pow_levels, trig_source})
         self._gen: tuple[int, dict[str, Any], dict[int, str], dict[str, Any]] | None = None
         self._sel: tuple[int, str] | None = None                # trace.sel: (канал, имя измерения)
-        super().__init__(transport, parent, command_delay_s)
+        super().__init__(transport, parent, command_delay_s, read_pause_s)
 
     @property
     def channels(self) -> int:
@@ -470,11 +470,15 @@ class KeysightPNA(VISAInstrument):
             on = bool(value)
             self._continuous = on
             if on:
-                self._ensure_continuous()
-                self._clear_oper_events()
+                if self._is_triggered() and not self._oper_supported:
+                    self._start_sweep()
+                else:
+                    self._ensure_continuous()
+                    self._clear_oper_events()
                 self._last_cont_read = time.monotonic()
             else:
                 self._abort()
+            self._sync_poll_timer()
             return
         if spec.key == "meas.complex":
             self._complex = bool(value)
@@ -578,8 +582,11 @@ class KeysightPNA(VISAInstrument):
         finally:                                  # отказ записи не должен останавливать развёртки
             if self._continuous:
                 if self._cal is None:
-                    self._ensure_continuous()
-                    self._clear_oper_events()
+                    if self._is_triggered() and not self._oper_supported:
+                        self._start_sweep()
+                    else:
+                        self._ensure_continuous()
+                        self._clear_oper_events()
                     self._last_cont_read = 0.0 if (spec.key.endswith(".enabled") and value) else time.monotonic()
             elif was_armed:
                 self._start_sweep()
@@ -587,6 +594,16 @@ class KeysightPNA(VISAInstrument):
     def after_write(self, spec: Param, value: Any) -> None:
         if spec.key in ("scale.div", "scale.ref", "scale.rpos"):
             self._sync_sel_scale()
+        elif spec.key == "trig.source":
+            self._clear_oper_events()
+            if self._continuous:
+                if self._is_triggered() and not self._oper_supported:
+                    self._start_sweep()
+                elif not self._is_triggered():
+                    self._opc_pending = False
+                    self.opc_latched = False
+                    self._ensure_continuous()
+            self._sync_poll_timer()
 
     def _write_slot(self, spec: Param, value: Any) -> bool:
         found = self._slot_of(spec.key)
@@ -727,12 +744,16 @@ class KeysightPNA(VISAInstrument):
 
     def _sync_all(self) -> None:
         self._read_keys(list(self._params))
-        if self._cal is None and any(s.enabled and s.name for s in self._slots):
+        if self._cal is None and not self._is_triggered() and any(s.enabled and s.name for s in self._slots):
             self._safe_read_trace()
         if self._continuous:
-            self._ensure_continuous()
-            self._clear_oper_events()
+            if self._is_triggered() and not self._oper_supported:
+                self._start_sweep()
+            else:
+                self._ensure_continuous()
+                self._clear_oper_events()
             self._last_cont_read = time.monotonic() if self._sweep.get("meas.count") else 0.0
+        self._sync_poll_timer()
         self._check_errors(context="sync")
         self.sync_done.emit()
 
@@ -1134,16 +1155,25 @@ class KeysightPNA(VISAInstrument):
         if self._values.get("mark.state"):
             self._read_keys(["mark.y"])
 
+    def _is_triggered(self) -> bool:
+        return self._values.get("trig.source", "IMM") != "IMM"
+
+    def is_triggered_mode(self) -> bool:
+        return self._is_triggered() or not self._continuous
+
     def after_poll_timeout(self) -> None:
         """Чтение трассы прервал таймаут (обмен уже восстановлен): развёртки не должны остановиться."""
         if self._continuous:
-            self._ensure_continuous()
+            if self._is_triggered() and not self._oper_supported:
+                self._start_sweep()
+            else:
+                self._ensure_continuous()
         elif self._armed:
             self._start_sweep()
 
     def _cont_fallback_s(self) -> float:
         swt = float(self._values.get("sweep.time") or 0.1)
-        return min(max(0.3, swt), 1.0)
+        return max(min(max(0.3, swt), 1.0), self.read_pause_s)
 
     def poll(self) -> None:
         if self._cal is not None:
@@ -1153,6 +1183,7 @@ class KeysightPNA(VISAInstrument):
                 self._publish("cal.busy", False)
             return
         if self._continuous:
+            triggered = self._is_triggered()
             if self._oper_supported:
                 try:
                     even = int(parse_number(self.query("STAT:OPER:EVEN?")))
@@ -1170,6 +1201,21 @@ class KeysightPNA(VISAInstrument):
                     self._last_cont_read = time.monotonic()
                     self._read_trace()
                     return
+                if triggered:
+                    # Триггерный режим (EXT/MAN): данные отдаём строго по сигналу прибора о завершении развёртки
+                    return
+            if triggered:
+                # Если STAT:OPER не поддерживается прибором — ждём аппаратный сигнал *OPC
+                if not self._opc_pending:
+                    self._start_sweep()
+                    return
+                if self.opc_done("развёртка"):
+                    self._set_armed(False)
+                    self._last_cont_read = time.monotonic()
+                    self._read_trace()
+                    if self._continuous and self._state is ConnectionState.CONNECTED:
+                        self._start_sweep()
+                return
             fallback_s = self._cont_fallback_s()
             if time.monotonic() - self._last_cont_read >= fallback_s:
                 self._last_cont_read = time.monotonic()
@@ -1185,6 +1231,7 @@ class KeysightPNA(VISAInstrument):
             self._continuous = False
             self._publish("meas.continuous", False)
             self._start_sweep()
+            self._sync_poll_timer()
             return None
         if name == "abort":
             self._continuous = False
@@ -1192,6 +1239,7 @@ class KeysightPNA(VISAInstrument):
             self._abort()
             for c in self._active_channels():
                 self.write(f"SENS{c}:SWE:MODE HOLD")
+            self._sync_poll_timer()
             return None
         if name == "autoscale":
             cmd = self._scale_cmd("scale.div")

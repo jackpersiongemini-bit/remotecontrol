@@ -191,6 +191,10 @@ class Instrument(QObject):
     def set_poll_interval(self, ms: int) -> None:
         self._proxy.set_poll_interval(ms)
 
+    def set_read_pause(self, seconds: float) -> None:
+        """Пауза между считываниями в непрерывном режиме, с (минимум 50 мс)."""
+        self._proxy.set_read_pause(seconds)
+
     def set_command_delay(self, seconds: float) -> None:
         """Пауза между командами прибору, с (0 - без паузы)."""
         self._proxy.set_command_delay(seconds)

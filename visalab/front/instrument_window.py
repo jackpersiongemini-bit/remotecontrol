@@ -36,7 +36,8 @@ from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR
 from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
                      Window, WriteState, mark_growing)
 
-__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay", "parse_power_list",
+__all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay",
+           "saved_poll_pause", "parse_power_list",
            "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "WINDOW_EVENTS", "window_for"]
 
 PRESET_SETTLE_S = 5.0      # после клика по пресету: столько ждать, пока прибор примет все значения
@@ -78,6 +79,16 @@ def saved_delay(settings: QSettings, group: str) -> float | None:
     v = settings.value(f"{group}/DELAY", "")
     try:
         return None if v in (None, "") else max(0.0, float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def saved_poll_pause(settings: QSettings, group: str) -> float | None:
+    """Сохранённая на странице настроек пауза между считываниями в непрерывном режиме, с
+    (None - не задана: как у драйвера)."""
+    v = settings.value(f"{group}/POLL_PAUSE", "")
+    try:
+        return None if v in (None, "") else max(0.05, float(v))
     except (TypeError, ValueError):
         return None
 
@@ -568,6 +579,9 @@ class InstrumentWindow(Window):
         self.recall_size(QSize(self.minimumWidth(), 0))
         self.set_page(settings.value(f"{self._prefix}/TAB", 0, type=int), fit=False)
         self.set_expanded(settings.value(f"{self._prefix}/EXPANDED", False, type=bool))
+        saved_poll = saved_poll_pause(settings, self.CONNECTION_GROUP)
+        if saved_poll is not None:
+            proxy.set_read_pause(saved_poll)
         self._update_tabs()
         WINDOW_EVENTS.changed.emit(proxy)
 
@@ -904,6 +918,15 @@ class InstrumentWindow(Window):
         self.delay_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._show_delay()
         self.delay_edit.returnPressed.connect(self.apply_delay)
+        self.poll_edit = QLineEdit()
+        self.poll_edit.setObjectName("cfg")
+        self.poll_edit.setPlaceholderText("driver default")
+        self.poll_edit.setToolTip("Pause between readings in continuous mode (e.g. 500m = 500 ms, 2 = 2 s); "
+                                  "triggered and level modes read on instrument completion signal. "
+                                  "Enter applies at once, empty = driver default")
+        self.poll_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._show_poll_pause()
+        self.poll_edit.returnPressed.connect(self.apply_poll_pause)
         self.apply_button = self._tool("APPLY", "Save and reconnect with these settings", self.apply_connection)
         self.apply_button.setProperty("wide", True)
         apply_line = PanelLine("", self.apply_button)
@@ -911,7 +934,8 @@ class InstrumentWindow(Window):
         table = PanelTable(
             (PanelLine("DRV", self.driver_choice), PanelLine("MDL", self.model_choice, self.new_model_button)),
             PanelLine("ADDR", self.address_edit),
-            (PanelLine("DLY", self.delay_edit), apply_line),
+            (PanelLine("DLY", self.delay_edit), PanelLine("POLL", self.poll_edit)),
+            apply_line,
         )
         table.hide()
         return table
@@ -920,6 +944,8 @@ class InstrumentWindow(Window):
         models = [("AUTO", "")] + [(m, m) for m in all_models(self.settings, kind)]
         self.model_choice.set_choices(models, value)
         self.new_model_button.setEnabled(model_class(kind) is not None)
+        if hasattr(self, "poll_edit"):
+            self._show_poll_pause()
 
     def new_model(self) -> None:
         """Окно создания модели; после SAVE модель появляется в списке MDL и выбирается."""
@@ -977,8 +1003,41 @@ class InstrumentWindow(Window):
         self._show_delay()
         return True
 
+    def _show_poll_pause(self) -> None:
+        saved = saved_poll_pause(self.settings, self.CONNECTION_GROUP)
+        self.poll_edit.setText("" if saved is None else si_format(saved, "s", 4))
+        try:
+            default = COORD.default_poll_pause(self._driver_kind())
+        except KeyError:
+            default = 0.5
+        self.poll_edit.setPlaceholderText(f"default {si_format(default, 's', 4)}" if default else "driver default")
+
+    def apply_poll_pause(self) -> bool:
+        """POLL: пауза между считываниями в непрерывном режиме; сохранить в ini и сразу применить к прибору."""
+        text = self.poll_edit.text().strip()
+        if not text:
+            self.settings.remove(f"{self.CONNECTION_GROUP}/POLL_PAUSE")
+            try:
+                default = COORD.default_poll_pause(self._driver_kind())
+            except KeyError:
+                default = 0.5
+            self.proxy.set_read_pause(default)
+            return True
+        try:
+            value = si_parse(text, "s")
+            if not math.isfinite(value) or value < 0.05 or value > 3600.0:
+                raise ValueError("out of range")
+        except ValueError:
+            self._show_poll_pause()
+            return False
+        self.settings.setValue(f"{self.CONNECTION_GROUP}/POLL_PAUSE", value)
+        self.proxy.set_read_pause(value)
+        self._show_poll_pause()
+        return True
+
     def apply_connection(self) -> None:
         self.apply_delay()
+        self.apply_poll_pause()
         driver = self.driver_choice.value or self._driver_kind()
         address = self.address_edit.text().strip() or "sim"
         model = self.model_choice.value or ""
