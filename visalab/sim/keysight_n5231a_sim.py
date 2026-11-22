@@ -239,6 +239,11 @@ class KeysightPNASim(SimInstrument):
         self.on("CALCulate#:MARKer:AOFF", self._mk_aoff)
         self.on("CALCulate#:MARKer#:Y", get=self._mk_y)
         self.on("CALCulate#:MARKer#[:STATe]", self._mk_state, lambda a, g: "1" if self._mk(g)["on"] else "0")
+        self.on("CALCulate#:LIMit:DISPlay[:STATe]", self._lim_disp, lambda a, g: "1" if self._lim(g)["disp"] else "0")
+        self.on("CALCulate#:LIMit[:STATe]", self._lim_stat, lambda a, g: "1" if self._lim(g)["stat"] else "0")
+        self.on("CALCulate#:LIMit:DATA", self._lim_data_set, self._lim_data_get)
+        self.on("CALCulate#:LIMit:DATA:DELete", self._lim_data_del)
+        self.on("CALCulate#:LIMit:FAIL", get=self._lim_fail)
         self.on("SENSe#:FREQuency:STARt", self._f("start"), self._gs("start"))
         self.on("SENSe#:FREQuency:STOP", self._f("stop"), self._gs("stop"))
         self.on("SENSe#:FREQuency:CENTer", self._f("center"), self._gs("center"))
@@ -607,6 +612,64 @@ class KeysightPNASim(SimInstrument):
         pick = max if a.strip().upper().startswith("MAX") else min
         i = pick(range(len(data)), key=data.__getitem__)
         mk.update(on=True, x=fs[i])
+
+    # ------------------------------------------------------- линии пределов (limit lines)
+    def _lim(self, g) -> dict:
+        m = self._cur(g)
+        return m.setdefault("limit", {"disp": False, "stat": False, "segs": []})
+
+    def _lim_disp(self, a, g):
+        self._lim(g)["disp"] = self.boolean(a)
+
+    def _lim_stat(self, a, g):
+        self._lim(g)["stat"] = self.boolean(a)
+
+    def _lim_data_del(self, a, g):
+        self._lim(g)["segs"] = []
+
+    def _lim_data_set(self, a, g):
+        toks = [t.strip() for t in a.split(",") if t.strip()]
+        if len(toks) % 5 != 0:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        segs = []
+        for i in range(0, len(toks), 5):
+            t = int(round(float(toks[i])))
+            if t not in (0, 1, 2):
+                raise SimError(-224, "Illegal parameter value", ESR_EXE)
+            segs.append((t, float(toks[i + 1]), float(toks[i + 2]), float(toks[i + 3]), float(toks[i + 4])))
+        self._lim(g)["segs"] = segs
+
+    def _lim_data_get(self, a, g):
+        segs = self._lim(g)["segs"]
+        if not segs:
+            return "0"
+        parts = []
+        for t, x1, x2, y1, y2 in segs:
+            parts.extend((str(t), f"{x1:+.11E}", f"{x2:+.11E}", f"{y1:+.11E}", f"{y2:+.11E}"))
+        return ",".join(parts)
+
+    def _lim_fail(self, a, g):
+        lim = self._lim(g)
+        segs = [s for s in lim["segs"] if s[0] in (1, 2)]
+        if not lim["stat"] or not segs:
+            return "0"
+        ch = self._ch(g)
+        name = self._selected(ch)
+        data, fs = self.fdata(name), self.freqs(ch)
+        if len(data) == 2 * len(fs):
+            return "0"
+        for f, y in zip(fs, data):
+            for t, x1, x2, y1, y2 in segs:
+                lo_x, hi_x = (x1, x2) if x1 <= x2 else (x2, x1)
+                if f < lo_x - 1e-9 or f > hi_x + 1e-9:
+                    continue
+                if abs(x2 - x1) < 1e-12:
+                    lim_y = y1
+                else:
+                    lim_y = y1 + (y2 - y1) * (f - x1) / (x2 - x1)
+                if (t == 1 and y > lim_y) or (t == 2 and y < lim_y):
+                    return "1"
+        return "0"
 
     # ------------------------------------------------------- память, математика
     def _memorize(self, a, g):

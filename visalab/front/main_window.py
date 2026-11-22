@@ -1839,12 +1839,26 @@ class LivePanel(Panel):
             plot.set_scale(scale, divs_y=DEVICE_DIVS_Y if scale is not None else None)
             plot.set_traces(items)
             plot.set_markers(self._vna_markers_for_items(items, len(traces)))
+            lim_segs = []
+            lim_fail: bool | None = None
+            for _tname, tr in items:
+                meta = tr.meta or {}
+                segs = meta.get("limits")
+                if segs:
+                    lim_segs.extend(segs)
+                lf = meta.get("limit_fail")
+                if lf is True:
+                    lim_fail = True
+                elif lf is False and lim_fail is None:
+                    lim_fail = False
+            plot.set_limit_lines(lim_segs, fail=lim_fail if lim_segs else None)
         self._use_plots(max(1, len(groups_list)))
         if not groups_list:
             plot = self._plot(0)
             plot.set_scale(None)
             plot.set_traces([])
             plot.set_markers([])
+            plot.set_limit_lines([], fail=None)
         if self.proxy.value("gen.state") is True:
             port = self.proxy.value("gen.port")
             pt = f" P{port}" if port in (1, 2) else ""

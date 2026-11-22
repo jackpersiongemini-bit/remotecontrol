@@ -18,7 +18,7 @@ from ..core.trace import Trace
 from .plot_tools import (ANALYSIS_KEYS, MATH_MODES, PlotSettingsPopup, analyze_trace, format_analysis, trace_math,
                          validate_math_expr)
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
-                    UI_COLOR_TEXT, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS)
+                    UI_COLOR_ERROR, UI_COLOR_TEXT, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS)
 
 __all__ = ["LivePlot", "nice_range", "decimate_trace_polygon", "nearest_index"]
 
@@ -194,6 +194,8 @@ class LivePlot(QWidget):
         self.points = False
         self.marker: tuple[float, float] | None = None
         self.markers: list[tuple[str, float, float, int]] = []
+        self.limit_lines: list[tuple[str, float, float, float, float]] = []
+        self.limit_fail: bool | None = None
         self.x_range: tuple[float, float] | None = None      # фиксированная ось X (время ваттметра)
         self._scale: tuple[float, float, float] | None = None
         self._fixed_scale: tuple[float, float, float] | None = None
@@ -387,6 +389,26 @@ class LivePlot(QWidget):
         if cleaned == self.markers:
             return
         self.markers = cleaned
+        self.update()
+
+    def set_limit_lines(self, segments, fail: bool | None = None) -> None:
+        """Задать сегменты limit line ``[(kind, x1, x2, y1, y2), ...]`` (``kind`` = ``'MAX'`` | ``'MIN'``)
+        и результат limit test (``True`` = FAIL, ``False`` = PASS, ``None`` = только отображение)."""
+        cleaned: list[tuple[str, float, float, float, float]] = []
+        for seg in (segments or ()):
+            if len(seg) < 5:
+                continue
+            kind = str(seg[0]).upper()
+            if kind not in ("MAX", "MIN"):
+                continue
+            vals = tuple(float(v) for v in seg[1:5])
+            if all(math.isfinite(v) for v in vals):
+                cleaned.append((kind, vals[0], vals[1], vals[2], vals[3]))
+        fail_val = None if fail is None else bool(fail)
+        if cleaned == self.limit_lines and fail_val == self.limit_fail:
+            return
+        self.limit_lines = cleaned
+        self.limit_fail = fail_val
         self.update()
 
     # ------------------------------------------------------------ настройки шкалы, MEM и анализа
@@ -836,6 +858,27 @@ class LivePlot(QWidget):
                 mc = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
                 mc.setAlpha(115)
                 self._draw_trace(p, mtr, x0, x1, lo, hi, r, self._y_transform, mc, dashed=True)
+        # Линии пределов (limit lines ВАЦ): верхний (MAX) и нижний (MIN) пределы
+        if not self._math_active() and self.limit_lines and hi > lo:
+            lim_col = QColor(UI_COLOR_ERROR)
+            shade_col = QColor(UI_COLOR_ERROR)
+            shade_col.setAlpha(42)
+            lim_pen = QPen(lim_col, 1.6)
+            lim_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            for kind, lx1, lx2, ly1_raw, ly2_raw in self.limit_lines:
+                ly1 = yt(ly1_raw) if yt is not None else ly1_raw
+                ly2 = yt(ly2_raw) if yt is not None else ly2_raw
+                if not (math.isfinite(ly1) and math.isfinite(ly2)):
+                    continue
+                p1 = QPointF(px(lx1), r.bottom() - (ly1 - lo) / (hi - lo) * r.height())
+                p2 = QPointF(px(lx2), r.bottom() - (ly2 - lo) / (hi - lo) * r.height())
+                dy = -6.0 if kind == "MAX" else 6.0
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(shade_col)
+                p.drawPolygon(QPolygonF([p1, p2, QPointF(p2.x(), p2.y() + dy), QPointF(p1.x(), p1.y() + dy)]))
+                p.setPen(lim_pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawLine(p1, p2)
         draw_pts = self.points or self.show_points
         for i, (_name, t) in enumerate(eff):
             color = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
@@ -956,6 +999,23 @@ class LivePlot(QWidget):
             p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, dx_s)
         p.drawText(bottom, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, x1_s)
 
+        # Плашка статуса Limit Test (PASS / FAIL) в левом верхнем углу графика
+        if not self._math_active() and self.limit_lines and self.limit_fail is not None:
+            fm_l = QFontMetrics(self._font)
+            badge_txt = "FAIL" if self.limit_fail else "PASS"
+            badge_col = QColor(UI_COLOR_ERROR if self.limit_fail else "#4ec970")
+            bw_l = fm_l.horizontalAdvance(badge_txt) + 14
+            bh_l = fm_l.height() + 4
+            lbox = QRectF(r.left() + 6, r.top() + 5, bw_l, bh_l)
+            lbg = QColor(UI_COLOR_BACKGROUND)
+            lbg.setAlpha(224)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setPen(QPen(badge_col, 1.1))
+            p.setBrush(lbg)
+            p.drawRoundedRect(lbox, 4, 4)
+            p.setPen(badge_col)
+            p.drawText(lbox, Qt.AlignmentFlag.AlignCenter, badge_txt)
+
         # полоса выбранных метрик анализа под осью X
         if an_lines:
             p.setPen(QColor(UI_COLOR_TEXT))
@@ -975,7 +1035,8 @@ class LivePlot(QWidget):
                tuple((n, id(t)) for n, t in self.memory),
                self.memory_visible, self.math_mode, self.math_expr,
                self.points, self.show_points, self.show_grid,
-               self.marker, tuple(self.markers), self.x_range, self.manual_x_range,
+               self.marker, tuple(self.markers), tuple(self.limit_lines), self.limit_fail,
+               self.x_range, self.manual_x_range,
                self.manual_scale, self._scale, self._divs_y, self._y_unit, self._y_transform,
                tuple(self.analysis_metrics))
         if self._cache is None or self._cache_key != key:

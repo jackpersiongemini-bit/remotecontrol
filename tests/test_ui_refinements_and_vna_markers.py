@@ -254,3 +254,71 @@ def test_psu_voltage_units_channel_power_and_total_power(qtbot, tmp_path):
         w.cleanup()
         w.close()
         p.shutdown()
+
+
+def test_vna_limit_lines_read_and_displayed(qtbot, tmp_path):
+    """ВАЦ: limit lines (MAX/MIN) считываются с прибора в Trace.meta['limits'] и рисуются на LivePlot
+    вместе со статусом PASS/FAIL."""
+    from visalab.drivers import KeysightPNA
+    from visalab.sim import KeysightPNASim
+
+    s = QSettings(str(tmp_path / "vna_lim.ini"), QSettings.Format.IniFormat)
+    sim = KeysightPNASim()
+    # Настраиваем limit line прямо на приборе (как оператор с передней панели PNA):
+    # тип 1 = MAX (-10 dB на 1..3 ГГц), тип 2 = MIN (-40 dB), тип 0 = OFF (должен игнорироваться)
+    sim.meas["CH1_S11_1"]["limit"] = {
+        "disp": True,
+        "stat": True,
+        "segs": [
+            (1, 1.0e9, 3.0e9, -10.0, -10.0),
+            (2, 1.5e9, 2.5e9, -40.0, -40.0),
+            (0, 1.0e9, 2.0e9, 0.0, 0.0),
+        ],
+    }
+    p_vna = attach(InstrumentProxy(KeysightPNA, SimTransport(sim, latency_s=0.001)))
+    links = ProxyLinks()
+    links.add(p_vna)
+    mw = MainWindow(s, ActivityMonitor(links))
+    qtbot.addWidget(mw)
+    try:
+        with qtbot.waitSignal(p_vna.sync_done, timeout=5000):
+            p_vna.open()
+        qtbot.waitUntil(
+            lambda: p_vna.value("trace") is not None and len((p_vna.value("trace").meta or {}).get("limits", ())) == 2,
+            timeout=5000,
+        )
+        tr = p_vna.value("trace")
+        assert tr.meta["limits"] == (
+            ("MAX", 1.0e9, 3.0e9, -10.0, -10.0),
+            ("MIN", 1.5e9, 2.5e9, -40.0, -40.0),
+        )
+        # S11 вне резонанса ~0 dB > -10 dB -> limit test FAIL
+        assert tr.meta["limit_test"] is True
+        assert tr.meta["limit_fail"] is True
+
+        panel = mw.panels[p_vna]
+        qtbot.waitUntil(lambda: len(panel.plots) >= 1 and len(panel.plots[0].limit_lines) == 2, timeout=5000)
+        assert panel.plots[0].limit_fail is True
+
+        mw.show()
+        qtbot.waitExposed(mw)
+        panel.plots[0].repaint()
+
+        # Ставим мягкий предел (MAX +5 dB, MIN -80 dB) -> PASS
+        sim.meas["CH1_S11_1"]["limit"]["segs"] = [
+            (1, 1.0e9, 3.0e9, 5.0, 5.0),
+            (2, 1.0e9, 3.0e9, -80.0, -80.0),
+        ]
+        p_vna.sync()
+        qtbot.waitUntil(lambda: panel.plots[0].limit_fail is False, timeout=5000)
+        panel.plots[0].repaint()
+
+        # Выключаем limit lines -> пропадают с графика
+        sim.meas["CH1_S11_1"]["limit"]["disp"] = False
+        sim.meas["CH1_S11_1"]["limit"]["stat"] = False
+        p_vna.sync()
+        qtbot.waitUntil(lambda: len(panel.plots[0].limit_lines) == 0 and panel.plots[0].limit_fail is None, timeout=5000)
+    finally:
+        mw.cleanup()
+        mw.close()
+        p_vna.shutdown()

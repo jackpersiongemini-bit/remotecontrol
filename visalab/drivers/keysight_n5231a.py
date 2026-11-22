@@ -81,6 +81,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -181,6 +182,9 @@ class KeysightPNA(VISAInstrument):
         self._mark_n = 1
         self._markers_cache: dict[tuple[int, str], list[tuple[int, float, float | None]]] = {}
         self._markers_scan_ts: dict[tuple[int, str], float] = {}
+        self._limits_supported = True
+        self._limits_cache: dict[tuple[int, str], dict[str, Any]] = {}
+        self._limits_scan_ts: dict[tuple[int, str], float] = {}
         self._cal_stim = True                  # cal set применяется вместе со своим стимулом
         #: идущая калибровка: {"channel", "steps": [описание], "done": {шаг}, "busy": шаг | None}
         self._cal: dict | None = None
@@ -393,6 +397,9 @@ class KeysightPNA(VISAInstrument):
         self._scale_skip = set()
         self._markers_cache = {}
         self._markers_scan_ts = {}
+        self._limits_supported = True
+        self._limits_cache = {}
+        self._limits_scan_ts = {}
         self._setup_oper_sync()
         self._continuous = True
         self._ensure_continuous()
@@ -417,6 +424,8 @@ class KeysightPNA(VISAInstrument):
         self._sweep = {}
         self._markers_cache = {}
         self._markers_scan_ts = {}
+        self._limits_cache = {}
+        self._limits_scan_ts = {}
         self._power_offset = 0.0
         self._power_offset_state = False
 
@@ -759,6 +768,8 @@ class KeysightPNA(VISAInstrument):
             pass
 
     def _sync_all(self) -> None:
+        self._markers_scan_ts.clear()
+        self._limits_scan_ts.clear()
         self._read_keys(list(self._params))
         if self._cal is None and not self._is_triggered() and any(s.enabled and s.name for s in self._slots):
             self._safe_read_trace()
@@ -935,6 +946,82 @@ class KeysightPNA(VISAInstrument):
         out = self._read_trace_markers(c, name, full=True, select=True)
         self._publish_trace_markers(c, name, out)
         return out
+
+    # ------------------------------------------------------- линии пределов (limit lines)
+    @staticmethod
+    def _parse_limit_data(raw: str) -> tuple[tuple[str, float, float, float, float], ...]:
+        """Разобрать ответ ``CALC<c>:LIM:DATA?`` (5 чисел на сегмент: type, x1, x2, y1, y2).
+
+        type: 0 = OFF (пропускаем), 1 = MAX (верхний предел), 2 = MIN (нижний предел).
+        """
+        text = (raw or "").strip().strip('"').strip()
+        if not text:
+            return ()
+        nums: list[float] = []
+        for tok in text.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                nums.append(parse_number(tok))
+            except ValueError:
+                return ()
+        segs: list[tuple[str, float, float, float, float]] = []
+        for i in range(0, len(nums) - 4, 5):
+            t = int(round(nums[i]))
+            if t == 1:
+                kind = "MAX"
+            elif t == 2:
+                kind = "MIN"
+            else:
+                continue
+            x1, x2, y1, y2 = nums[i + 1], nums[i + 2], nums[i + 3], nums[i + 4]
+            if all(math.isfinite(v) for v in (x1, x2, y1, y2)):
+                segs.append((kind, x1, x2, y1, y2))
+        return tuple(segs)
+
+    def _read_trace_limits(self, channel: int, name: str, *, force: bool = False) -> dict[str, Any] | None:
+        """Прочитать limit lines выбранного измерения ``(channel, name)`` (``CALC<c>:PAR:SEL`` уже выполнен)."""
+        if not self._limits_supported:
+            return None
+        key = (channel, name)
+        now = time.monotonic()
+        cached = self._limits_cache.get(key)
+        need_full = force or key not in self._limits_scan_ts or (now - self._limits_scan_ts[key] >= 2.0)
+        old_timeout = self.transport.timeout_ms
+        self.transport.timeout_ms = min(old_timeout, 1500)
+        try:
+            if not need_full and cached is not None:
+                if cached.get("test") and cached.get("segments"):
+                    try:
+                        fail = self._mark_stat_on(self.query(f"CALC{channel}:LIM:FAIL?"))
+                        cached = {**cached, "fail": fail}
+                        self._limits_cache[key] = cached
+                    except ValueError:
+                        pass
+                return cached
+            disp = self._mark_stat_on(self.query(f"CALC{channel}:LIM:DISP?"))
+            test = self._mark_stat_on(self.query(f"CALC{channel}:LIM:STAT?"))
+            if not disp and not test:
+                res: dict[str, Any] = {"segments": (), "test": False, "fail": None}
+            else:
+                segs = self._parse_limit_data(self.query(f"CALC{channel}:LIM:DATA?"))
+                fail = self._mark_stat_on(self.query(f"CALC{channel}:LIM:FAIL?")) if (test and segs) else None
+                res = {"segments": segs, "test": test, "fail": fail}
+            self._limits_cache[key] = res
+            self._limits_scan_ts[key] = now
+            return res
+        except ValueError:
+            return cached
+        except TransportTimeout:
+            if not self._try_resync():
+                raise
+            errors = self._drain_scale_errors()
+            if any(-199 <= code <= -100 for code, _ in errors):
+                self._limits_supported = False
+            return cached
+        finally:
+            self.transport.timeout_ms = old_timeout
 
     # ------------------------------------------------------- масштаб трейса trace.sel
     def _drain_scale_errors(self) -> list[tuple[int, str]]:
@@ -1201,7 +1288,19 @@ class KeysightPNA(VISAInstrument):
                 if all(isinstance(v, (int, float)) for v in cached):
                     scale = cached
             markers = self._read_trace_markers(c, slot.name)
-            meta = {**(stim if c == self._stim_ch else {}), "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math, "markers": tuple(markers)}
+            limits = self._read_trace_limits(c, slot.name)
+            meta = {
+                **(stim if c == self._stim_ch else {}),
+                "channel": c,
+                "name": slot.name,
+                "sparam": sparam,
+                "format": fmt,
+                "math": math,
+                "markers": tuple(markers),
+                "limits": tuple(limits["segments"]) if limits else (),
+                "limit_test": bool(limits["test"]) if limits else False,
+                "limit_fail": limits["fail"] if limits else None,
+            }
             if scale is not None:
                 meta["scale_div"], meta["scale_ref"], meta["scale_rpos"] = scale
                 if self._sel == (c, slot.name):
