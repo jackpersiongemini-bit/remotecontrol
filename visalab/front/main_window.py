@@ -26,7 +26,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import QMimeData, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QTableWidget,
+                             QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name

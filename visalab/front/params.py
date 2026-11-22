@@ -1251,7 +1251,7 @@ class Panel(QFrame):
         Panel QTableWidget#pmTable, Panel QTableWidget#pmTable QWidget,
         Panel QTableWidget#currTable, Panel QTableWidget#currTable QWidget { background-color: $UI_COLOR_BACKGROUND; }
         Panel QTableWidget#pmTable, Panel QTableWidget#currTable { color: $UI_COLOR_TEXT_MUTED; padding: 2px 4px; }
-        Panel QTableWidget#pmTable::item,
+        Panel QTableWidget#pmTable::item { border: none; border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 0 8px; }
         Panel QTableWidget#currTable::item { border: none; border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 0 8px; }
         Panel QTableWidget#pmTable QHeaderView::section,
         Panel QTableWidget#currTable QHeaderView::section {

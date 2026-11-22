@@ -16,7 +16,7 @@ from ..core.units import si_format, si_parse
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER,
                     UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL,
                     UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED, UI_FONT_SIZE_PT,
-                    UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, render_qss)
+                    UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, checkbox_qss, render_qss)
 
 __all__ = [
     "ANALYSIS_METRICS",
@@ -321,22 +321,12 @@ _POPUP_STYLE = render_qss("""
         spacing: 6px;
         color: $UI_COLOR_TEXT;
     }
-    PlotSettingsPopup QCheckBox::indicator {
-        width: 14px; height: 14px;
-        border-radius: 3px;
-        border: 1px solid $UI_COLOR_BORDER_LIGHT;
-        background: $UI_COLOR_BACKGROUND;
-    }
-    PlotSettingsPopup QCheckBox::indicator:checked {
-        background: $UI_COLOR_INVERT;
-        border-color: $UI_COLOR_TEXT;
-    }
     PlotSettingsPopup QFrame#sep {
         background-color: $UI_COLOR_BORDER;
         max-height: 1px;
         min-height: 1px;
     }
-""")
+""") + "\n" + checkbox_qss("PlotSettingsPopup ")
 
 
 def _parse_axis_number(text: str, unit: str) -> float | None:
@@ -525,7 +515,7 @@ class PlotSettingsPopup(QFrame):
         e.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         e.setMinimumWidth(86)
         e.setToolTip(tip)
-        e.editingFinished.connect(slot)
+        e.returnPressed.connect(slot)
         return e
 
     def sync_from_plot(self) -> None:

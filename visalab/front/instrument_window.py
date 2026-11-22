@@ -709,9 +709,10 @@ class InstrumentWindow(Window):
                 pass
         if self._floating_size is not None and self._floating_size.isValid():
             self.resize(max(self.minimumWidth(), self._floating_size.width()), self._floating_size.height())
-        pos = self._floating_pos if self._floating_pos is not None else fallback_pos
-        if pos is not None:
-            self.move(pos)
+        if self._floating_pos is not None:
+            self.move(self._clamp_pos(self._floating_pos))
+        elif not self.recall_pos() and fallback_pos is not None:
+            self.move(self._clamp_pos(fallback_pos))
         if save:
             self.settings.setValue(f"{self._prefix}/DOCKED", False)
         if show:
