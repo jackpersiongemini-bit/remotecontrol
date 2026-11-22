@@ -223,6 +223,7 @@ class KeysightPNASim(SimInstrument):
         self.on("DISPlay:WINDow#:TRACe#:Y[:SCALe]:AUTO", self._autoscale)
         self.on("CALCulate#:CORRection:EDELay[:TIME]", self._meas_num("edel", -10, 10),
                 lambda a, g: f"{self._cur(g).get('edel', 0.0):+.11E}")
+        self.on("CALCulate#:CORRection[:STATe]", self._meas_corr_set, self._meas_corr_get)
         self.on("CALCulate#:SMOothing:APERture", self._meas_num("aper", 1, 25),
                 lambda a, g: f"{self._cur(g).get('aper', 1.5):+.11E}")
         self.on("CALCulate#:SMOothing[:STATe]", self._smo_set, lambda a, g: "1" if self._cur(g).get("smo") else "0")
@@ -734,12 +735,37 @@ class KeysightPNASim(SimInstrument):
         return ",".join(f"{v:+.11E}" for v in out)
 
     # ----------------------------------------------------------- калибровка
+    def _meas_corr_set(self, a, g):
+        ch = self._ch(g)
+        st = self.stim(ch)
+        on = self.boolean(a)
+        if on and not st["cset"]:
+            raise SimError(-221, "Settings conflict; no calibration", ESR_EXE)
+        cur = self._cur(g)
+        # Зафиксировать текущее состояние остальных треков этого канала перед локальным изменением
+        for m in self.meas.values():
+            if m["ch"] == ch and m is not cur and "corr" not in m:
+                m["corr"] = st["corr"]
+        cur["corr"] = on
+        # Канальный флаг коррекции: ON, пока хотя бы на одном треке канала включена коррекция
+        ch_meas = [m for m in self.meas.values() if m["ch"] == ch]
+        st["corr"] = any(m.get("corr", st["corr"]) for m in ch_meas) if ch_meas else on
+
+    def _meas_corr_get(self, a, g) -> str:
+        ch = self._ch(g)
+        m = self._cur(g)
+        return "1" if m.get("corr", self.stim(ch)["corr"]) else "0"
+
     def _corr_set(self, a, g):
-        st = self.stim(self._ch(g))
+        ch = self._ch(g)
+        st = self.stim(ch)
         on = self.boolean(a)
         if on and not st["cset"]:
             raise SimError(-221, "Settings conflict; no calibration", ESR_EXE)
         st["corr"] = on
+        for m in self.meas.values():
+            if m["ch"] == ch:
+                m.pop("corr", None)
 
     def _cset_act(self, a, g):
         name, _, stim = a.rpartition(",")
@@ -748,7 +774,8 @@ class KeysightPNASim(SimInstrument):
         name = name.strip().strip("'\"")
         if name not in self.csets:
             raise SimError(-224, "Illegal parameter value; no such cal set", ESR_EXE)
-        st = self.stim(self._ch(g))
+        ch = self._ch(g)
+        st = self.stim(ch)
         cal = self.csets[name]
         if self.boolean(stim):
             st.update(cal)
@@ -757,10 +784,17 @@ class KeysightPNASim(SimInstrument):
         same = all(st[k] == cal[k] for k in ("start", "stop", "poin", "type"))
         st["corr"] = same or (st["interp"] and st["type"] == cal["type"]
                               and cal["start"] <= st["start"] and st["stop"] <= cal["stop"])
+        for m in self.meas.values():
+            if m["ch"] == ch:
+                m.pop("corr", None)
 
     def _cset_deact(self, a, g):
-        st = self.stim(self._ch(g))
+        ch = self._ch(g)
+        st = self.stim(ch)
         st["cset"], st["corr"] = "", False
+        for m in self.meas.values():
+            if m["ch"] == ch:
+                m.pop("corr", None)
 
     def _cset_del(self, a, g):
         name = a.strip().strip("'\"")

@@ -95,27 +95,57 @@ def _auto(proxy: Instrument, key: str):
 
 
 class MathButton(IndicatorButton):
-    """Математика с памятью у всех читаемых измерений; показывает первое читаемое. Индикатор - не DATA."""
+    """Математика с памятью для выбранного трека (``trace_editor.current``). Индикатор - не DATA."""
 
-    def __init__(self, proxy: Instrument, parent=None):
+    def __init__(self, proxy: Instrument, trace_editor: "TraceEditor | None" = None, parent=None):
         super().__init__("DATA", parent)
         self.proxy = proxy
+        self.trace_editor = trace_editor
         self.setObjectName("choice")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Math with the memory trace for every measurement being read")
+        self.setToolTip("Math with the memory trace for the selected trace")
         self.clicked.connect(self._menu)
+        if trace_editor is not None:
+            trace_editor.chips.selected.connect(lambda _i: self.refresh())
+        proxy.action_done.connect(self._on_action)
         for n in range(1, SLOTS + 1):
-            for what in ("math", "enabled", "name"):
+            for what in ("math", "enabled", "name", "channel"):
                 if proxy.supports(f"m{n}.{what}"):
                     proxy.subscribe(f"m{n}.{what}", lambda _v: self.refresh())
+        if proxy.supports("trace.sel"):
+            proxy.subscribe("trace.sel", lambda _v: self.refresh())
         self.refresh()
+
+    def _on_action(self, name: str, _result) -> None:
+        if name in ("meas_table", "meas_config", "meas_create", "meas_delete", "meas_move"):
+            self.refresh()
+
+    def _selected_slot(self) -> int | None:
+        if self.trace_editor is not None and self.trace_editor.current is not None:
+            return self.trace_editor.slot_of(*self.trace_editor.current)
+        sel = str(self.proxy.value("trace.sel") or "")
+        if ":" in sel:
+            ch_s, _, tname = sel.partition(":")
+            if ch_s.isdigit():
+                ch = int(ch_s)
+                for n in range(1, SLOTS + 1):
+                    if self.proxy.value(f"m{n}.channel") == ch and self.proxy.value(f"m{n}.name") == tname:
+                        return n
+        return None
 
     def slots(self) -> list[int]:
         p = self.proxy
+        sel = self._selected_slot()
+        if sel is not None:
+            return [sel]
         return [n for n in range(1, SLOTS + 1) if p.value(f"m{n}.enabled") is True and p.value(f"m{n}.name")]
 
     def value(self) -> str | None:
+        if self.trace_editor is not None:
+            row = self.trace_editor.row()
+            if row is not None:
+                return row[4]
         s = self.slots()
         return self.proxy.value(f"m{s[0]}.math") if s else None
 
@@ -124,11 +154,19 @@ class MathButton(IndicatorButton):
 
     def refresh(self) -> None:
         v = self.value()
+        has_target = (self.trace_editor is not None and self.trace_editor.current is not None) or bool(self.slots())
         self.setText(next((n for n, d in MATH if d == v), "DATA" if v is None else str(v)))
-        self.setEnabled(bool(self.slots()))
+        self.setEnabled(has_target)
         self.update()
 
     def set_value(self, value: str) -> None:
+        if self.trace_editor is not None and self.trace_editor.current is not None:
+            self.trace_editor.configure("math", value)
+            return
+        sel = self._selected_slot()
+        if sel is not None:
+            self.proxy.set(f"m{sel}.math", value)
+            return
         for n in self.slots():
             self.proxy.set(f"m{n}.math", value)
 
@@ -1002,11 +1040,19 @@ class VNAWindow(InstrumentWindow):
                 "Traces (measurements) on the analyzer: click a chip - select it, the lines below set it up. "
                 "The bar - the trace is read after every sweep. + new trace, − delete the selected one."))
         if "mem_store" in proxy.actions:
-            mem = [ActionButton(proxy, "mem_store", "CAPTURE", "Copy data to memory for every measurement being read")]
+            cap = self.capture_button = QPushButton("CAPTURE")
+            cap.setObjectName("choice")
+            cap.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            cap.setCursor(Qt.CursorShape.PointingHandCursor)
+            cap.setToolTip("Copy data to memory for the selected trace")
+            cap.setEnabled(proxy.is_connected)
+            cap.clicked.connect(self.capture_memory)
+            proxy.state_changed.connect(lambda _s: (not sip.isdeleted(cap)) and cap.setEnabled(proxy.is_connected))
+            mem = [cap]
         else:
             mem = []
-        if sup("m1.math"):                            # MEM и MATH - одной строкой
-            self.math_button = MathButton(proxy)
+        if sup("m1.math"):                            # MEM и MATH - одной строкой (строго по выбранному треку)
+            self.math_button = MathButton(proxy, getattr(self, "trace_editor", None))
             mem.append(self.math_button)
         if mem:
             top.append(PanelLine("MEM", *mem))
@@ -1124,7 +1170,7 @@ class VNAWindow(InstrumentWindow):
                     ("STIM", "cal.stim", [("CAL", True), ("KEEP", False)],
                      "Applying a cal set: CAL - take its stimulus too (start, stop, points, IFBW, power),\n"
                      "KEEP - keep the channel stimulus (interpolated if INT is on)"),
-                    ("CORR", "cal.state", [("OFF", False), ("ON", True)], "Correction on the channel"),
+                    ("CORR", "cal.state", [("OFF", False), ("ON", True)], "Correction on the selected trace"),
                     ("INT", "cal.interp", ONOFF, "Interpolate the calibration when the stimulus differs")):
                 if sup(key):
                     w = PSButton(proxy, key, choices)
@@ -1269,6 +1315,16 @@ class VNAWindow(InstrumentWindow):
             save.append(tuple(export_row))
         if save:
             self.page_specs.append(("SAVE", (), PanelTable(*save)))
+
+    def capture_memory(self) -> None:
+        """CAPTURE: сохранить текущую трассу в память только выбранного трека."""
+        if not self.proxy.is_connected or "mem_store" not in self.proxy.actions:
+            return
+        cur = self.trace_editor.current if hasattr(self, "trace_editor") else None
+        if cur is not None:
+            self.proxy.action("mem_store", cur[0], cur[1])
+        else:
+            self.proxy.action("mem_store")
 
     def open_cal_window(self) -> None:
         w = self.cal_window

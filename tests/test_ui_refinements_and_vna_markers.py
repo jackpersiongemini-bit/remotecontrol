@@ -367,3 +367,77 @@ def test_light_and_dark_theme_live_switch(qtbot, tmp_path):
         mw.cleanup()
         mw.close()
         p_gen.shutdown()
+
+
+def test_vna_corr_and_math_apply_per_trace_preserving_limit_lines(qtbot, tmp_path):
+    """CORR OFF/ON, CAPTURE и MATH применяются строго к выбранному треку, не ломая остальные
+    треки канала и их limit lines; _parse_limit_data поддерживает оба формата (5*N и 1+5*N)."""
+    from visalab.drivers import KeysightPNA
+    from visalab.sim import KeysightPNASim
+
+    # Проверка обоих форматов CALC:LIM:DATA? (PNA 5*N и ENA/PNA 1+5*N)
+    assert KeysightPNA._parse_limit_data("1,1e9,3e9,-10,-10,2,1e9,3e9,-40,-40") == (
+        ("MAX", 1e9, 3e9, -10.0, -10.0),
+        ("MIN", 1e9, 3e9, -40.0, -40.0),
+    )
+    assert KeysightPNA._parse_limit_data("2,1,1e9,3e9,-10,-10,2,1e9,3e9,-40,-40") == (
+        ("MAX", 1e9, 3e9, -10.0, -10.0),
+        ("MIN", 1e9, 3e9, -40.0, -40.0),
+    )
+
+    s = QSettings(str(tmp_path / "vna_per_trace.ini"), QSettings.Format.IniFormat)
+    sim = KeysightPNASim()
+    sim.meas["USER_S21"] = {"s": "S21", "fmt": "MLOG", "ch": 1}
+    sim.meas["CH1_S11_1"]["limit"] = {
+        "disp": True,
+        "stat": True,
+        "segs": [(1, 1.0e9, 3.0e9, -10.0, -10.0)],
+    }
+    p = attach(InstrumentProxy(KeysightPNA, SimTransport(sim, latency_s=0.001)))
+    win = VNAWindow(p, s)
+    qtbot.addWidget(win)
+    try:
+        with qtbot.waitSignal(p.sync_done, timeout=5000):
+            p.open()
+        te = win.trace_editor
+        qtbot.waitUntil(lambda: len(te.chips.buttons()) == 2, timeout=5000)
+
+        # Включаем чтение обоих треков и применяем cal set к каналу 1 -> CORR ON на обоих треках
+        p.set("m2.enabled", True)
+        p.set("cal.set", "CAL_1-3G")
+        qtbot.waitUntil(lambda: p.value("cal.state") is True, timeout=5000)
+
+        # Выбираем второй трек (USER_S21) и выключаем CORR -> OFF только у USER_S21!
+        te.chips.buttons()[1].click()
+        qtbot.waitUntil(lambda: p.value("trace.sel") == "1:USER_S21", timeout=5000)
+        p.set("cal.state", False)
+        qtbot.waitUntil(lambda: p.value("cal.state") is False, timeout=5000)
+        assert sim.meas["USER_S21"].get("corr") is False
+        assert sim.meas["CH1_S11_1"].get("corr", sim.c["corr"]) is True
+
+        # Возвращаемся на первый трек (CH1_S11_1) -> у него CORR остался ON, и limit line на месте!
+        te.chips.buttons()[0].click()
+        qtbot.waitUntil(lambda: p.value("trace.sel") == "1:CH1_S11_1" and p.value("cal.state") is True, timeout=5000)
+        qtbot.waitUntil(
+            lambda: p.value("m1.trace") is not None and len((p.value("m1.trace").meta or {}).get("limits", ())) == 1,
+            timeout=5000,
+        )
+
+        # Переходим на USER_S21, нажимаем CAPTURE и ставим MATH = DIV -> применяется ТОЛЬКО к USER_S21!
+        te.chips.buttons()[1].click()
+        qtbot.waitUntil(lambda: p.value("trace.sel") == "1:USER_S21", timeout=5000)
+        win.capture_button.click()
+        qtbot.waitUntil(lambda: sim.meas["USER_S21"].get("mem") is not None, timeout=5000)
+        assert sim.meas["CH1_S11_1"].get("mem") is None
+
+        win.math_button.set_value("DIV")
+        qtbot.waitUntil(lambda: win.math_button.text() == "D/M" and sim.meas["USER_S21"].get("math") == "DIV", timeout=5000)
+        assert sim.meas["CH1_S11_1"].get("math", "NORM") == "NORM"
+
+        # Переключаемся обратно на CH1_S11_1 -> MathButton показывает DATA (NORM) этого трека!
+        te.chips.buttons()[0].click()
+        qtbot.waitUntil(lambda: win.math_button.text() == "DATA", timeout=5000)
+    finally:
+        win.cleanup()
+        win.close()
+        p.shutdown()

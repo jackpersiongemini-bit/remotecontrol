@@ -241,7 +241,7 @@ class KeysightPNA(VISAInstrument):
             Param("state.dir", "Папка состояний на анализаторе", Kind.STR, section="Память",
                   query="MMEM:CDIR?", write='MMEM:CDIR "{value}"'),
             Param("trace.sel", "Трейс (масштаб)", Kind.STR, section=sc, query="<virtual>", write="<virtual>",
-                  also_read=(*SCALE_KEYS, *MARK_KEYS)),
+                  also_read=(*SCALE_KEYS, *MARK_KEYS, "cal.state")),
             Param("mark.n", "Маркер трейса", I, section=mk, query="<virtual>", write="<virtual>", minimum=1,
                   maximum=MARKS, also_read=MARK_KEYS),
             Param("mark.state", "Маркер вкл.", B, section=mk, query="<mark>", write="<mark>",
@@ -594,6 +594,8 @@ class KeysightPNA(VISAInstrument):
         try:
             if spec.key == "cal.set":
                 self._cal_apply(str(value or "").strip())
+            elif spec.key == "cal.state":
+                self._write_trace_corr(spec, bool(value))
             elif spec.key == "source.power":
                 super().write_param(spec, float(value) + self._active_power_offset())
             elif not self._write_slot(spec, value):
@@ -618,6 +620,9 @@ class KeysightPNA(VISAInstrument):
             self._sync_sel_markers(full=True)
         elif spec.key in ("marker.state", "marker.freq") and self.meas_name:
             self._sync_sel_markers((1, self.meas_name), full=True)
+        elif spec.key == "cal.state":
+            if self._sel:
+                self._limits_scan_ts.pop(self._sel, None)
         elif spec.key in ("trig.source", "gen.state"):
             self._clear_oper_events()
             if self._continuous and self._cal is None:
@@ -682,6 +687,8 @@ class KeysightPNA(VISAInstrument):
         if key == "cal.set":
             name = self.query(f"SENS{self._stim_ch}:CORR:CSET:ACT? NAME").strip().strip('"').strip()
             return "" if not name or name.upper().startswith("NO ") else name
+        if key == "cal.state":
+            return self._read_trace_corr(spec)
         if key == "trace.sel":
             return f"{self._sel[0]}:{self._sel[1]}" if self._sel else None
         if key == "mark.n":
@@ -966,6 +973,9 @@ class KeysightPNA(VISAInstrument):
                 nums.append(parse_number(tok))
             except ValueError:
                 return ()
+        # Формат Keysight ENA / некоторых прошивок PNA: ведущее число = кол-во сегментов (1 + 5*N)
+        if len(nums) >= 6 and len(nums) % 5 == 1 and int(round(nums[0])) * 5 + 1 == len(nums):
+            nums = nums[1:]
         segs: list[tuple[str, float, float, float, float]] = []
         for i in range(0, len(nums) - 4, 5):
             t = int(round(nums[i]))
@@ -1549,9 +1559,43 @@ class KeysightPNA(VISAInstrument):
             return None
         return super().run_custom_action(name, args)
 
-    # -------------------------------------------------------- память трасс
-    def _mem_store(self, args: tuple) -> list[int]:
-        """Данные -> память у слотов ``args`` (номера), без аргументов - у всех включённых."""
+    # -------------------------------------------------------- память трасс и коррекция трека
+    def _write_trace_corr(self, spec: Param, on: bool) -> None:
+        """Включить / выключить коррекцию только для выбранного трека ``trace.sel`` (``CALC<c>:CORR:STAT``)."""
+        if self._sel and self._sel[0] == self._stim_ch and self._sel[1] in self._catalog(self._sel[0]):
+            c, name = self._sel
+            self.write(f"CALC{c}:PAR:SEL '{name}'")
+            self.write(f"CALC{c}:CORR:STAT {spec.to_scpi(on)}")
+            return
+        super().write_param(spec, on)
+
+    def _read_trace_corr(self, spec: Param) -> bool:
+        """Прочитать состояние коррекции выбранного трека ``trace.sel`` (``CALC<c>:CORR:STAT?``)."""
+        if self._sel and self._sel[0] == self._stim_ch and self._sel[1] in self._catalog(self._sel[0]):
+            c, name = self._sel
+            self.write(f"CALC{c}:PAR:SEL '{name}'")
+            return spec.from_scpi(self.query(f"CALC{c}:CORR:STAT?"))
+        return super().read_param_raw(self._stim_spec(spec))
+
+    def _mem_store(self, args: tuple):
+        """Данные -> память: ``(channel, name)`` или ``('sel',)`` - только указанный/выбранный трек;
+        номера слотов ``args`` - указанные слоты; без аргументов - все включённые слоты."""
+        if len(args) == 2 and isinstance(args[1], str):
+            c, name = int(args[0]), args[1].strip()
+            if not name or name not in self._catalog(c):
+                raise ValueError(f"нет измерения {name!r} на канале {c}")
+            self.write(f"CALC{c}:PAR:SEL '{name}'")
+            self.write(f"CALC{c}:MATH:MEM")
+            self._check_errors(context="mem_store")
+            return [(c, name)]
+        if args == ("sel",):
+            if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
+                raise ValueError("трейс не выбран (trace.sel)")
+            c, name = self._sel
+            self.write(f"CALC{c}:PAR:SEL '{name}'")
+            self.write(f"CALC{c}:MATH:MEM")
+            self._check_errors(context="mem_store")
+            return [(c, name)]
         nums = [int(a) for a in args] if args else \
             [n for n, s in enumerate(self._slots, 1) if s.enabled and s.name]
         for n in nums:

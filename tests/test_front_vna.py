@@ -135,14 +135,16 @@ def test_trace_chips_read_and_mem_math(qtbot, vna):
     te.chips.buttons()[0].click()
     te.read.click()                                            # m1 больше не читается
     _wait(qtbot, lambda: proxy.value("m1.enabled") is False)
+    te.chips.buttons()[2].click()                              # выбираем трек канала 2 (CH2_S12)
+    _wait(qtbot, lambda: proxy.value("trace.sel") == "2:CH2_S12")
     assert win.math_button.slots() == [n]
-    proxy.action("mem_store")
+    win.capture_button.click()                                 # CAPTURE: память только выбранного трека
     _wait(qtbot, lambda: sim.meas["CH2_S12"].get("mem") is not None)
-    assert sim.meas["CH1_S11_1"].get("mem") is None            # только читаемые
-    win.math_button.set_value("DIV")
-    te.chips.buttons()[2].click()
+    assert sim.meas["CH1_S11_1"].get("mem") is None            # другие треки не тронуты
+    win.math_button.set_value("DIV")                           # MATH: только выбранный трек
     _wait(qtbot, lambda: win.math_button.text() == "D/M" and te.math.text() == "D/M")
     assert sim.meas["CH2_S12"]["math"] == "DIV"
+    assert sim.meas["CH1_S11_1"].get("math", "NORM") == "NORM"
 
 
 def test_trace_edit_create_move_delete(qtbot, vna):
