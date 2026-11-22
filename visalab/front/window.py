@@ -26,6 +26,7 @@ from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDE
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
            "CustomExpandButton", "CustomFullButton", "CustomLockButton", "CustomDockButton", "CustomFavButton",
+           "PanelSettingsButton", "PanelClearButton", "PanelCloseButton",
            "Switch", "CustomOnButton", "CustomSyncButton", "CustomInitButton", "mark_growing", "QWIDGETSIZE_MAX"]
 
 QWIDGETSIZE_MAX = (1 << 24) - 1
@@ -741,6 +742,79 @@ class CustomFavButton(IconButtonBase):
         else:
             p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+
+
+class PanelSettingsButton(IconButtonBase):
+    """Простая векторная кнопка настроек графика (3 горизонтальных ползунка), инвертируется при наведении/выборе."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setFixedSize(26, 24)
+        self.toggled.connect(self._on_toggled)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._icon_color = self.icon_color_hover if (checked or self.underMouse()) else self._rest_color
+        self.update()
+
+    def leaveEvent(self, e):  # noqa: N802 - Qt
+        super().leaveEvent(e)
+        if self.isChecked():
+            self._icon_color = self.icon_color_hover
+            self.update()
+
+    def refresh_theme(self) -> None:
+        super().refresh_theme()
+        if self.isChecked():
+            self._icon_color = self.icon_color_hover
+            self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        if self.isChecked():
+            self._icon_color = self.icon_color_hover
+        self._pen(p)
+        cx, cy = self.width() / 2, self.height() / 2
+        for dy, kx in ((-3.5, -2.0), (0.0, 2.0), (3.5, -0.5)):
+            y = cy + dy
+            p.drawLine(QLineF(cx - 5.0, y, cx + 5.0, y))
+            p.drawLine(QLineF(cx + kx, y - 1.3, cx + kx, y + 1.3))
+
+
+class PanelClearButton(IconButtonBase):
+    """Простая векторная кнопка очистки графика/таблицы, инвертируется при наведении."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(26, 24)
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy = self.width() / 2, self.height() / 2
+        p.drawLine(QLineF(cx - 4.8, cy - 3.2, cx + 4.8, cy - 3.2))
+        p.drawLine(QLineF(cx - 1.8, cy - 4.8, cx + 1.8, cy - 4.8))
+        p.drawLine(QLineF(cx - 3.6, cy - 3.2, cx - 2.8, cy + 4.4))
+        p.drawLine(QLineF(cx + 3.6, cy - 3.2, cx + 2.8, cy + 4.4))
+        p.drawLine(QLineF(cx - 2.8, cy + 4.4, cx + 2.8, cy + 4.4))
+
+
+class PanelCloseButton(IconButtonBase):
+    """Простая векторная кнопка закрытия панели (×), 1-в-1 как CustomCloseButton, инвертируется при наведении."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(26, 24)
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy, r = self.width() / 2, self.height() / 2, 4.0
+        p.drawLine(QLineF(cx - r, cy - r, cx + r, cy + r))
+        p.drawLine(QLineF(cx - r, cy + r, cx + r, cy - r))
 
 
 def short_address(address: str) -> str:

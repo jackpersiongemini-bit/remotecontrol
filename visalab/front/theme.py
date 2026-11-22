@@ -55,20 +55,20 @@ DARK_COLORS = {
 }
 
 LIGHT_COLORS = {
-    # Светлая лабораторная палитра: мягкий светло-серый фон, контрастный графитовый текст, чистые акценты.
-    "UI_COLOR_BACKGROUND": "#f5f6f8",      # фон окна, графиков и полей ввода
-    "UI_COLOR_PANEL": "#e7eaef",           # фон панелей
-    "UI_COLOR_CONTROL": "#e1e5ec",         # заголовок окна
-    "UI_COLOR_BORDER": "#c5ccd6",          # рамки и сетка графиков
-    "UI_COLOR_BORDER_LIGHT": "#606874",    # единицы измерения, подписи осей, приглушённый текст
-    "UI_COLOR_INDICATOR_FRAME": "#9aa3b0", # тонкая рамка вокруг активного элемента и ручка скроллбара
-    "UI_COLOR_INDICATOR": "#475569",       # полоса-индикатор «включено / открыто»
-    "UI_COLOR_TEXT": "#181b20",            # основной текст
-    "UI_COLOR_TEXT_MUTED": "#262b33",      # текст в панелях
-    "UI_COLOR_INVERT": "#3a4352",          # инверсия (активная вкладка / чип)
-    "UI_COLOR_INVERT_HOVER": "#4e5a6e",    # инверсия при наведении
+    # Светлая лабораторная палитра: нейтральные монохромные тона в стиле тёмной темы, но на светлом фоне.
+    "UI_COLOR_BACKGROUND": "#f4f4f4",      # фон окна, графиков и полей ввода
+    "UI_COLOR_PANEL": "#e8e8e8",           # фон панелей
+    "UI_COLOR_CONTROL": "#e0e0e0",         # заголовок окна
+    "UI_COLOR_BORDER": "#c8c8c8",          # рамки и сетка графиков
+    "UI_COLOR_BORDER_LIGHT": "#6e6e6e",    # единицы измерения, подписи осей, приглушённый текст
+    "UI_COLOR_INDICATOR_FRAME": "#9e9e9e", # тонкая рамка вокруг активного элемента и ручка скроллбара
+    "UI_COLOR_INDICATOR": "#6e6e6e",       # полоса-индикатор «включено / открыто»
+    "UI_COLOR_TEXT": "#1c1c1c",            # основной текст
+    "UI_COLOR_TEXT_MUTED": "#2b2b2b",      # текст в панелях
+    "UI_COLOR_INVERT": "#525252",          # инверсия (активная вкладка / чип)
+    "UI_COLOR_INVERT_HOVER": "#3c3c3c",    # инверсия при наведении
     "UI_COLOR_TEXT_INVERSE": "#ffffff",    # текст на инвертированных элементах
-    "UI_COLOR_ACCENT": "#181b20",
+    "UI_COLOR_ACCENT": "#1c1c1c",
     "UI_COLOR_SUCCESS": "#1f883d",
     "UI_COLOR_SUCCESS_HOVER": "#2da44e",
     "UI_COLOR_ERROR": "#cf222e",
@@ -76,7 +76,7 @@ LIGHT_COLORS = {
 }
 
 DARK_TRACE_COLORS = ("#f2f2f2", "#e3a21a", "#5aa9e6", "#4fbf6f", "#e0605f", "#b48ad8", "#9a9a9a", "#d8c36a")
-LIGHT_TRACE_COLORS = ("#181b20", "#d97706", "#0284c7", "#15803d", "#dc2626", "#7c3aed", "#4b5563", "#a16207")
+LIGHT_TRACE_COLORS = ("#1c1c1c", "#d97706", "#0284c7", "#15803d", "#dc2626", "#7c3aed", "#4b5563", "#a16207")
 
 _CURRENT_THEME: str = "light"
 TOKENS: dict[str, object] = {**LIGHT_COLORS, **BASE_METRICS}
@@ -248,8 +248,10 @@ def apply_theme(name: str) -> str:
                 mod_dict[k] = palette[k]
         if "UI_TRACE_COLORS" in mod_dict:
             mod_dict["UI_TRACE_COLORS"] = traces
-        for obj in list(mod_dict.values()):
-            if isinstance(obj, type):
+        for attr_name, obj in list(mod_dict.items()):
+            if isinstance(obj, _ThemedQSS):
+                mod_dict[attr_name] = obj.rerender()
+            elif isinstance(obj, type):
                 for attr in ("STYLE_SHEET", "STYLE"):
                     val = obj.__dict__.get(attr)
                     if isinstance(val, _ThemedQSS):
@@ -267,7 +269,8 @@ def apply_theme(name: str) -> str:
 
     app = QApplication.instance()
     if app is not None:
-        for w in list(app.allWidgets()):
+        all_widgets = list(app.allWidgets())
+        for w in all_widgets:
             if sip.isdeleted(w):
                 continue
             ss = w.styleSheet()
@@ -275,6 +278,13 @@ def apply_theme(name: str) -> str:
                 parts = _QSS_REGISTRY[ss]
                 new_ss = _ThemedQSS(_eval_parts(parts), parts)
                 w.setStyleSheet(new_ss)
+        for w in all_widgets:
+            if sip.isdeleted(w):
+                continue
+            st = w.style()
+            if st is not None:
+                st.unpolish(w)
+                st.polish(w)
             if hasattr(w, "refresh_theme"):
                 try:
                     w.refresh_theme()

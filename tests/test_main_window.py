@@ -769,7 +769,9 @@ def test_vna_panel_stays_visible_in_hold_and_with_non_m1_slot(qtbot, lab, tmp_pa
 
 
 def test_titlebar_sinc_emblem_and_instrument_tiles(qtbot, lab, tmp_path):
-    """Заголовок главного окна: без надписи LAB, слева пульсирующая sinc-эмблема и кнопки приборов."""
+    """Заголовок окна графиков: пульсирующая sinc-эмблема без надписи LAB и без плиток приборов;
+    плитки приборов (VNA, SA, PM, GEN...) принадлежат независимому окну инструментов."""
+    from PyQt6.QtCore import QPoint
     from visalab.front.main_window import SincEmblem
     links, px, _bench = lab
     settings = QSettings(str(tmp_path / "tb.ini"), QSettings.Format.IniFormat)
@@ -781,7 +783,6 @@ def test_titlebar_sinc_emblem_and_instrument_tiles(qtbot, lab, tmp_path):
         assert win.titleBar.title_label.isHidden()
         assert isinstance(win.emblem, SincEmblem)
         assert win.titleBar.hBoxLayout.indexOf(win.emblem) == 0
-        assert win.titleBar.hBoxLayout.indexOf(win._tiles_host) == 1
         assert win.emblem._timer.isActive()
 
         # Фаза пульсации движется на тиках анимации
@@ -789,19 +790,27 @@ def test_titlebar_sinc_emblem_and_instrument_tiles(qtbot, lab, tmp_path):
         qtbot.wait(100)
         assert win.emblem.pulse != p0
 
-        # Все плитки приборов находятся в заголовке и не перехватываются перетаскиванием окна
+        # Все плитки приборов принадлежат независимому окну инструментов (НЕ окну графиков)
+        dw = win.instrument_dock_window
+        dw.show()
+        qtbot.waitExposed(dw)
+        assert dw.titleBar.title_label.isHidden()
+        assert dw.titleBar.hBoxLayout.indexOf(dw._tiles_host) == 0
         for p in px.values():
             tile = win.tiles[p]
-            assert tile.parentWidget() is win._tiles_host
-            assert win.titleBar.isAncestorOf(tile)
-            pos = tile.mapTo(win.titleBar, tile.rect().center())
-            assert not win.titleBar.canDrag(pos)
+            assert not win.titleBar.isAncestorOf(tile)
+            assert tile.parentWidget() is dw._tiles_host
+            assert dw.titleBar.isAncestorOf(tile)
+            pos = tile.mapTo(dw.titleBar, tile.rect().center())
+            assert not dw.titleBar.canDrag(pos)
 
-        # Пустое место заголовка остаётся перетаскиваемым
-        empty_x = win._tiles_host.geometry().right() + 30
-        if empty_x < win.titleBar.minimized_button.x() - 10:
-            from PyQt6.QtCore import QPoint
-            assert win.titleBar.canDrag(QPoint(empty_x, win.titleBar.height() // 2))
+        # Пустое место заголовка обоих окон остаётся перетаскиваемым
+        empty_x = dw._tiles_host.geometry().right() + 30
+        if empty_x < dw.titleBar.minimized_button.x() - 10:
+            assert dw.titleBar.canDrag(QPoint(empty_x, dw.titleBar.height() // 2))
+        empty_gx = win.emblem.geometry().right() + 30
+        if empty_gx < win.titleBar.minimized_button.x() - 10:
+            assert win.titleBar.canDrag(QPoint(empty_gx, win.titleBar.height() // 2))
 
         win.hide()
         assert not win.emblem._timer.isActive()

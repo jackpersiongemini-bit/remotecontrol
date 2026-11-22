@@ -224,10 +224,11 @@ def test_main_window_source_below_graph_and_mem_scale_controls(qtbot, tmp_path):
         qtbot.waitUntil(lambda: "dBm" in sa_panel.process_label.text() and not sa_panel.process_label.text().startswith("NOISE"),
                         timeout=10000)
 
-        # Заголовок облегчён: иконки настроек, очистки и закрытия; настройки открываются вместо графика
-        assert not sa_panel.settings_button.icon().isNull()
-        assert not sa_panel.clear_button.icon().isNull()
-        assert not sa_panel.close_button.icon().isNull()
+        # Заголовок облегчён: векторные кнопки настроек, очистки и закрытия; настройки открываются вместо графика
+        from visalab.front.window import PanelClearButton, PanelCloseButton, PanelSettingsButton
+        assert isinstance(sa_panel.settings_button, PanelSettingsButton)
+        assert isinstance(sa_panel.clear_button, PanelClearButton)
+        assert isinstance(sa_panel.close_button, PanelCloseButton)
         assert sa_panel.stack.currentIndex() == 0
         sa_panel.settings_button.click()
         assert sa_panel.stack.currentIndex() == 1

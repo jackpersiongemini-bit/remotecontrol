@@ -644,11 +644,13 @@ class PNLabel(PLineEdit):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
 
-def paint_indicator(p: QPainter, rect: QRectF, bar: str = UI_COLOR_INDICATOR) -> None:
+def paint_indicator(p: QPainter, rect: QRectF, bar: str | None = None) -> None:
     """Индикатор «включено/выбрано»: тонкая рамка и толстая нижняя граница по скруглению.
 
     Рисуется вручную: QSS с разной толщиной границ даёт кривые углы на скруглениях.
     """
+    if bar is None:
+        bar = UI_COLOR_INDICATOR
     p.save()
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setBrush(Qt.BrushStyle.NoBrush)
@@ -1210,6 +1212,15 @@ class Panel(QFrame):
         }
         Panel CustomLockButton:hover, Panel CustomFavButton:hover { background-color: $UI_COLOR_INVERT_HOVER; }
         Panel CustomLockButton:checked { background-color: $UI_COLOR_INVERT; }
+        Panel PanelSettingsButton, Panel PanelClearButton, Panel PanelCloseButton {
+            min-width: 26px; max-width: 26px;
+            min-height: 24px; max-height: 24px;
+            background-color: $UI_COLOR_BACKGROUND; border: none; border-radius: ${UI_BORDER_RADIUS_PX}px; padding: 0;
+        }
+        Panel PanelSettingsButton:hover, Panel PanelClearButton:hover, Panel PanelCloseButton:hover {
+            background-color: $UI_COLOR_INVERT_HOVER;
+        }
+        Panel PanelSettingsButton:checked { background-color: $UI_COLOR_INVERT; }
         Panel PSpinBox::up-button, Panel PSpinBox::down-button {
             width: 0px; height: 0px; border: none; background: transparent;
         }

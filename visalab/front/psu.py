@@ -256,7 +256,8 @@ class SourceTile(QFrame):
             background-color: $UI_COLOR_PANEL;
             color: $UI_COLOR_TEXT;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
-            font-size: 13pt;
+            font-family: $UI_MONOSPACE_FONT_FAMILY;
+            font-size: ${UI_FONT_SIZE_PT}pt;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             padding: 4px 8px;
         }
@@ -264,14 +265,16 @@ class SourceTile(QFrame):
             background-color: $UI_COLOR_PANEL;
             color: $UI_COLOR_BORDER_LIGHT;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
-            font-size: 10pt;
+            font-family: $UI_MONOSPACE_FONT_FAMILY;
+            font-size: ${UI_FONT_SIZE_PT}pt;
             padding: 2px 8px;
         }
         SourceTile QLabel#measPower {
             background-color: $UI_COLOR_PANEL;
             color: $UI_COLOR_TEXT_MUTED;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
-            font-size: 10pt;
+            font-family: $UI_MONOSPACE_FONT_FAMILY;
+            font-size: ${UI_FONT_SIZE_PT}pt;
             padding: 2px 8px;
         }
     """)

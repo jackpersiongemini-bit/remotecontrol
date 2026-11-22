@@ -43,6 +43,8 @@ def setup(opened, args, settings):
     QApplication.instance().aboutToQuit.connect(win.monitor.stop)    # до остановки приборов
     win.before_quit.append(lambda: remember_windows(opened, settings))
     win.show_window()                      # во весь экран, если так было при выходе
+    if settings.value(f"{win.SETTINGS_GROUP}/DOCK_VISIBLE", None) is None:
+        win.set_dock_visible(True, save=False)
     if args.sim:
         # Генератор, анализатор и ваттметр на симуляторах стоят на стенде симуляторов сами (visalab/sim/bench.py:
         # тракт 10 dB + 0.2 dB/ГГц - ACAL ваттметра даёт GAIN и наклон таблицы). Здесь - только обзор анализатора

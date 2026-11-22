@@ -180,9 +180,9 @@ class FavoritesManager:
         self._extra_layout.setSpacing(4)
         self._extra_host.hide()
 
-        self._empty_label = QLabel("Favorites empty — click ★ to choose", panel)
+        self._empty_label = QLabel("Favorites empty — configure in SET (★)", panel)
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_label.setStyleSheet(f"color: {UI_COLOR_BORDER_LIGHT}; padding: 4px 0;")
+        self._empty_label.setStyleSheet(render_qss("color: $UI_COLOR_BORDER_LIGHT; padding: 4px 0;"))
         self._empty_label.hide()
 
         lay.addWidget(self._extra_host)
@@ -362,7 +362,7 @@ class FavoritesPopup(QFrame):
         FavoritesPopup QLabel#favSection {
             color: $UI_COLOR_BORDER_LIGHT;
             font-family: $UI_MONOSPACE_FONT_FAMILY;
-            font-size: 9pt;
+            font-size: ${UI_FONT_SIZE_PT}pt;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             padding-top: 6px;
             background: transparent;
@@ -373,7 +373,7 @@ class FavoritesPopup(QFrame):
             border: 1px solid $UI_COLOR_BORDER;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
             font-family: $UI_MONOSPACE_FONT_FAMILY;
-            font-size: 9pt;
+            font-size: ${UI_FONT_SIZE_PT}pt;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             padding: 2px 8px;
             min-height: 22px;

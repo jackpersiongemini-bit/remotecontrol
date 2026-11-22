@@ -57,31 +57,41 @@ def test_separate_dock_window_two_tabs_horizontal(qtbot, tmp_path):
     mw = MainWindow(s, ActivityMonitor(links))
     qtbot.addWidget(mw)
     try:
-        # Приборная панель — отдельное окно, не встроенное внутрь MainWindow
+        # Приборная панель — отдельное независимое окно с плитками приборов в заголовке и вкладками FAV / SET
         assert isinstance(mw.instrument_dock_window, InstrumentDockWindow)
         assert mw.instrument_dock_window.isWindow()
         assert mw.instrument_dock_window.parentWidget() is None
         assert mw.instrument_dock.tabs.count() == 2
-        assert [mw.instrument_dock.tabs.tabText(i) for i in range(2)] == ["FAV", "ALL"]
-        assert isinstance(mw.instrument_dock._cards_layout, QHBoxLayout)
+        assert [mw.instrument_dock.tabs.tabText(i) for i in range(2)] == ["FAV", "SET"]
+        assert isinstance(mw.instrument_dock._columns_layout, QHBoxLayout)
         assert mw.instrument_dock.scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        for pr in (p_vna, p_pm):
+            assert mw.instrument_dock_window.titleBar.isAncestorOf(mw.tiles[pr])
+            assert not mw.titleBar.isAncestorOf(mw.tiles[pr])
 
         mw.instrument_dock.attach(w_vna, show=True, save=False)
         mw.instrument_dock.attach(w_pm, show=True, save=False)
+        mw.instrument_dock_window.resize(960, 640)
         mw.set_dock_visible(True)
         qtbot.waitUntil(lambda: mw.instrument_dock_window.isVisible(), timeout=3000)
+        qtbot.waitUntil(lambda: mw.instrument_dock.column_count == 2, timeout=3000)
 
-        # Вкладка 0 (FAV): у каждого прибора видно только избранное
+        # Вкладка 0 (FAV): у каждого прибора видно ТОЛЬКО избранное (без настроек)
         mw.instrument_dock.set_tab(0)
         assert mw.instrument_dock.view_mode == "fav"
         assert not w_vna.preset_panel.isHidden() and w_vna.parameter_panel.isHidden()
         assert not w_pm.preset_panel.isHidden() and w_pm.parameter_panel.isHidden()
 
-        # Вкладка 1 (ALL): у каждого прибора видны вкладки настроек
+        # Вкладка 1 (SET): все настройки и выбор избранного (★), без дублирования панели избранного
         mw.instrument_dock.set_tab(1)
         assert mw.instrument_dock.view_mode == "all"
         assert w_vna.preset_panel.isHidden() and not w_vna.parameter_panel.isHidden()
         assert w_pm.preset_panel.isHidden() and not w_pm.parameter_panel.isHidden()
+        assert not w_vna.fav_button.isHidden() and not w_pm.fav_button.isHidden()
+
+        # Сужаем окно -> адаптивно перестраивается в 1 колонку
+        mw.instrument_dock_window.resize(440, 640)
+        qtbot.waitUntil(lambda: mw.instrument_dock.column_count == 1, timeout=3000)
 
         # При откреплении обратно восстанавливаются обе панели
         w_vna.undock(show=False, save=False)
@@ -99,7 +109,8 @@ def test_sinc_emblem_borderless_and_spinboxes_no_arrows(qtbot, tmp_path):
     s = QSettings(str(tmp_path / "emblem.ini"), QSettings.Format.IniFormat)
     e = SincEmblem()
     qtbot.addWidget(e)
-    assert e.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert not e.autoFillBackground()
+    assert "transparent" in e.styleSheet()
     e.show()
     qtbot.waitExposed(e)
     e.repaint()
@@ -441,3 +452,84 @@ def test_vna_corr_and_math_apply_per_trace_preserving_limit_lines(qtbot, tmp_pat
         win.cleanup()
         win.close()
         p.shutdown()
+
+
+def test_dark_theme_indicators_panel_icons_hover_and_uniform_fonts(qtbot, tmp_path):
+    """Проверка:
+    1) В тёмной теме paint_indicator берёт тёмный UI_COLOR_INDICATOR (не светлый),
+       а виджеты/шаблоны (FavoritesManager._empty_label, PlotSettingsWidget, InstrumentDock)
+       полностью перекрашиваются без остатков светлой темы.
+    2) Кнопки панелей (settings / clear / close) — простые IconButtonBase, инвертирующие цвет
+       иконки в UI_COLOR_TEXT_INVERSE (чёрный в тёмной теме, белый в светлой) при наведении и выборе.
+    3) Шрифт стандартизирован (${UI_FONT_SIZE_PT}pt = 10pt, без 9pt / 13pt).
+    """
+    from PyQt6.QtCore import QPointF, QRectF
+    from PyQt6.QtGui import QColor, QEnterEvent, QImage, QPainter
+    from visalab.front import params as params_mod
+    from visalab.front import theme
+    from visalab.front.favorites import FavoritesPopup
+    from visalab.front.instrument_dock import InstrumentDock
+    from visalab.front.psu import SourceTile
+    from visalab.front.window import IconButtonBase, PanelClearButton, PanelCloseButton, PanelSettingsButton
+
+    # 1. Стандартизация шрифта: нигде в InstrumentDock / FavoritesPopup / SourceTile нет 9pt или 13pt
+    for sheet in (InstrumentDock.STYLE_SHEET, FavoritesPopup.STYLE_SHEET, SourceTile.STYLE):
+        assert "9pt" not in sheet
+        assert "13pt" not in sheet
+
+    s = QSettings(str(tmp_path / "dark_icons.ini"), QSettings.Format.IniFormat)
+    links = ProxyLinks()
+    p_sa = _proxy("e4446a")
+    links.add(p_sa)
+    w_sa = SpectrumWindow(p_sa, s)
+    mw = MainWindow(s, ActivityMonitor(links))
+    qtbot.addWidget(w_sa)
+    qtbot.addWidget(mw)
+    try:
+        panel = mw.panels[p_sa]
+        for btn, cls in (
+            (panel.settings_button, PanelSettingsButton),
+            (panel.clear_button, PanelClearButton),
+            (panel.close_button, PanelCloseButton),
+        ):
+            assert isinstance(btn, IconButtonBase) and isinstance(btn, cls)
+
+        # Переключаем в тёмную тему
+        mw.set_theme("dark")
+        assert theme.current_theme() == "dark"
+        assert params_mod.UI_COLOR_INDICATOR == theme.DARK_COLORS["UI_COLOR_INDICATOR"]
+
+        # Проверяем реальную отрисовку paint_indicator в тёмной теме: нижняя полоса = DARK UI_COLOR_INDICATOR
+        img = QImage(40, 28, QImage.Format.Format_ARGB32)
+        img.fill(QColor(theme.DARK_COLORS["UI_COLOR_BACKGROUND"]))
+        painter = QPainter(img)
+        params_mod.paint_indicator(painter, QRectF(0.5, 0.5, 39.0, 27.0))
+        painter.end()
+        px_col = img.pixelColor(20, 26)
+        assert px_col.name().lower() == theme.DARK_COLORS["UI_COLOR_INDICATOR"].lower()
+
+        # FavoritesManager._empty_label тоже перекрашен в тёмную тему
+        assert theme.DARK_COLORS["UI_COLOR_BORDER_LIGHT"] in w_sa.favorites._empty_label.styleSheet()
+
+        # Наведение на кнопки панелей в тёмной теме инвертирует цвет иконки на чёрный (#222222)
+        dark_inv = QColor(theme.DARK_COLORS["UI_COLOR_TEXT_INVERSE"])
+        dark_muted = QColor(theme.DARK_COLORS["UI_COLOR_TEXT_MUTED"])
+        for btn in (panel.settings_button, panel.clear_button, panel.close_button):
+            assert btn._icon_color == dark_muted
+            btn.enterEvent(QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5)))
+            assert btn._icon_color == dark_inv
+            btn.leaveEvent(QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5)))
+            assert btn._icon_color == dark_muted
+
+        # Выбор (checked) кнопки настроек тоже инвертирует цвет иконки
+        panel.settings_button.setChecked(True)
+        assert panel.settings_button._icon_color == dark_inv
+        panel.settings_button.setChecked(False)
+        assert panel.settings_button._icon_color == dark_muted
+    finally:
+        theme.apply_theme("light")
+        w_sa.cleanup()
+        w_sa.close()
+        mw.cleanup()
+        mw.close()
+        p_sa.shutdown()

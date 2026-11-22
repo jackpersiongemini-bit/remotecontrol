@@ -33,12 +33,13 @@ from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
 from ..core.units import si_format, si_parse
 from ..core.trace import Trace
-from .instrument_dock import InstrumentDock, InstrumentDockWindow, unregister_dock
+from .instrument_dock import (InstrumentDock, InstrumentDockWindow, InstrumentTile, TILE_MIN_HEIGHT,
+                              unregister_dock)
 from .instrument_window import WINDOW_EVENTS, all_instrument_windows, window_for
 from .live_plot import LivePlot, nearest_index
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
 from .plot_tools import (ANALYSIS_KEYS, ANALYSIS_METRICS, PlotSettingsWidget, analyze_trace, eval_math_expr,
-                         format_analysis, make_panel_icon, validate_math_expr)
+                         format_analysis, validate_math_expr)
 from .pm_view import (PMPointsDialog, PowerCurvePlot, RangeSet, filter_pm_matrix, filter_pm_matrix_by_ranges,
                       load_pm_points_csv, parse_range_expr)
 from .power_meter import pm_time_scale
@@ -50,12 +51,13 @@ from .split_layout import (CUSTOM_LAYOUT_MODE, DROP_ZONES, LAYOUT_DESCRIPTIONS, 
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
                     UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, UI_TITLE_BAR_ITEM_SIZE_PX,
                     WINDOW_BAR_HEIGHT, apply_theme, checkbox_qss, current_theme, render_qss, scrollbar_qss)
-from .window import CustomFullButton, Window, WindowBar, mark_growing, short_address
+from .window import (CustomFullButton, PanelClearButton, PanelCloseButton, PanelSettingsButton, Window, WindowBar,
+                     mark_growing, short_address)
 
-__all__ = ["MainWindow", "SincEmblem", "InstrumentTile", "LivePanel", "CurrentPanel", "ScenarioChip", "PowerTable",
-           "CurrentTable", "LAYOUT_MODES", "CUSTOM_LAYOUT_MODE", "PLOT_LAYOUT_MODES", "PM_UNITS", "CURRENT_UNITS"]
+__all__ = ["MainWindow", "SincEmblem", "InstrumentTile", "TILE_MIN_HEIGHT", "LivePanel", "CurrentPanel",
+           "ScenarioChip", "PowerTable", "CurrentTable", "LAYOUT_MODES", "CUSTOM_LAYOUT_MODE",
+           "PLOT_LAYOUT_MODES", "PM_UNITS", "CURRENT_UNITS"]
 
-TILE_MIN_HEIGHT = UI_TITLE_BAR_ITEM_SIZE_PX
 PLOT_MIN_HEIGHT = 240
 RIGHT_PANEL_MIN_HEIGHT = 320
 UI_REFRESH_MS = 60
@@ -164,7 +166,8 @@ class SincEmblem(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sincEmblem")
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent; border: none;")
         self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.setToolTip("VISALAB")
         self._phase = 0.0
@@ -245,51 +248,6 @@ class SincEmblem(QWidget):
         p.setBrush(QColor(UI_COLOR_TEXT))
         p.drawEllipse(peak, dot_r, dot_r)
         p.end()
-
-
-class InstrumentTile(IndicatorButton):
-    """Плитка прибора: что это (VNA, PM...); индикатор - окно прибора открыто, красная - у прибора ошибка."""
-
-    def __init__(self, proxy, parent=None):
-        super().__init__(parent)
-        self.proxy = proxy
-        self.setObjectName("chip")
-        self.setProperty("tile", True)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.window_open = False
-        self.error = False
-        self.setMinimumWidth(54)
-        self.setFixedHeight(TILE_MIN_HEIGHT)
-
-    def indicated(self) -> bool:
-        return self.window_open
-
-    def show_state(self, name: str, window_open: bool, error: bool, tip: str = "") -> None:
-        window_open, error = bool(window_open), bool(error)
-        changed = (self.text() != name) or (window_open != self.window_open) or (error != self.error)
-        if self.text() != name:
-            self.setText(name)
-        if error != self.error:
-            self.setProperty("wstate", "error" if error else "")
-            _repolish(self)
-        self.window_open, self.error = window_open, error
-        if tip and self.toolTip() != tip:
-            self.setToolTip(tip)
-        if changed:
-            self.update()
-
-    def paintEvent(self, e):  # noqa: N802 - Qt
-        QPushButton.paintEvent(self, e)
-        p = QPainter(self)
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        if self.window_open:                  # окно открыто - индикатор (при ошибке - красная полоса)
-            paint_indicator(p, rect, UI_COLOR_ERROR if self.error else UI_COLOR_INDICATOR)
-        if self.error:                        # ошибка - красная рамка поверх
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setPen(QPen(QColor(UI_COLOR_ERROR), 1.5))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(rect.adjusted(0.25, 0.25, -0.25, -0.25), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
 
 
 def _dbm_to_w(dbm: float) -> float:
@@ -664,19 +622,18 @@ class CurrentTable(QTableWidget):
 
 
 def _icon_btn(kind: str, tip: str, slot, *, checkable: bool = False) -> QPushButton:
-    """Компактная кнопка заголовка панели с векторной HiDPI-иконкой."""
-    b = QPushButton()
-    b.setObjectName("tool")
+    """Компактная кнопка заголовка панели в стиле кнопок заголовка окна (инверсия цвета при наведении)."""
+    cls = {
+        "settings": PanelSettingsButton,
+        "clear": PanelClearButton,
+        "close": PanelCloseButton,
+    }.get(kind, PanelCloseButton)
+    b = cls()
     b.setProperty("_icon_kind", kind)
-    b.setIcon(make_panel_icon(kind, 15))
-    b.setIconSize(QSize(15, 15))
-    b.setFixedSize(26, 24)
-    b.setCheckable(checkable)
-    b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    if checkable:
+        b.setCheckable(True)
     b.setToolTip(tip)
     b.clicked.connect(slot)
-    b.refresh_theme = lambda b=b, k=kind: b.setIcon(make_panel_icon(k, 15))  # type: ignore[attr-defined]
     return b
 
 
@@ -2150,12 +2107,11 @@ class MainWindow(Window):
         else:
             self.layout_mode = LAYOUT_MODES[0]
 
-        # Заголовок окна: эмблема sinc слева, кнопки приборов (VNA, SA, PM...) вместо надписи LAB,
-        # справа - фишка активного сценария и системные кнопки (_ / ⛶ / ×)
+        # Заголовок окна графиков: эмблема sinc слева, справа - фишка активного сценария и (_ / ⛶ / ×).
+        # Плитки приборов (VNA, SA, PM, GEN, PULSE, PSU) принадлежат независимому окну инструментов.
         self.titleBar.title_label.hide()
-        _tile_qss = render_qss("""
-            QWidget#tilesHost { background: transparent; border: none; }
-            InstrumentTile, ScenarioChip {
+        _scenario_qss = render_qss("""
+            ScenarioChip {
                 background-color: $UI_COLOR_BACKGROUND;
                 color: $UI_COLOR_TEXT_MUTED;
                 border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
@@ -2164,26 +2120,16 @@ class MainWindow(Window):
                 font-size: ${UI_FONT_SIZE_PT}pt;
                 padding: 0 10px;
             }
-            InstrumentTile:hover, ScenarioChip:hover {
+            ScenarioChip:hover {
                 background-color: $UI_COLOR_INVERT_HOVER;
                 color: $UI_COLOR_TEXT_INVERSE;
                 border-color: $UI_COLOR_INVERT_HOVER;
                 font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             }
-            InstrumentTile[wstate="error"] {
-                color: $UI_COLOR_ERROR;
-            }
         """)
-        self.titleBar.setStyleSheet(WindowBar.STYLE_SHEET + "\n" + _tile_qss)
+        self.titleBar.setStyleSheet(WindowBar.STYLE_SHEET + "\n" + _scenario_qss)
         self.emblem = SincEmblem(self.titleBar)
-        self._tiles_host = QWidget(self.titleBar)
-        self._tiles_host.setObjectName("tilesHost")
-        self._tiles_host.setStyleSheet(_tile_qss)
-        self.tiles_layout = QHBoxLayout(self._tiles_host)
-        self.tiles_layout.setContentsMargins(0, 0, 0, 0)
-        self.tiles_layout.setSpacing(4)
         self.titleBar.insert_widget(self.emblem, 0)
-        self.titleBar.insert_widget(self._tiles_host, 1)
 
         self.scenario_chip = ScenarioChip(self.titleBar)
         self.scenario_chip.clicked.connect(self._open_scenario)
@@ -2396,9 +2342,11 @@ class MainWindow(Window):
         )
         self.tabs_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
-        # Отдельное окно приборной панели (независимо от окна графиков): 2 вкладки (FAV / ALL), горизонтальный скролл
-        self.instrument_dock_window = InstrumentDockWindow(settings)
+        # Независимое окно инструментов (аналог MainWindow): плитки VNA/SA/PM/GEN/PULSE/PSU в заголовке,
+        # 2 вкладки (FAV / SET) и адаптивная многоколоночная группировка
+        self.instrument_dock_window = InstrumentDockWindow(settings, monitor=self.monitor)
         self.instrument_dock = self.instrument_dock_window.dock
+        self.tiles = self.instrument_dock_window.tiles
         self.instrument_dock.changed.connect(self._on_dock_changed)
         self.instrument_dock_window.visibility_changed.connect(self._on_dock_visibility_changed)
         self.instrument_dock_window.hide()
@@ -2460,8 +2408,8 @@ class MainWindow(Window):
             return
         self._save_splitters()
         proxies = self.monitor.proxies()
-        for p in [p for p in self.tiles if p not in proxies]:
-            self.tiles.pop(p).deleteLater()
+        if not sip.isdeleted(self.instrument_dock_window):
+            self.instrument_dock_window.rebuild_tiles()
         for p in [p for p in self.panels if p not in proxies]:
             panel = self.panels.pop(p)
             panel.setParent(None)
@@ -2472,12 +2420,6 @@ class MainWindow(Window):
             panel = self.current_panels.pop(key)
             panel.setParent(None)
             panel.deleteLater()
-        for i, p in enumerate(proxies):
-            if p not in self.tiles:
-                tile = InstrumentTile(p, self._tiles_host)
-                tile.clicked.connect(lambda _=False, p=p: self.open_instrument(p))
-                self.tiles[p] = tile
-            self.tiles_layout.insertWidget(i, self.tiles[p])
         for p in self.monitor.receivers():
             if p not in self.panels:
                 panel = LivePanel(p, self.monitor, settings=self.settings)
@@ -2585,35 +2527,12 @@ class MainWindow(Window):
                 self._refresh_timer.start()
 
     def _update_tile(self, proxy) -> None:
-        """Плитка: имя прибора; индикатор - его окно открыто; красная - ошибка: индикатор ошибок окна горит
-        (до CLEAR в журнале), связь не установилась или потеряна."""
+        """Обновить плитку прибора в заголовке окна инструментов."""
         if sip.isdeleted(self):
             return
-        tile = self.tiles.get(proxy)
-        if tile is None or sip.isdeleted(tile):
-            return
-        name = self.monitor.name(proxy)
-        w = window_for(proxy)
-        window_open = w is not None and w.isVisible()
-        lost = proxy.state is ConnectionState.ERROR or bool(getattr(proxy, "reconnecting", False))
-        errors = w is not None and w.has_errors()
-        if proxy.state is ConnectionState.CONNECTED:
-            link = "connected"
-        elif lost:
-            link = "no connection, reconnecting" if getattr(proxy, "reconnecting", False) else "connection error"
-        elif proxy.state is ConnectionState.CONNECTING:
-            link = "connecting"
-        else:
-            link = "off"
-        tip = [f"{name}: {proxy.name}", short_address(proxy.address), link]
-        if errors:
-            tip.append(w.error_indicator.toolTip())
-        if w is not None and w.is_docked:
-            state_txt = "Window is docked" if window_open else "Window is docked (hidden)"
-        else:
-            state_txt = "Window is open" if window_open else "Window is closed"
-        tip.append(f"{state_txt}. Click - show the window")
-        tile.show_state(name, window_open, errors or lost, "\n".join(tip))
+        dw = getattr(self, "instrument_dock_window", None)
+        if dw is not None and not sip.isdeleted(dw):
+            dw.update_tile(proxy)
 
     def _on_runs(self, *_args) -> None:
         if sip.isdeleted(self):
@@ -3519,6 +3438,7 @@ class MainWindow(Window):
                 self.instrument_dock.detach(w, show=False, save=False)
         dw = getattr(self, "instrument_dock_window", None)
         if dw is not None and not sip.isdeleted(dw):
+            dw.cleanup()
             dw.save_size()
             dw.hide()
             dw.close()

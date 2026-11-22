@@ -243,12 +243,13 @@ def test_main_window_two_pane_active_by_video_level_and_inline_settings(qtbot, t
         assert win.right_scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         assert win.right_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
-        # 2) Облегчённый заголовок: имя + процесс + только 3 иконки (настройки, clear, close), без нижней строки source
+        # 2) Облегчённый заголовок: имя + процесс + только 3 векторные кнопки (настройки, clear, close), без нижней строки source
+        from visalab.front.window import PanelClearButton, PanelCloseButton, PanelSettingsButton
         for panel in (vna_p, sa_p, pm_p):
             assert not hasattr(panel, "source")
-            assert not panel.settings_button.icon().isNull()
-            assert not panel.clear_button.icon().isNull()
-            assert not panel.close_button.icon().isNull()
+            assert isinstance(panel.settings_button, PanelSettingsButton)
+            assert isinstance(panel.clear_button, PanelClearButton)
+            assert isinstance(panel.close_button, PanelCloseButton)
             # Открытие настроек заменяет сам график внутри панели
             assert panel.stack.currentIndex() == 0
             panel.settings_button.click()
