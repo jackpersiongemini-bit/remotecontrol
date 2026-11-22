@@ -28,6 +28,7 @@ from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.params import ConnectionState
+from ..core.units import si_format
 from ..coord import Instrument
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
@@ -129,9 +130,54 @@ class SourceField(PLineEdit):
         self.show_value(self._value)               # подсказка - уставка, слева - измерение
 
 
+class SourceReadout(QLabel):
+    """Только чтение: текущее измеренное напряжение / ток на плитке избранного (клики проходят плитке)."""
+
+    def __init__(self, proxy: Instrument, set_key: str, meas_key: str, unit: str, *, primary: bool = True, parent=None):
+        super().__init__("---", parent)
+        self.proxy = proxy
+        self.set_key = set_key
+        self.meas_key = meas_key
+        self.unit = unit
+        self._meas: float | None = None
+        self._setpoint: float | None = None
+        self.setObjectName("measPrimary" if primary else "measSecondary")
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        proxy.subscribe(meas_key, self._on_meas)
+        if proxy.supports(set_key):
+            proxy.subscribe(set_key, self._on_setpoint)
+
+    @property
+    def measured(self) -> float | None:
+        return self._meas
+
+    @property
+    def setpoint(self) -> float | None:
+        return self._setpoint
+
+    def _fmt(self, value: float | None) -> str:
+        if not isinstance(value, (int, float)):
+            return "---"
+        if abs(value) < 1e-9:
+            return f"0 {self.unit}"
+        return si_format(float(value), self.unit, 4)
+
+    def _on_meas(self, value: Any) -> None:
+        self._meas = float(value) if isinstance(value, (int, float)) else None
+        self.setText(self._fmt(self._meas))
+
+    def _on_setpoint(self, value: Any) -> None:
+        self._setpoint = float(value) if isinstance(value, (int, float)) else None
+
+
 class SourceTile(QFrame):
-    """Плитка канала. Ведёт себя как привязанный к ``chN.output`` виджет (key / proxy / spec /
-    set_value), поэтому журнал ошибок и цвет рамки при записи работают как у кнопок."""
+    """Плитка канала в избранном: только индикация текущего напряжения/тока и вкл/выкл по клику.
+
+    Ведёт себя как привязанный к ``chN.output`` виджет (key / proxy / spec / set_value),
+    поэтому журнал ошибок и цвет рамки при записи работают как у кнопок.
+    """
 
     STYLE = render_qss("""
         SourceTile { background-color: $UI_COLOR_BACKGROUND; border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BACKGROUND;
@@ -139,12 +185,25 @@ class SourceTile(QFrame):
         SourceTile:hover { border-color: $UI_COLOR_BORDER; }
         SourceTile[wstate="process"] { border-color: $UI_COLOR_PROCESS; }
         SourceTile[wstate="error"] { border-color: $UI_COLOR_ERROR; }
-        SourceTile QLabel#side { color: $UI_COLOR_BORDER_LIGHT; }
         SourceTile QLabel { background: transparent; color: $UI_COLOR_BORDER_LIGHT; padding: 0; }
         SourceTile QLabel#name { color: $UI_COLOR_TEXT; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         SourceTile QLabel#mode[mode="CC"] { color: $UI_COLOR_PROCESS; }
         SourceTile QLabel#mode[mode="OVP"] { color: $UI_COLOR_ERROR; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
-        SourceTile PLineEdit { background-color: $UI_COLOR_PANEL; border-color: $UI_COLOR_PANEL; }
+        SourceTile QLabel#measPrimary {
+            background-color: $UI_COLOR_PANEL;
+            color: $UI_COLOR_TEXT;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
+            font-size: 13pt;
+            font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+            padding: 4px 8px;
+        }
+        SourceTile QLabel#measSecondary {
+            background-color: $UI_COLOR_PANEL;
+            color: $UI_COLOR_BORDER_LIGHT;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
+            font-size: 10pt;
+            padding: 2px 8px;
+        }
     """)
 
     def __init__(self, proxy: Instrument, n: int, title: str = "", parent=None):
@@ -157,12 +216,14 @@ class SourceTile(QFrame):
         self.locked = False                         # блокировка (CH1 без потребления CH2/CH3)
         self.lock_reason = ""
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumWidth(150)
+        self.setMinimumWidth(120)
 
         self.name = QLabel(title or f"CH{n}")
         self.name.setObjectName("name")
+        self.name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.mode = QLabel("")
         self.mode.setObjectName("mode")
+        self.mode.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.head = QHBoxLayout()
         self.head.setContentsMargins(0, 0, 0, 0)
         self.head.setSpacing(6)
@@ -173,12 +234,14 @@ class SourceTile(QFrame):
         lay.setContentsMargins(8, 6, 8, 10)
         lay.setSpacing(4)
         lay.addLayout(self.head)
-        self.fields: dict[str, SourceField] = {}
-        for q, set_key, meas_key in (("V", "voltage", "meas_v"), ("I", "current", "meas_i")):
-            f = SourceField(proxy, f"ch{n}.{set_key}", f"ch{n}.{meas_key}")
-            f.setToolTip(f"CH{n} {q}: measured; small text - setpoint. Click to set")
-            self.fields[q] = f
-            lay.addWidget(f)
+        self.fields: dict[str, SourceReadout] = {}
+        for q, set_key, meas_key, unit, primary in (
+            ("V", "voltage", "meas_v", "V", True),
+            ("I", "current", "meas_i", "A", False),
+        ):
+            r = SourceReadout(proxy, f"ch{n}.{set_key}", f"ch{n}.{meas_key}", unit, primary=primary)
+            self.fields[q] = r
+            lay.addWidget(r)
 
         proxy.subscribe(self.key, self._on_value, self._on_status)
         for k in (f"ch{n}.mode", f"ch{n}.ovp_tripped"):
@@ -304,6 +367,7 @@ class RuleRow(PanelLine):
         self.channels, self.rule, self.error = channels, None, ""
         self._changed = changed
         self.edit.returnPressed.connect(self.commit)
+        self.edit.editingFinished.connect(self.commit)
         self.toggle.changed.connect(lambda _v: self._changed())
         self.delete.clicked.connect(lambda: remove(self))
         self.parse()
@@ -396,8 +460,7 @@ class PSUWindow(InstrumentWindow):
         self.grid = SourceGrid([(proxy, n, f"CH{n}") for n in range(1, nch + 1)
                                 if proxy.supports(f"ch{n}.output")])
         self.tiles = {t.n: t for t in self.grid.tiles}
-        for t in self.grid.tiles:
-            self.saved_widgets += [t.fields["V"], t.fields["I"]]       # выходы после Init не включаем
+        self.setpoint_fields: dict[int, dict[str, PLineEdit]] = {}
         grid_line = PanelLine("", self.grid)
         grid_line._name.hide()
         self.top_lines = [grid_line]
@@ -407,8 +470,30 @@ class PSUWindow(InstrumentWindow):
             line._name.hide()
             self.top_lines.append(line)
 
-        # PROT: защита по каналам (столбцы CH1..CHn)
         chans = sorted(self.tiles)
+
+        # CH: уставки напряжения и тока по каналам (в избранном плитки только отображают и вкл/выкл)
+        ch_heads = []
+        for n in chans:
+            h = PLabel(text=f"CH{n}")
+            h.setObjectName("heading")
+            ch_heads.append(h)
+        ch_rows = [PanelLine("", *ch_heads)]
+        for q, key, tip_word in (("V", "voltage", "Voltage setpoint"), ("I", "current", "Current limit")):
+            ws = []
+            for n in chans:
+                if proxy.supports(f"ch{n}.{key}"):
+                    w = PLineEdit(proxy, f"ch{n}.{key}")
+                    w.setToolTip(f"CH{n} {tip_word}")
+                    self.setpoint_fields.setdefault(n, {})[q] = w
+                    ws.append(w)
+            if len(ws) == len(chans):
+                self.saved_widgets += ws
+                ch_rows.append(PanelLine(q, *ws))
+        if len(ch_rows) > 1:
+            self.page_specs.append(("CH", tuple(f"ch{n}.output" for n in chans), PanelTable(*ch_rows)))
+
+        # PROT: защита по каналам (столбцы CH1..CHn)
         heads = []
         for n in chans:
             h = PLabel(text=f"CH{n}")

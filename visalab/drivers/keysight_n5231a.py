@@ -179,6 +179,8 @@ class KeysightPNA(VISAInstrument):
         self._last_cont_read = 0.0
         self._complex = False                  # SDATA - только по запросу (комплексные форматы есть сами)
         self._mark_n = 1
+        self._markers_cache: dict[tuple[int, str], list[tuple[int, float, float | None]]] = {}
+        self._markers_scan_ts: dict[tuple[int, str], float] = {}
         self._cal_stim = True                  # cal set применяется вместе со своим стимулом
         #: идущая калибровка: {"channel", "steps": [описание], "done": {шаг}, "busy": шаг | None}
         self._cal: dict | None = None
@@ -389,6 +391,8 @@ class KeysightPNA(VISAInstrument):
         self._wnum_supported = True
         self._scale_read_supported = True
         self._scale_skip = set()
+        self._markers_cache = {}
+        self._markers_scan_ts = {}
         self._setup_oper_sync()
         self._continuous = True
         self._ensure_continuous()
@@ -411,6 +415,8 @@ class KeysightPNA(VISAInstrument):
         self._cal = None
         self._gen = None
         self._sweep = {}
+        self._markers_cache = {}
+        self._markers_scan_ts = {}
         self._power_offset = 0.0
         self._power_offset_state = False
 
@@ -519,13 +525,13 @@ class KeysightPNA(VISAInstrument):
             return
         if spec.key == "mark.x":
             cmd = self._mark_cmd()
-            if self.query(cmd + ":STAT?").strip() not in ("1", "ON"):
+            if not self._mark_stat_on(self.query(cmd + ":STAT?")):
                 self.write(f"{cmd}:STAT 1")
             self.write(f"{cmd}:X {spec.to_scpi(value)}")
             return
         if spec.key == "marker.freq":
             self.select_channel(1)
-            if self.query("CALC1:MARK1:STAT?").strip() not in ("1", "ON"):
+            if not self._mark_stat_on(self.query("CALC1:MARK1:STAT?")):
                 self.write("CALC1:MARK1:STAT 1")
             self.write(f"CALC1:MARK1:X {spec.to_scpi(value)}")
             return
@@ -599,6 +605,10 @@ class KeysightPNA(VISAInstrument):
     def after_write(self, spec: Param, value: Any) -> None:
         if spec.key in ("scale.div", "scale.ref", "scale.rpos"):
             self._sync_sel_scale()
+        elif spec.key in ("mark.state", "mark.x"):
+            self._sync_sel_markers(full=True)
+        elif spec.key in ("marker.state", "marker.freq") and self.meas_name:
+            self._sync_sel_markers((1, self.meas_name), full=True)
         elif spec.key in ("trig.source", "gen.state"):
             self._clear_oper_events()
             if self._continuous and self._cal is None:
@@ -671,7 +681,7 @@ class KeysightPNA(VISAInstrument):
             if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
                 return None
             cmd = self._mark_cmd()
-            on = self.query(cmd + ":STAT?").strip() in ("1", "ON")
+            on = self._mark_stat_on(self.query(cmd + ":STAT?"))
             if key == "mark.state":
                 return on
             if not on:
@@ -729,7 +739,7 @@ class KeysightPNA(VISAInstrument):
             if not self.meas_name and not self._catalog(1):
                 return None
             self.select_channel(1)
-            if self.query("CALC1:MARK1:STAT?").strip() not in ("1", "ON"):
+            if not self._mark_stat_on(self.query("CALC1:MARK1:STAT?")):
                 return None
             if key == "marker.value":
                 return parse_number(self.query("CALC1:MARK1:Y?").split(",")[0])
@@ -832,6 +842,18 @@ class KeysightPNA(VISAInstrument):
         return replace(spec, query=q, write=w)
 
     # ------------------------------------------------------- маркеры трейса trace.sel
+    @staticmethod
+    def _mark_stat_on(raw: str) -> bool:
+        s = (raw or "").strip().upper()
+        if s in ("1", "+1", "ON"):
+            return True
+        if s in ("0", "+0", "-0", "OFF", ""):
+            return False
+        try:
+            return parse_number(s) != 0.0
+        except ValueError:
+            return False
+
     def _mark_cmd(self, n: int | None = None) -> str:
         if not self._sel:
             raise ValueError("трейс не выбран (trace.sel)")
@@ -839,17 +861,79 @@ class KeysightPNA(VISAInstrument):
         self.write(f"CALC{c}:PAR:SEL '{name}'")
         return f"CALC{c}:MARK{self._mark_n if n is None else n}"
 
+    def _read_trace_markers(self, channel: int, name: str, *, full: bool = False,
+                            select: bool = False) -> list[tuple[int, float, float | None]]:
+        """Прочитать включённые маркеры трейса ``(channel, name)`` -> ``[(n, x, y), ...]``.
+
+        Полное сканирование 1..MARKS делается при первом чтении, по явному запросу (``full=True``)
+        или раз в 2.5 с; в промежутках перечитываются только уже известные активные маркеры.
+        """
+        key = (channel, name)
+        now = time.monotonic()
+        need_full = full or key not in self._markers_scan_ts or (now - self._markers_scan_ts[key] >= 2.5)
+        cached = self._markers_cache.get(key, [])
+        nums = range(1, MARKS + 1) if need_full else [n for n, _x, _y in cached]
+        if not nums:
+            return list(cached)
+        if select:
+            self.write(f"CALC{channel}:PAR:SEL '{name}'")
+        out: list[tuple[int, float, float | None]] = []
+        for n in nums:
+            cmd = f"CALC{channel}:MARK{n}"
+            try:
+                if self._mark_stat_on(self.query(cmd + ":STAT?")):
+                    mx = parse_number(self.query(cmd + ":X?"))
+                    try:
+                        my: float | None = parse_number(self.query(cmd + ":Y?").split(",")[0])
+                    except ValueError:
+                        my = None
+                    out.append((n, mx, my))
+            except ValueError:
+                continue
+            except TransportTimeout:
+                if not self._try_resync():
+                    raise
+                self._drain_scale_errors()
+                return list(cached)
+        self._markers_cache[key] = out
+        if need_full:
+            self._markers_scan_ts[key] = now
+        return out
+
+    def _sync_sel_markers(self, target: tuple[int, str] | None = None, *, full: bool = True) -> None:
+        """Обновить маркеры в метаданных уже прочитанной трассы (без ожидания следующей развёртки)."""
+        sel = target or self._sel
+        if not sel:
+            return
+        c, name = sel
+        if name not in self._catalog(c):
+            return
+        markers = self._read_trace_markers(c, name, full=full, select=True)
+        self._publish_trace_markers(c, name, markers)
+
+    def _publish_trace_markers(self, channel: int, name: str,
+                               markers: list[tuple[int, float, float | None]]) -> None:
+        m_tuple = tuple(markers)
+        for n, slot in enumerate(self._slots, 1):
+            if (slot.channel, slot.name) != (channel, name):
+                continue
+            key = f"m{n}.trace"
+            tr = self._sweep.get(key)
+            if not isinstance(tr, Trace):
+                continue
+            new_tr = replace(tr, meta={**(tr.meta or {}), "markers": m_tuple})
+            self._sweep[key] = new_tr
+            self._publish(key, new_tr)
+            if n == 1:
+                self._sweep["trace"] = new_tr
+                self._publish("trace", new_tr)
+
     def _mark_table(self) -> list[tuple[int, float, float | None]]:
-        out = []
         if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
-            return out
+            return []
         c, name = self._sel
-        self.write(f"CALC{c}:PAR:SEL '{name}'")
-        for n in range(1, MARKS + 1):
-            cmd = f"CALC{c}:MARK{n}"
-            if self.query(cmd + ":STAT?").strip() in ("1", "ON"):
-                out.append((n, parse_number(self.query(cmd + ":X?")),
-                            parse_number(self.query(cmd + ":Y?").split(",")[0])))
+        out = self._read_trace_markers(c, name, full=True, select=True)
+        self._publish_trace_markers(c, name, out)
         return out
 
     # ------------------------------------------------------- масштаб трейса trace.sel
@@ -1116,7 +1200,8 @@ class KeysightPNA(VISAInstrument):
                 cached = tuple(self._values.get(k) for k in ("scale.div", "scale.ref", "scale.rpos"))
                 if all(isinstance(v, (int, float)) for v in cached):
                     scale = cached
-            meta = {**(stim if c == self._stim_ch else {}), "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math}
+            markers = self._read_trace_markers(c, slot.name)
+            meta = {**(stim if c == self._stim_ch else {}), "channel": c, "name": slot.name, "sparam": sparam, "format": fmt, "math": math, "markers": tuple(markers)}
             if scale is not None:
                 meta["scale_div"], meta["scale_ref"], meta["scale_rpos"] = scale
                 if self._sel == (c, slot.name):
@@ -1288,7 +1373,7 @@ class KeysightPNA(VISAInstrument):
             return None
         if name in ("mark_peak", "mark_min"):
             cmd = self._mark_cmd()
-            if self.query(cmd + ":STAT?").strip() not in ("1", "ON"):
+            if not self._mark_stat_on(self.query(cmd + ":STAT?")):
                 self.write(f"{cmd}:STAT 1")
             self.write(f"{cmd}:FUNC:EXEC {'MAX' if name == 'mark_peak' else 'MIN'}")
             self._read_keys(MARK_KEYS)
@@ -1296,20 +1381,25 @@ class KeysightPNA(VISAInstrument):
         if name == "mark_aoff":
             if not self._sel or self._sel[1] not in self._catalog(self._sel[0]):
                 return []
-            c = self._sel[0]
+            c, mname = self._sel
             self._mark_cmd()
             self.write(f"CALC{c}:MARK:AOFF")
+            self._markers_cache[(c, mname)] = []
+            self._markers_scan_ts[(c, mname)] = time.monotonic()
+            self._publish_trace_markers(c, mname, [])
             self._read_keys(MARK_KEYS)
             return []
         if name == "mark_table":
             return self._mark_table()
         if name in ("marker_peak", "marker_min"):
             self.select_channel(1)
-            if self.query("CALC1:MARK1:STAT?").strip() not in ("1", "ON"):
+            if not self._mark_stat_on(self.query("CALC1:MARK1:STAT?")):
                 self.write("CALC1:MARK1:STAT 1")
                 self._values["marker.state"] = True
             self.write(f"CALC1:MARK1:FUNC:EXEC {'MAX' if name == 'marker_peak' else 'MIN'}")
             self._read_keys(["marker.state", "marker.freq", "marker.value"])
+            if self.meas_name:
+                self._sync_sel_markers((1, self.meas_name), full=True)
             return None
         if name == "meas_table":
             return self._meas_table()

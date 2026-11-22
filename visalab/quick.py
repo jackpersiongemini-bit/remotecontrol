@@ -109,7 +109,7 @@ def _repolish(w: QWidget) -> None:
 
 # ======================================================================= поля
 class SpinField(QDoubleSpinBox):
-    """Число, привязанное к ключу прибора. Отправка только по Enter и stepBy (стрелки / колесо).
+    """Число, привязанное к ключу прибора. Отправка по Enter, stepBy (стрелки / колесо) и уходу фокуса.
 
     ``scale`` - во сколько раз отображаемая единица больше единицы СИ (MHz -> 1e6).
     """
@@ -132,6 +132,7 @@ class SpinField(QDoubleSpinBox):
         self.setToolTip(key)
         self.setEnabled(False)
         self._shown: float | None = None
+        self._escaped = False
         proxy.subscribe(key, self._on_value, self._on_status)
         self.lineEdit().returnPressed.connect(self._commit_on_enter)
 
@@ -176,9 +177,11 @@ class SpinField(QDoubleSpinBox):
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
         if e.key() == Qt.Key.Key_Escape:
+            self._escaped = True
             self._revert()
             self.clearFocus()
             return
+        self._escaped = False
         if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._commit_on_enter()
             e.accept()
@@ -186,7 +189,12 @@ class SpinField(QDoubleSpinBox):
         super().keyPressEvent(e)
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
-        if self._shown is not None:
+        escaped = self._escaped
+        self._escaped = False
+        if not escaped:
+            self.interpretText()
+            self._commit()
+        elif self._shown is not None:
             self._revert()
         super().focusOutEvent(e)
         v = self.proxy.value(self.key)              # показать актуальное значение прибора

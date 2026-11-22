@@ -182,6 +182,7 @@ class LNumber(QLineEdit):
         self.unit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.unit_button.setToolTip(f"Unit: {unit}" if unit else "")
         self.returnPressed.connect(self._commit)
+        self.editingFinished.connect(self._commit)
         self.show_value(self._value)
 
     @property
@@ -253,7 +254,6 @@ class LNumber(QLineEdit):
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
         super().focusOutEvent(e)
-        self.setModified(False)
         self.show_value(self._value)
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt

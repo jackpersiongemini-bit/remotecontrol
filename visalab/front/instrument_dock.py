@@ -1,10 +1,12 @@
-"""Контейнер (док-панель) для окон приборов: прикрепление и открепление по клику.
+"""Отдельное окно приборной панели (док-панель) с двумя вкладками и горизонтальной прокруткой.
 
-Окна приборов (``InstrumentWindow``) могут работать как отдельные плавающие окна или
-прикрепляться внутрь ``InstrumentDock`` (встроен в ``MainWindow`` либо открыт отдельным
-окном ``InstrumentDockWindow`` при автономном запуске прибора). При прикреплении окно
-прибора остаётся тем же виджетом ``InstrumentWindow`` со всеми сигналами, привязками и
-вкладками — меняется только его родитель и режим заголовка.
+Вкладка 0 (``FAV``) — избранное всех прикреплённых приборов, разложенных рядом по горизонтали
+(векторный анализатор, ваттметр, анализатор спектра, генератор, источник питания и т.д.).
+Вкладка 1 (``ALL``) — полные настройки всех прикреплённых приборов в том же горизонтальном ряду
+с горизонтальной полосой прокрутки.
+
+При прикреплении окно прибора (``InstrumentWindow``) остаётся тем же виджетом со всеми сигналами,
+привязками и вкладками — меняется только его родитель и режим отображения (``fav`` / ``all``).
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
+from .params import PTabBar
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
                     UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE,
                     UI_COLOR_TEXT_MUTED, WINDOW_BAR_HEIGHT, checkbox_qss, render_qss, scrollbar_qss)
@@ -39,18 +42,13 @@ def _prune_docks() -> None:
 
 
 def active_dock(settings: QSettings | None = None, create: bool = False) -> "InstrumentDock | None":
-    """Вернуть основной док процесса (обычно док ``MainWindow``). При ``create=True`` создаст
-    отдельное окно ``InstrumentDockWindow``, если главного окна в процессе нет."""
+    """Вернуть основной док процесса. При ``create=True`` создаст отдельное окно
+    ``InstrumentDockWindow``, если ни одного дока ещё нет."""
     global _STANDALONE_WINDOW
     _prune_docks()
     if _DOCKS:
-        # 1. Предпочитаем видимый док внутри открытого MainWindow (самый свежий)
         for d in reversed(_DOCKS):
-            if not d.is_standalone and d.window().isVisible():
-                return d
-        # 2. Иначе самый свежий не-standalone док
-        for d in reversed(_DOCKS):
-            if not d.is_standalone:
+            if d.window().isVisible():
                 return d
         return _DOCKS[-1]
     if not create:
@@ -64,7 +62,7 @@ def active_dock(settings: QSettings | None = None, create: bool = False) -> "Ins
 
 
 class _DockCard(QFrame):
-    """Рамка вокруг прикреплённого окна прибора в списке дока."""
+    """Колонка-карточка одного прикреплённого прибора в горизонтальном ряду дока."""
 
     def __init__(self, win: QWidget, dock: "InstrumentDock", parent=None):
         super().__init__(parent)
@@ -75,8 +73,15 @@ class _DockCard(QFrame):
         lay.setContentsMargins(1, 1, 1, 1)
         lay.setSpacing(0)
         self.card_layout = lay
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
+        self.sync_width()
         win.installEventFilter(self)
+
+    def sync_width(self) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.instrument_window):
+            return
+        w = max(self.instrument_window.minimumWidth(), 370)
+        self.setFixedWidth(w + 2)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt
         if obj is self.instrument_window and not sip.isdeleted(self):
@@ -91,9 +96,11 @@ class _DockCard(QFrame):
 
 
 class InstrumentDock(QFrame):
-    """Панель-контейнер для прикреплённых окон приборов с прокруткой и кнопками DOCK ALL / UNDOCK ALL."""
+    """Горизонтальная приборная панель с двумя вкладками (FAV / ALL) и прокруткой."""
 
-    #: состав или видимость прикреплённых приборов изменились
+    TABS = ("FAV", "ALL")
+
+    #: состав, видимость или вкладка прикреплённых приборов изменились
     changed = pyqtSignal()
     #: пользователь нажал кнопку скрытия дока
     close_requested = pyqtSignal()
@@ -113,7 +120,7 @@ class InstrumentDock(QFrame):
             border: none;
         }
         InstrumentDock QLabel#dockTitle {
-            color: $UI_COLOR_TEXT;
+            color: $UI_COLOR_TEXT_MUTED;
             font-family: $UI_MONOSPACE_FONT_FAMILY;
             font-size: ${UI_FONT_SIZE_PT}pt;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
@@ -152,25 +159,60 @@ class InstrumentDock(QFrame):
             border: 1px solid $UI_COLOR_BORDER;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
         }
+        InstrumentDock QTabBar::tab {
+            background-color: $UI_COLOR_BACKGROUND;
+            color: $UI_COLOR_TEXT_MUTED;
+            border: 1px solid $UI_COLOR_BORDER;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
+            font-family: $UI_MONOSPACE_FONT_FAMILY;
+            font-size: 9pt;
+            font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+            padding: 3px 12px;
+            margin-right: 4px;
+            min-height: 20px;
+        }
+        InstrumentDock QTabBar::tab:selected {
+            background-color: $UI_COLOR_INVERT;
+            color: $UI_COLOR_TEXT_INVERSE;
+            border-color: $UI_COLOR_INVERT;
+        }
+        InstrumentDock QTabBar::tab:hover:!selected {
+            background-color: $UI_COLOR_INVERT_HOVER;
+            color: $UI_COLOR_TEXT_INVERSE;
+            border-color: $UI_COLOR_INVERT_HOVER;
+        }
     """) + scrollbar_qss("InstrumentDock ") + "\n" + checkbox_qss("InstrumentDock ")
 
-    def __init__(self, parent=None, *, closable: bool = True, is_standalone: bool = False):
+    def __init__(self, parent=None, *, settings: QSettings | None = None, closable: bool = False,
+                 is_standalone: bool = True):
         super().__init__(parent)
+        self.settings = settings
         self.is_standalone = is_standalone
         self._cards: dict[object, _DockCard] = {}
         self.setStyleSheet(self.STYLE_SHEET)
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(360)
 
         header = QWidget(self)
         header.setObjectName("dockHeader")
         hl = QHBoxLayout(header)
         hl.setContentsMargins(6, 4, 6, 4)
-        hl.setSpacing(4)
+        hl.setSpacing(6)
+
+        self.tabs = PTabBar(self)
+        self.tabs.addTab("FAV")
+        self.tabs.setTabToolTip(0, "Favorites of all docked instruments")
+        self.tabs.addTab("ALL")
+        self.tabs.setTabToolTip(1, "All settings of all docked instruments")
+        saved_tab = settings.value("DOCK/TAB", 0, type=int) if settings is not None else 0
+        self.tabs.setCurrentIndex(1 if saved_tab == 1 else 0)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
         self.title_label = QLabel("INSTRUMENTS")
         self.title_label.setObjectName("dockTitle")
-        self.dock_all_button = self._btn("DOCK ALL", "Attach all instrument windows into this dock", self.dock_all)
+        self.dock_all_button = self._btn("DOCK ALL", "Attach all instrument windows into this panel", self.dock_all)
         self.undock_all_button = self._btn("UNDOCK ALL", "Detach all instruments into separate floating windows",
                                            self.undock_all)
+        hl.addWidget(self.tabs)
         hl.addWidget(self.title_label)
         hl.addStretch(1)
         hl.addWidget(self.dock_all_button)
@@ -183,14 +225,15 @@ class InstrumentDock(QFrame):
 
         self._host = QWidget()
         self._host.setObjectName("dockHost")
-        self._cards_layout = QVBoxLayout(self._host)
+        self._cards_layout = QHBoxLayout(self._host)
         self._cards_layout.setContentsMargins(4, 4, 4, 4)
         self._cards_layout.setSpacing(8)
+        self._cards_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self._empty_label = QLabel("NO DOCKED INSTRUMENTS\nClick the dock button on any instrument window or DOCK ALL")
         self._empty_label.setObjectName("dockEmpty")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setWordWrap(True)
-        self._cards_layout.addWidget(self._empty_label)
+        self._cards_layout.addWidget(self._empty_label, 1)
         self._cards_layout.addStretch(1)
 
         self.scroll = QScrollArea(self)
@@ -198,6 +241,7 @@ class InstrumentDock(QFrame):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.scroll.setWidget(self._host)
 
         root = QVBoxLayout(self)
@@ -218,6 +262,37 @@ class InstrumentDock(QFrame):
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.clicked.connect(slot)
         return b
+
+    # ------------------------------------------------------------ вкладки FAV / ALL
+    @property
+    def view_mode(self) -> str:
+        """``'fav'`` (вкладка 0: избранное) или ``'all'`` (вкладка 1: все настройки)."""
+        return "all" if self.tabs.currentIndex() == 1 else "fav"
+
+    def set_tab(self, index: int) -> None:
+        index = 1 if int(index) == 1 else 0
+        if self.tabs.currentIndex() != index:
+            self.tabs.setCurrentIndex(index)
+        else:
+            self._apply_view_mode()
+
+    def set_view_mode(self, mode: str) -> None:
+        self.set_tab(1 if mode == "all" else 0)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.settings is not None:
+            self.settings.setValue("DOCK/TAB", 1 if index == 1 else 0)
+        self._apply_view_mode()
+        self.changed.emit()
+
+    def _apply_view_mode(self) -> None:
+        self._prune_cards()
+        mode = self.view_mode
+        for win, card in list(self._cards.items()):
+            if not sip.isdeleted(win):
+                win.set_dock_view_mode(mode)
+                card.sync_width()
+        self._host.adjustSize()
 
     # ------------------------------------------------------------ состав
     def windows(self) -> list:
@@ -245,14 +320,14 @@ class InstrumentDock(QFrame):
         self._prune_cards()
         shown = [w for w in self._cards if not w.isHidden()]
         total = len(self._cards)
-        self.title_label.setText(f"INSTRUMENTS ({len(shown)})" if shown else "INSTRUMENTS")
+        self.title_label.setText(f"({len(shown)})" if shown else "")
         self._empty_label.setVisible(len(shown) == 0)
         self.undock_all_button.setEnabled(total > 0)
         self.changed.emit()
 
     # ------------------------------------------------------------ прикрепить / открепить
     def attach(self, win, *, show: bool = True, save: bool = True) -> None:
-        """Прикрепить ``InstrumentWindow`` в этот док."""
+        """Прикрепить ``InstrumentWindow`` в этот док (добавляется в горизонтальный ряд)."""
         if win is None or sip.isdeleted(win):
             return
         self._prune_cards()
@@ -274,10 +349,11 @@ class InstrumentDock(QFrame):
         card.card_layout.addWidget(win)
         # вставляем перед завершающим stretch
         insert_idx = max(0, self._cards_layout.count() - 1)
-        self._cards_layout.insertWidget(insert_idx, card)
+        self._cards_layout.insertWidget(insert_idx, card, 0, Qt.AlignmentFlag.AlignTop)
         self._cards[win] = card
 
         win._on_dock_attached(self, save=save)
+        card.sync_width()
         card.setVisible(bool(show))
         win.setVisible(bool(show))
         win._fit_height()
@@ -303,11 +379,12 @@ class InstrumentDock(QFrame):
         self._update_state()
 
     def reveal(self, win) -> None:
-        """Показать прикреплённое окно прибора и прокрутить док к нему."""
+        """Показать прикреплённое окно прибора и прокрутить горизонтально до него."""
         self._prune_cards()
         card = self._cards.get(win)
         if card is None:
             return
+        card.sync_width()
         card.show()
         win.show()
         win._fit_height()
@@ -331,15 +408,30 @@ class InstrumentDock(QFrame):
 
 
 class InstrumentDockWindow(Window):
-    """Отдельное плавающее окно-док (используется при автономном запуске окна прибора без MainWindow)."""
+    """Отдельное окно приборной панели (независимо от окна графиков), помнит позицию и размер."""
+
+    visibility_changed = pyqtSignal(bool)
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(settings, parent)
         self.setWindowTitle("INSTRUMENTS")
-        self.dock = InstrumentDock(self, closable=False, is_standalone=True)
+        self.dock = InstrumentDock(self, settings=settings, closable=False, is_standalone=True)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
         lay.setSpacing(0)
         lay.addWidget(self.dock, 1)
-        self.setMinimumWidth(400)
-        self.recall_size(QSize(460, 680))
+        self.setMinimumWidth(420)
+        self.setMinimumHeight(260)
+        self.recall_size(QSize(960, 560))
+
+    def showEvent(self, e):  # noqa: N802 - Qt
+        super().showEvent(e)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, e):  # noqa: N802 - Qt
+        super().hideEvent(e)
+        self.visibility_changed.emit(False)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt
+        super().closeEvent(event)
+        self.visibility_changed.emit(False)

@@ -398,9 +398,21 @@ WINDOW_EVENTS = WindowEvents()
 _INSTRUMENT_WINDOWS: list["InstrumentWindow"] = []
 
 
+def _proxy_alive(proxy) -> bool:
+    if proxy is None or sip.isdeleted(proxy) or getattr(proxy, "_shut_down", False):
+        return False
+    inner = getattr(proxy, "_proxy", None)
+    if inner is not None and (sip.isdeleted(inner) or getattr(inner, "_shut_down", False)):
+        return False
+    return True
+
+
 def all_instrument_windows() -> list["InstrumentWindow"]:
     """Все живые окна приборов в процессе (и плавающие, и прикреплённые к доку)."""
-    _INSTRUMENT_WINDOWS[:] = [w for w in _INSTRUMENT_WINDOWS if not sip.isdeleted(w)]
+    _INSTRUMENT_WINDOWS[:] = [
+        w for w in _INSTRUMENT_WINDOWS
+        if not sip.isdeleted(w) and _proxy_alive(w.proxy)
+    ]
     return list(_INSTRUMENT_WINDOWS)
 
 
@@ -470,6 +482,7 @@ class InstrumentWindow(Window):
         self._expanded = False
         self._overlay: str | None = None        # вместо таблицы: "errors" / "connection"
         self._dock = None
+        self._dock_view_mode: str | None = None  # None (плавающее) | "fav" | "all"
         self._floating_pos = None
         self._floating_size = None
         self._fav_popup: FavoritesPopup | None = None
@@ -623,6 +636,8 @@ class InstrumentWindow(Window):
 
     def cleanup(self) -> None:
         """Отключить глобальные сигналы и закрыть дочерние окна перед заменой/удалением."""
+        if self in _INSTRUMENT_WINDOWS:
+            _INSTRUMENT_WINDOWS.remove(self)
         if self.is_docked:
             self._dock.detach(self, show=False, save=False)
         if getattr(self, "_fav_popup", None) is not None and not sip.isdeleted(self._fav_popup):
@@ -691,6 +706,7 @@ class InstrumentWindow(Window):
         self.dock_button.set_docked(True)
         self.dock_button.setToolTip("Detach into a floating window")
         self.titleBar.minimized_button.hide()
+        self.set_dock_view_mode(getattr(dock, "view_mode", "fav"))
         if save:
             self.settings.setValue(f"{self._prefix}/DOCKED", True)
         WINDOW_EVENTS.changed.emit(self.proxy)
@@ -700,6 +716,7 @@ class InstrumentWindow(Window):
         self.dock_button.set_docked(False)
         self.dock_button.setToolTip("Attach into the instrument dock")
         self.titleBar.minimized_button.show()
+        self.set_dock_view_mode(None)
         self.hide()
         self.setParent(None, Qt.WindowType.Window)
         if hasattr(self, "updateFrameless"):
@@ -816,18 +833,45 @@ class InstrumentWindow(Window):
         super().hideEvent(e)
         WINDOW_EVENTS.changed.emit(self.proxy)
 
+    def set_dock_view_mode(self, mode: str | None) -> None:
+        """Режим отображения внутри приборной панели (дока): ``'fav'`` (только избранное),
+        ``'all'`` (только вкладки настроек) или ``None`` (обычное плавающее окно)."""
+        mode = mode if mode in ("fav", "all") else None
+        self._dock_view_mode = mode
+        if mode == "fav":
+            self.preset_panel.setVisible(True)
+            self.parameter_panel.setVisible(self._overlay == "errors")
+            self.expand_button.hide()
+        elif mode == "all":
+            self.preset_panel.setVisible(False)
+            self.parameter_panel.setVisible(True)
+            self.expand_button.hide()
+        else:
+            self.preset_panel.setVisible(True)
+            self.parameter_panel.setVisible(True)
+            self.expand_button.show()
+        self._show_pages()
+        self._fit_height()
+
     def _show_pages(self) -> None:
-        overlay = self._overlay if self._expanded else None
+        show_body = True if self._dock_view_mode == "all" else (
+            self._overlay == "errors" if self._dock_view_mode == "fav" else self._expanded
+        )
+        overlay = self._overlay if show_body else None
         for i, page in enumerate(self.pages):
-            page.setVisible(self._expanded and overlay is None and i == self.tabs.currentIndex())
+            page.setVisible(show_body and overlay is None and i == self.tabs.currentIndex())
         self.error_page.setVisible(overlay == "errors")
-        self.tabs.show_selection = self._expanded and overlay is None
+        self.tabs.show_selection = show_body and overlay is None
         self.tabs.update()
 
     def _on_tab_clicked(self, index: int) -> None:
         """Клик по вкладке: из журнала - обратно к таблице; в свёрнутом окне - развернуть;
         повторный клик по уже открытой вкладке - свернуть."""
         if index < 0:
+            return
+        if self._dock_view_mode == "all":
+            self._overlay = None
+            self.set_page(index, fit=True)
             return
         if self._overlay:
             self._overlay = None
@@ -844,7 +888,12 @@ class InstrumentWindow(Window):
 
     def _show_overlay(self, name: str) -> None:
         self._overlay = name
-        if self._expanded:
+        if self._dock_view_mode == "fav":
+            self.parameter_panel.setVisible(True)
+            self._show_pages()
+            self._fit_height()
+            return
+        if self._dock_view_mode == "all" or self._expanded:
             self._show_pages()
             self._fit_height()
         else:
@@ -852,6 +901,8 @@ class InstrumentWindow(Window):
 
     def _close_overlay(self) -> None:
         self._overlay = None
+        if self._dock_view_mode == "fav":
+            self.parameter_panel.setVisible(False)
         self._show_pages()
         self._fit_height()
 
@@ -1039,19 +1090,21 @@ class InstrumentWindow(Window):
         self.delay_edit.setObjectName("cfg")
         self.delay_edit.setPlaceholderText("driver default")
         self.delay_edit.setToolTip("Pause between commands to the instrument (e.g. 50m = 50 ms); "
-                                   "Enter applies at once, empty = driver default")
+                                   "Enter or focus out applies at once, empty = driver default")
         self.delay_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._show_delay()
         self.delay_edit.returnPressed.connect(self.apply_delay)
+        self.delay_edit.editingFinished.connect(self.apply_delay)
         self.poll_edit = QLineEdit()
         self.poll_edit.setObjectName("cfg")
         self.poll_edit.setPlaceholderText("driver default")
         self.poll_edit.setToolTip("Pause between readings in continuous mode (e.g. 500m = 500 ms, 2 = 2 s); "
                                   "triggered and level modes read on instrument completion signal. "
-                                  "Enter applies at once, empty = driver default")
+                                  "Enter or focus out applies at once, empty = driver default")
         self.poll_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._show_poll_pause()
         self.poll_edit.returnPressed.connect(self.apply_poll_pause)
+        self.poll_edit.editingFinished.connect(self.apply_poll_pause)
         self.apply_button = self._tool("APPLY", "Save and reconnect with these settings", self.apply_connection)
         self.apply_button.setProperty("wide", True)
         apply_line = PanelLine("", self.apply_button)

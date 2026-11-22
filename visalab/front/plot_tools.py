@@ -658,11 +658,12 @@ def _parse_axis_number(text: str, unit: str) -> float | None:
 
 
 class _CommitLineEdit(QLineEdit):
-    """Поле ввода настроек графика: отправка строго по Enter, откат при уходе фокуса / Esc."""
+    """Поле ввода настроек графика: отправка по Enter и уходу фокуса, откат по Esc."""
 
     def __init__(self, tip: str, on_commit, parent=None):
         super().__init__(parent)
         self._committed = ""
+        self._escaped = False
         self._on_commit = on_commit
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.setMinimumWidth(82)
@@ -677,20 +678,25 @@ class _CommitLineEdit(QLineEdit):
         self.blockSignals(False)
 
     def _commit(self) -> None:
+        self._escaped = False
         self._on_commit()
         self.clearFocus()
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
         if e.key() == Qt.Key.Key_Escape:
+            self._escaped = True
             self.set_committed(self._committed)
             self.clearFocus()
             return
+        self._escaped = False
         super().keyPressEvent(e)
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
+        escaped = self._escaped
+        self._escaped = False
         super().focusOutEvent(e)
-        if self.text() != self._committed:
-            self.set_committed(self._committed)
+        if not escaped and self.text() != self._committed:
+            self._on_commit()
 
 
 class PlotSettingsWidget(QWidget):

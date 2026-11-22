@@ -162,6 +162,7 @@ class PLineEdit(QLineEdit, _Bound):
             self.unit_button = b
         self.bind(proxy, key)
         self.returnPressed.connect(self.change_value)
+        self.editingFinished.connect(self.change_value)
         self._update_unit()
 
     @property
@@ -246,9 +247,8 @@ class PLineEdit(QLineEdit, _Bound):
             self.setModified(False)
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
-        super().focusOutEvent(e)                  # уход фокуса без Enter: отменить несохранённый ввод
+        super().focusOutEvent(e)                  # editingFinished -> change_value
         self.setPlaceholderText("")
-        self.setModified(False)
         self.show_value(self._value, force=True)
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
@@ -320,7 +320,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
     знаками. ``step_changed(шаг или None)`` - окно хранит выбор в ini.
 
     Единица - кнопка слева со списком префиксов (как у PLineEdit). Ввод с клавиатуры пишется
-    только по Enter (уход фокуса отменяет правку), шаг стрелкой или колесом (``stepBy``) - сразу.
+    по Enter и уходу фокуса (Esc отменяет правку), шаг колесом / клавишами (``stepBy``) - сразу.
     """
 
     setToolTip = _Bound.set_custom_tip
@@ -345,7 +345,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self.setDecimals(9)
         self.setRange(-1e15, 1e15)
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.setCorrectionMode(QAbstractSpinBox.CorrectionMode.CorrectToPreviousValue)
         self.unit_button: QPushButton | None = None
         if self.unit:
@@ -415,25 +415,6 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self.pinned = True
         self._update_unit()
         self.show_value(self._value, force=True)
-
-    def paintEvent(self, e):  # noqa: N802 - Qt
-        """Стрелки рисуются сами: QSS у кнопок спинбокса убирает стандартные."""
-        super().paintEvent(e)
-        from PyQt6.QtWidgets import QStyle, QStyleOptionSpinBox
-        opt = QStyleOptionSpinBox()
-        self.initStyleOption(opt)
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor(UI_COLOR_TEXT_MUTED if self.isEnabled() else UI_COLOR_BORDER_LIGHT))
-        pen.setWidthF(1.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        for sc, up in ((QStyle.SubControl.SC_SpinBoxUp, True), (QStyle.SubControl.SC_SpinBoxDown, False)):
-            r = QRectF(self.style().subControlRect(QStyle.ComplexControl.CC_SpinBox, opt, sc, self))
-            cx, cy, a = r.center().x(), r.center().y() + (1 if up else -1), 3.0
-            d = -a / 2 if up else a / 2
-            p.drawLine(QPointF(cx - a, cy - d), QPointF(cx, cy + d))
-            p.drawLine(QPointF(cx, cy + d), QPointF(cx + a, cy - d))
 
     # -------------------------------------------------------- текст
     def textFromValue(self, v: float) -> str:  # noqa: N802 - Qt
@@ -551,10 +532,10 @@ class PSpinBox(QDoubleSpinBox, _Bound):
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
         uncommitted = self._dirty or self.lineEdit().isModified()
-        self._dirty = False
-        self.lineEdit().setModified(False)
         if uncommitted:
-            self.show_value(self._value, force=True)
+            self.interpretText()
+            self._dirty = True
+            self.commit()
         super().focusOutEvent(e)
         self._release_step()
 
@@ -1193,7 +1174,7 @@ class Panel(QFrame):
         Panel CustomLockButton:hover, Panel CustomFavButton:hover { background-color: $UI_COLOR_INVERT_HOVER; }
         Panel CustomLockButton:checked { background-color: $UI_COLOR_INVERT; }
         Panel PSpinBox::up-button, Panel PSpinBox::down-button {
-            subcontrol-origin: border; width: 16px; border: none; background: transparent;
+            width: 0px; height: 0px; border: none; background: transparent;
         }
         Panel PSpinBox::up-button { subcontrol-position: top right; }
         Panel PSpinBox::down-button { subcontrol-position: bottom right; }

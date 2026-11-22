@@ -15,7 +15,7 @@ from typing import Callable
 
 from PyQt6 import sip
 from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
-from PyQt6.QtWidgets import QLabel, QPushButton
+from PyQt6.QtWidgets import QLabel, QPushButton, QSizePolicy
 
 from ..coord import (COORD, Instrument, PowerMeterSweep, ScenarioError, SpectrumSweep, SweepPoint, SweepResult,
                      sweep_points)
@@ -162,6 +162,8 @@ class SweepController(QObject):
         self.status = QLabel("READY")
         self.status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.status.setStyleSheet("color: #8a8a8a;")
+        self.status.setMinimumWidth(0)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.status.setToolTip("Sweep progress and summary (min / max / flatness / P1dB)")
 
         self._update_controls()
@@ -181,14 +183,17 @@ class SweepController(QObject):
         return self.run is not None
 
     def lines(self) -> list:
-        """Строки для ``PanelTable``: график, SWP, FRQ, PWR, OPT, статус."""
+        """Строки для ``PanelTable``: график, MODE, RUN, FRQ, PWR, OPT (+ TRK для SA), статус.
+        Не более 3 элементов в строке, чтобы минимальная ширина окна PM/SA оставалась компактной."""
         plot_line = PanelLine("", self.plot)
         plot_line._name.hide()
         status_line = PanelLine("", self.status)
         status_line._name.hide()
-        swp_line = PanelLine("SWP", self.mode, self.law, self.repeat, self.run_button,
-                             self.save_button, self.clear_button).set_help(
-            "Coordinated sweep: mode (FREQ / POW / 2D), grid law (LIN / LOG), single/continuous, run, CSV export"
+        mode_line = PanelLine("SWP", self.mode, self.law, self.repeat).set_help(
+            "Coordinated sweep: mode (FREQ / POW / 2D), grid law (LIN / LOG), single/continuous"
+        )
+        run_line = PanelLine("RUN", self.run_button, self.save_button, self.clear_button).set_help(
+            "Start / stop sweep, save CSV, or clear sweep results"
         )
         frq_line = PanelLine("FRQ", self.f_start, self.f_stop, self.f_points).set_help(
             "Frequency sweep range: START, STOP, and number of points"
@@ -196,14 +201,17 @@ class SweepController(QObject):
         pwr_line = PanelLine("PWR", self.p_start, self.p_stop, self.p_points).set_help(
             "Source power sweep range: START, STOP (dBm), and number of points"
         )
-        opt_ws = [self.dwell]
-        if self.is_sa and self.sa_track is not None and self.sa_span is not None:
-            opt_ws.extend([self.sa_track, self.sa_span])
-        opt_ws.append(self.view)
-        opt_line = PanelLine("OPT", *opt_ws).set_help(
-            "Sweep options: dwell time, tracking span (SA), and plot Y axis (POUT / GAIN)"
+        opt_line = PanelLine("OPT", self.dwell, self.view).set_help(
+            "Sweep options: dwell time and plot Y axis (POUT / GAIN)"
         )
-        return [plot_line, swp_line, frq_line, pwr_line, opt_line, status_line]
+        rows = [plot_line, mode_line, run_line, frq_line, pwr_line, opt_line]
+        if self.is_sa and self.sa_track is not None and self.sa_span is not None:
+            trk_line = PanelLine("TRK", self.sa_track, self.sa_span).set_help(
+                "Spectrum analyzer tracking mode (TRK / FIX) and span during sweep"
+            )
+            rows.append(trk_line)
+        rows.append(status_line)
+        return rows
 
     # ------------------------------------------------------------ состояние элементов
     def _on_mode_changed(self, value) -> None:

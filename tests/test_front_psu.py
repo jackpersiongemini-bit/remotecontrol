@@ -60,19 +60,19 @@ def test_field_shows_measurement_and_setpoint(qtbot, psu):
     proxy.set("ch2.output", True)
     _wait(qtbot, proxy, "ch2.meas_v", lambda v: v == pytest.approx(5.0, abs=1e-3))
     f = win.tiles[2].fields["V"]
-    qtbot.waitUntil(lambda: f.text() == "5", timeout=5000)        # покой: измерение в поле
-    assert f.side.text() == "5"                                  # мелко снизу слева - уставка
+    qtbot.waitUntil(lambda: f.text() == "5 V", timeout=5000)      # плитка избранного: только текущее напряжение
+    assert f.setpoint == pytest.approx(5.0)
     proxy.set("ch2.output", False)
-    qtbot.waitUntil(lambda: f.text() == "0", timeout=5000)        # выход выключен: измерено 0
-    assert f.side.text().startswith("5")
+    qtbot.waitUntil(lambda: f.text() == "0 V", timeout=5000)      # выход выключен: измерено 0 V
+    # Уставки напряжения и тока редактируются на вкладке CH в настройках
     win.show()
     qtbot.waitExposed(win)
-    assert not f.hasFocus()                                       # фокус при показе не захватывается
-    f.setFocus()
-    qtbot.waitUntil(f.hasFocus, timeout=2000)
-    assert f.text() == "" and f.placeholderText() == "5" and f.side.text().startswith("0")
-    qtbot.keyClicks(f, "7.5")
-    qtbot.keyClick(f, Qt.Key.Key_Return)
+    win.set_expanded(True)
+    win.set_page(0)
+    v_edit = win.setpoint_fields[2]["V"]
+    v_edit.setText("7.5")
+    v_edit.setModified(True)
+    v_edit.returnPressed.emit()
     _wait(qtbot, proxy, "ch2.voltage", lambda v: v == pytest.approx(7.5))
 
 
@@ -85,9 +85,8 @@ def test_tile_click_toggles_output(qtbot, psu):
     _click_tile(qtbot, t)
     _wait(qtbot, proxy, "ch3.output", lambda v: v is True)
     qtbot.waitUntil(lambda: t.is_on() and t.mode.text() == "CV", timeout=5000)
-    qtbot.mouseClick(t.fields["V"], Qt.MouseButton.LeftButton)   # клик по полю - не переключает
-    assert proxy.value("ch3.output") is True
-    _click_tile(qtbot, t)
+    # Клик прямо по индикации напряжения внутри плитки тоже переключает выход (плитка только чтение + вкл/выкл)
+    qtbot.mouseClick(t, Qt.MouseButton.LeftButton, pos=t.fields["V"].geometry().center())
     _wait(qtbot, proxy, "ch3.output", lambda v: v is False)
     qtbot.waitUntil(lambda: t.mode.text() == "OFF", timeout=5000)
 
@@ -136,7 +135,7 @@ def test_rules_edit_save_and_errors(qtbot, psu):
 
 def test_off_all_and_tabs(qtbot, psu):
     proxy, win, _s = psu
-    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["PROT", "OUT", "RULES", "SET"]
+    assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["CH", "PROT", "OUT", "RULES", "SET"]
     for n in (2, 3):
         proxy.set(f"ch{n}.output", True)
     _wait(qtbot, proxy, "ch3.output", lambda v: v is True)
@@ -158,4 +157,5 @@ def test_psu_launcher(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(run_psu.PSUWindow, "__init__", track)
     assert run_psu.main(["--sim", "--ini", str(tmp_path / "x.ini"), "--no-connect"]) == 0
     assert len(made) == 1 and len(made[0].grid.tiles) == 3
+    made[0].cleanup()
     made[0].proxy.shutdown()

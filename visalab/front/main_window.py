@@ -24,7 +24,7 @@ from typing import Any
 
 from PyQt6 import sip
 from PyQt6.QtCore import QMimeData, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
+from PyQt6.QtGui import QBrush, QColor, QDrag, QFont, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QShortcut
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
                              QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget,
                              QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
@@ -33,9 +33,9 @@ from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
 from ..core.units import si_format, si_parse
 from ..core.trace import Trace
-from .instrument_dock import InstrumentDock, unregister_dock
+from .instrument_dock import InstrumentDock, InstrumentDockWindow, unregister_dock
 from .instrument_window import WINDOW_EVENTS, all_instrument_windows, window_for
-from .live_plot import LivePlot
+from .live_plot import LivePlot, nearest_index
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
 from .plot_tools import (ANALYSIS_KEYS, ANALYSIS_METRICS, PlotSettingsWidget, analyze_trace, eval_math_expr,
                          format_analysis, make_panel_icon, validate_math_expr)
@@ -76,32 +76,47 @@ SETTINGS = (
 
 
 class SettingField(QLineEdit):
-    """Порог: число с единицей; Enter - применить, Esc / уход фокуса - вернуть."""
+    """Порог: число с единицей; Enter и уход фокуса - применить, Esc - вернуть."""
+
+    focus_committed = pyqtSignal()
 
     def __init__(self, unit: str, scale: float, parent=None):
         super().__init__(parent)
         self.setObjectName("cfg")
         self.unit, self.scale = unit, scale
         self.value = 0.0
+        self._escaped = False
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
         if e.key() == Qt.Key.Key_Escape:
+            self._escaped = True
             self.show_value(self.value)
             self.clearFocus()
             return
+        self._escaped = False
         super().keyPressEvent(e)
         if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.setModified(False)
             self.clearFocus()
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
         super().focusOutEvent(e)
-        self.show_value(self.value)
+        if self._escaped:
+            self._escaped = False
+            self.show_value(self.value)
+            return
+        if self.isModified():
+            self.setModified(False)
+            self.focus_committed.emit()
+        else:
+            self.show_value(self.value)
 
     def show_value(self, v: float) -> None:
         self.value = v
         shown = v * self.scale
         self.setText(si_format(shown, self.unit, 6) if self.unit == "Hz" else f"{shown:g} {self.unit}")
+        self.setModified(False)
 
     def parsed(self) -> float:
         return si_parse(self.text(), self.unit) / self.scale
@@ -137,18 +152,19 @@ def _vna_scale(tr: Trace) -> tuple[float, float, float] | None:
 
 
 class SincEmblem(QWidget):
-    """Пульсирующая эмблема sinc(x) = sin(πx)/(πx) в левой части заголовка главного окна."""
+    """Пульсирующая эмблема sinc(x) = sin(πx)/(πx) без рамки в левой части заголовка главного окна."""
 
-    WIDTH = 48
+    WIDTH = 44
     HEIGHT = UI_TITLE_BAR_ITEM_SIZE_PX
     TICK_MS = 33
-    PERIOD_S = 2.4
-    _SAMPLES = 64
-    _X_MAX = 3.5
+    PERIOD_S = 2.6
+    _SAMPLES = 72
+    _X_MAX = 3.2
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sincEmblem")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.setToolTip("VISALAB")
         self._phase = 0.0
@@ -180,27 +196,20 @@ class SincEmblem(QWidget):
         self._timer.stop()
 
     def paintEvent(self, e):  # noqa: N802 - Qt
+        if self.width() <= 0 or self.height() <= 0:
+            return
         p = QPainter(self)
+        if not p.isActive():
+            return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         pulse = self.pulse
 
-        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
-        border = QColor(UI_COLOR_BORDER)
-        border = border.lighter(int(100 + 28 * pulse))
-        p.setBrush(QColor(UI_COLOR_BACKGROUND))
-        p.setPen(QPen(border, 1.0))
-        p.drawRoundedRect(rect, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-
-        pad_x, pad_top, pad_bot = 5.0, 4.0, 4.0
+        pad_x, pad_top, pad_bot = 3.0, 4.0, 3.0
         plot_w = self.width() - 2.0 * pad_x
         plot_h = self.height() - pad_top - pad_bot
-        # sinc(x) лежит в [-0.217, 1.0]: ось 0 - примерно на 76% высоты области
+        # sinc(x) лежит в [-0.217, 1.0]: ось 0 на ~78% высоты
         y_zero = pad_top + plot_h * 0.78
-        y_scale = (y_zero - pad_top) * (0.70 + 0.30 * pulse)
-
-        # Тонкая базовая ось нуля
-        p.setPen(QPen(QColor(UI_COLOR_BORDER), 0.75))
-        p.drawLine(QPointF(pad_x, y_zero), QPointF(self.width() - pad_x, y_zero))
+        y_scale = (y_zero - pad_top) * (0.76 + 0.24 * pulse)
 
         pts = [
             QPointF(pad_x + plot_w * i / (self._SAMPLES - 1), y_zero - y * y_scale)
@@ -210,42 +219,32 @@ class SincEmblem(QWidget):
         for pt in pts[1:]:
             curve.lineTo(pt)
 
-        # Мягкое заполнение под кривой
-        fill_path = QPainterPath(curve)
-        fill_path.lineTo(QPointF(pts[-1].x(), y_zero))
-        fill_path.lineTo(QPointF(pts[0].x(), y_zero))
-        fill_path.closeSubpath()
-        fill_color = QColor(UI_COLOR_TEXT)
-        fill_color.setAlpha(int(12 + 28 * pulse))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(fill_color)
-        p.drawPath(fill_path)
-
-        # Пульсирующее свечение вдоль sinc-кривой
-        glow = QColor(UI_COLOR_TEXT)
-        glow.setAlpha(int(18 + 52 * pulse))
-        glow_pen = QPen(glow, 3.6)
+        # Деликатное мягкое свечение без рамки и подложки
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        glow_color = QColor(UI_COLOR_TEXT)
+        glow_color.setAlpha(int(18 + 38 * pulse))
+        glow_pen = QPen(glow_color, 3.2)
         glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         glow_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(glow_pen)
         p.drawPath(curve)
 
-        # Основная чёткая линия кривой
-        fg = QColor(UI_COLOR_TEXT)
-        fg.setAlpha(int(185 + 70 * pulse))
-        fg_pen = QPen(fg, 1.45)
+        # Чёткая основная линия sinc(x)
+        fg_color = QColor(UI_COLOR_TEXT)
+        fg_color.setAlpha(int(200 + 55 * pulse))
+        fg_pen = QPen(fg_color, 1.6)
         fg_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         fg_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(fg_pen)
         p.drawPath(curve)
 
-        # Пульсирующая точка в главном максимуме (x = 0)
+        # Мягкий акцент в главном максимуме (x = 0)
         peak = QPointF(pad_x + plot_w * 0.5, y_zero - y_scale)
-        dot_r = 1.15 + 0.55 * pulse
+        dot_r = 1.15 + 0.45 * pulse
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(UI_COLOR_TEXT))
         p.drawEllipse(peak, dot_r, dot_r)
+        p.end()
 
 
 class InstrumentTile(IndicatorButton):
@@ -669,12 +668,13 @@ def _icon_btn(kind: str, tip: str, slot, *, checkable: bool = False) -> QPushBut
 
 
 class _RangeCommitEdit(QLineEdit):
-    """Поле ввода строки диапазонов/формул в настройках графика: Enter применяет, Esc/уход фокуса откатывает."""
+    """Поле ввода строки диапазонов/формул в настройках графика: Enter и уход фокуса применяют, Esc откатывает."""
 
     def __init__(self, placeholder: str, tip: str, on_commit, parent=None):
         super().__init__(parent)
         self._committed = ""
         self._on_commit = on_commit
+        self._escaped = False
         self.setObjectName("cfg")
         self.setPlaceholderText(placeholder)
         self.setToolTip(tip)
@@ -694,20 +694,26 @@ class _RangeCommitEdit(QLineEdit):
         self.style().polish(self)
 
     def _commit(self) -> None:
+        self._escaped = False
         self._on_commit()
         self.clearFocus()
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
         if e.key() == Qt.Key.Key_Escape:
+            self._escaped = True
             self.set_committed(self._committed)
             self.clearFocus()
             return
+        self._escaped = False
         super().keyPressEvent(e)
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
         super().focusOutEvent(e)
+        if self._escaped:
+            self._escaped = False
+            return
         if self.text() != self._committed:
-            self.set_committed(self._committed)
+            self._on_commit()
 
 
 def _settings_scroll_area(inner: QWidget) -> QScrollArea:
@@ -1762,6 +1768,53 @@ class LivePanel(Panel):
         if self.stack.currentIndex() == 1:
             self._sync_settings_view()
 
+    def _vna_markers_for_items(self, items: list[tuple[str, Trace]], total_traces: int) -> list[tuple[str, float, float, int]]:
+        """Собрать активные маркеры для трасс одного графика ВАЦ."""
+        markers_out: list[tuple[str, float, float, int]] = []
+        multi = len(items) > 1
+        sel_raw = str(self.proxy.value("trace.sel") or "")
+        for idx, (tname, tr) in enumerate(items):
+            meta = tr.meta or {}
+            raw_list = meta.get("markers")
+            if raw_list is not None:
+                for entry in raw_list:
+                    if len(entry) < 2:
+                        continue
+                    mn, mx = entry[0], _num(entry[1])
+                    my = _num(entry[2]) if len(entry) > 2 else None
+                    if mx is None:
+                        continue
+                    if my is None and len(tr) > 0:
+                        my = _num(tr.y[nearest_index(tr, mx)])
+                    if my is None:
+                        continue
+                    lbl = f"{tname} M{mn}" if (multi and tname) else f"M{mn}"
+                    markers_out.append((lbl, mx, my, idx))
+            else:
+                # Фоллбек для трасс без meta["markers"]: одиночный маркер mark.* или marker.*
+                tr_id = f"{meta.get('channel', 1)}:{meta.get('name', '')}"
+                is_sel = bool(sel_raw) and sel_raw == tr_id
+                if (is_sel or total_traces == 1) and self.proxy.value("mark.state") is True:
+                    mx = _num(self.proxy.value("mark.x"))
+                    my = _num(self.proxy.value("mark.y"))
+                    if mx is not None:
+                        if my is None and len(tr) > 0:
+                            my = _num(tr.y[nearest_index(tr, mx)])
+                        if my is not None:
+                            mn = self.proxy.value("mark.n") or 1
+                            lbl = f"{tname} M{mn}" if (multi and tname) else f"M{mn}"
+                            markers_out.append((lbl, mx, my, idx))
+                elif idx == 0 and total_traces == 1 and self.proxy.value("marker.state") is True:
+                    mx = _num(self.proxy.value("marker.freq"))
+                    my = _num(self.proxy.value("marker.value"))
+                    if mx is not None:
+                        if my is None and len(tr) > 0:
+                            my = _num(tr.y[nearest_index(tr, mx)])
+                        if my is not None:
+                            lbl = f"{tname} M1" if (multi and tname) else "M1"
+                            markers_out.append((lbl, mx, my, idx))
+        return markers_out
+
     def _refresh_vna(self, a: Activity) -> str:
         traces = self.monitor.vna_traces(self.proxy)
         split_each = self._vna_split_traces
@@ -1785,11 +1838,13 @@ class LivePanel(Panel):
             plot = self._plot(i)
             plot.set_scale(scale, divs_y=DEVICE_DIVS_Y if scale is not None else None)
             plot.set_traces(items)
+            plot.set_markers(self._vna_markers_for_items(items, len(traces)))
         self._use_plots(max(1, len(groups_list)))
         if not groups_list:
             plot = self._plot(0)
             plot.set_scale(None)
             plot.set_traces([])
+            plot.set_markers([])
         if self.proxy.value("gen.state") is True:
             port = self.proxy.value("gen.port")
             pt = f" P{port}" if port in (1, 2) else ""
@@ -2185,6 +2240,7 @@ class MainWindow(Window):
             f.setMinimumWidth(130)                  # поле тянется с окном, как в окнах приборов
             f.show_value(getattr(self.monitor.th, name))
             f.returnPressed.connect(lambda n=name: self._apply_setting(n))
+            f.focus_committed.connect(lambda n=name: self._apply_setting(n))
             self.fields[name] = f
             line = PanelLine(label, f)
             line.setToolTip(tip)
@@ -2303,39 +2359,20 @@ class MainWindow(Window):
         )
         self.tabs_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
-        self._left_pane = QWidget()
-        left_lay = QVBoxLayout(self._left_pane)
-        left_lay.setContentsMargins(0, 0, 0, 0)
-        left_lay.setSpacing(8)
-        left_lay.addWidget(self.tabs_panel)
-        left_lay.addWidget(self.live_page, 1)            # растянули окно - графики растут (Алексей 2026-11-18)
-        left_lay.addWidget(self.settings_panel)
-        left_lay.addStretch(0)                            # SET: поля сверху, пустое место снизу
-
-        self.instrument_dock = InstrumentDock(self, closable=True, is_standalone=False)
-        self.instrument_dock.close_requested.connect(lambda: self.set_dock_visible(False))
+        # Отдельное окно приборной панели (независимо от окна графиков): 2 вкладки (FAV / ALL), горизонтальный скролл
+        self.instrument_dock_window = InstrumentDockWindow(settings)
+        self.instrument_dock = self.instrument_dock_window.dock
         self.instrument_dock.changed.connect(self._on_dock_changed)
-        self.instrument_dock.hide()
-
-        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.main_splitter.setChildrenCollapsible(False)
-        self.main_splitter.setHandleWidth(8)
-        self.main_splitter.setStyleSheet(render_qss("""
-            QSplitter { background: $UI_COLOR_BACKGROUND; }
-            QSplitter::handle { background: transparent; }
-            QSplitter::handle:horizontal { width: 8px; }
-            QSplitter::handle:hover { background: $UI_COLOR_BORDER_LIGHT; border-radius: 2px; }
-        """))
-        self.main_splitter.addWidget(self._left_pane)
-        self.main_splitter.addWidget(self.instrument_dock)
-        self.main_splitter.setStretchFactor(0, 1)
-        self.main_splitter.setStretchFactor(1, 0)
-        self.main_splitter.splitterMoved.connect(lambda _p, _i: self._save_dock_splitter())
+        self.instrument_dock_window.visibility_changed.connect(self._on_dock_visibility_changed)
+        self.instrument_dock_window.hide()
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
         lay.setSpacing(8)
-        lay.addWidget(self.main_splitter, 1)
+        lay.addWidget(self.tabs_panel)
+        lay.addWidget(self.live_page, 1)            # растянули окно - графики растут (Алексей 2026-11-18)
+        lay.addWidget(self.settings_panel)
+        lay.addStretch(0)                            # SET: поля сверху, пустое место снизу
         self.tabs.currentChanged.connect(self.set_page)
         self.set_page(settings.value(f"{self.SETTINGS_GROUP}/TAB", 0, type=int))
 
@@ -2695,6 +2732,7 @@ class MainWindow(Window):
             show_cb.toggled.connect(lambda checked, k=key: self.set_panel_shown(k, checked))
             level_cb.toggled.connect(lambda checked, k=key: self.set_panel_by_level(k, checked))
             level_edit.returnPressed.connect(lambda k=key: self._apply_display_level(k))
+            level_edit.focus_committed.connect(lambda k=key: self._apply_display_level(k))
             rl.addWidget(lbl)
             rl.addWidget(show_cb)
             rl.addWidget(level_cb)
@@ -3340,39 +3378,35 @@ class MainWindow(Window):
     def toggle_full_screen(self) -> None:
         self.set_full_screen(not self.isFullScreen())
 
-    # ------------------------------------------------------------ док приборов
-    def _save_dock_splitter(self) -> None:
-        if not self.instrument_dock.isVisible():
-            return
-        sizes = self.main_splitter.sizes()
-        if len(sizes) == 2 and sizes[0] > 0 and sizes[1] > 0:
-            self.settings.setValue(f"{self.SETTINGS_GROUP}/DOCK_SPLITTER", json.dumps(sizes))
-
-    def _restore_dock_splitter(self) -> None:
-        raw = self.settings.value(f"{self.SETTINGS_GROUP}/DOCK_SPLITTER", "", type=str)
-        try:
-            sizes = json.loads(raw) if raw else []
-        except (TypeError, ValueError):
-            sizes = []
-        if isinstance(sizes, list) and len(sizes) == 2 and all(isinstance(x, int) and x > 0 for x in sizes):
-            self.main_splitter.setSizes(sizes)
-        else:
-            total = max(self.width(), 900)
-            dock_w = min(480, max(420, int(total * 0.38)))
-            self.main_splitter.setSizes([max(300, total - dock_w), dock_w])
-
+    # ------------------------------------------------------------ док приборов (отдельное окно)
     def set_dock_visible(self, on: bool, *, save: bool = True) -> None:
         on = bool(on)
-        if not on:
-            self._save_dock_splitter()
-        self.instrument_dock.setVisible(on)
+        dw = self.instrument_dock_window
+        if not sip.isdeleted(dw):
+            if on:
+                if dw.isMinimized():
+                    dw.showNormal()
+                dw.show()
+                dw.raise_()
+                dw.activateWindow()
+            else:
+                dw.save_size()
+                dw.hide()
         self.dock_button.blockSignals(True)
         self.dock_button.setChecked(on)
         self.dock_button.blockSignals(False)
-        if on:
-            self._restore_dock_splitter()
         if save:
             self.settings.setValue(f"{self.SETTINGS_GROUP}/DOCK_VISIBLE", on)
+        for proxy in list(self.tiles):
+            self._update_tile(proxy)
+
+    def _on_dock_visibility_changed(self, visible: bool) -> None:
+        if sip.isdeleted(self):
+            return
+        self.dock_button.blockSignals(True)
+        self.dock_button.setChecked(bool(visible))
+        self.dock_button.blockSignals(False)
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/DOCK_VISIBLE", bool(visible))
         for proxy in list(self.tiles):
             self._update_tile(proxy)
 
@@ -3384,7 +3418,7 @@ class MainWindow(Window):
             return
         shown = self.instrument_dock.visible_windows()
         self.dock_button.setText(f"DOCK ({len(shown)})" if shown else "DOCK")
-        if shown and not self.instrument_dock.isVisible():
+        if shown and not self.instrument_dock_window.isVisible():
             self.set_dock_visible(True)
         for proxy in list(self.tiles):
             self._update_tile(proxy)
@@ -3414,6 +3448,10 @@ class MainWindow(Window):
                 self.set_dock_visible(True)
                 self.instrument_dock.reveal(w)
             else:
+                dw = w._dock.window()
+                if dw is not None:
+                    dw.show()
+                    dw.raise_()
                 w._dock.reveal(w)
             return
         if w.isMinimized():
@@ -3432,6 +3470,11 @@ class MainWindow(Window):
             unregister_dock(self.instrument_dock)
             for w in list(self.instrument_dock.windows()):
                 self.instrument_dock.detach(w, show=False, save=False)
+        dw = getattr(self, "instrument_dock_window", None)
+        if dw is not None and not sip.isdeleted(dw):
+            dw.save_size()
+            dw.hide()
+            dw.close()
         try:
             WINDOW_EVENTS.changed.disconnect(self._on_window_event)
         except (TypeError, RuntimeError):
@@ -3448,7 +3491,9 @@ class MainWindow(Window):
         self._dirty_current.clear()
         self._save_splitters()
         self._save_live_split()
-        self._save_dock_splitter()
+        dw = getattr(self, "instrument_dock_window", None)
+        if dw is not None and not sip.isdeleted(dw):
+            dw.save_size()
         for panel in self.panels.values():
             if not sip.isdeleted(panel):
                 panel._save_plot_splitters()

@@ -193,6 +193,7 @@ class LivePlot(QWidget):
         self.traces: list[tuple[str, Trace]] = []
         self.points = False
         self.marker: tuple[float, float] | None = None
+        self.markers: list[tuple[str, float, float, int]] = []
         self.x_range: tuple[float, float] | None = None      # фиксированная ось X (время ваттметра)
         self._scale: tuple[float, float, float] | None = None
         self._fixed_scale: tuple[float, float, float] | None = None
@@ -365,6 +366,27 @@ class LivePlot(QWidget):
         if marker == self.marker:
             return
         self.marker = marker
+        self.update()
+
+    def set_markers(self, markers) -> None:
+        """Задать список именованных маркеров ``[(label, x, y[, color_idx]), ...]`` (например, маркеры ВАЦ)."""
+        cleaned: list[tuple[str, float, float, int]] = []
+        for item in (markers or ()):
+            if len(item) == 3:
+                label, x, y = item
+                cidx = 0
+            elif len(item) >= 4:
+                label, x, y, cidx = item[0], item[1], item[2], int(item[3])
+            else:
+                continue
+            if x is None or y is None:
+                continue
+            xf, yf = float(x), float(y)
+            if math.isfinite(xf) and math.isfinite(yf):
+                cleaned.append((str(label), xf, yf, cidx))
+        if cleaned == self.markers:
+            return
+        self.markers = cleaned
         self.update()
 
     # ------------------------------------------------------------ настройки шкалы, MEM и анализа
@@ -826,7 +848,64 @@ class LivePlot(QWidget):
                 p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.4))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawPolygon(QPointF(mx, my - 5), QPointF(mx + 5, my), QPointF(mx, my + 5), QPointF(mx - 5, my))
+        # Именованные маркеры (например, маркеры ВАЦ M1..M10)
+        drawn_markers: list[tuple[str, float, float, int]] = []
+        if not self._math_active() and self.markers:
+            fm_m = QFontMetrics(self._font)
+            for label, mx_raw, my_raw, cidx in self.markers:
+                my_val = yt(my_raw) if yt is not None else my_raw
+                if not (math.isfinite(mx_raw) and math.isfinite(my_val)):
+                    continue
+                drawn_markers.append((label, mx_raw, my_val, cidx))
+                if mx_raw < min(x0, x1) - 1e-12 * max(1.0, abs(x1 - x0)) or mx_raw > max(x0, x1) + 1e-12 * max(1.0, abs(x1 - x0)):
+                    continue
+                mx, my = px(mx_raw), py(my_val)
+                mc = QColor(UI_TRACE_COLORS[cidx % len(UI_TRACE_COLORS)])
+                # Треугольник-указатель прямо над точкой
+                p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
+                p.setBrush(mc)
+                p.drawPolygon(QPointF(mx, my), QPointF(mx - 5.0, my - 8.5), QPointF(mx + 5.0, my - 8.5))
+                short_lbl = label.rsplit(" ", 1)[-1]
+                lw = fm_m.horizontalAdvance(short_lbl) + 6
+                lh = fm_m.height() + 1
+                lx = max(r.left() + 2, min(mx - lw / 2.0, r.right() - lw - 2))
+                ly = my - 10.0 - lh
+                if ly < r.top() + 2:
+                    ly = min(my + 4.0, r.bottom() - lh - 2)
+                lbg = QColor(UI_COLOR_BACKGROUND)
+                lbg.setAlpha(210)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(lbg)
+                p.drawRoundedRect(QRectF(lx, ly, lw, lh), 2.5, 2.5)
+                p.setPen(mc)
+                p.drawText(QRectF(lx, ly, lw, lh), Qt.AlignmentFlag.AlignCenter, short_lbl)
         p.restore()
+
+        # Табличка значений активных маркеров в правом верхнем углу графика
+        if drawn_markers:
+            xu_m = first.x_unit
+            yu_m = self._effective_y_unit(first)
+            fm_m = QFontMetrics(self._font)
+            rows_m: list[tuple[str, int]] = []
+            for label, mx_raw, my_val, cidx in drawn_markers[:6]:
+                x_s = si_format(mx_raw, xu_m, 4) if xu_m in self._SI_UNITS else (f"{mx_raw:g} {xu_m}" if xu_m else f"{mx_raw:g}")
+                y_s = si_format(my_val, yu_m, 4) if yu_m in self._SI_UNITS else (f"{my_val:.2f} {yu_m}" if yu_m else f"{my_val:.3g}")
+                rows_m.append((f"{label}: {x_s}  {y_s}", cidx))
+            line_h = fm_m.height() + 3
+            box_w = max(fm_m.horizontalAdvance(txt) for txt, _c in rows_m) + 14
+            box_h = len(rows_m) * line_h + 6
+            if box_w < r.width() - 12 and box_h < r.height() - 12:
+                box = QRectF(r.right() - box_w - 6, r.top() + 5, box_w, box_h)
+                bg = QColor(UI_COLOR_BACKGROUND)
+                bg.setAlpha(224)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                p.setPen(QPen(QColor(UI_COLOR_BORDER), 1.0))
+                p.setBrush(bg)
+                p.drawRoundedRect(box, 4, 4)
+                for idx_m, (txt, cidx) in enumerate(rows_m):
+                    p.setPen(QColor(UI_TRACE_COLORS[cidx % len(UI_TRACE_COLORS)]))
+                    p.drawText(QRectF(box.left() + 7, box.top() + 3 + idx_m * line_h, box_w - 14, line_h),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
 
         # подписи: легенда сверху слева, шкала сверху справа, ось X снизу
         xu = first.x_unit
@@ -896,7 +975,7 @@ class LivePlot(QWidget):
                tuple((n, id(t)) for n, t in self.memory),
                self.memory_visible, self.math_mode, self.math_expr,
                self.points, self.show_points, self.show_grid,
-               self.marker, self.x_range, self.manual_x_range,
+               self.marker, tuple(self.markers), self.x_range, self.manual_x_range,
                self.manual_scale, self._scale, self._divs_y, self._y_unit, self._y_transform,
                tuple(self.analysis_metrics))
         if self._cache is None or self._cache_key != key:

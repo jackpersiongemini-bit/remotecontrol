@@ -441,7 +441,9 @@ class ActivityMonitor(QObject):
             self._emit(proxy)                         # одна перерисовка на развёртку
         elif prof == "network_analyzer" and (
             (key.startswith("m") and key.endswith((".enabled", ".trace")))
-            or key in ("scale.div", "scale.ref", "scale.rpos")
+            or key in ("scale.div", "scale.ref", "scale.rpos",
+                       "mark.state", "mark.x", "mark.y", "mark.n",
+                       "marker.state", "marker.freq", "marker.value", "trace.sel")
         ):
             if self._has_vna_traces(proxy):
                 self._last_data[proxy] = now

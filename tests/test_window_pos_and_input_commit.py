@@ -90,7 +90,7 @@ def test_instrument_window_position_remembered_on_quit(qtbot, tmp_path):
         p2.shutdown()
 
 
-def test_plineedit_commits_only_on_enter_not_focus_out(qtbot, tmp_path):
+def test_plineedit_commits_on_enter_and_focus_out(qtbot, tmp_path):
     s = QSettings(str(tmp_path / "sdg.ini"), QSettings.Format.IniFormat)
     proxy = _proxy(SiglentSDG, SiglentSDGSim())
     try:
@@ -101,25 +101,32 @@ def test_plineedit_commits_only_on_enter_not_focus_out(qtbot, tmp_path):
         proxy.set("ch1.wave", "PULSE")
         qtbot.waitUntil(lambda: proxy.value("ch1.wave") == "PULSE", timeout=5000)
         high = win.channels[0]["high"]
-        orig = proxy.value("ch1.high")
 
-        # Ввод и уход фокуса БЕЗ Enter -> значение НЕ отправляется и откатывается
-        high.setText("2.75 V")
+        # Ввод и уход фокуса -> отправляется
+        high.setText("2.25 V")
         high.setModified(True)
         _focus_out(high)
-        qtbot.wait(80)
-        assert proxy.value("ch1.high") == pytest.approx(orig)
+        qtbot.waitUntil(lambda: proxy.value("ch1.high") == pytest.approx(2.25), timeout=5000)
+
+        # Esc откатывает без отправки
+        high.setText("3.5 V")
+        high.setModified(True)
+        qtbot.keyClick(high, Qt.Key.Key_Escape)
+        qtbot.wait(60)
+        assert proxy.value("ch1.high") == pytest.approx(2.25)
 
         # Ввод и Enter -> отправляется
         high.setText("2.75 V")
         high.setModified(True)
         high.returnPressed.emit()
         qtbot.waitUntil(lambda: proxy.value("ch1.high") == pytest.approx(2.75), timeout=5000)
+        win.cleanup()
     finally:
         proxy.shutdown()
 
 
-def test_pspinbox_commits_on_enter_and_stepby_not_focus_out(qtbot, tmp_path):
+def test_pspinbox_commits_on_enter_stepby_and_focus_out_no_arrows(qtbot, tmp_path):
+    from PyQt6.QtWidgets import QAbstractSpinBox
     s = QSettings(str(tmp_path / "rf.ini"), QSettings.Format.IniFormat)
     proxy = _proxy(KeysightE8267D, KeysightE8267DSim())
     try:
@@ -130,33 +137,40 @@ def test_pspinbox_commits_on_enter_and_stepby_not_focus_out(qtbot, tmp_path):
         qtbot.waitUntil(lambda: proxy.value("rf.frequency") is not None, timeout=5000)
         from visalab.front.params import PSpinBox
         freq = next(w for w in win.findChildren(PSpinBox) if w.key == "rf.frequency")
-        orig = proxy.value("rf.frequency")
+        assert freq.buttonSymbols() == QAbstractSpinBox.ButtonSymbols.NoButtons
 
-        # Ввод и уход фокуса БЕЗ Enter -> НЕ отправляется и возвращается к исходному
+        # Уход фокуса -> отправляется
         freq.lineEdit().setText("2.5")
         freq.lineEdit().setModified(True)
         freq._dirty = True
         _focus_out(freq)
-        qtbot.wait(80)
-        assert proxy.value("rf.frequency") == pytest.approx(orig)
-        assert freq.value() * freq._factor() == pytest.approx(orig)
+        qtbot.waitUntil(lambda: proxy.value("rf.frequency") == pytest.approx(2.5e9), timeout=5000)
+
+        # Esc -> откатывает без отправки
+        freq.lineEdit().setText("3.1")
+        freq.lineEdit().setModified(True)
+        freq._dirty = True
+        qtbot.keyClick(freq, Qt.Key.Key_Escape)
+        qtbot.wait(60)
+        assert proxy.value("rf.frequency") == pytest.approx(2.5e9)
 
         # Enter -> отправляется
-        freq.lineEdit().setText("2.5")
+        freq.lineEdit().setText("2.8")
         freq.lineEdit().setModified(True)
         freq._dirty = True
         qtbot.keyClick(freq, Qt.Key.Key_Return)
-        qtbot.waitUntil(lambda: proxy.value("rf.frequency") == pytest.approx(2.5e9), timeout=5000)
+        qtbot.waitUntil(lambda: proxy.value("rf.frequency") == pytest.approx(2.8e9), timeout=5000)
 
         # stepBy -> отправляется сразу
         before_step = proxy.value("rf.frequency")
         freq.stepBy(1)
         qtbot.waitUntil(lambda: proxy.value("rf.frequency") > before_step, timeout=5000)
+        win.cleanup()
     finally:
         proxy.shutdown()
 
 
-def test_lnumber_and_setting_field_commit_only_on_enter(qtbot, tmp_path):
+def test_lnumber_and_setting_field_commit_on_enter_and_focus_out(qtbot, tmp_path):
     # PowerMeter LNumber (GAIN)
     s = QSettings(str(tmp_path / "pm.ini"), QSettings.Format.IniFormat)
     proxy = _proxy(DRIVERS["u2021xa"][0], KeysightU2021XASim())
@@ -165,15 +179,15 @@ def test_lnumber_and_setting_field_commit_only_on_enter(qtbot, tmp_path):
         qtbot.addWidget(pm)
         from visalab.front.power_meter import LNumber
         gain = next(w for w in pm.findChildren(LNumber) if w.unit == "dB")
-        orig_gain = gain.value
         gain.setText("12.5")
         gain.setModified(True)
         _focus_out(gain)
-        assert gain.value == orig_gain
-        gain.setText("12.5")
+        assert gain.value == pytest.approx(12.5)
+        gain.setText("15.0")
         gain.setModified(True)
         gain.returnPressed.emit()
-        assert gain.value == pytest.approx(12.5)
+        assert gain.value == pytest.approx(15.0)
+        pm.cleanup()
     finally:
         proxy.shutdown()
 
@@ -182,11 +196,12 @@ def test_lnumber_and_setting_field_commit_only_on_enter(qtbot, tmp_path):
     mw = MainWindow(ms, ActivityMonitor(ProxyLinks()))
     qtbot.addWidget(mw)
     f = mw.fields["pm_floor_dbm"]
-    orig_th = mw.monitor.th.pm_floor_dbm
     f.setText("-42")
+    f.setModified(True)
     _focus_out(f)
-    assert mw.monitor.th.pm_floor_dbm == pytest.approx(orig_th)
-    f.setText("-42")
-    f.returnPressed.emit()
     assert mw.monitor.th.pm_floor_dbm == pytest.approx(-42.0)
+    f.setText("-35")
+    f.setModified(True)
+    f.returnPressed.emit()
+    assert mw.monitor.th.pm_floor_dbm == pytest.approx(-35.0)
     mw.cleanup()
