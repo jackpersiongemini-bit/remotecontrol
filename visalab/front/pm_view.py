@@ -1,26 +1,24 @@
-"""График ваттметра по частоте/мощности, загрузка/редактирование CSV-списка целевых точек и фильтрация.
-
-* ``load_pm_points_csv`` / ``save_pm_points_csv`` / ``filter_pm_matrix`` — работа с CSV-файлом целевых точек
-  ``(частота Hz, мощность источника dBm | None)``;
-* :class:`PowerCurvePlot` — график ваттметра: отдельная кривая на каждый уровень подаваемой мощности,
-  поддержка единиц (dBm / W / dBW / V / dB), подписи значений мощности над точками максимальной по мощности
-  кривой и под точками минимальной по мощности кривой;
-* :class:`PMPointsDialog` — встроенный тёмный редактор CSV-списка точек (загрузка, правка ячеек, генератор
-  сетки, импорт текущих измерений, сохранение).
+"""График ваттметра по частоте/мощности, фильтрация по диапазонам множеств ``{f1}+{[f2,f3],[f4,f5]}-{[f6]}``,
+поддержка масштаба, памяти (MEM), математики (MATH) и анализа (ANALYSIS), а также совместимость с CSV-точками.
 """
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
+import json
 import math
 from pathlib import Path
 
-from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                              QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+from ..core.trace import Trace
 from ..core.units import si_format, si_parse
 from .live_plot import nice_range
+from .plot_tools import (ANALYSIS_KEYS, MATH_MODES, PlotSettingsPopup, analyze_trace, format_analysis, trace_math,
+                         validate_math_expr)
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER,
                     UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL,
                     UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED, UI_FONT_SIZE_PT,
@@ -29,6 +27,9 @@ from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND
 __all__ = [
     "parse_freq_hz",
     "parse_power_dbm",
+    "RangeSet",
+    "parse_range_expr",
+    "filter_pm_matrix_by_ranges",
     "load_pm_points_csv",
     "save_pm_points_csv",
     "filter_pm_matrix",
@@ -105,13 +106,225 @@ def parse_power_dbm(text: str) -> float | None:
         return None
 
 
-def load_pm_points_csv(path) -> list[tuple[float, float | None]]:
-    """Загрузить список целевых точек ``[(freq_hz, power_dbm | None)]`` из CSV.
+# ------------------------------------------------------------ множества диапазонов {f1}+{[f2,f3],[f4,f5]}-{[f6]}
+@dataclass(frozen=True)
+class RangeSet:
+    """Множество точек и отрезков вида ``{f1}+{[f2,f3],[f4,f5]}-{[f6]}``."""
 
-    Поддерживает разделители ``,`` / ``;`` / ``\\t``, необязательный заголовок, SI-суффиксы частот
-    (``1 GHz``, ``2.4G``, ``500M``), 1 колонку (только частота -> любая мощность), 2 колонки
-    (``freq, power``) и несколько колонок мощностей в строке (``freq, p1, p2, ...``).
+    raw: str
+    ops: tuple[tuple[str, tuple[tuple[float, float], ...]], ...]
+    kind: str = "freq"  # "freq" | "power"
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.ops
+
+    def _tol(self, v: float) -> float:
+        if self.kind == "power":
+            return 0.05
+        return max(1.0, 1e-6 * abs(v))
+
+    def contains(self, value: float | None) -> bool:
+        if self.is_empty:
+            return True
+        if value is None or not math.isfinite(value):
+            return False
+        x = float(value)
+        included = False
+        for op, items in self.ops:
+            hit = any((lo - self._tol(lo)) <= x <= (hi + self._tol(hi)) for lo, hi in items)
+            if op == "+":
+                if hit:
+                    included = True
+            else:
+                if hit:
+                    included = False
+        return included
+
+    def bounds(self) -> tuple[float, float] | None:
+        vals = [v for op, items in self.ops if op == "+" for lo, hi in items for v in (lo, hi)]
+        return (min(vals), max(vals)) if vals else None
+
+
+def _split_top_level_terms(expr: str) -> list[tuple[str, str]]:
+    """Разбить выражение ``{...}+{...}-{...}`` на термы ``[('+', '...'), ('-', '...')]`` на нулевом уровне скобок."""
+    terms: list[tuple[str, str]] = []
+    brace = 0
+    bracket = 0
+    op = "+"
+    buf: list[str] = []
+    n = len(expr)
+    i = 0
+    while i < n:
+        ch = expr[i]
+        if ch == "{":
+            brace += 1
+            buf.append(ch)
+        elif ch == "}":
+            brace -= 1
+            if brace < 0:
+                raise ValueError("Unmatched '}'")
+            buf.append(ch)
+        elif ch == "[":
+            bracket += 1
+            buf.append(ch)
+        elif ch == "]":
+            bracket -= 1
+            if bracket < 0:
+                raise ValueError("Unmatched ']'")
+            buf.append(ch)
+        elif ch in ("+", "-") and brace == 0 and bracket == 0:
+            cur = "".join(buf).strip()
+            # Унарный знак в начале числа или после 'e'/'E' (например -20 или 1e-3) не разделяет термы
+            prev_ch = cur[-1] if cur else ""
+            if not cur or prev_ch in ("e", "E", ","):
+                buf.append(ch)
+            else:
+                terms.append((op, cur))
+                op = ch
+                buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if brace != 0:
+        raise ValueError("Unclosed '{'")
+    if bracket != 0:
+        raise ValueError("Unclosed '['")
+    tail = "".join(buf).strip()
+    if tail:
+        terms.append((op, tail))
+    elif terms:
+        raise ValueError(f"Trailing '{op}' operator")
+    return terms
+
+
+def _split_items(group: str) -> list[str]:
+    """Разбить содержимое ``{...}`` по запятым вне ``[...]``."""
+    s = group.strip()
+    if s.startswith("{"):
+        if not s.endswith("}"):
+            raise ValueError("Expected closing '}'")
+        s = s[1:-1].strip()
+    if not s:
+        return []
+    parts: list[str] = []
+    bracket = 0
+    buf: list[str] = []
+    for ch in s:
+        if ch == "[":
+            bracket += 1
+            buf.append(ch)
+        elif ch == "]":
+            bracket -= 1
+            if bracket < 0:
+                raise ValueError("Unmatched ']'")
+            buf.append(ch)
+        elif ch == "," and bracket == 0:
+            item = "".join(buf).strip()
+            if not item:
+                raise ValueError("Empty element near ','")
+            parts.append(item)
+            buf = []
+        else:
+            buf.append(ch)
+    if bracket != 0:
+        raise ValueError("Unclosed '['")
+    last = "".join(buf).strip()
+    if last:
+        parts.append(last)
+    return parts
+
+
+def _parse_scalar(text: str, kind: str) -> float:
+    if kind == "power":
+        s = str(text or "").strip()
+        for suf in ("dBm", "dbm", "DBM"):
+            if s.endswith(suf):
+                s = s[:-len(suf)].strip()
+                break
+        try:
+            v = float(s)
+        except ValueError as exc:
+            raise ValueError(f"Invalid power value: {text!r}") from exc
+        if not math.isfinite(v):
+            raise ValueError(f"Invalid power value: {text!r}")
+        return round(v, 3)
+    v = parse_freq_hz(text)
+    if v is None:
+        raise ValueError(f"Invalid frequency value: {text!r}")
+    return float(v)
+
+
+def parse_range_expr(expr: str, kind: str = "freq") -> RangeSet:
+    """Разобрать строку множества диапазонов вида ``{f1}+{[f2,f3],[f4,f5]}-{[f6]}``.
+
+    * Пустая строка -> пустой фильтр (проходят все значения).
+    * ``{v}`` / ``[v]`` / ``v`` -> одиночная точка.
+    * ``[a, b]`` -> замкнутый отрезок ``[min(a, b), max(a, b)]``.
+    * ``+`` объединяет множества, ``-`` вычитает (слева направо).
+    * Для ``kind="freq"`` поддерживаются SI-суффиксы (``1G``, ``500M``, ``2.4 GHz``);
+      для ``kind="power"`` — значения в dBm, включая отрицательные (``{-20}+{[-15,-5]}-{[-10]}``).
     """
+    raw = str(expr or "").strip()
+    if not raw:
+        return RangeSet("", (), kind)
+    terms = _split_top_level_terms(raw)
+    ops: list[tuple[str, tuple[tuple[float, float], ...]]] = []
+    for op, grp in terms:
+        items_str = _split_items(grp)
+        if not items_str:
+            raise ValueError(f"Empty set in {grp!r}")
+        parsed_items: list[tuple[float, float]] = []
+        for it in items_str:
+            if it.startswith("["):
+                if not it.endswith("]"):
+                    raise ValueError(f"Unclosed interval {it!r}")
+                inner = it[1:-1].strip()
+                if not inner:
+                    raise ValueError("Empty interval []")
+                bounds = [b.strip() for b in inner.split(",")]
+                if len(bounds) == 1:
+                    val = _parse_scalar(bounds[0], kind)
+                    parsed_items.append((val, val))
+                elif len(bounds) == 2:
+                    a = _parse_scalar(bounds[0], kind)
+                    b = _parse_scalar(bounds[1], kind)
+                    parsed_items.append((min(a, b), max(a, b)))
+                else:
+                    raise ValueError(f"Interval must have 1 or 2 bounds: {it!r}")
+            else:
+                val = _parse_scalar(it, kind)
+                parsed_items.append((val, val))
+        ops.append((op, tuple(parsed_items)))
+    return RangeSet(raw, tuple(ops), kind)
+
+
+def filter_pm_matrix_by_ranges(
+    columns: list[float | None],
+    rows: list[tuple[float, dict[float | None, float]]],
+    freq_range: RangeSet | None = None,
+    power_range: RangeSet | None = None,
+) -> tuple[list[float | None], list[tuple[float, dict[float | None, float]]]]:
+    """Отфильтровать матрицу измерений по множествам диапазонов частоты и мощности."""
+    use_f = freq_range is not None and not freq_range.is_empty
+    use_p = power_range is not None and not power_range.is_empty
+    if not use_f and not use_p:
+        return list(columns), list(rows)
+    out_cols = [c for c in columns if (not use_p or power_range.contains(c))]
+    col_set = set(out_cols)
+    out_rows: list[tuple[float, dict[float | None, float]]] = []
+    for f, vals in rows:
+        if use_f and not freq_range.contains(f):
+            continue
+        filtered = {p: v for p, v in vals.items() if p in col_set}
+        if filtered:
+            out_rows.append((f, filtered))
+    return out_cols, out_rows
+
+
+# ------------------------------------------------------------ CSV-функции (совместимость)
+def load_pm_points_csv(path) -> list[tuple[float, float | None]]:
+    """Загрузить список целевых точек ``[(freq_hz, power_dbm | None)]`` из CSV."""
     raw = Path(path).read_text(encoding="utf-8-sig")
     pts: list[tuple[float, float | None]] = []
     seen: set[tuple[float, float | None]] = set()
@@ -125,7 +338,7 @@ def load_pm_points_csv(path) -> list[tuple[float, float | None]]:
             continue
         freq = parse_freq_hz(cells[0])
         if freq is None:
-            continue  # строка заголовка или мусор
+            continue
         f_key = float(round(freq, 3))
         if len(cells) == 1:
             pair = (f_key, None)
@@ -182,11 +395,7 @@ def filter_pm_matrix(
     rows: list[tuple[float, dict[float | None, float]]],
     target_points: list[tuple[float, float | None]],
 ) -> tuple[list[float | None], list[tuple[float, dict[float | None, float]]], set[tuple[float, float | None]]]:
-    """Отфильтровать измеренную матрицу ваттметра по списку целевых точек из CSV.
-
-    Возвращает ``(out_cols, out_rows, planned_cells)``, где ``out_rows`` содержит все целевые частоты
-    из CSV (даже ещё не измеренные), а ``planned_cells`` — множество запланированных ячеек ``(freq, col_p)``.
-    """
+    """Отфильтровать измеренную матрицу ваттметра по списку целевых точек из CSV."""
     if not target_points:
         return list(columns), list(rows), set()
 
@@ -194,7 +403,6 @@ def filter_pm_matrix(
     for f, p in target_points:
         by_tgt_freq.setdefault(float(f), []).append(p)
 
-    # Какие колонки мощностей нужны: все явно заданные в CSV + измеренные, попавшие под wildcard (None)
     num_cols: set[float] = {p for _f, p in target_points if p is not None}
     has_none_col = False
     for f_tgt, tgt_ps in by_tgt_freq.items():
@@ -218,11 +426,9 @@ def filter_pm_matrix(
         tgt_ps = by_tgt_freq[f_tgt]
         wildcard = None in tgt_ps
         row_vals: dict[float | None, float] = {}
-        # Отмечаем запланированные ячейки
         for col_p in out_cols:
             if wildcard or any(_match_power(col_p, tp) for tp in tgt_ps if tp is not None):
                 planned.add((f_tgt, col_p))
-        # Ищем совпадающие измерения
         for f_m, vals in rows:
             if not _match_freq(f_m, f_tgt):
                 continue
@@ -242,12 +448,17 @@ def filter_pm_matrix(
 class PowerCurvePlot(QWidget):
     """График ваттметра: для каждого уровня мощности источника — своя кривая по частоте.
 
-    Точки кривой с максимальной мощностью подписываются измеренным значением СВЕРХУ точки,
-    а точки кривой с минимальной мощностью — СНИЗУ точки.
+    Подписываются ТОЛЬКО две крайние кривые по мощности:
+    * максимальная мощность (например, 17 dBm) — СВЕРХУ точек;
+    * минимальная мощность (например, 12 dBm) — СНИЗУ точек;
+    * промежуточные мощности (например, 16 dBm) — без числовых подписей.
+    Поддерживает масштаб (SCALE), память (MEM), математику (MATH) и анализ (ANALYSIS).
     """
 
     DIVS_X, DIVS_Y = 10, 6
     _SI_UNITS = ("W", "V")
+    settings_changed = pyqtSignal()
+    settings_requested = pyqtSignal()
 
     def __init__(self, unit: str = "dBm", parent=None, min_height: int = 240):
         super().__init__(parent)
@@ -259,19 +470,128 @@ class PowerCurvePlot(QWidget):
         self._cache: QPixmap | None = None
         self._cache_key: tuple | None = None
         self._font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
-        self._font.setPointSizeF(8)
+        self._font.setPointSizeF(10.0)
         self._lbl_font = QFont(self._font)
-        self._lbl_font.setPointSizeF(7.5)
+        self._lbl_font.setPointSizeF(9.5)
+
+        # Настройки шкалы, памяти (MEM), математики (MATH) и анализа
+        self.manual_scale: bool = False
+        self._manual_scale: tuple[float, float, float] | None = None
+        self._manual_divs_y: int = self.DIVS_Y
+        self._divs_y: int = self.DIVS_Y
+        self.manual_x_range: tuple[float, float] | None = None
+        self.show_grid: bool = True
+        self.show_points: bool = True
+        self.memory: list[tuple[str, Trace]] = []
+        self.memory_visible: bool = True
+        self.math_mode: str = "OFF"
+        self.math_expr: str = ""
+        self.analysis_metrics: list[str] = []
+        self._settings: QSettings | None = None
+        self._settings_key: str = ""
+        self._popup: PlotSettingsPopup | None = None
+
         #: последние нарисованные подписи точек: [(placement "above"|"below", text, pt_x, pt_y, lbl_y)]
         self.point_labels: list[tuple[str, str, float, float, float]] = []
         self._curves: list[tuple[float | None, str, list[tuple[float, float, float]]]] = []
+        self._eff_curves: list[tuple[float | None, str, list[tuple[float, float]]]] = []
         self._scale: tuple[float, float, float] | None = None
         self.setMouseTracking(True)
         self.setMinimumHeight(min_height)
         self.setMinimumWidth(200)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setToolTip("Power meter curves (one per source power). Top curve labeled above points, bottom curve below")
+        self.setToolTip("Double-click: store / clear MEM · Wheel: zoom Y · Right-click: plot settings")
 
+    @property
+    def memory_diff(self) -> bool:
+        return self.math_mode == "SUB" and bool(self.memory)
+
+    @memory_diff.setter
+    def memory_diff(self, on: bool) -> None:
+        if on and self.memory:
+            self.math_mode = "SUB"
+        elif self.math_mode == "SUB":
+            self.math_mode = "OFF"
+
+    def _math_active(self) -> bool:
+        if self.math_mode == "OFF":
+            return False
+        if self.math_mode == "EXPR":
+            return bool(self.math_expr.strip()) and validate_math_expr(self.math_expr)[0]
+        return bool(self.memory)
+
+    # ------------------------------------------------------------ сохранение настроек
+    def bind_settings(self, settings: QSettings | None, key: str) -> None:
+        self._settings = settings
+        self._settings_key = key
+        if settings is None or not key:
+            return
+        base = key
+        self.show_grid = bool(settings.value(f"{base}/GRID", True, type=bool))
+        self.show_points = bool(settings.value(f"{base}/POINTS", True, type=bool))
+        raw_an = settings.value(f"{base}/ANALYSIS", "", type=str)
+        try:
+            items = json.loads(raw_an) if raw_an else []
+            if isinstance(items, list):
+                self.analysis_metrics = [k for k in items if k in ANALYSIS_KEYS]
+        except (TypeError, ValueError):
+            self.analysis_metrics = []
+        man = bool(settings.value(f"{base}/MANUAL_SCALE", False, type=bool))
+        ref_raw = settings.value(f"{base}/MAN_REF", None)
+        div_raw = settings.value(f"{base}/MAN_DIV", None)
+        divs_raw = settings.value(f"{base}/MAN_DIVS", None)
+        if man and ref_raw not in (None, "") and div_raw not in (None, ""):
+            try:
+                ref = float(ref_raw)
+                div = float(div_raw)
+                divs = max(2, min(20, int(divs_raw))) if divs_raw not in (None, "") else self.DIVS_Y
+                if math.isfinite(ref) and math.isfinite(div) and div > 0:
+                    self.manual_scale = True
+                    self._manual_divs_y = divs
+                    self._manual_scale = (ref - divs * div, ref, div)
+                    self._divs_y = divs
+            except (TypeError, ValueError):
+                pass
+        x0_raw = settings.value(f"{base}/X_MIN", None)
+        x1_raw = settings.value(f"{base}/X_MAX", None)
+        if x0_raw not in (None, "") and x1_raw not in (None, ""):
+            try:
+                x0, x1 = float(x0_raw), float(x1_raw)
+                if math.isfinite(x0) and math.isfinite(x1) and x1 > x0:
+                    self.manual_x_range = (x0, x1)
+            except (TypeError, ValueError):
+                pass
+        saved_expr = str(settings.value(f"{base}/MATH_EXPR", "", type=str) or "").strip()
+        saved_mode = str(settings.value(f"{base}/MATH_MODE", "OFF", type=str) or "OFF").upper()
+        self.math_expr = saved_expr if (saved_expr and validate_math_expr(saved_expr)[0]) else ""
+        self.math_mode = "EXPR" if (saved_mode == "EXPR" and self.math_expr) else "OFF"
+        self._rebuild_effective()
+        self.update()
+
+    def _save_settings(self) -> None:
+        if self._settings is None or not self._settings_key:
+            return
+        base = self._settings_key
+        s = self._settings
+        s.setValue(f"{base}/GRID", self.show_grid)
+        s.setValue(f"{base}/POINTS", self.show_points)
+        s.setValue(f"{base}/ANALYSIS", json.dumps(self.analysis_metrics))
+        s.setValue(f"{base}/MANUAL_SCALE", self.manual_scale)
+        s.setValue(f"{base}/MATH_MODE", self.math_mode if self.math_mode == "EXPR" else "OFF")
+        s.setValue(f"{base}/MATH_EXPR", self.math_expr)
+        if self.manual_scale and self._manual_scale is not None:
+            _lo, hi, step = self._manual_scale
+            s.setValue(f"{base}/MAN_REF", hi)
+            s.setValue(f"{base}/MAN_DIV", step)
+            s.setValue(f"{base}/MAN_DIVS", self._manual_divs_y)
+        if self.manual_x_range is not None:
+            s.setValue(f"{base}/X_MIN", self.manual_x_range[0])
+            s.setValue(f"{base}/X_MAX", self.manual_x_range[1])
+        else:
+            s.remove(f"{base}/X_MIN")
+            s.remove(f"{base}/X_MAX")
+
+    # ------------------------------------------------------------ данные
     def set_unit(self, unit: str) -> None:
         if unit == self.unit:
             return
@@ -300,6 +620,22 @@ class PowerCurvePlot(QWidget):
         self._rebuild_curves()
         self.update()
 
+    def _effective_unit(self) -> str:
+        if self._math_active():
+            if self.math_mode == "SUB":
+                return "dB" if self.unit in ("dBm", "dB") else self.unit
+            if self.math_mode in ("DIV", "MUL"):
+                return ""
+        return self.unit
+
+    def _as_traces(self) -> list[tuple[str, Trace]]:
+        out: list[tuple[str, Trace]] = []
+        for _cp, lbl, pts in self._curves:
+            xs = tuple(f for f, _yv, _d in pts)
+            ys = tuple(yv for _f, yv, _d in pts)
+            out.append((lbl, Trace(xs, ys, "Hz", self.unit, name=lbl, uniform=False)))
+        return out
+
     def _rebuild_curves(self) -> None:
         """Собрать кривые [(src_power, label, [(freq_hz, y_display, raw_dbm), ...])]."""
         curves: list[tuple[float | None, str, list[tuple[float, float, float]]]] = []
@@ -316,20 +652,260 @@ class PowerCurvePlot(QWidget):
                 pts.sort(key=lambda t: t[0])
                 curves.append((col_p, _fmt_source_power(col_p), pts))
         self._curves = curves
-        all_y = [yv for _cp, _lbl, pts in curves for _f, yv, _dbm in pts]
+        self._rebuild_effective()
+
+    def _rebuild_effective(self) -> None:
+        eff: list[tuple[float | None, str, list[tuple[float, float]]]] = []
+        math_on = self._math_active()
+        for i, (cp, lbl, pts) in enumerate(self._curves):
+            if math_on:
+                xs = tuple(f for f, _y, _d in pts)
+                ys = tuple(yv for _f, yv, _d in pts)
+                live_tr = Trace(xs, ys, "Hz", self.unit, name=lbl, uniform=False)
+                mem_tr = (self.memory[i][1] if i < len(self.memory) else self.memory[0][1]) if self.memory else None
+                mtr = trace_math(live_tr, mem_tr, self.math_mode, self.math_expr)
+                m_pts = [(float(x), float(y)) for x, y in zip(mtr.x, mtr.y) if math.isfinite(x) and math.isfinite(y)]
+                if m_pts:
+                    prefix = {"SUB": "Δ", "ADD": "+", "DIV": "÷", "MUL": "×", "EXPR": "f:"}.get(self.math_mode, "")
+                    eff.append((cp, f"{prefix}{lbl}", m_pts))
+            else:
+                eff.append((cp, lbl, [(f, yv) for f, yv, _d in pts]))
+        self._eff_curves = eff
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self.manual_scale and self._manual_scale is not None:
+            self._divs_y = self._manual_divs_y
+            self._scale = self._manual_scale
+            return
+        self._divs_y = self.DIVS_Y
+        x_lim = self.manual_x_range
+        all_y = [
+            yv for _cp, _lbl, pts in self._eff_curves for f, yv in pts
+            if math.isfinite(yv) and (x_lim is None or x_lim[0] <= f <= x_lim[1])
+        ]
         if not all_y:
             self._scale = None
             return
+        eu = self._effective_unit()
         lo, hi = min(all_y), max(all_y)
-        span = max(hi - lo, 2.0 if self.unit not in self._SI_UNITS else max(abs(hi) * 0.2, 1e-12))
-        # Дополнительный запас сверху и снизу под подписи точек максимальной и минимальной кривых
-        pad = span * 0.22
-        lo_p = max(0.0, lo - pad) if self.unit in self._SI_UNITS and lo >= 0 else lo - pad
+        span = max(hi - lo, 2.0 if eu not in self._SI_UNITS else max(abs(hi) * 0.2, 1e-12))
+        pad = span * 0.24
+        lo_p = max(0.0, lo - pad) if eu in self._SI_UNITS and lo >= 0 else lo - pad
         hi_p = hi + pad
-        self._scale = nice_range(lo_p, hi_p, self.DIVS_Y)
+        self._scale = nice_range(lo_p, hi_p, self._divs_y)
 
+    # ------------------------------------------------------------ API настроек (единый с LivePlot)
+    def set_manual_scale(self, ref: float, per_div: float, divs_y: int | None = None) -> None:
+        ref, per_div = float(ref), float(per_div)
+        if not (math.isfinite(ref) and math.isfinite(per_div) and per_div > 0):
+            return
+        divs = self._manual_divs_y if divs_y is None else max(2, min(20, int(divs_y)))
+        self.manual_scale = True
+        self._manual_divs_y = divs
+        self._manual_scale = (ref - divs * per_div, ref, per_div)
+        self._divs_y = divs
+        self._scale = self._manual_scale
+        self._save_settings()
+        self.settings_changed.emit()
+        self.update()
+
+    def set_auto_scale(self) -> None:
+        self.manual_scale = False
+        self._manual_scale = None
+        self._divs_y = self.DIVS_Y
+        self._rescale()
+        self._save_settings()
+        self.settings_changed.emit()
+        self.update()
+
+    def autoscale_once(self) -> None:
+        x_lim = self.manual_x_range
+        all_y = [
+            yv for _cp, _lbl, pts in self._eff_curves for f, yv in pts
+            if math.isfinite(yv) and (x_lim is None or x_lim[0] <= f <= x_lim[1])
+        ]
+        if not all_y:
+            return
+        lo_n, hi_n, step_n = nice_range(min(all_y), max(all_y), self._divs_y)
+        self.set_manual_scale(hi_n, step_n, self._divs_y)
+
+    def set_x_zoom(self, x_min: float | None, x_max: float | None) -> None:
+        if x_min is None or x_max is None:
+            self.manual_x_range = None
+        else:
+            x0, x1 = float(x_min), float(x_max)
+            if math.isfinite(x0) and math.isfinite(x1) and x1 > x0:
+                self.manual_x_range = (x0, x1)
+        self._rescale()
+        self._save_settings()
+        self.settings_changed.emit()
+        self.update()
+
+    def reset_view(self) -> None:
+        self.manual_x_range = None
+        self.set_auto_scale()
+
+    def set_show_grid(self, on: bool) -> None:
+        self.show_grid = bool(on)
+        self._save_settings()
+        self.settings_changed.emit()
+        self.update()
+
+    def set_show_points(self, on: bool) -> None:
+        self.show_points = bool(on)
+        self._save_settings()
+        self.settings_changed.emit()
+        self.update()
+
+    def store_memory(self) -> bool:
+        trs = self._as_traces()
+        if not trs:
+            return False
+        self.memory = trs
+        self.memory_visible = True
+        self._rebuild_effective()
+        self.settings_changed.emit()
+        self.update()
+        return True
+
+    def clear_memory(self) -> None:
+        if not self.memory and self.math_mode not in ("SUB", "ADD", "DIV", "MUL"):
+            return
+        self.memory = []
+        if self.math_mode in ("SUB", "ADD", "DIV", "MUL"):
+            self.math_mode = "OFF"
+        self._rebuild_effective()
+        self.settings_changed.emit()
+        self.update()
+
+    def toggle_memory(self) -> bool:
+        if self.memory:
+            self.clear_memory()
+            return False
+        return self.store_memory()
+
+    def set_memory_visible(self, on: bool) -> None:
+        self.memory_visible = bool(on)
+        self.settings_changed.emit()
+        self.update()
+
+    def set_memory_diff(self, on: bool) -> None:
+        self.set_math("SUB" if (bool(on) and bool(self.memory)) else "OFF")
+
+    def set_math(self, mode: str, expr: str | None = None) -> None:
+        mode = str(mode or "OFF").upper()
+        if mode not in MATH_MODES:
+            mode = "OFF"
+        if expr is not None:
+            self.math_expr = str(expr).strip()
+        if mode in ("SUB", "ADD", "DIV", "MUL") and not self.memory:
+            mode = "OFF"
+        if mode == "EXPR" and (not self.math_expr or not validate_math_expr(self.math_expr)[0]):
+            mode = "OFF"
+        self.math_mode = mode
+        self._rebuild_effective()
+        self._save_settings()
+        self.settings_changed.emit()
+        self.update()
+
+    def set_analysis_metrics(self, metrics: list[str] | tuple[str, ...]) -> None:
+        cleaned = [k for k in ANALYSIS_KEYS if k in set(metrics)]
+        if cleaned == self.analysis_metrics:
+            return
+        self.analysis_metrics = cleaned
+        self._save_settings()
+        self.settings_changed.emit()
+        self.update()
+
+    def toggle_analysis_metric(self, key: str, on: bool) -> None:
+        if key not in ANALYSIS_KEYS:
+            return
+        cur = set(self.analysis_metrics)
+        if on:
+            cur.add(key)
+        else:
+            cur.discard(key)
+        self.set_analysis_metrics(list(cur))
+
+    def _primary_trace(self) -> Trace | None:
+        if not self._eff_curves:
+            return None
+        max_idx, _min_idx = self._min_max_curve_indices()
+        idx = max_idx if max_idx is not None else 0
+        _cp, lbl, pts = self._eff_curves[idx]
+        if not pts:
+            return None
+        return Trace(tuple(f for f, _y in pts), tuple(y for _f, y in pts), "Hz", self._effective_unit(), name=lbl, uniform=False)
+
+    def analysis_results(self) -> dict:
+        tr = self._primary_trace()
+        return analyze_trace(tr, x_range=self.manual_x_range) if tr is not None else {}
+
+    def analysis_lines(self) -> list[str]:
+        if not self.analysis_metrics:
+            return []
+        tr = self._primary_trace()
+        if tr is None:
+            return []
+        stats = analyze_trace(tr, x_range=self.manual_x_range)
+        tokens = format_analysis(stats, self.analysis_metrics, "Hz", self._effective_unit())
+        if not tokens:
+            return []
+        fm = QFontMetrics(self._font)
+        max_w = max(120, self.width() - 16)
+        lines: list[str] = []
+        cur = ""
+        for tok in tokens:
+            cand = f"{cur}  ·  {tok}" if cur else tok
+            if cur and fm.horizontalAdvance(cand) > max_w:
+                lines.append(cur)
+                cur = tok
+            else:
+                cur = cand
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def open_settings(self, global_pos: QPoint | None = None) -> PlotSettingsPopup:
+        if self._popup is not None:
+            self._popup.close()
+        self._popup = PlotSettingsPopup(self, self)
+        pos = global_pos if global_pos is not None else self.mapToGlobal(QPoint(self.width() - 280, 24))
+        self._popup.show_at(pos)
+        return self._popup
+
+    def plot_settings_state(self) -> dict:
+        ref = self._scale[1] if self._scale is not None else None
+        div = self._scale[2] if self._scale is not None else None
+        return {
+            "manual_scale": self.manual_scale,
+            "ref": ref,
+            "div": div,
+            "divs_y": self._divs_y,
+            "y_unit": self._effective_unit(),
+            "x_unit": "Hz",
+            "x_bounds": self._x_bounds(),
+            "manual_x_range": self.manual_x_range,
+            "show_grid": self.show_grid,
+            "show_points": self.show_points,
+            "has_memory": bool(self.memory),
+            "memory_count": len(self.memory),
+            "memory_visible": self.memory_visible,
+            "memory_diff": self.memory_diff,
+            "math_mode": self.math_mode,
+            "math_expr": self.math_expr,
+            "analysis_metrics": list(self.analysis_metrics),
+            "supports_divs": True,
+            "supports_x_zoom": True,
+            "supports_points": True,
+        }
+
+    # ------------------------------------------------------------ оси и крайние кривые
     def _x_bounds(self) -> tuple[float, float]:
-        xs = [f for _cp, _lbl, pts in self._curves for f, _y, _d in pts]
+        if self.manual_x_range is not None:
+            return self.manual_x_range
+        xs = [f for _cp, _lbl, pts in self._eff_curves for f, _y in pts]
         if self.target_freqs:
             xs.extend(self.target_freqs)
         if not xs:
@@ -342,23 +918,32 @@ class PowerCurvePlot(QWidget):
         return x0 - pad, x1 + pad
 
     def _min_max_curve_indices(self) -> tuple[int | None, int | None]:
-        """Индексы (max_idx, min_idx) кривых по мощности; при 1 кривой - (0, None)."""
-        if not self._curves:
+        """Индексы (max_idx, min_idx) кривых по мощности источника; промежуточные не подписываются."""
+        if not self._eff_curves:
             return None, None
-        if len(self._curves) == 1:
+        if len(self._eff_curves) == 1:
             return 0, None
-        # Сортируем по средней измеренной мощности (и по мощности источника при равенстве)
-        keys = [
-            (sum(yv for _f, yv, _d in pts) / len(pts), -1e9 if cp is None else cp, idx)
-            for idx, (cp, _lbl, pts) in enumerate(self._curves)
-        ]
+        has_src = all(cp is not None for cp, _lbl, _pts in self._eff_curves)
+        if has_src:
+            keys = [(float(cp), sum(yv for _f, yv in pts) / len(pts), idx)
+                    for idx, (cp, _lbl, pts) in enumerate(self._eff_curves)]
+        else:
+            keys = [(sum(yv for _f, yv in pts) / len(pts), -1e9 if cp is None else float(cp), idx)
+                    for idx, (cp, _lbl, pts) in enumerate(self._eff_curves)]
         max_idx = max(keys)[2]
         min_idx = min(keys)[2]
         return max_idx, (None if min_idx == max_idx else min_idx)
 
-    def _plot_rect(self) -> QRectF:
-        return QRectF(self.rect()).adjusted(8, 22, -8, -22)
+    def _analysis_height(self, lines: list[str] | None = None) -> int:
+        if lines is None:
+            lines = self.analysis_lines()
+        return (len(lines) * 18 + 6) if lines else 0
 
+    def _plot_rect(self, analysis_h: int | None = None) -> QRectF:
+        ah = self._analysis_height() if analysis_h is None else analysis_h
+        return QRectF(self.rect()).adjusted(8, 25, -8, -(25 + ah))
+
+    # ------------------------------------------------------------ мышь
     def mouseMoveEvent(self, e):  # noqa: N802 - Qt
         self._mouse = e.position()
         self.update()
@@ -367,6 +952,42 @@ class PowerCurvePlot(QWidget):
         self._mouse = None
         self.update()
 
+    def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt
+        if e.button() == Qt.MouseButton.LeftButton:
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.store_memory()
+            else:
+                self.toggle_memory()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def wheelEvent(self, e):  # noqa: N802 - Qt
+        delta = e.angleDelta().y()
+        if delta == 0 or self._scale is None:
+            super().wheelEvent(e)
+            return
+        lo, hi, step = self._scale
+        divs = self._divs_y
+        if e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
+            shift = step * 0.5 * (1 if delta > 0 else -1)
+            self.set_manual_scale(hi + shift, step, divs)
+        else:
+            factor = 0.8 if delta > 0 else 1.25
+            new_step = max(1e-12, step * factor)
+            center = (lo + hi) * 0.5
+            new_hi = center + new_step * divs * 0.5
+            self.set_manual_scale(new_hi, new_step, divs)
+        e.accept()
+
+    def contextMenuEvent(self, e):  # noqa: N802 - Qt
+        if self.receivers(self.settings_requested) > 0:
+            self.settings_requested.emit()
+        else:
+            self.open_settings(e.globalPos())
+        e.accept()
+
+    # ------------------------------------------------------------ рисование
     def _draw_point_labels(
         self,
         p: QPainter,
@@ -375,33 +996,39 @@ class PowerCurvePlot(QWidget):
         color: QColor,
         placement: str,
     ) -> None:
-        """Подписать точки кривой мощностью: ``above`` — над точкой, ``below`` — под точкой."""
+        """Подписать точки кривой мощностью: ``above`` — над точкой, ``below`` — под точкой (с непрозрачной подложкой)."""
         if not pts_px:
             return
         p.setFont(self._lbl_font)
         fm = QFontMetrics(self._lbl_font)
-        th = fm.height()
-        p.setPen(color)
+        th = fm.height() + 2
         occupied: list[tuple[float, float]] = []
-        # Приоритет: крайние точки, затем промежуточные слева направо
         order = list(range(len(pts_px)))
         if len(order) > 2:
             order = [0, len(pts_px) - 1, *range(1, len(pts_px) - 1)]
+        eu = self._effective_unit()
+        bg = QColor(UI_COLOR_BACKGROUND)
+        bg.setAlpha(224)
         for idx in order:
             x_px, y_px, y_val = pts_px[idx]
-            text = _fmt_short_value(y_val, self.unit)
+            text = _fmt_short_value(y_val, eu)
             if not text:
                 continue
-            tw = fm.horizontalAdvance(text) + 4
+            tw = fm.horizontalAdvance(text) + 8
             lx = max(r.left() + 2, min(x_px - tw / 2.0, r.right() - tw - 2))
-            if any(not (lx + tw + 2 < ox0 or lx > ox1 + 2) for ox0, ox1 in occupied):
+            if any(not (lx + tw + 3 < ox0 or lx > ox1 + 3) for ox0, ox1 in occupied):
                 continue
             occupied.append((lx, lx + tw))
             if placement == "above":
-                ly = max(r.top() + 2, y_px - th - 4)
+                ly = max(r.top() + 2, y_px - th - 5)
             else:
-                ly = min(r.bottom() - th - 2, y_px + 5)
-            p.drawText(QRectF(lx, ly, tw, th), Qt.AlignmentFlag.AlignCenter, text)
+                ly = min(r.bottom() - th - 2, y_px + 6)
+            box = QRectF(lx, ly, tw, th)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(box, 3, 3)
+            p.setPen(color)
+            p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
             self.point_labels.append((placement, text, x_px, y_px, ly))
 
     def _render_base(self) -> QPixmap:
@@ -417,24 +1044,29 @@ class PowerCurvePlot(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(UI_COLOR_BACKGROUND))
         p.drawRoundedRect(QRectF(self.rect()), UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-        r = self._plot_rect()
+
+        an_lines = self.analysis_lines()
+        ah = self._analysis_height(an_lines)
+        r = self._plot_rect(ah)
         p.setFont(self._font)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         grid_pen = QPen(QColor(UI_COLOR_BORDER), 1)
         grid_pen.setCosmetic(True)
         p.setPen(grid_pen)
-        for i in range(self.DIVS_X + 1):
-            x = r.left() + r.width() * i / self.DIVS_X
-            p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
-        for i in range(self.DIVS_Y + 1):
-            y = r.top() + r.height() * i / self.DIVS_Y
-            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+        if self.show_grid:
+            for i in range(self.DIVS_X + 1):
+                x = r.left() + r.width() * i / self.DIVS_X
+                p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+            for i in range(self._divs_y + 1):
+                y = r.top() + r.height() * i / self._divs_y
+                p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+        else:
+            p.drawRect(r)
 
         muted = QColor(UI_COLOR_BORDER_LIGHT)
-        if not self._curves or self._scale is None:
+        if not self._eff_curves or self._scale is None:
             p.setPen(muted)
-            msg = "NO CSV POINTS MEASURED YET" if self.target_freqs else "NO POINTS YET"
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, msg)
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "NO POINTS YET")
             p.end()
             return pm
 
@@ -447,7 +1079,6 @@ class PowerCurvePlot(QWidget):
         def py(y: float) -> float:
             return r.bottom() - (min(max(y, lo), hi) - lo) / (hi - lo) * r.height()
 
-        # Метки целевых частот из CSV по нижней оси
         if self.target_freqs:
             p.setPen(QPen(muted, 1))
             for tf in self.target_freqs:
@@ -459,23 +1090,38 @@ class PowerCurvePlot(QWidget):
         p.save()
         p.setClipRect(r.adjusted(-4, -4, 4, 4))
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # Сохранённая память (пунктиром под живыми кривыми)
+        if self.memory and self.memory_visible and not self._math_active():
+            for i, (_mlbl, mtr) in enumerate(self.memory):
+                mc = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
+                mc.setAlpha(115)
+                mpts = [QPointF(px(x), py(y)) for x, y in zip(mtr.x, mtr.y) if math.isfinite(x) and math.isfinite(y)]
+                if len(mpts) > 1:
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    pen = QPen(mc, 1.2, Qt.PenStyle.DashLine)
+                    pen.setCosmetic(True)
+                    p.setPen(pen)
+                    p.drawPolyline(QPolygonF(mpts))
+
         rendered_pts: dict[int, tuple[QColor, list[tuple[float, float, float]]]] = {}
-        for i, (_cp, _lbl, pts) in enumerate(self._curves):
+        for i, (_cp, _lbl, pts) in enumerate(self._eff_curves):
             color = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
-            pts_px = [(px(f), py(yv), yv) for f, yv, _d in pts]
+            pts_px = [(px(f), py(yv), yv) for f, yv in pts]
             rendered_pts[i] = (color, pts_px)
             if len(pts_px) > 1:
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                pen = QPen(color, 1.4)
+                pen = QPen(color, 1.5)
                 pen.setCosmetic(True)
                 p.setPen(pen)
                 p.drawPolyline(QPolygonF([QPointF(x, y) for x, y, _v in pts_px]))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(color)
-            for x_px, y_px, _v in pts_px:
-                p.drawEllipse(QPointF(x_px, y_px), 3.0, 3.0)
+            if self.show_points or len(pts_px) == 1:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(color)
+                for x_px, y_px, _v in pts_px:
+                    p.drawEllipse(QPointF(x_px, y_px), 3.2, 3.2)
 
-        # Подписи мощности: максимальная кривая — сверху точек, минимальная — снизу точек
+        # Подписи мощности ТОЛЬКО для крайних кривых: max-мощность сверху, min-мощность снизу
         if max_idx is not None and max_idx in rendered_pts:
             c_max, pts_max = rendered_pts[max_idx]
             self._draw_point_labels(p, pts_max, r, c_max, "above")
@@ -487,36 +1133,68 @@ class PowerCurvePlot(QWidget):
         # Легенда (сверху слева) и шкала Y (сверху справа)
         p.setFont(self._font)
         x_leg = r.left() + 2
-        for i, (_cp, lbl, _pts) in enumerate(self._curves):
+        for i, (_cp, lbl, _pts) in enumerate(self._eff_curves):
             color = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
             p.setPen(color)
-            w = p.fontMetrics().horizontalAdvance(lbl) + 12
-            if x_leg + w > r.right() - 120:
+            w = p.fontMetrics().horizontalAdvance(lbl) + 14
+            if x_leg + w > r.right() - 140:
                 break
-            p.drawText(QRectF(x_leg, 3, w, 15), Qt.AlignmentFlag.AlignLeft, lbl)
+            p.drawText(QRectF(x_leg, 3, w, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, lbl)
             x_leg += w
+        if self._math_active():
+            tag_map = {"SUB": "[DATA−MEM]", "ADD": "[DATA+MEM]", "DIV": "[DATA/MEM]", "MUL": "[DATA×MEM]"}
+            tag = f"[f: {self.math_expr}]" if self.math_mode == "EXPR" else tag_map.get(self.math_mode, "[MATH]")
+            p.setPen(muted)
+            tw = p.fontMetrics().horizontalAdvance(tag) + 10
+            p.drawText(QRectF(x_leg, 3, tw, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, tag)
+        elif self.memory:
+            tag = "[MEM]" if self.memory_visible else "[MEM OFF]"
+            p.setPen(muted)
+            tw = p.fontMetrics().horizontalAdvance(tag) + 10
+            p.drawText(QRectF(x_leg, 3, tw, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, tag)
+
+        eu = self._effective_unit()
         p.setPen(muted)
-        if self.unit in self._SI_UNITS:
-            scale_s = f"{si_format(hi, self.unit, 4)}  {si_format(step, self.unit, 3)}/div"
+        if eu in self._SI_UNITS:
+            scale_s = f"{si_format(hi, eu, 4)}  {si_format(step, eu, 3)}/div"
         else:
-            div_u = "dB" if self.unit == "dBm" else self.unit
-            scale_s = f"{hi:g} {self.unit}  {step:g} {div_u}/div"
-        p.drawText(QRectF(r.left(), 3, r.width(), 15), Qt.AlignmentFlag.AlignRight, scale_s)
+            div_u = "dB" if eu == "dBm" else eu
+            top_s = f"{hi:g} {eu}" if eu else f"{hi:g}"
+            div_s = f"{step:g} {div_u}/div" if div_u else f"{step:g}/div"
+            scale_s = f"{top_s}  {div_s}"
+        if self.manual_scale:
+            scale_s += "  MAN"
+        p.drawText(QRectF(r.left(), 3, r.width(), 19), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, scale_s)
 
         # Ось X снизу
-        bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 15)
-        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, "Hz", 4))
-        p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, 'Hz', 3)}/div")
-        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, "Hz", 4))
+        bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 19)
+        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, si_format(x0, "Hz", 4))
+        p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   f"{si_format((x1 - x0) / self.DIVS_X, 'Hz', 3)}/div")
+        p.drawText(bottom, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, si_format(x1, "Hz", 4))
+
+        # Полоса выбранных метрик анализа под осью X
+        if an_lines:
+            p.setPen(QColor(UI_COLOR_TEXT))
+            y_an = r.bottom() + 24
+            for ln in an_lines:
+                p.drawText(QRectF(r.left() + 2, y_an, r.width() - 4, 18),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, ln)
+                y_an += 18
         p.end()
         return pm
 
     def paintEvent(self, e):  # noqa: N802 - Qt
         if self.width() <= 0 or self.height() <= 0:
             return
-        key = (self.width(), self.height(), self.devicePixelRatioF(), self.unit,
-               tuple((cp, tuple(pts)) for cp, _lbl, pts in self._curves),
-               tuple(self.target_freqs), self._scale)
+        key = (
+            self.width(), self.height(), self.devicePixelRatioF(), self.unit,
+            tuple((cp, lbl, tuple(pts)) for cp, lbl, pts in self._eff_curves),
+            tuple((n, id(t)) for n, t in self.memory),
+            self.memory_visible, self.math_mode, self.math_expr,
+            self.show_grid, self.show_points, self.manual_scale, self.manual_x_range,
+            tuple(self.target_freqs), self._scale, self._divs_y, tuple(self.analysis_metrics),
+        )
         if self._cache is None or self._cache_key != key:
             self._cache = self._render_base()
             self._cache_key = key
@@ -525,7 +1203,7 @@ class PowerCurvePlot(QWidget):
             return
         p.drawPixmap(0, 0, self._cache)
         m = self._mouse
-        if m is None or not self._curves or self._scale is None:
+        if m is None or not self._eff_curves or self._scale is None:
             return
         r = self._plot_rect()
         if not r.contains(m):
@@ -541,8 +1219,8 @@ class PowerCurvePlot(QWidget):
 
         best = None
         best_d2 = math.inf
-        for _cp, lbl, pts in self._curves:
-            for f, yv, _d in pts:
+        for _cp, lbl, pts in self._eff_curves:
+            for f, yv in pts:
                 cx, cy = px(f), py(yv)
                 d2 = (cx - m.x()) ** 2 + (cy - m.y()) ** 2
                 if d2 < best_d2:
@@ -555,15 +1233,26 @@ class PowerCurvePlot(QWidget):
         p.setPen(QPen(QColor(UI_COLOR_BORDER_LIGHT), 1, Qt.PenStyle.DashLine))
         p.drawLine(QPointF(cx, r.top()), QPointF(cx, r.bottom()))
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.5))
+        p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.6))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(QPointF(cx, cy), 4.5, 4.5)
+        readout = f"{si_format(f, 'Hz', 5)}  {_fmt_short_value(yv, self._effective_unit())}  ({lbl})"
+        fm = QFontMetrics(self._font)
+        bw = fm.horizontalAdvance(readout) + 14
+        bh = fm.height() + 6
+        bx = (r.left() + 6) if cx >= r.center().x() else (r.right() - bw - 6)
+        bx = max(r.left() + 4, min(bx, r.right() - bw - 4))
+        badge = QRectF(bx, r.top() + 5, bw, bh)
+        bg = QColor(UI_COLOR_BACKGROUND)
+        bg.setAlpha(238)
+        p.setPen(QPen(QColor(UI_COLOR_BORDER_LIGHT), 1.0))
+        p.setBrush(bg)
+        p.drawRoundedRect(badge, 4, 4)
         p.setPen(QColor(UI_COLOR_TEXT))
-        p.drawText(QRectF(r.left(), r.top() + 2, r.width() - 4, 14), Qt.AlignmentFlag.AlignRight,
-                   f"{si_format(f, 'Hz', 5)}  {_fmt_short_value(yv, self.unit)}  ({lbl})")
+        p.drawText(badge, Qt.AlignmentFlag.AlignCenter, readout)
 
 
-# ------------------------------------------------------------ редактор CSV-списка целевых точек
+# ------------------------------------------------------------ редактор CSV-списка целевых точек (совместимость)
 _DIALOG_STYLE = render_qss("""
     PMPointsDialog {
         background-color: $UI_COLOR_PANEL;
@@ -637,7 +1326,6 @@ class PMPointsDialog(QDialog):
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(8)
 
-        # Заголовок и путь файла
         top = QHBoxLayout()
         hdr = QLabel("TARGET POINTS (CSV)")
         hdr.setObjectName("heading")
@@ -648,7 +1336,6 @@ class PMPointsDialog(QDialog):
         top.addWidget(self.file_label)
         lay.addLayout(top)
 
-        # Кнопки работы с CSV и строками
         bar = QHBoxLayout()
         bar.setSpacing(4)
         self.load_btn = self._btn("LOAD CSV", "Load target points from a CSV file", self.load_file)
@@ -664,7 +1351,6 @@ class PMPointsDialog(QDialog):
         self.from_meas_btn.setEnabled(bool(self._measured))
         lay.addLayout(bar)
 
-        # Таблица редактирования точек
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["FREQ (Hz / GHz)", "POWER (dBm, blank = any)"])
         self.table.verticalHeader().hide()
@@ -674,7 +1360,6 @@ class PMPointsDialog(QDialog):
         hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.table, 1)
 
-        # Быстрый генератор сетки частота × мощность
         gen_row = QHBoxLayout()
         gen_row.setSpacing(4)
         self.gen_f1 = self._edit("1G", "Grid start frequency (e.g. 1G, 500M)")
@@ -693,7 +1378,6 @@ class PMPointsDialog(QDialog):
         gen_row.addWidget(self.gen_btn)
         lay.addLayout(gen_row)
 
-        # Нижние кнопки OK / Cancel
         foot = QHBoxLayout()
         self.hint_label = QLabel("Format: freq_hz, power_dbm (SI suffixes like 2.4G supported)")
         self.hint_label.setObjectName("muted")

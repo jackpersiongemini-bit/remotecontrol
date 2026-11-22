@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import QWidget
 
 from ..core.units import si_format
 from ..core.trace import Trace
-from .plot_tools import ANALYSIS_KEYS, PlotSettingsPopup, analyze_trace, format_analysis, trace_diff
+from .plot_tools import (ANALYSIS_KEYS, MATH_MODES, PlotSettingsPopup, analyze_trace, format_analysis, trace_math,
+                         validate_math_expr)
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
                     UI_COLOR_TEXT, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS)
 
@@ -185,6 +186,7 @@ class LivePlot(QWidget):
     DIVS_X, DIVS_Y = 10, 6
     _SI_UNITS = ("W", "s", "Hz", "V", "A")
     settings_changed = pyqtSignal()
+    settings_requested = pyqtSignal()
 
     def __init__(self, parent=None, min_height: int = 240):
         super().__init__(parent)
@@ -199,7 +201,7 @@ class LivePlot(QWidget):
         self._y_unit: str | None = None
         self._y_transform = None
 
-        # Пользовательские настройки шкалы, памяти (MEM) и анализа
+        # Пользовательские настройки шкалы, памяти (MEM), математики (MATH) и анализа
         self.manual_scale: bool = False
         self._manual_scale: tuple[float, float, float] | None = None
         self._manual_divs_y: int = self.DIVS_Y
@@ -208,22 +210,41 @@ class LivePlot(QWidget):
         self.show_points: bool = False
         self.memory: list[tuple[str, Trace]] = []
         self.memory_visible: bool = True
-        self.memory_diff: bool = False
+        self.math_mode: str = "OFF"
+        self.math_expr: str = ""
         self.analysis_metrics: list[str] = []
         self._settings: QSettings | None = None
         self._settings_key: str = ""
         self._popup: PlotSettingsPopup | None = None
-        self._diff_cache: dict[tuple[int, int, int], Trace] = {}
+        self._math_cache: dict[tuple, Trace] = {}
 
         self._mouse: QPointF | None = None
         self._cache: QPixmap | None = None
         self._cache_key: tuple | None = None
         self._font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
-        self._font.setPointSizeF(8)
+        self._font.setPointSizeF(10.0)
         self.setMouseTracking(True)
         self.setMinimumHeight(min_height)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setToolTip("Double-click: store / clear MEM · Wheel: zoom Y · Right-click: scale, analysis & MEM")
+        self.setToolTip("Double-click: store / clear MEM · Wheel: zoom Y · Right-click: plot settings")
+
+    @property
+    def memory_diff(self) -> bool:
+        return self.math_mode == "SUB" and bool(self.memory)
+
+    @memory_diff.setter
+    def memory_diff(self, on: bool) -> None:
+        if on and self.memory:
+            self.math_mode = "SUB"
+        elif self.math_mode == "SUB":
+            self.math_mode = "OFF"
+
+    def _math_active(self) -> bool:
+        if self.math_mode == "OFF":
+            return False
+        if self.math_mode == "EXPR":
+            return bool(self.math_expr.strip()) and validate_math_expr(self.math_expr)[0]
+        return bool(self.memory)
 
     # ------------------------------------------------------------ сохранение настроек графика
     def bind_settings(self, settings: QSettings | None, key: str) -> None:
@@ -266,6 +287,13 @@ class LivePlot(QWidget):
                     self.manual_x_range = (x0, x1)
             except (TypeError, ValueError):
                 pass
+        saved_expr = str(settings.value(f"{base}/MATH_EXPR", "", type=str) or "").strip()
+        saved_mode = str(settings.value(f"{base}/MATH_MODE", "OFF", type=str) or "OFF").upper()
+        self.math_expr = saved_expr if (saved_expr and validate_math_expr(saved_expr)[0]) else ""
+        if saved_mode == "EXPR" and self.math_expr:
+            self.math_mode = "EXPR"
+        else:
+            self.math_mode = "OFF"
         self._rescale()
         self.update()
 
@@ -278,6 +306,8 @@ class LivePlot(QWidget):
         s.setValue(f"{base}/POINTS", self.show_points)
         s.setValue(f"{base}/ANALYSIS", json.dumps(self.analysis_metrics))
         s.setValue(f"{base}/MANUAL_SCALE", self.manual_scale)
+        s.setValue(f"{base}/MATH_MODE", self.math_mode if self.math_mode == "EXPR" else "OFF")
+        s.setValue(f"{base}/MATH_EXPR", self.math_expr)
         if self.manual_scale and self._manual_scale is not None:
             _lo, hi, step = self._manual_scale
             s.setValue(f"{base}/MAN_REF", hi)
@@ -311,7 +341,7 @@ class LivePlot(QWidget):
         self._y_transform = y_transform
         if not self.manual_scale:
             self._divs_y = new_divs
-            if scale is not None and not (self.memory_diff and self.memory):
+            if scale is not None and not self._math_active():
                 self._scale = scale
             else:
                 self._scale = None
@@ -326,7 +356,7 @@ class LivePlot(QWidget):
             return
         self.traces = cleaned
         self.points = points
-        self._diff_cache.clear()
+        self._math_cache.clear()
         self._rescale()
         self.update()
 
@@ -411,18 +441,19 @@ class LivePlot(QWidget):
             return False
         self.memory = [(n, t) for n, t in self.traces]
         self.memory_visible = True
-        self._diff_cache.clear()
+        self._math_cache.clear()
         self._rescale()
         self.settings_changed.emit()
         self.update()
         return True
 
     def clear_memory(self) -> None:
-        if not self.memory and not self.memory_diff:
+        if not self.memory and self.math_mode not in ("SUB", "ADD", "DIV", "MUL"):
             return
         self.memory = []
-        self.memory_diff = False
-        self._diff_cache.clear()
+        if self.math_mode in ("SUB", "ADD", "DIV", "MUL"):
+            self.math_mode = "OFF"
+        self._math_cache.clear()
         if not self.manual_scale:
             self._scale = None
             self._rescale()
@@ -442,14 +473,25 @@ class LivePlot(QWidget):
         self.update()
 
     def set_memory_diff(self, on: bool) -> None:
-        on = bool(on) and bool(self.memory)
-        if on == self.memory_diff:
-            return
-        self.memory_diff = on
-        self._diff_cache.clear()
+        self.set_math("SUB" if (bool(on) and bool(self.memory)) else "OFF")
+
+    def set_math(self, mode: str, expr: str | None = None) -> None:
+        """Задать режим математики графика: ``OFF / SUB / ADD / DIV / MUL / EXPR``."""
+        mode = str(mode or "OFF").upper()
+        if mode not in MATH_MODES:
+            mode = "OFF"
+        if expr is not None:
+            self.math_expr = str(expr).strip()
+        if mode in ("SUB", "ADD", "DIV", "MUL") and not self.memory:
+            mode = "OFF"
+        if mode == "EXPR" and (not self.math_expr or not validate_math_expr(self.math_expr)[0]):
+            mode = "OFF"
+        self.math_mode = mode
+        self._math_cache.clear()
         if not self.manual_scale:
             self._scale = None
             self._rescale()
+        self._save_settings()
         self.settings_changed.emit()
         self.update()
 
@@ -502,6 +544,8 @@ class LivePlot(QWidget):
             "memory_count": len(self.memory),
             "memory_visible": self.memory_visible,
             "memory_diff": self.memory_diff,
+            "math_mode": self.math_mode,
+            "math_expr": self.math_expr,
             "analysis_metrics": list(self.analysis_metrics),
             "supports_divs": True,
             "supports_x_zoom": True,
@@ -510,22 +554,23 @@ class LivePlot(QWidget):
 
     # ------------------------------------------------------------ трассы, шкала и анализ
     def _effective_traces(self) -> tuple[list[tuple[str, Trace]], object]:
-        if self.memory_diff and self.memory and self.traces:
+        if self._math_active() and self.traces:
             out: list[tuple[str, Trace]] = []
             yt_id = id(self._y_transform)
             for i, (name, tr) in enumerate(self.traces):
-                mem_tr = self.memory[i][1] if i < len(self.memory) else self.memory[0][1]
-                ck = (id(tr), id(mem_tr), yt_id)
-                diff_tr = self._diff_cache.get(ck)
-                if diff_tr is None:
-                    diff_tr = trace_diff(tr, mem_tr, y_transform=self._y_transform)
-                    self._diff_cache[ck] = diff_tr
-                out.append((f"Δ{name}" if name else "ΔMEM", diff_tr))
+                mem_tr = (self.memory[i][1] if i < len(self.memory) else self.memory[0][1]) if self.memory else None
+                ck = (id(tr), id(mem_tr), yt_id, self.math_mode, self.math_expr)
+                math_tr = self._math_cache.get(ck)
+                if math_tr is None:
+                    math_tr = trace_math(tr, mem_tr, self.math_mode, self.math_expr, y_transform=self._y_transform)
+                    self._math_cache[ck] = math_tr
+                prefix = {"SUB": "Δ", "ADD": "+", "DIV": "÷", "MUL": "×", "EXPR": "f:"}.get(self.math_mode, "")
+                out.append((f"{prefix}{name}" if name else math_tr.name, math_tr))
             return out, None
         return self.traces, self._y_transform
 
     def _effective_y_unit(self, first: Trace | None) -> str:
-        if self.memory_diff and self.memory and first is not None:
+        if self._math_active() and first is not None:
             return first.y_unit
         if self._y_unit is not None:
             return self._y_unit
@@ -568,7 +613,7 @@ class LivePlot(QWidget):
             self._scale = self._manual_scale
             return
         self._divs_y = self._device_divs_y
-        if self._fixed_scale is not None and not (self.memory_diff and self.memory):
+        if self._fixed_scale is not None and not self._math_active():
             self._scale = self._fixed_scale
             return
         eff, yt = self._effective_traces()
@@ -651,18 +696,21 @@ class LivePlot(QWidget):
         e.accept()
 
     def contextMenuEvent(self, e):  # noqa: N802 - Qt
-        self.open_settings(e.globalPos())
+        if self.receivers(self.settings_requested) > 0:
+            self.settings_requested.emit()
+        else:
+            self.open_settings(e.globalPos())
         e.accept()
 
     # ------------------------------------------------------------ рисование
     def _analysis_height(self, lines: list[str] | None = None) -> int:
         if lines is None:
             lines = self.analysis_lines()
-        return (len(lines) * 14 + 4) if lines else 0
+        return (len(lines) * 18 + 6) if lines else 0
 
     def _plot_rect(self, analysis_h: int | None = None) -> QRectF:
         ah = self._analysis_height() if analysis_h is None else analysis_h
-        return QRectF(self.rect()).adjusted(6, 20, -6, -(20 + ah))
+        return QRectF(self.rect()).adjusted(8, 25, -8, -(25 + ah))
 
     def _x_bounds(self) -> tuple[float, float]:
         if self.manual_x_range is not None:
@@ -761,7 +809,7 @@ class LivePlot(QWidget):
         p.setClipRect(r.adjusted(-3, -3, 3, 3))
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         # Память (MEM) рисуется пунктиром под живыми трассами (в режиме overlay)
-        if self.memory and self.memory_visible and not self.memory_diff:
+        if self.memory and self.memory_visible and not self._math_active():
             for i, (_mname, mtr) in enumerate(self.memory):
                 mc = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
                 mc.setAlpha(115)
@@ -770,12 +818,12 @@ class LivePlot(QWidget):
         for i, (_name, t) in enumerate(eff):
             color = QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)])
             self._draw_trace(p, t, x0, x1, lo, hi, r, yt, color, draw_pts=draw_pts)
-        if (not self.memory_diff and self.marker
+        if (not self._math_active() and self.marker
                 and math.isfinite(self.marker[0]) and math.isfinite(self.marker[1])):
             my_val = yt(self.marker[1]) if yt is not None else self.marker[1]
             if math.isfinite(my_val):
                 mx, my = px(self.marker[0]), py(my_val)
-                p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.2))
+                p.setPen(QPen(QColor(UI_COLOR_TEXT), 1.4))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawPolygon(QPointF(mx, my - 5), QPointF(mx + 5, my), QPointF(mx, my + 5), QPointF(mx - 5, my))
         p.restore()
@@ -788,14 +836,20 @@ class LivePlot(QWidget):
             if not name:
                 continue
             p.setPen(QColor(UI_TRACE_COLORS[i % len(UI_TRACE_COLORS)]))
-            w = p.fontMetrics().horizontalAdvance(name) + 12
-            p.drawText(QRectF(x_legend, 3, w, 14), Qt.AlignmentFlag.AlignLeft, name)
+            w = p.fontMetrics().horizontalAdvance(name) + 14
+            p.drawText(QRectF(x_legend, 3, w, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
             x_legend += w
-        if self.memory:
-            tag = "[DATA−MEM]" if self.memory_diff else ("[MEM]" if self.memory_visible else "[MEM OFF]")
+        if self._math_active():
+            tag_map = {"SUB": "[DATA−MEM]", "ADD": "[DATA+MEM]", "DIV": "[DATA/MEM]", "MUL": "[DATA×MEM]"}
+            tag = f"[f: {self.math_expr}]" if self.math_mode == "EXPR" else tag_map.get(self.math_mode, "[MATH]")
             p.setPen(muted)
-            tw = p.fontMetrics().horizontalAdvance(tag) + 8
-            p.drawText(QRectF(x_legend, 3, tw, 14), Qt.AlignmentFlag.AlignLeft, tag)
+            tw = p.fontMetrics().horizontalAdvance(tag) + 10
+            p.drawText(QRectF(x_legend, 3, tw, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, tag)
+        elif self.memory:
+            tag = "[MEM]" if self.memory_visible else "[MEM OFF]"
+            p.setPen(muted)
+            tw = p.fontMetrics().horizontalAdvance(tag) + 10
+            p.drawText(QRectF(x_legend, 3, tw, 19), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, tag)
 
         p.setPen(muted)
         if yu in self._SI_UNITS:
@@ -807,8 +861,8 @@ class LivePlot(QWidget):
             scale = f"{top_s}  {div_s}"
         if self.manual_scale:
             scale += "  MAN"
-        p.drawText(QRectF(r.left(), 3, r.width(), 14), Qt.AlignmentFlag.AlignRight, scale)
-        bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 14)
+        p.drawText(QRectF(r.left(), 3, r.width(), 19), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, scale)
+        bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 19)
         if xu in self._SI_UNITS:
             x0_s = si_format(x0, xu, 4)
             x1_s = si_format(x1, xu, 4)
@@ -818,18 +872,19 @@ class LivePlot(QWidget):
             x0_s = f"{x0:g} {xu}" if xu else f"{x0:g}"
             x1_s = f"{x1:g} {xu}" if xu else f"{x1:g}"
             dx_s = f"{(x1 - x0) / self.DIVS_X:.3g} {dx_u}/div" if dx_u else f"{(x1 - x0) / self.DIVS_X:.3g}/div"
-        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, x0_s)
+        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, x0_s)
         if x1 != x0:
-            p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, dx_s)
-        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, x1_s)
+            p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, dx_s)
+        p.drawText(bottom, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, x1_s)
 
         # полоса выбранных метрик анализа под осью X
         if an_lines:
             p.setPen(QColor(UI_COLOR_TEXT))
-            y_an = r.bottom() + 19
+            y_an = r.bottom() + 24
             for ln in an_lines:
-                p.drawText(QRectF(r.left() + 2, y_an, r.width() - 4, 14), Qt.AlignmentFlag.AlignLeft, ln)
-                y_an += 14
+                p.drawText(QRectF(r.left() + 2, y_an, r.width() - 4, 18),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, ln)
+                y_an += 18
         p.end()
         return pm
 
@@ -839,7 +894,7 @@ class LivePlot(QWidget):
         key = (self.width(), self.height(), self.devicePixelRatioF(),
                tuple((n, id(t)) for n, t in self.traces),
                tuple((n, id(t)) for n, t in self.memory),
-               self.memory_visible, self.memory_diff,
+               self.memory_visible, self.math_mode, self.math_expr,
                self.points, self.show_points, self.show_grid,
                self.marker, self.x_range, self.manual_x_range,
                self.manual_scale, self._scale, self._divs_y, self._y_unit, self._y_transform,
@@ -877,11 +932,26 @@ class LivePlot(QWidget):
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(UI_COLOR_TEXT))
-            p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
-            p.setPen(QColor(UI_COLOR_TEXT))
+            p.drawEllipse(QPointF(cx, cy), 3.0, 3.0)
             yu = self._effective_y_unit(first)
             xu = first.x_unit
             x_txt = si_format(first.x[i], xu, 5) if xu in self._SI_UNITS else (f"{first.x[i]:.2f} {xu}" if xu else f"{first.x[i]:.4g}")
             y_txt = si_format(yi, yu, 4) if yu in self._SI_UNITS else (f"{yi:.2f} {yu}" if yu else f"{yi:.3g}")
-            p.drawText(QRectF(r.left(), r.top() + 2, r.width() - 4, 14), Qt.AlignmentFlag.AlignRight,
-                       f"{x_txt}  {y_txt}")
+            readout = f"{x_txt}  {y_txt}"
+            fm = QFontMetrics(self._font)
+            bw = fm.horizontalAdvance(readout) + 14
+            bh = fm.height() + 6
+            # Ставим табличку на противоположной от вертикальной прямой стороне, чтобы прямая не перекрывала числа
+            if cx >= r.center().x():
+                bx = r.left() + 6
+            else:
+                bx = r.right() - bw - 6
+            bx = max(r.left() + 4, min(bx, r.right() - bw - 4))
+            badge = QRectF(bx, r.top() + 5, bw, bh)
+            bg = QColor(UI_COLOR_BACKGROUND)
+            bg.setAlpha(238)
+            p.setPen(QPen(QColor(UI_COLOR_BORDER_LIGHT), 1.0))
+            p.setBrush(bg)
+            p.drawRoundedRect(badge, 4, 4)
+            p.setPen(QColor(UI_COLOR_TEXT))
+            p.drawText(badge, Qt.AlignmentFlag.AlignCenter, readout)

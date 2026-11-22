@@ -221,23 +221,23 @@ def test_main_window_source_below_graph_and_mem_scale_controls(qtbot, tmp_path):
         win.resize(900, 760)
         win.show()
         sa_panel = win.panels[proxies["e4446a"]]
-        qtbot.waitUntil(lambda: "← GEN" in sa_panel.source.text() and sa_panel.source.isVisibleTo(sa_panel),
+        qtbot.waitUntil(lambda: "dBm" in sa_panel.process_label.text() and not sa_panel.process_label.text().startswith("NOISE"),
                         timeout=10000)
-        qtbot.wait(50)
 
-        # Источник (← GEN ...) находится ПОД графиком, а не в заголовке!
-        qtbot.waitUntil(
-            lambda: (sa_panel.source.geometry().top() > sa_panel.plots[0].geometry().bottom()
-                     > sa_panel.title.geometry().bottom()),
-            timeout=2000,
-        )
-
-        # Кнопка MEM синхронизирована с графиком (двойной клик / клик по кнопке)
-        assert sa_panel.mem_button.isVisibleTo(sa_panel) and not sa_panel.mem_button.isChecked()
-        sa_panel.mem_button.click()
-        assert sa_panel.mem_button.isChecked() and bool(sa_panel.plots[0].memory)
-        sa_panel.plots[0].clear_memory()
-        assert not sa_panel.mem_button.isChecked()
+        # Заголовок облегчён: иконки настроек, очистки и закрытия; настройки открываются вместо графика
+        assert not sa_panel.settings_button.icon().isNull()
+        assert not sa_panel.clear_button.icon().isNull()
+        assert not sa_panel.close_button.icon().isNull()
+        assert sa_panel.stack.currentIndex() == 0
+        sa_panel.settings_button.click()
+        assert sa_panel.stack.currentIndex() == 1
+        assert not sa_panel.plots[0].memory
+        sa_panel.plot_settings_widget.mem_store_btn.click()
+        assert bool(sa_panel.plots[0].memory)
+        sa_panel.clear_button.click()
+        assert not sa_panel.plots[0].memory
+        sa_panel.settings_button.click()
+        assert sa_panel.stack.currentIndex() == 0
 
         # Анализ и ручная шкала на панели SA сохраняются и восстанавливаются при перезапуске
         sa_panel.plots[0].set_analysis_metrics(["mean", "min", "max", "flatness", "nonlin"])

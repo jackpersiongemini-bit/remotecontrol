@@ -25,9 +25,9 @@ from typing import Any
 from PyQt6 import sip
 from PyQt6.QtCore import QMimeData, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QDrag, QFont, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget,
-                             QTableWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+                             QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget,
+                             QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..coord import COORD, Activity, ActivityMonitor, Coordinator, profile_name
 from ..core.params import ConnectionState
@@ -37,7 +37,10 @@ from .instrument_dock import InstrumentDock, unregister_dock
 from .instrument_window import WINDOW_EVENTS, all_instrument_windows, window_for
 from .live_plot import LivePlot
 from .params import IndicatorButton, Panel, PanelLine, PanelTable, PTabBar, _repolish, paint_indicator
-from .pm_view import PMPointsDialog, PowerCurvePlot, filter_pm_matrix, load_pm_points_csv
+from .plot_tools import (ANALYSIS_KEYS, ANALYSIS_METRICS, PlotSettingsWidget, analyze_trace, eval_math_expr,
+                         format_analysis, make_panel_icon, validate_math_expr)
+from .pm_view import (PMPointsDialog, PowerCurvePlot, RangeSet, filter_pm_matrix, filter_pm_matrix_by_ranges,
+                      load_pm_points_csv, parse_range_expr)
 from .power_meter import pm_time_scale
 from .split_layout import (CUSTOM_LAYOUT_MODE, DROP_ZONES, LAYOUT_DESCRIPTIONS, LAYOUT_MODES, PLOT_LAYOUT_MODES,
                            DropZoneOverlay, GraphSplitter, PaneLeaf, PaneNode, PaneSplit, build_preset_tree,
@@ -46,7 +49,7 @@ from .split_layout import (CUSTOM_LAYOUT_MODE, DROP_ZONES, LAYOUT_DESCRIPTIONS, 
                            tree_structure_sig, tree_to_dict)
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
                     UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, UI_TITLE_BAR_ITEM_SIZE_PX,
-                    WINDOW_BAR_HEIGHT, checkbox_qss, render_qss)
+                    WINDOW_BAR_HEIGHT, checkbox_qss, render_qss, scrollbar_qss)
 from .window import CustomFullButton, Window, WindowBar, mark_growing, short_address
 
 __all__ = ["MainWindow", "SincEmblem", "InstrumentTile", "LivePanel", "CurrentPanel", "ScenarioChip", "PowerTable",
@@ -54,6 +57,7 @@ __all__ = ["MainWindow", "SincEmblem", "InstrumentTile", "LivePanel", "CurrentPa
 
 TILE_MIN_HEIGHT = UI_TITLE_BAR_ITEM_SIZE_PX
 PLOT_MIN_HEIGHT = 240
+RIGHT_PANEL_MIN_HEIGHT = 320
 UI_REFRESH_MS = 60
 PM_UNITS = ("dBm", "W", "dBW", "V", "dB")
 _PM_UNIT_LABELS = {"dBm": "dBm", "W": "W", "dBW": "dBW", "V": "V (50 Ω)", "dB": "dB (Pout − Pin)"}
@@ -649,8 +653,87 @@ class CurrentTable(QTableWidget):
             p.drawText(QRectF(self.viewport().rect()), Qt.AlignmentFlag.AlignCenter, self.EMPTY)
 
 
+def _icon_btn(kind: str, tip: str, slot, *, checkable: bool = False) -> QPushButton:
+    """Компактная кнопка заголовка панели с векторной HiDPI-иконкой."""
+    b = QPushButton()
+    b.setObjectName("tool")
+    b.setIcon(make_panel_icon(kind, 15))
+    b.setIconSize(QSize(15, 15))
+    b.setFixedSize(26, 24)
+    b.setCheckable(checkable)
+    b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.setToolTip(tip)
+    b.clicked.connect(slot)
+    return b
+
+
+class _RangeCommitEdit(QLineEdit):
+    """Поле ввода строки диапазонов/формул в настройках графика: Enter применяет, Esc/уход фокуса откатывает."""
+
+    def __init__(self, placeholder: str, tip: str, on_commit, parent=None):
+        super().__init__(parent)
+        self._committed = ""
+        self._on_commit = on_commit
+        self.setObjectName("cfg")
+        self.setPlaceholderText(placeholder)
+        self.setToolTip(tip)
+        self.returnPressed.connect(self._commit)
+
+    def set_committed(self, text: str, *, invalid: bool = False) -> None:
+        self._committed = text
+        self.blockSignals(True)
+        self.setText(text)
+        self.setModified(False)
+        self.blockSignals(False)
+        self.set_invalid(invalid)
+
+    def set_invalid(self, invalid: bool) -> None:
+        self.setProperty("invalid", bool(invalid))
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _commit(self) -> None:
+        self._on_commit()
+        self.clearFocus()
+
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        if e.key() == Qt.Key.Key_Escape:
+            self.set_committed(self._committed)
+            self.clearFocus()
+            return
+        super().keyPressEvent(e)
+
+    def focusOutEvent(self, e):  # noqa: N802 - Qt
+        super().focusOutEvent(e)
+        if self.text() != self._committed:
+            self.set_committed(self._committed)
+
+
+def _settings_scroll_area(inner: QWidget) -> QScrollArea:
+    area = QScrollArea()
+    area.setObjectName("panelSettingsScroll")
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.setWidget(inner)
+    area.setStyleSheet(render_qss("""
+        QScrollArea#panelSettingsScroll, QWidget#panelSettingsBody {
+            background-color: $UI_COLOR_BACKGROUND;
+            border: none;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
+        }
+        QWidget#panelSettingsBody QLabel#sec { font-weight: 600; color: $UI_COLOR_TEXT; }
+        QWidget#panelSettingsBody QLabel#muted { color: $UI_COLOR_BORDER_LIGHT; }
+        QWidget#panelSettingsBody QLabel#err { color: $UI_COLOR_ERROR; }
+        QWidget#panelSettingsBody QLineEdit[invalid="true"] { border-color: $UI_COLOR_ERROR; }
+        QWidget#panelSettingsBody QFrame#sep { background-color: $UI_COLOR_BORDER; max-height: 1px; min-height: 1px; }
+    """) + "\n" + scrollbar_qss("QScrollArea#panelSettingsScroll "))
+    return area
+
+
 class CurrentPanel(Panel):
-    """Панель таблицы токов одного канала ИП (частота × мощность генератора)."""
+    """Панель таблицы токов одного канала ИП (частота × мощность генератора) со встроенными настройками и анализом."""
 
     move_requested = pyqtSignal(str, int)
     swap_requested = pyqtSignal(str, str)
@@ -666,82 +749,331 @@ class CurrentPanel(Panel):
         self.plots: list[LivePlot] = []
         self.power_table: PowerTable | None = None
         self._drag_pos: QPoint | None = None
+        self._process_override: str = ""
         self._rf_choice_key: str = ""
+        self._freq_range: RangeSet = RangeSet("", (), "freq")
+        self._power_range: RangeSet = RangeSet("", (), "power")
+        self._math_expr: str = ""
+        self.analysis_metrics: list[str] = []
         if settings is not None:
             self._rf_choice_key = str(settings.value(f"MAIN/CURR_RF/{self.panel_key}", "") or "")
+            raw_f = str(settings.value(f"MAIN/CURR_FREQ_RANGE/{self.panel_key}", "", type=str) or "").strip()
+            raw_p = str(settings.value(f"MAIN/CURR_POWER_RANGE/{self.panel_key}", "", type=str) or "").strip()
+            try:
+                self._freq_range = parse_range_expr(raw_f, "freq")
+            except ValueError:
+                self._freq_range = RangeSet("", (), "freq")
+            try:
+                self._power_range = parse_range_expr(raw_p, "power")
+            except ValueError:
+                self._power_range = RangeSet("", (), "power")
+            expr = str(settings.value(f"MAIN/CURR_MATH/{self.panel_key}", "", type=str) or "").strip()
+            self._math_expr = expr if (expr and validate_math_expr(expr)[0]) else ""
+            raw_an = str(settings.value(f"MAIN/CURR_ANALYSIS/{self.panel_key}", "", type=str) or "")
+            try:
+                items = json.loads(raw_an) if raw_an else []
+                if isinstance(items, list):
+                    self.analysis_metrics = [k for k in items if k in ANALYSIS_KEYS]
+            except (TypeError, ValueError):
+                self.analysis_metrics = []
 
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
+        lay.setSpacing(4)
+
+        # Облегчённый заголовок: имя прибора + процесс над графиком + 3 иконки (настройки, clear, закрыть)
         head = QHBoxLayout()
         head.setSpacing(6)
         self.title = QLabel(f"{monitor.name(proxy)} CH{self.channel}")
         self.title.setObjectName("heading")
         self.title.setToolTip(f"{monitor.name(proxy)} CH{self.channel}: {proxy.name} ({short_address(proxy.address)})")
-        self.address = QLabel(short_address(proxy.address))
-        self.source = QLabel()
-        self.source.setObjectName("source")
-        self.level = QLabel()
-        self.level.setObjectName("heading")
+        self.process_label = QLabel()
+        self.process_label.setObjectName("heading")
+        self.process_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.level = self.process_label  # совместимость
 
-        self.rf_button = QPushButton("RF: AUTO")
-        self.rf_button.setObjectName("chip")
-        self.rf_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.rf_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.rf_button.setToolTip("Select RF generator source for frequency / output power axes (AUTO or specific generator)")
-        self.rf_button.clicked.connect(self._open_rf_menu)
+        self.settings_button = _icon_btn("settings", "Toggle settings for this table",
+                                         self._on_settings_toggled, checkable=True)
+        self.clear_button = _icon_btn("clear", "Clear this channel's current table", self.clear_data)
+        self.close_button = _icon_btn("close", "Hide this current table",
+                                      lambda: self.close_requested.emit(self.panel_key))
+        head.addWidget(self.title)
+        head.addWidget(self.process_label, 1)
+        head.addWidget(self.settings_button)
+        head.addWidget(self.clear_button)
+        head.addWidget(self.close_button)
+        lay.addLayout(head)
 
         saved_unit = str(settings.value(f"MAIN/CURR_UNIT/{self.panel_key}", "AUTO") or "AUTO") if settings else "AUTO"
         if saved_unit not in CURRENT_UNITS:
             saved_unit = "AUTO"
-        self.unit_button = QPushButton(saved_unit)
-        self.unit_button.setObjectName("chip")
-        self.unit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.unit_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.unit_button.setToolTip("Current table unit (AUTO / mA / A / µA). Click - next, right click - choose")
-        self.unit_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.unit_button.clicked.connect(self._next_unit)
-        self.unit_button.customContextMenuRequested.connect(self._unit_menu)
 
-        self.clear_button = QPushButton("CLEAR")
-        self.clear_button.setObjectName("chip")
-        self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clear_button.setToolTip("Clear this channel's current table")
-        self.clear_button.clicked.connect(lambda: self.monitor.clear_psu_table(self.proxy, self.channel))
-
-        self.move_prev_button = LivePanel._tool_btn("◀", "Move current table earlier",
-                                                    lambda: self.move_requested.emit(self.panel_key, -1))
-        self.move_next_button = LivePanel._tool_btn("▶", "Move current table later",
-                                                    lambda: self.move_requested.emit(self.panel_key, 1))
-        self.close_button = LivePanel._tool_btn("×", "Hide this current table",
-                                                lambda: self.close_requested.emit(self.panel_key))
-        head.addWidget(self.title)
-        head.addStretch()
-        head.addWidget(self.level)
-        head.addWidget(self.rf_button)
-        head.addWidget(self.unit_button)
-        head.addWidget(self.clear_button)
-        head.addWidget(self.move_prev_button)
-        head.addWidget(self.move_next_button)
-        head.addWidget(self.close_button)
-        lay.addLayout(head)
-
+        # Содержимое: страница 0 — таблица + строка анализа; страница 1 — встроенные настройки
+        self.stack = QStackedWidget()
+        content_page = QWidget()
+        c_lay = QVBoxLayout(content_page)
+        c_lay.setContentsMargins(0, 0, 0, 0)
+        c_lay.setSpacing(4)
         self.current_table = mark_growing(CurrentTable(unit=saved_unit))
-        lay.addWidget(self.current_table, 1)
-        foot = QHBoxLayout()
-        foot.setContentsMargins(2, 0, 2, 0)
-        foot.setSpacing(6)
-        foot.addWidget(self.source)
-        foot.addStretch()
-        foot.addWidget(self.address)
-        lay.addLayout(foot)
+        c_lay.addWidget(self.current_table, 1)
+        self.analysis_label = QLabel()
+        self.analysis_label.setObjectName("source")
+        self.analysis_label.setWordWrap(True)
+        self.analysis_label.hide()
+        c_lay.addWidget(self.analysis_label)
+        self.stack.addWidget(content_page)
+
+        self._settings_body = self._build_settings_view(saved_unit)
+        self._settings_scroll = _settings_scroll_area(self._settings_body)
+        self.stack.addWidget(self._settings_scroll)
+        lay.addWidget(self.stack, 1)
+
         super().__init__(body, parent=parent)
         self.setAcceptDrops(True)
-        self.address.setStyleSheet("color: #8a8a8a;")
-        self.source.setStyleSheet("color: #8a8a8a;")
         self._apply_saved_rf_source()
+
+    def _build_settings_view(self, saved_unit: str) -> QWidget:
+        w = QWidget()
+        w.setObjectName("panelSettingsBody")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        hdr = QLabel("CURRENT TABLE SETTINGS")
+        hdr.setObjectName("sec")
+        done_btn = QPushButton("DONE")
+        done_btn.setObjectName("chip")
+        done_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        done_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        done_btn.setToolTip("Return to current table")
+        done_btn.clicked.connect(lambda: self.set_settings_open(False))
+        top.addWidget(hdr)
+        top.addStretch()
+        top.addWidget(done_btn)
+        lay.addLayout(top)
+
+        # Выбор RF-источника
+        rf_row = QHBoxLayout()
+        rf_row.setSpacing(6)
+        rf_lbl = QLabel("RF SOURCE")
+        rf_lbl.setObjectName("muted")
+        self.rf_button = QPushButton("RF: AUTO")
+        self.rf_button.setObjectName("chip")
+        self.rf_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rf_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rf_button.setToolTip("Select RF generator source for frequency / output power axes")
+        self.rf_button.clicked.connect(self._open_rf_menu)
+        rf_row.addWidget(rf_lbl)
+        rf_row.addWidget(self.rf_button)
+        rf_row.addStretch()
+        lay.addLayout(rf_row)
+
+        # Единицы тока
+        u_row = QHBoxLayout()
+        u_row.setSpacing(4)
+        u_lbl = QLabel("UNIT")
+        u_lbl.setObjectName("muted")
+        u_row.addWidget(u_lbl)
+        self.unit_buttons: dict[str, QPushButton] = {}
+        for u in CURRENT_UNITS:
+            b = QPushButton(u)
+            b.setObjectName("chip")
+            b.setCheckable(True)
+            b.setChecked(u == saved_unit)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(_CURR_UNIT_LABELS[u])
+            b.clicked.connect(lambda _=False, unit=u: self.set_unit(unit))
+            self.unit_buttons[u] = b
+            u_row.addWidget(b)
+        u_row.addStretch()
+        lay.addLayout(u_row)
+
+        # Диапазоны частот и мощностей
+        sep1 = QFrame()
+        sep1.setObjectName("sep")
+        lay.addWidget(sep1)
+        rng_lbl = QLabel("RANGES  {f1}+{[f2,f3],[f4,f5]}-{[f6]}")
+        rng_lbl.setObjectName("sec")
+        lay.addWidget(rng_lbl)
+        rng_grid = QGridLayout()
+        rng_grid.setHorizontalSpacing(6)
+        rng_grid.setVerticalSpacing(4)
+        fl = QLabel("FREQ")
+        fl.setObjectName("muted")
+        pl = QLabel("POWER")
+        pl.setObjectName("muted")
+        self.freq_range_edit = _RangeCommitEdit(
+            "{1G}+{[2G,3G]}-{[2.5G]}",
+            "Frequency range set expression (Enter to apply, blank = all)",
+            self._apply_freq_range,
+        )
+        self.freq_range_edit.set_committed(self._freq_range.raw)
+        self.power_range_edit = _RangeCommitEdit(
+            "{12}+{[15,17]}-{[16]}",
+            "Power range set expression in dBm (Enter to apply, blank = all)",
+            self._apply_power_range,
+        )
+        self.power_range_edit.set_committed(self._power_range.raw)
+        rng_grid.addWidget(fl, 0, 0)
+        rng_grid.addWidget(self.freq_range_edit, 0, 1)
+        rng_grid.addWidget(pl, 1, 0)
+        rng_grid.addWidget(self.power_range_edit, 1, 1)
+        lay.addLayout(rng_grid)
+        self.range_status = QLabel("")
+        self.range_status.setObjectName("muted")
+        lay.addWidget(self.range_status)
+
+        # MATH для токов
+        sep2 = QFrame()
+        sep2.setObjectName("sep")
+        lay.addWidget(sep2)
+        m_row = QHBoxLayout()
+        m_row.setSpacing(6)
+        ml = QLabel("MATH f(x,y)")
+        ml.setObjectName("sec")
+        self.math_edit = _RangeCommitEdit(
+            "e.g. y * 1000, y - 0.01",
+            "Math formula applied to current values y (A) at frequency x (Hz); Enter to apply",
+            self._apply_math,
+        )
+        self.math_edit.set_committed(self._math_expr)
+        m_row.addWidget(ml)
+        m_row.addWidget(self.math_edit, 1)
+        lay.addLayout(m_row)
+
+        # ANALYSIS для токов
+        sep3 = QFrame()
+        sep3.setObjectName("sep")
+        lay.addWidget(sep3)
+        an_hdr = QHBoxLayout()
+        an_lbl = QLabel("ANALYSIS")
+        an_lbl.setObjectName("sec")
+        all_b = QPushButton("ALL")
+        all_b.setObjectName("chip")
+        all_b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        all_b.setCursor(Qt.CursorShape.PointingHandCursor)
+        all_b.setToolTip("Enable all analysis metrics")
+        all_b.clicked.connect(lambda: self.set_analysis_metrics(list(ANALYSIS_KEYS)))
+        none_b = QPushButton("NONE")
+        none_b.setObjectName("chip")
+        none_b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        none_b.setCursor(Qt.CursorShape.PointingHandCursor)
+        none_b.setToolTip("Disable all analysis metrics")
+        none_b.clicked.connect(lambda: self.set_analysis_metrics([]))
+        an_hdr.addWidget(an_lbl)
+        an_hdr.addStretch()
+        an_hdr.addWidget(all_b)
+        an_hdr.addWidget(none_b)
+        lay.addLayout(an_hdr)
+
+        an_grid = QGridLayout()
+        an_grid.setHorizontalSpacing(10)
+        an_grid.setVerticalSpacing(4)
+        self.analysis_checks: dict[str, QCheckBox] = {}
+        for idx, (key, label, tip) in enumerate(ANALYSIS_METRICS):
+            cb = QCheckBox(label)
+            cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            cb.setToolTip(tip)
+            cb.setChecked(key in self.analysis_metrics)
+            cb.toggled.connect(lambda checked, k=key: self._toggle_analysis(k, checked))
+            self.analysis_checks[key] = cb
+            an_grid.addWidget(cb, idx // 2, idx % 2)
+        lay.addLayout(an_grid)
+        lay.addStretch(1)
+        return w
+
+    def set_process_text(self, text: str) -> None:
+        self._process_override = str(text or "").strip()
+        if self._process_override:
+            self.process_label.setText(self._process_override)
+
+    def set_settings_open(self, on: bool) -> None:
+        on = bool(on)
+        self.stack.setCurrentIndex(1 if on else 0)
+        self.settings_button.blockSignals(True)
+        self.settings_button.setChecked(on)
+        self.settings_button.blockSignals(False)
+
+    def _on_settings_toggled(self) -> None:
+        self.set_settings_open(self.settings_button.isChecked())
+
+    def clear_data(self) -> None:
+        self.monitor.clear_psu_table(self.proxy, self.channel)
+
+    def _apply_freq_range(self) -> None:
+        raw = self.freq_range_edit.text().strip()
+        try:
+            self._freq_range = parse_range_expr(raw, "freq")
+        except ValueError as exc:
+            self.freq_range_edit.set_invalid(True)
+            self.range_status.setObjectName("err")
+            self.range_status.setText(str(exc))
+            return
+        self.freq_range_edit.set_committed(self._freq_range.raw, invalid=False)
+        self.range_status.setObjectName("muted")
+        self.range_status.setText("")
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/CURR_FREQ_RANGE/{self.panel_key}", self._freq_range.raw)
+        self.refresh()
+
+    def _apply_power_range(self) -> None:
+        raw = self.power_range_edit.text().strip()
+        try:
+            self._power_range = parse_range_expr(raw, "power")
+        except ValueError as exc:
+            self.power_range_edit.set_invalid(True)
+            self.range_status.setObjectName("err")
+            self.range_status.setText(str(exc))
+            return
+        self.power_range_edit.set_committed(self._power_range.raw, invalid=False)
+        self.range_status.setObjectName("muted")
+        self.range_status.setText("")
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/CURR_POWER_RANGE/{self.panel_key}", self._power_range.raw)
+        self.refresh()
+
+    def _apply_math(self) -> None:
+        expr = self.math_edit.text().strip()
+        if not expr:
+            self._math_expr = ""
+            self.math_edit.set_committed("", invalid=False)
+        else:
+            ok, err = validate_math_expr(expr)
+            if not ok:
+                self.math_edit.set_invalid(True)
+                self.range_status.setObjectName("err")
+                self.range_status.setText(err)
+                return
+            self._math_expr = expr
+            self.math_edit.set_committed(expr, invalid=False)
+            self.range_status.setObjectName("muted")
+            self.range_status.setText("")
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/CURR_MATH/{self.panel_key}", self._math_expr)
+        self.refresh()
+
+    def set_analysis_metrics(self, metrics: list[str] | tuple[str, ...]) -> None:
+        cleaned = [k for k in ANALYSIS_KEYS if k in set(metrics)]
+        self.analysis_metrics = cleaned
+        for k, cb in self.analysis_checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(k in cleaned)
+            cb.blockSignals(False)
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/CURR_ANALYSIS/{self.panel_key}", json.dumps(cleaned))
+        self.refresh()
+
+    def _toggle_analysis(self, key: str, on: bool) -> None:
+        cur = set(self.analysis_metrics)
+        if on:
+            cur.add(key)
+        else:
+            cur.discard(key)
+        self.set_analysis_metrics(list(cur))
 
     def _rf_proxy_key(self, rf_proxy) -> str:
         return f"{self.monitor.name(rf_proxy)}:{rf_proxy.address}"
@@ -786,94 +1118,66 @@ class CurrentPanel(Panel):
         menu.popup(self.rf_button.mapToGlobal(self.rf_button.rect().bottomLeft()))
 
     def set_unit(self, unit: str) -> None:
-        if unit not in CURRENT_UNITS or unit == self.current_table.unit:
+        if unit not in CURRENT_UNITS:
             return
         self.current_table.set_unit(unit)
-        self.unit_button.setText(unit)
+        for u, b in self.unit_buttons.items():
+            b.blockSignals(True)
+            b.setChecked(u == unit)
+            b.blockSignals(False)
         if self.settings is not None:
             self.settings.setValue(f"MAIN/CURR_UNIT/{self.panel_key}", unit)
         self.refresh()
-
-    def _next_unit(self) -> None:
-        idx = CURRENT_UNITS.index(self.current_table.unit)
-        self.set_unit(CURRENT_UNITS[(idx + 1) % len(CURRENT_UNITS)])
-
-    def _unit_menu(self, pos: QPoint) -> None:
-        menu = QMenu(self)
-        menu.setObjectName("psmenu")
-        for u in CURRENT_UNITS:
-            act = menu.addAction(_CURR_UNIT_LABELS[u])
-            act.setCheckable(True)
-            act.setChecked(u == self.current_table.unit)
-            act.triggered.connect(lambda _=False, unit=u: self.set_unit(unit))
-        menu.popup(self.unit_button.mapToGlobal(pos))
-
-    def mousePressEvent(self, e):  # noqa: N802 - Qt
-        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 40:
-            self._drag_pos = e.position().toPoint()
-        else:
-            self._drag_pos = None
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):  # noqa: N802 - Qt
-        if (self._drag_pos is not None and (e.buttons() & Qt.MouseButton.LeftButton)
-                and (e.position().toPoint() - self._drag_pos).manhattanLength() >= QApplication.startDragDistance()):
-            self._drag_pos = None
-            mime = QMimeData()
-            mime.setData(_PANEL_MIME, self.panel_key.encode("utf-8"))
-            drag = QDrag(self)
-            drag.setMimeData(mime)
-            drag.exec(Qt.DropAction.MoveAction)
-            return
-        super().mouseMoveEvent(e)
-
-    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
-        self._drag_pos = None
-        super().mouseReleaseEvent(e)
-
-    def dragEnterEvent(self, e):  # noqa: N802 - Qt
-        if e.mimeData().hasFormat(_PANEL_MIME):
-            e.acceptProposedAction()
-            return
-        super().dragEnterEvent(e)
-
-    def dropEvent(self, e):  # noqa: N802 - Qt
-        if e.mimeData().hasFormat(_PANEL_MIME):
-            src = bytes(e.mimeData().data(_PANEL_MIME)).decode("utf-8")
-            if src and src != self.panel_key:
-                self.swap_requested.emit(src, self.panel_key)
-            e.acceptProposedAction()
-            return
-        super().dropEvent(e)
 
     def refresh(self, _activity=None) -> None:
         self.title.setText(f"{self.monitor.name(self.proxy)} CH{self.channel}")
         self._apply_saved_rf_source()
         src = self.monitor.psu_source(self.proxy, self.channel)
-        if src is not None:
-            pw = f"  {_fmt_num(src.power)} dBm" if src.power is not None else ""
-            self.source.setText(f"← {src.name} {si_format(src.freq, 'Hz', 6)}{pw}")
-        else:
-            self.source.setText("")
-
         cols, rows = self.monitor.psu_matrix(self.proxy, self.channel)
+        cols, rows = filter_pm_matrix_by_ranges(cols, rows, self._freq_range, self._power_range)
+        if self._math_expr:
+            m_rows: list[tuple[float, dict[float | None, float]]] = []
+            for f, vals in rows:
+                nv = {p: eval_math_expr(self._math_expr, f, v) for p, v in vals.items()}
+                nv = {p: v for p, v in nv.items() if math.isfinite(v)}
+                if nv:
+                    m_rows.append((f, nv))
+            rows = m_rows
         cur_f = None if src is None else src.freq
         cur_p = None if src is None or src.power is None else round(float(src.power), 3)
         self.current_table.set_matrix(cols, rows, cur_f, cur_p)
 
+        # Анализ по данным таблицы токов
+        if self.analysis_metrics and rows:
+            xs = [f for f, vals in rows for _v in vals.values()]
+            ys = [v for _f, vals in rows for v in vals.values()]
+            tr = Trace(tuple(xs), tuple(ys), "Hz", "A", name="I", uniform=False)
+            stats = analyze_trace(tr)
+            tokens = format_analysis(stats, self.analysis_metrics, "Hz", "A")
+            if tokens:
+                self.analysis_label.setText("  ·  ".join(tokens))
+                self.analysis_label.show()
+            else:
+                self.analysis_label.hide()
+        else:
+            self.analysis_label.hide()
+
+        if self._process_override:
+            self.process_label.setText(self._process_override)
+            return
         if self.proxy.state is not ConnectionState.CONNECTED:
-            self.level.setText("OFF")
+            self.process_label.setText("OFF")
             return
         ch_on = self.proxy.value(f"ch{self.channel}.output")
         cur_i = _num(self.proxy.value(f"ch{self.channel}.meas_i"))
         cur_v = _num(self.proxy.value(f"ch{self.channel}.meas_v"))
         if ch_on is False:
-            self.level.setText("OFF")
+            self.process_label.setText("OFF")
         elif cur_i is not None:
             v_txt = f"  {cur_v:.2f} V" if cur_v is not None else ""
-            self.level.setText(f"{_format_current(cur_i, self.current_table.unit)}{v_txt}")
+            self.process_label.setText(f"{_format_current(cur_i, self.current_table.unit)}{v_txt}")
         else:
-            self.level.setText("NO DATA")
+            self.process_label.setText("NO DATA")
 
 
 class ScenarioChip(IndicatorButton):
@@ -908,7 +1212,8 @@ class ScenarioChip(IndicatorButton):
 
 
 class LivePanel(Panel):
-    """Живые данные одного приёмника: можно разделять экран перетаскиванием, разворачивать, переставлять и закрывать."""
+    """Живые данные одного приёмника: облегчённый заголовок (имя, процесс, настройки / очистка / закрыть)
+    и встроенная страница настроек вместо графика (SCALE, MEM, MATH, ANALYSIS и параметры прибора)."""
 
     move_requested = pyqtSignal(object, int)
     swap_requested = pyqtSignal(str, str)
@@ -925,43 +1230,19 @@ class LivePanel(Panel):
         self.panel_key = f"{monitor.name(proxy)}:{proxy.address}"
         self._drag_pos: QPoint | None = None
         self._maximized = False
+        self._process_override: str = ""
         self._active_plot_count = 0
+        self._selected_plot_idx = 0
         self._plots_sig: tuple | None = None
         self._plot_root: QWidget | None = None
         self._plot_splitters: list[tuple[str, GraphSplitter]] = []
-        body = QWidget()
-        lay = QVBoxLayout(body)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        head = QHBoxLayout()
-        head.setSpacing(4)
-        self.title = QLabel()
-        self.title.setObjectName("heading")
-        self.address = QLabel(short_address(proxy.address))
-        self.source = QLabel()
-        self.source.setObjectName("source")
-        self.level = QLabel()
-        self.level.setObjectName("heading")
+
         saved_vna_split = bool(settings.value(f"MAIN/VNA_SPLIT/{self.panel_key}", False, type=bool)) if settings else False
-        self.split_traces_button = QPushButton("SPLIT")
-        self.split_traces_button.setObjectName("chip")
-        self.split_traces_button.setCheckable(True)
-        self.split_traces_button.setChecked(saved_vna_split)
-        self.split_traces_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.split_traces_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.split_traces_button.setToolTip("Split each VNA trace into its own graph (unchecked - group traces with the same scale)")
-        self.split_traces_button.toggled.connect(self.set_split_traces)
-        self.split_traces_button.hide()
         saved_plot_mode = str(settings.value(f"MAIN/PLOT_LAYOUT/{self.panel_key}", PLOT_LAYOUT_MODES[0])
                               or PLOT_LAYOUT_MODES[0]) if settings else PLOT_LAYOUT_MODES[0]
         self.plot_layout_mode = saved_plot_mode if saved_plot_mode in PLOT_LAYOUT_MODES else PLOT_LAYOUT_MODES[0]
-        self.plot_layout_button = QPushButton(self.plot_layout_mode)
-        self.plot_layout_button.setObjectName("chip")
-        self.plot_layout_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.plot_layout_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.plot_layout_button.setToolTip("Arrange plots inside this panel: 1 COL (stack), 2 COL (grid), ROW (side by side). Click to switch")
-        self.plot_layout_button.clicked.connect(self._cycle_plot_layout)
-        self.plot_layout_button.hide()
+        self._vna_split_traces = saved_vna_split
+
         saved_unit = str(settings.value(f"MAIN/PM_UNIT/{self.panel_key}", "dBm") or "dBm") if settings else "dBm"
         if saved_unit not in PM_UNITS:
             saved_unit = "dBm"
@@ -969,107 +1250,78 @@ class LivePanel(Panel):
         saved_pm_table = bool(settings.value(f"MAIN/PM_SHOW_TABLE/{self.panel_key}", True, type=bool)) if settings else True
         if not saved_pm_plot and not saved_pm_table:
             saved_pm_plot = True
-        saved_csv_on = bool(settings.value(f"MAIN/PM_CSV_ON/{self.panel_key}", False, type=bool)) if settings else False
-        self.pm_csv_path: str = str(settings.value(f"MAIN/PM_CSV_PATH/{self.panel_key}", "", type=str) or "") if settings else ""
-        self.pm_csv_points: list[tuple[float, float | None]] = self._load_pm_csv_points()
-        self.pm_csv_enabled: bool = saved_csv_on and bool(self.pm_csv_points)
+        self._pm_show_plot = saved_pm_plot
+        self._pm_show_table = saved_pm_table
 
-        self.pm_plot_button = QPushButton("PLOT")
-        self.pm_plot_button.setObjectName("chip")
-        self.pm_plot_button.setCheckable(True)
-        self.pm_plot_button.setChecked(saved_pm_plot)
-        self.pm_plot_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.pm_plot_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.pm_plot_button.setToolTip("Show / hide power meter frequency-power curve graph")
-        self.pm_plot_button.toggled.connect(self.set_pm_show_plot)
-        self.pm_plot_button.hide()
+        # Диапазоны частот и мощностей ваттметра: {f1}+{[f2,f3],[f4,f5]}-{[f6]}
+        raw_pm_f = str(settings.value(f"MAIN/PM_FREQ_RANGE/{self.panel_key}", "", type=str) or "").strip() if settings else ""
+        raw_pm_p = str(settings.value(f"MAIN/PM_POWER_RANGE/{self.panel_key}", "", type=str) or "").strip() if settings else ""
+        try:
+            self.pm_freq_range: RangeSet = parse_range_expr(raw_pm_f, "freq")
+        except ValueError:
+            self.pm_freq_range = RangeSet("", (), "freq")
+        try:
+            self.pm_power_range: RangeSet = parse_range_expr(raw_pm_p, "power")
+        except ValueError:
+            self.pm_power_range = RangeSet("", (), "power")
 
-        self.pm_table_button = QPushButton("TBL")
-        self.pm_table_button.setObjectName("chip")
-        self.pm_table_button.setCheckable(True)
-        self.pm_table_button.setChecked(saved_pm_table)
-        self.pm_table_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.pm_table_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.pm_table_button.setToolTip("Show / hide power meter frequency × power table")
-        self.pm_table_button.toggled.connect(self.set_pm_show_table)
-        self.pm_table_button.hide()
+        # Совместимость со старым CSV API (если вызывается из тестов)
+        self.pm_csv_path: str = ""
+        self.pm_csv_points: list[tuple[float, float | None]] = []
+        self.pm_csv_enabled: bool = False
 
-        self.pm_csv_button = QPushButton("CSV")
-        self.pm_csv_button.setObjectName("chip")
-        self.pm_csv_button.setCheckable(True)
-        self.pm_csv_button.setChecked(self.pm_csv_enabled)
-        self.pm_csv_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.pm_csv_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.pm_csv_button.setToolTip("Filter displayed points by CSV target list (click to toggle, ✎ to load/edit CSV)")
-        self.pm_csv_button.toggled.connect(self.set_pm_csv_enabled)
-        self.pm_csv_button.hide()
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
 
-        self.pm_csv_edit_button = self._tool_btn("✎", "Load, edit, generate, or save CSV list of points to display",
-                                                 self.edit_pm_csv_points)
-        self.pm_csv_edit_button.hide()
+        # Облегчённый заголовок: имя прибора + процесс над графиком + 3 иконки (настройки, clear, закрыть)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        self.title = QLabel()
+        self.title.setObjectName("heading")
+        self.title.setToolTip(f"{monitor.name(proxy)}: {proxy.name} ({short_address(proxy.address)})")
+        self.process_label = QLabel()
+        self.process_label.setObjectName("heading")
+        self.process_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.level = self.process_label  # совместимость
 
-        self.unit_button = QPushButton(saved_unit)
-        self.unit_button.setObjectName("chip")
-        self.unit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.unit_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.unit_button.setToolTip("Power table and graph unit (dBm / W / dBW / V / dB gain). Click - next, right click - choose")
-        self.unit_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.unit_button.clicked.connect(self._next_pm_unit)
-        self.unit_button.customContextMenuRequested.connect(self._pm_unit_menu)
-        self.unit_button.hide()
-        self.clear_button = QPushButton("CLEAR")
-        self.clear_button.setObjectName("chip")
-        self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clear_button.setToolTip("Clear the frequency / power table and graph")
-        self.clear_button.clicked.connect(lambda: self.monitor.clear_pm_table(self.proxy))
-        self.clear_button.hide()
-        self.mem_button = QPushButton("MEM")
-        self.mem_button.setObjectName("chip")
-        self.mem_button.setCheckable(True)
-        self.mem_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.mem_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.mem_button.setToolTip("Store or clear trace memory (MEM) — or double-click directly on a graph")
-        self.mem_button.clicked.connect(self._toggle_panel_mem)
-        self.mem_button.hide()
-        self.plot_settings_button = self._tool_btn(
-            "⚙",
-            "Graph scale, memory (MEM / DATA−MEM), and trace analysis checkboxes (or right-click graph)",
-            self._open_plot_settings,
+        self.settings_button = _icon_btn(
+            "settings",
+            "Open / close settings for this graph (scale, memory, math, analysis)",
+            self._on_settings_toggled,
+            checkable=True,
         )
-        self.plot_settings_button.hide()
-        self.move_prev_button = self._tool_btn("◀", "Move measurement panel earlier",
-                                               lambda: self.move_requested.emit(self.proxy, -1))
-        self.move_next_button = self._tool_btn("▶", "Move measurement panel later",
-                                               lambda: self.move_requested.emit(self.proxy, 1))
-        self.maximize_button = self._tool_btn("⤢", "Maximize this panel to fill the screen (double-click header or Esc to restore)",
-                                              lambda: self.maximize_requested.emit(self.proxy))
-        self.close_button = self._tool_btn("×", "Hide this measurement panel",
-                                           lambda: self.close_requested.emit(self.proxy))
+        self.clear_button = _icon_btn(
+            "clear",
+            "Clear measurement data / table / stored memory",
+            self.clear_data,
+        )
+        self.close_button = _icon_btn(
+            "close",
+            "Hide this measurement panel",
+            lambda: self.close_requested.emit(self.proxy),
+        )
         head.addWidget(self.title)
-        head.addWidget(self.address)
-        head.addStretch()
-        head.addWidget(self.level)
-        head.addWidget(self.pm_plot_button)
-        head.addWidget(self.pm_table_button)
-        head.addWidget(self.pm_csv_button)
-        head.addWidget(self.pm_csv_edit_button)
-        head.addWidget(self.split_traces_button)
-        head.addWidget(self.plot_layout_button)
-        head.addWidget(self.unit_button)
+        head.addWidget(self.process_label, 1)
+        head.addWidget(self.settings_button)
         head.addWidget(self.clear_button)
-        head.addWidget(self.mem_button)
-        head.addWidget(self.plot_settings_button)
-        head.addWidget(self.move_prev_button)
-        head.addWidget(self.move_next_button)
-        head.addWidget(self.maximize_button)
         head.addWidget(self.close_button)
         lay.addLayout(head)
+
+        # Стек: страница 0 — график / таблица, страница 1 — встроенные настройки вместо графика
+        self.stack = QStackedWidget()
+        self._content_page = QWidget()
+        c_lay = QVBoxLayout(self._content_page)
+        c_lay.setContentsMargins(0, 0, 0, 0)
+        c_lay.setSpacing(0)
+
         self._plots_host = QWidget()
         self.plots_box = QVBoxLayout(self._plots_host)
         self.plots_box.setContentsMargins(0, 0, 0, 0)
         self.plots_box.setSpacing(0)
-        lay.addWidget(self._plots_host, 1)
+        c_lay.addWidget(self._plots_host, 1)
+
         self.plots: list[LivePlot] = []
         self.power_table: PowerTable | None = None      # не ``table``: так Panel зовёт своё содержимое
         self.pm_plot: PowerCurvePlot | None = None
@@ -1079,6 +1331,9 @@ class LivePanel(Panel):
             self.pm_splitter.setChildrenCollapsible(False)
             self.pm_splitter.setHandleWidth(8)
             self.pm_plot = mark_growing(PowerCurvePlot(unit=saved_unit, min_height=PLOT_MIN_HEIGHT))
+            self.pm_plot.bind_settings(self.settings, f"MAIN/PM_PLOT/{self.panel_key}")
+            self.pm_plot.settings_requested.connect(lambda: self.set_settings_open(True))
+            self.pm_plot.settings_changed.connect(self._sync_settings_view)
             self.power_table = PowerTable(unit=saved_unit)
             self.pm_splitter.addWidget(self.pm_plot)
             self.pm_splitter.addWidget(self.power_table)
@@ -1086,21 +1341,18 @@ class LivePanel(Panel):
             self.pm_splitter.setStretchFactor(1, 1)
             self._restore_pm_splitter()
             self.pm_splitter.splitterMoved.connect(lambda _p, _i: self._save_pm_splitter())
-            lay.addWidget(self.pm_splitter, 1)
+            c_lay.addWidget(self.pm_splitter, 1)
             self._plots_host.hide()
 
-        # Источник сигнала (← GEN ... / CW ...) вынесен под график, чтобы не перегружать заголовок
-        self.source.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.source.hide()
-        lay.addWidget(self.source)
-        self._active_plot_count = 0
+        self.stack.addWidget(self._content_page)
+        self._settings_body = self._build_settings_view(saved_unit)
+        self._settings_scroll = _settings_scroll_area(self._settings_body)
+        self.stack.addWidget(self._settings_scroll)
+        lay.addWidget(self.stack, 1)
+
         super().__init__(body, parent=parent)
-        self.setAcceptDrops(True)
         self.setMinimumWidth(220)
-        self._drop_overlay = DropZoneOverlay(self)
-        self.address.setStyleSheet("color: #8a8a8a;")
-        self.source.setStyleSheet("color: #8a8a8a;")
-        self._sync_footer()
+        self._sync_settings_view()
 
     @staticmethod
     def _tool_btn(text: str, tip: str, slot) -> QPushButton:
@@ -1112,118 +1364,278 @@ class LivePanel(Panel):
         b.clicked.connect(slot)
         return b
 
-    def set_maximized(self, on: bool) -> None:
+    def _build_settings_view(self, saved_unit: str) -> QWidget:
+        w = QWidget()
+        w.setObjectName("panelSettingsBody")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        hdr = QLabel("GRAPH SETTINGS")
+        hdr.setObjectName("sec")
+        done_btn = QPushButton("DONE")
+        done_btn.setObjectName("chip")
+        done_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        done_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        done_btn.setToolTip("Return to graph view")
+        done_btn.clicked.connect(lambda: self.set_settings_open(False))
+        top.addWidget(hdr)
+        top.addStretch()
+        top.addWidget(done_btn)
+        lay.addLayout(top)
+
+        # Выбор графика (если у ВАЦ несколько графиков)
+        self._plot_selector_host = QWidget()
+        self._plot_selector_lay = QHBoxLayout(self._plot_selector_host)
+        self._plot_selector_lay.setContentsMargins(0, 0, 0, 0)
+        self._plot_selector_lay.setSpacing(4)
+        self._plot_selector_host.hide()
+        lay.addWidget(self._plot_selector_host)
+
+        # Опции VNA (разделение трасс и сетка графиков)
+        self.split_traces_cb: QCheckBox | None = None
+        self.plot_layout_buttons: dict[str, QPushButton] = {}
+        if self.profile == "network_analyzer":
+            vna_row = QHBoxLayout()
+            vna_row.setSpacing(8)
+            self.split_traces_cb = QCheckBox("Split each trace")
+            self.split_traces_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.split_traces_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.split_traces_cb.setChecked(self._vna_split_traces)
+            self.split_traces_cb.setToolTip("Show each VNA trace in its own graph")
+            self.split_traces_cb.toggled.connect(self.set_split_traces)
+            vna_row.addWidget(self.split_traces_cb)
+            vna_row.addStretch()
+            for mode in PLOT_LAYOUT_MODES:
+                b = QPushButton(mode)
+                b.setObjectName("chip")
+                b.setCheckable(True)
+                b.setChecked(mode == self.plot_layout_mode)
+                b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setToolTip(f"Arrange VNA plots as {mode}")
+                b.clicked.connect(lambda _=False, m=mode: self.set_plot_layout_mode(m))
+                self.plot_layout_buttons[mode] = b
+                vna_row.addWidget(b)
+            lay.addLayout(vna_row)
+            sep = QFrame()
+            sep.setObjectName("sep")
+            lay.addWidget(sep)
+
+        # Опции PM (график/таблица, единицы, множества диапазонов частот и мощностей)
+        self.pm_plot_cb: QCheckBox | None = None
+        self.pm_table_cb: QCheckBox | None = None
+        self.pm_unit_buttons: dict[str, QPushButton] = {}
+        self.pm_freq_range_edit: _RangeCommitEdit | None = None
+        self.pm_power_range_edit: _RangeCommitEdit | None = None
+        self.pm_range_status: QLabel | None = None
+        if self.profile == "power_meter":
+            view_row = QHBoxLayout()
+            view_row.setSpacing(10)
+            self.pm_plot_cb = QCheckBox("Graph")
+            self.pm_plot_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.pm_plot_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.pm_plot_cb.setChecked(self._pm_show_plot)
+            self.pm_plot_cb.setToolTip("Show / hide power meter frequency-power curve graph")
+            self.pm_plot_cb.toggled.connect(self.set_pm_show_plot)
+            self.pm_table_cb = QCheckBox("Table")
+            self.pm_table_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.pm_table_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.pm_table_cb.setChecked(self._pm_show_table)
+            self.pm_table_cb.setToolTip("Show / hide power meter frequency × power table")
+            self.pm_table_cb.toggled.connect(self.set_pm_show_table)
+            view_row.addWidget(self.pm_plot_cb)
+            view_row.addWidget(self.pm_table_cb)
+            view_row.addStretch()
+            lay.addLayout(view_row)
+
+            unit_row = QHBoxLayout()
+            unit_row.setSpacing(4)
+            ul = QLabel("UNIT")
+            ul.setObjectName("muted")
+            unit_row.addWidget(ul)
+            for u in PM_UNITS:
+                b = QPushButton(u)
+                b.setObjectName("chip")
+                b.setCheckable(True)
+                b.setChecked(u == saved_unit)
+                b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setToolTip(_PM_UNIT_LABELS[u])
+                b.clicked.connect(lambda _=False, unit=u: self.set_pm_unit(unit))
+                self.pm_unit_buttons[u] = b
+                unit_row.addWidget(b)
+            unit_row.addStretch()
+            lay.addLayout(unit_row)
+
+            sep_r = QFrame()
+            sep_r.setObjectName("sep")
+            lay.addWidget(sep_r)
+
+            rng_hdr = QHBoxLayout()
+            rl = QLabel("RANGES  {f1}+{[f2,f3],[f4,f5]}-{[f6]}")
+            rl.setObjectName("sec")
+            clr_rng = QPushButton("RESET")
+            clr_rng.setObjectName("chip")
+            clr_rng.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            clr_rng.setCursor(Qt.CursorShape.PointingHandCursor)
+            clr_rng.setToolTip("Clear frequency and power range filters (show all points)")
+            clr_rng.clicked.connect(self._clear_pm_ranges)
+            rng_hdr.addWidget(rl)
+            rng_hdr.addStretch()
+            rng_hdr.addWidget(clr_rng)
+            lay.addLayout(rng_hdr)
+
+            rng_grid = QGridLayout()
+            rng_grid.setHorizontalSpacing(6)
+            rng_grid.setVerticalSpacing(4)
+            fl = QLabel("FREQ")
+            fl.setObjectName("muted")
+            pl = QLabel("POWER")
+            pl.setObjectName("muted")
+            self.pm_freq_range_edit = _RangeCommitEdit(
+                "{1G}+{[2G,3G],[4G,5G]}-{[2.5G]}",
+                "Frequency range set expression (SI units allowed; Enter to apply, blank = all)",
+                self._apply_pm_freq_range,
+            )
+            self.pm_freq_range_edit.set_committed(self.pm_freq_range.raw)
+            self.pm_power_range_edit = _RangeCommitEdit(
+                "{12}+{[15,17]}-{[16]}",
+                "Source power range set expression in dBm (Enter to apply, blank = all)",
+                self._apply_pm_power_range,
+            )
+            self.pm_power_range_edit.set_committed(self.pm_power_range.raw)
+            rng_grid.addWidget(fl, 0, 0)
+            rng_grid.addWidget(self.pm_freq_range_edit, 0, 1)
+            rng_grid.addWidget(pl, 1, 0)
+            rng_grid.addWidget(self.pm_power_range_edit, 1, 1)
+            lay.addLayout(rng_grid)
+
+            self.pm_range_status = QLabel("")
+            self.pm_range_status.setObjectName("muted")
+            lay.addWidget(self.pm_range_status)
+
+            sep_p = QFrame()
+            sep_p.setObjectName("sep")
+            lay.addWidget(sep_p)
+
+        # Единая панель SCALE + MEM + MATH + ANALYSIS для всех графиков (VNA, SA, PM)
+        self.plot_settings_widget = PlotSettingsWidget(self._current_settings_plot(), w)
+        lay.addWidget(self.plot_settings_widget)
+        lay.addStretch(1)
+        return w
+
+    def _current_settings_plot(self):
+        if self.profile == "power_meter":
+            if self._active_plot_count > 0 and self.plots:
+                return self.plots[0]
+            return self.pm_plot
+        active = self._active_plots()
+        if not active:
+            return self._plot(0) if self.profile in ("network_analyzer", "spectrum_analyzer") else None
+        idx = max(0, min(self._selected_plot_idx, len(active) - 1))
+        return active[idx]
+
+    def _rebuild_plot_selector(self) -> None:
+        while self._plot_selector_lay.count():
+            item = self._plot_selector_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        active = self._active_plots()
+        if self.profile != "network_analyzer" or len(active) < 2:
+            self._plot_selector_host.hide()
+            return
+        self._selected_plot_idx = max(0, min(self._selected_plot_idx, len(active) - 1))
+        lbl = QLabel("PLOT")
+        lbl.setObjectName("muted")
+        self._plot_selector_lay.addWidget(lbl)
+        for i, pl in enumerate(active):
+            names = ", ".join(n for n, _t in pl.traces if n) or f"Plot {i + 1}"
+            b = QPushButton(f"{i + 1}: {names}")
+            b.setObjectName("chip")
+            b.setCheckable(True)
+            b.setChecked(i == self._selected_plot_idx)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(f"Edit settings for plot {i + 1}")
+            b.clicked.connect(lambda _=False, idx=i: self._select_settings_plot(idx))
+            self._plot_selector_lay.addWidget(b)
+        self._plot_selector_lay.addStretch()
+        self._plot_selector_host.show()
+
+    def _select_settings_plot(self, idx: int) -> None:
+        self._selected_plot_idx = max(0, int(idx))
+        self._rebuild_plot_selector()
+        self._sync_settings_view()
+
+    def _sync_settings_view(self) -> None:
+        if not hasattr(self, "plot_settings_widget"):
+            return
+        target = self._current_settings_plot()
+        self.plot_settings_widget.set_plot(target)
+
+    def set_settings_open(self, on: bool, *, plot_idx: int | None = None) -> None:
         on = bool(on)
-        if on == self._maximized:
-            return
-        self._maximized = on
-        self.maximize_button.setText("⤡" if on else "⤢")
-        self.maximize_button.setToolTip(
-            "Restore split view (double-click header or Esc)" if on
-            else "Maximize this panel to fill the screen (double-click header or Esc to restore)"
-        )
+        if plot_idx is not None:
+            self._selected_plot_idx = max(0, int(plot_idx))
+        if on:
+            self._rebuild_plot_selector()
+            self._sync_settings_view()
+        self.stack.setCurrentIndex(1 if on else 0)
+        self.settings_button.blockSignals(True)
+        self.settings_button.setChecked(on)
+        self.settings_button.blockSignals(False)
 
-    def resizeEvent(self, e):  # noqa: N802 - Qt
-        super().resizeEvent(e)
-        if self._drop_overlay.isVisible():
-            self._drop_overlay.setGeometry(self.rect())
+    def _on_settings_toggled(self) -> None:
+        self.set_settings_open(self.settings_button.isChecked())
 
-    def mousePressEvent(self, e):  # noqa: N802 - Qt
-        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 40:
-            self._drag_pos = e.position().toPoint()
+    def set_process_text(self, text: str) -> None:
+        self._process_override = str(text or "").strip()
+        if self._process_override:
+            self.process_label.setText(self._process_override)
+
+    def clear_data(self) -> None:
+        """Кнопка очистки (иконка корзины) в заголовке панели."""
+        if self.profile == "power_meter":
+            self.monitor.clear_pm_table(self.proxy)
+            if self.pm_plot is not None:
+                self.pm_plot.clear_memory()
+            for p in self.plots:
+                p.clear_memory()
         else:
-            self._drag_pos = None
-        super().mousePressEvent(e)
+            for p in self._active_plots():
+                p.clear_memory()
+                if p.math_mode != "OFF":
+                    p.set_math("OFF")
+        self._sync_settings_view()
 
-    def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt
-        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 40:
-            self._drag_pos = None
-            self.maximize_requested.emit(self.proxy)
-            e.accept()
-            return
-        super().mouseDoubleClickEvent(e)
-
-    def contextMenuEvent(self, e):  # noqa: N802 - Qt
-        if e.pos().y() <= 40:
-            self.context_menu_requested.emit(self.proxy, e.globalPos())
-            e.accept()
-            return
-        super().contextMenuEvent(e)
-
-    def mouseMoveEvent(self, e):  # noqa: N802 - Qt
-        if (self._drag_pos is not None and (e.buttons() & Qt.MouseButton.LeftButton)
-                and (e.position().toPoint() - self._drag_pos).manhattanLength() >= QApplication.startDragDistance()):
-            self._drag_pos = None
-            mime = QMimeData()
-            mime.setData(_PANEL_MIME, self.panel_key.encode("utf-8"))
-            drag = QDrag(self)
-            drag.setMimeData(mime)
-            drag.exec(Qt.DropAction.MoveAction)
-            return
-        super().mouseMoveEvent(e)
-
-    def mouseReleaseEvent(self, e):  # noqa: N802 - Qt
-        self._drag_pos = None
-        super().mouseReleaseEvent(e)
-
-    @staticmethod
-    def _drag_source(e) -> str:
-        if not e.mimeData().hasFormat(_PANEL_MIME):
-            return ""
-        return bytes(e.mimeData().data(_PANEL_MIME)).decode("utf-8", errors="ignore")
-
-    def dragEnterEvent(self, e):  # noqa: N802 - Qt
-        src = self._drag_source(e)
-        if src and src != self.panel_key:
-            self._drop_overlay.set_zone(detect_drop_zone(QRectF(self.rect()), e.position()))
-            e.acceptProposedAction()
-            return
-        super().dragEnterEvent(e)
-
-    def dragMoveEvent(self, e):  # noqa: N802 - Qt
-        src = self._drag_source(e)
-        if src and src != self.panel_key:
-            self._drop_overlay.set_zone(detect_drop_zone(QRectF(self.rect()), e.position()))
-            e.acceptProposedAction()
-            return
-        super().dragMoveEvent(e)
-
-    def dragLeaveEvent(self, e):  # noqa: N802 - Qt
-        self._drop_overlay.set_zone(None)
-        super().dragLeaveEvent(e)
-
-    def dropEvent(self, e):  # noqa: N802 - Qt
-        self._drop_overlay.set_zone(None)
-        src = self._drag_source(e)
-        if src and src != self.panel_key:
-            zone = detect_drop_zone(QRectF(self.rect()), e.position())
-            self.dock_requested.emit(src, self.panel_key, zone)
-            e.acceptProposedAction()
-            return
-        super().dropEvent(e)
+    def set_maximized(self, on: bool) -> None:
+        self._maximized = bool(on)
 
     # ------------------------------------------------------------ внутренние графики панели
     def set_split_traces(self, on: bool) -> None:
         on = bool(on)
-        if self.split_traces_button.isChecked() != on:
-            self.split_traces_button.blockSignals(True)
-            self.split_traces_button.setChecked(on)
-            self.split_traces_button.blockSignals(False)
+        self._vna_split_traces = on
+        if self.split_traces_cb is not None and self.split_traces_cb.isChecked() != on:
+            self.split_traces_cb.blockSignals(True)
+            self.split_traces_cb.setChecked(on)
+            self.split_traces_cb.blockSignals(False)
         if self.settings is not None:
             self.settings.setValue(f"MAIN/VNA_SPLIT/{self.panel_key}", on)
         if self.profile == "network_analyzer":
             self._refresh_vna(self.monitor.activity(self.proxy))
-
-    def _cycle_plot_layout(self) -> None:
-        nxt = PLOT_LAYOUT_MODES[(PLOT_LAYOUT_MODES.index(self.plot_layout_mode) + 1) % len(PLOT_LAYOUT_MODES)]
-        self.set_plot_layout_mode(nxt)
 
     def set_plot_layout_mode(self, mode: str) -> None:
         if mode not in PLOT_LAYOUT_MODES or mode == self.plot_layout_mode:
             return
         self._save_plot_splitters()
         self.plot_layout_mode = mode
-        self.plot_layout_button.setText(mode)
+        for m, b in self.plot_layout_buttons.items():
+            b.blockSignals(True)
+            b.setChecked(m == mode)
+            b.blockSignals(False)
         if self.settings is not None:
             self.settings.setValue(f"MAIN/PLOT_LAYOUT/{self.panel_key}", mode)
         self._plots_sig = None
@@ -1280,7 +1692,8 @@ class LivePanel(Panel):
             idx = len(self.plots)
             p = mark_growing(LivePlot(min_height=PLOT_MIN_HEIGHT))
             p.bind_settings(self.settings, f"MAIN/PLOT/{self.panel_key}/{idx}")
-            p.settings_changed.connect(self._sync_footer)
+            p.settings_changed.connect(self._sync_settings_view)
+            p.settings_requested.connect(lambda ix=idx: self.set_settings_open(True, plot_idx=ix))
             p.setParent(self._plots_host)
             p.hide()
             self.plots.append(p)
@@ -1288,12 +1701,10 @@ class LivePanel(Panel):
 
     def _use_plots(self, n: int) -> None:
         self._active_plot_count = max(0, int(n))
-        self.plot_layout_button.setVisible(self._active_plot_count >= 2)
         if self._active_plot_count == 0:
             self._plots_host.hide()
             for p in self.plots:
                 p.hide()
-            self._sync_footer()
             return
         self._plot(self._active_plot_count - 1)
         self._plots_host.show()
@@ -1301,7 +1712,6 @@ class LivePanel(Panel):
         if sig == self._plots_sig:
             for i, p in enumerate(self.plots):
                 p.setVisible(i < self._active_plot_count)
-            self._sync_footer()
             return
         self._save_plot_splitters()
         self._plots_sig = sig
@@ -1322,88 +1732,39 @@ class LivePanel(Panel):
             root = self._build_plot_node(tree) if tree is not None else self.plots[0]
         self._plot_root = root
         self.plots_box.addWidget(root, 1)
-        self._sync_footer()
+        if self.stack.currentIndex() == 1:
+            self._rebuild_plot_selector()
+            self._sync_settings_view()
 
     def _active_plots(self) -> list[LivePlot]:
         return self.plots[:self._active_plot_count]
 
-    def _sync_footer(self) -> None:
-        active = self._active_plots()
-        has_plots = bool(active)
-        has_source = bool(self.source.text())
-        self.mem_button.setVisible(has_plots)
-        self.plot_settings_button.setVisible(has_plots)
-        self.source.setVisible(has_source)
-        if has_plots:
-            any_mem = any(bool(p.memory) for p in active)
-            any_diff = any(bool(p.memory_diff) for p in active)
-            self.mem_button.blockSignals(True)
-            self.mem_button.setChecked(any_mem)
-            self.mem_button.setText("ΔMEM" if any_diff else "MEM")
-            self.mem_button.blockSignals(False)
-            n_an = sum(len(p.analysis_metrics) for p in active)
-            any_man = any(p.manual_scale or p.manual_x_range is not None for p in active)
-            tip_parts = ["Graph scale, memory (MEM / DATA−MEM), and trace analysis checkboxes (or right-click graph)"]
-            if any_man:
-                tip_parts.append("Manual scale active")
-            if n_an:
-                tip_parts.append(f"Analysis metrics active: {n_an}")
-            self.plot_settings_button.setToolTip("\n".join(tip_parts))
-
-    def _toggle_panel_mem(self) -> None:
-        active = self._active_plots()
-        if not active:
-            return
-        if any(p.memory for p in active):
-            for p in active:
-                p.clear_memory()
-        else:
-            for p in active:
-                p.store_memory()
-        self._sync_footer()
-
-    def _open_plot_settings(self) -> None:
-        active = self._active_plots()
-        if not active:
-            return
-        pos = self.plot_settings_button.mapToGlobal(QPoint(0, self.plot_settings_button.height() + 2))
-        if len(active) == 1:
-            active[0].open_settings(pos)
-            return
-        menu = QMenu(self)
-        menu.setObjectName("psmenu")
-        for i, p in enumerate(active):
-            names = ", ".join(n for n, _t in p.traces if n) or f"Plot {i + 1}"
-            act = menu.addAction(f"Plot {i + 1}: {names}")
-            act.triggered.connect(lambda _=False, pl=p, pt=pos: pl.open_settings(pt))
-        menu.popup(pos)
-
     def refresh(self, a: Activity) -> None:
         self.title.setText(a.name)
         if not a.connected:
-            self.level.setText("OFF")
-        if self.profile == "network_analyzer":
-            self._refresh_vna(a)
-        elif self.profile == "spectrum_analyzer":
-            self._refresh_sa(a)
-        elif self.profile == "power_meter":
-            self._refresh_pm(a)
-        if a.source is not None:
-            path = f"  PATH {a.path_db:+.1f} dB" if a.path_db is not None else ""
-            self.source.setText(f"← {a.source.name} {si_format(a.source.freq, 'Hz', 6)}{path}")
-        elif self.profile == "network_analyzer" and self.proxy.value("gen.state") is True:
-            port = self.proxy.value("gen.port")
-            pt = f" P{port}" if port in (1, 2) else ""
-            rf_off = " (RF OFF)" if self.proxy.value("rf.output") is False else ""
-            self.source.setText(f"CW{pt} {si_format(self.proxy.value('freq.cw'), 'Hz', 6)}{rf_off}")
+            status_txt = "OFF"
         else:
-            self.source.setText("")
-        self._sync_footer()
+            status_txt = ""
+        if self.profile == "network_analyzer":
+            vna_txt = self._refresh_vna(a)
+            if a.connected:
+                status_txt = vna_txt
+        elif self.profile == "spectrum_analyzer":
+            sa_txt = self._refresh_sa(a)
+            if a.connected:
+                status_txt = sa_txt
+        elif self.profile == "power_meter":
+            pm_txt = self._refresh_pm(a)
+            if a.connected:
+                status_txt = pm_txt
+        # Процесс выводится строго над графиком (активный сценарий в приоритете над статусом измерения)
+        self.process_label.setText(self._process_override or status_txt)
+        if self.stack.currentIndex() == 1:
+            self._sync_settings_view()
 
-    def _refresh_vna(self, a: Activity) -> None:
+    def _refresh_vna(self, a: Activity) -> str:
         traces = self.monitor.vna_traces(self.proxy)
-        split_each = self.split_traces_button.isChecked()
-        self.split_traces_button.setVisible(len(traces) > 1 or split_each)
+        split_each = self._vna_split_traces
         if split_each:
             groups_list: list[tuple[tuple[float, float, float] | None, list]] = [
                 (_vna_scale(tr), [(name, tr)]) for name, tr in traces
@@ -1429,10 +1790,14 @@ class LivePanel(Panel):
             plot = self._plot(0)
             plot.set_scale(None)
             plot.set_traces([])
-        if a.connected:
-            self.level.setText(f"{len(traces)} TRC" if traces else "NO TRC")
+        if self.proxy.value("gen.state") is True:
+            port = self.proxy.value("gen.port")
+            pt = f" P{port}" if port in (1, 2) else ""
+            rf_off = " (RF OFF)" if self.proxy.value("rf.output") is False else ""
+            return f"CW{pt} {si_format(self.proxy.value('freq.cw'), 'Hz', 6)}{rf_off}"
+        return f"{len(traces)} TRC" if traces else "NO TRC"
 
-    def _refresh_sa(self, a: Activity) -> None:
+    def _refresh_sa(self, a: Activity) -> str:
         tr = self.proxy.value("trace")
         plot = self._plot(0)
         self._use_plots(1)
@@ -1454,43 +1819,12 @@ class LivePanel(Panel):
             plot.set_marker(x, a.level)
         else:
             plot.set_marker(None)
-        if a.connected and a.level is not None:
+        if a.level is not None:
             where = f" @ {si_format(a.freq, 'Hz', 6)}" if a.freq is not None and present else ""
-            self.level.setText(f"{_dbm(a.level)}{where}" if present else f"NOISE {_dbm(a.floor)}")
+            return f"{_dbm(a.level)}{where}" if present else f"NOISE {_dbm(a.floor)}"
+        return ""
 
-    def _load_pm_csv_points(self) -> list[tuple[float, float | None]]:
-        if self.settings is None:
-            return []
-        if self.pm_csv_path:
-            try:
-                pts = load_pm_points_csv(self.pm_csv_path)
-                if pts:
-                    return pts
-            except OSError:
-                pass
-        raw = self.settings.value(f"MAIN/PM_CSV_POINTS/{self.panel_key}", "", type=str)
-        try:
-            items = json.loads(raw) if raw else []
-        except (TypeError, ValueError):
-            return []
-        out: list[tuple[float, float | None]] = []
-        if isinstance(items, list):
-            for it in items:
-                if isinstance(it, list) and len(it) == 2 and isinstance(it[0], (int, float)):
-                    p = None if it[1] is None else float(it[1])
-                    out.append((float(it[0]), p))
-        return out
-
-    def _save_pm_csv_state(self) -> None:
-        if self.settings is None:
-            return
-        self.settings.setValue(f"MAIN/PM_CSV_ON/{self.panel_key}", self.pm_csv_enabled)
-        self.settings.setValue(f"MAIN/PM_CSV_PATH/{self.panel_key}", self.pm_csv_path)
-        self.settings.setValue(
-            f"MAIN/PM_CSV_POINTS/{self.panel_key}",
-            json.dumps([[f, p] for f, p in self.pm_csv_points]),
-        )
-
+    # ------------------------------------------------------------ настройки ваттметра (диапазоны, вид, единицы)
     def _save_pm_splitter(self) -> None:
         if self.settings is None or self.pm_splitter is None or sip.isdeleted(self.pm_splitter):
             return
@@ -1515,16 +1849,19 @@ class LivePanel(Panel):
         if self.pm_plot is None:
             return
         on = bool(on)
-        if not on and not self.pm_table_button.isChecked():
-            self.pm_table_button.blockSignals(True)
-            self.pm_table_button.setChecked(True)
-            self.pm_table_button.blockSignals(False)
+        if not on and not self._pm_show_table:
+            self._pm_show_table = True
+            if self.pm_table_cb is not None:
+                self.pm_table_cb.blockSignals(True)
+                self.pm_table_cb.setChecked(True)
+                self.pm_table_cb.blockSignals(False)
             if self.settings is not None:
                 self.settings.setValue(f"MAIN/PM_SHOW_TABLE/{self.panel_key}", True)
-        if self.pm_plot_button.isChecked() != on:
-            self.pm_plot_button.blockSignals(True)
-            self.pm_plot_button.setChecked(on)
-            self.pm_plot_button.blockSignals(False)
+        self._pm_show_plot = on
+        if self.pm_plot_cb is not None and self.pm_plot_cb.isChecked() != on:
+            self.pm_plot_cb.blockSignals(True)
+            self.pm_plot_cb.setChecked(on)
+            self.pm_plot_cb.blockSignals(False)
         if self.settings is not None:
             self.settings.setValue(f"MAIN/PM_SHOW_PLOT/{self.panel_key}", on)
         self.refresh(self.monitor.activity(self.proxy))
@@ -1533,35 +1870,82 @@ class LivePanel(Panel):
         if self.power_table is None:
             return
         on = bool(on)
-        if not on and not self.pm_plot_button.isChecked():
-            self.pm_plot_button.blockSignals(True)
-            self.pm_plot_button.setChecked(True)
-            self.pm_plot_button.blockSignals(False)
+        if not on and not self._pm_show_plot:
+            self._pm_show_plot = True
+            if self.pm_plot_cb is not None:
+                self.pm_plot_cb.blockSignals(True)
+                self.pm_plot_cb.setChecked(True)
+                self.pm_plot_cb.blockSignals(False)
             if self.settings is not None:
                 self.settings.setValue(f"MAIN/PM_SHOW_PLOT/{self.panel_key}", True)
-        if self.pm_table_button.isChecked() != on:
-            self.pm_table_button.blockSignals(True)
-            self.pm_table_button.setChecked(on)
-            self.pm_table_button.blockSignals(False)
+        self._pm_show_table = on
+        if self.pm_table_cb is not None and self.pm_table_cb.isChecked() != on:
+            self.pm_table_cb.blockSignals(True)
+            self.pm_table_cb.setChecked(on)
+            self.pm_table_cb.blockSignals(False)
         if self.settings is not None:
             self.settings.setValue(f"MAIN/PM_SHOW_TABLE/{self.panel_key}", on)
         self.refresh(self.monitor.activity(self.proxy))
 
+    def set_pm_freq_range(self, expr: str) -> bool:
+        """Задать диапазон частот строкой ``{f1}+{[f2,f3],[f4,f5]}-{[f6]}``."""
+        try:
+            rs = parse_range_expr(expr, "freq")
+        except ValueError as exc:
+            if self.pm_freq_range_edit is not None:
+                self.pm_freq_range_edit.set_invalid(True)
+            if self.pm_range_status is not None:
+                self.pm_range_status.setObjectName("err")
+                self.pm_range_status.setText(f"Freq: {exc}")
+            return False
+        self.pm_freq_range = rs
+        if self.pm_freq_range_edit is not None:
+            self.pm_freq_range_edit.set_committed(rs.raw, invalid=False)
+        if self.pm_range_status is not None:
+            self.pm_range_status.setObjectName("muted")
+            self.pm_range_status.setText("")
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/PM_FREQ_RANGE/{self.panel_key}", rs.raw)
+        self.refresh(self.monitor.activity(self.proxy))
+        return True
+
+    def set_pm_power_range(self, expr: str) -> bool:
+        """Задать диапазон мощностей строкой ``{p1}+{[p2,p3]}-{[p4]}`` (dBm)."""
+        try:
+            rs = parse_range_expr(expr, "power")
+        except ValueError as exc:
+            if self.pm_power_range_edit is not None:
+                self.pm_power_range_edit.set_invalid(True)
+            if self.pm_range_status is not None:
+                self.pm_range_status.setObjectName("err")
+                self.pm_range_status.setText(f"Power: {exc}")
+            return False
+        self.pm_power_range = rs
+        if self.pm_power_range_edit is not None:
+            self.pm_power_range_edit.set_committed(rs.raw, invalid=False)
+        if self.pm_range_status is not None:
+            self.pm_range_status.setObjectName("muted")
+            self.pm_range_status.setText("")
+        if self.settings is not None:
+            self.settings.setValue(f"MAIN/PM_POWER_RANGE/{self.panel_key}", rs.raw)
+        self.refresh(self.monitor.activity(self.proxy))
+        return True
+
+    def _apply_pm_freq_range(self) -> None:
+        if self.pm_freq_range_edit is not None:
+            self.set_pm_freq_range(self.pm_freq_range_edit.text())
+
+    def _apply_pm_power_range(self) -> None:
+        if self.pm_power_range_edit is not None:
+            self.set_pm_power_range(self.pm_power_range_edit.text())
+
+    def _clear_pm_ranges(self) -> None:
+        self.set_pm_freq_range("")
+        self.set_pm_power_range("")
+
+    # Совместимость со старыми тестами CSV
     def set_pm_csv_enabled(self, on: bool) -> None:
-        on = bool(on)
-        if on and not self.pm_csv_points:
-            # Нет загруженных точек -> сразу открыть редактор CSV
-            self.pm_csv_button.blockSignals(True)
-            self.pm_csv_button.setChecked(False)
-            self.pm_csv_button.blockSignals(False)
-            self.edit_pm_csv_points(enable_on_accept=True)
-            return
-        self.pm_csv_enabled = on
-        if self.pm_csv_button.isChecked() != on:
-            self.pm_csv_button.blockSignals(True)
-            self.pm_csv_button.setChecked(on)
-            self.pm_csv_button.blockSignals(False)
-        self._save_pm_csv_state()
+        self.pm_csv_enabled = bool(on) and bool(self.pm_csv_points)
         self.refresh(self.monitor.activity(self.proxy))
 
     def set_pm_csv_points(self, points: list[tuple[float, float | None]], *,
@@ -1573,10 +1957,6 @@ class LivePanel(Panel):
             self.pm_csv_enabled = bool(enable) and bool(self.pm_csv_points)
         elif not self.pm_csv_points:
             self.pm_csv_enabled = False
-        self.pm_csv_button.blockSignals(True)
-        self.pm_csv_button.setChecked(self.pm_csv_enabled)
-        self.pm_csv_button.blockSignals(False)
-        self._save_pm_csv_state()
         self.refresh(self.monitor.activity(self.proxy))
 
     def load_pm_csv(self, path, *, enable: bool = True) -> list[tuple[float, float | None]]:
@@ -1584,46 +1964,21 @@ class LivePanel(Panel):
         self.set_pm_csv_points(pts, csv_path=str(path), enable=enable)
         return pts
 
-    def edit_pm_csv_points(self, enable_on_accept: bool = False) -> None:
-        cols, rows = self.monitor.pm_matrix(self.proxy)
-        measured = [(f, p) for f, vals in rows for p in vals]
-        dlg = PMPointsDialog(self.pm_csv_points, csv_path=self.pm_csv_path,
-                             measured_points=measured, parent=self)
-        if dlg.exec() == PMPointsDialog.DialogCode.Accepted:
-            pts = dlg.points()
-            self.set_pm_csv_points(pts, csv_path=dlg.csv_path,
-                                   enable=(True if (enable_on_accept and pts) else (self.pm_csv_enabled and bool(pts))))
-
     def set_pm_unit(self, unit: str) -> None:
         if self.power_table is None or unit not in PM_UNITS:
             return
         self.power_table.set_unit(unit)
         if self.pm_plot is not None:
             self.pm_plot.set_unit(unit)
-        self.unit_button.setText(unit)
+        for u, b in self.pm_unit_buttons.items():
+            b.blockSignals(True)
+            b.setChecked(u == unit)
+            b.blockSignals(False)
         if self.settings is not None:
             self.settings.setValue(f"MAIN/PM_UNIT/{self.panel_key}", unit)
         self.refresh(self.monitor.activity(self.proxy))
 
-    def _next_pm_unit(self) -> None:
-        if self.power_table is None:
-            return
-        idx = PM_UNITS.index(self.power_table.unit)
-        self.set_pm_unit(PM_UNITS[(idx + 1) % len(PM_UNITS)])
-
-    def _pm_unit_menu(self, pos: QPoint) -> None:
-        if self.power_table is None:
-            return
-        menu = QMenu(self)
-        menu.setObjectName("psmenu")
-        for u in PM_UNITS:
-            act = menu.addAction(_PM_UNIT_LABELS[u])
-            act.setCheckable(True)
-            act.setChecked(u == self.power_table.unit)
-            act.triggered.connect(lambda _=False, unit=u: self.set_pm_unit(unit))
-        menu.popup(self.unit_button.mapToGlobal(pos))
-
-    def _refresh_pm(self, a: Activity) -> None:
+    def _refresh_pm(self, a: Activity) -> str:
         """Временной режим (TRAC ON) - трасса во времени; иначе - график кривых по мощностям и/или таблица."""
         tr = self.proxy.value("trace")
         timed = self.proxy.value("trace.state") is True and isinstance(tr, Trace)
@@ -1638,14 +1993,9 @@ class LivePanel(Panel):
         if self.pm_splitter is not None:
             self.pm_splitter.setVisible(show_normal)
         if self.pm_plot is not None:
-            self.pm_plot.setVisible(show_normal and self.pm_plot_button.isChecked())
-        self.power_table.setVisible(show_normal and self.pm_table_button.isChecked())
-        self.pm_plot_button.setVisible(show_normal)
-        self.pm_table_button.setVisible(show_normal)
-        self.pm_csv_button.setVisible(show_normal)
-        self.pm_csv_edit_button.setVisible(show_normal)
-        self.unit_button.setVisible(show_normal)
-        self.clear_button.setVisible(show_normal)
+            self.pm_plot.setVisible(show_normal and self._pm_show_plot)
+        if self.power_table is not None:
+            self.power_table.setVisible(show_normal and self._pm_show_table)
         if show_normal:
             cols, rows = self.monitor.pm_matrix(self.proxy)
             planned: set[tuple[float, float | None]] = set()
@@ -1653,19 +2003,19 @@ class LivePanel(Panel):
             if self.pm_csv_enabled and self.pm_csv_points:
                 cols, rows, planned = filter_pm_matrix(cols, rows, self.pm_csv_points)
                 target_freqs = sorted({f for f, _p in self.pm_csv_points})
+            else:
+                cols, rows = filter_pm_matrix_by_ranges(cols, rows, self.pm_freq_range, self.pm_power_range)
             cur_p = None if a.source is None or a.source.power is None else round(float(a.source.power), 3)
             self.power_table.set_matrix(cols, rows, _num(self.proxy.value("freq")), cur_p, planned_cells=planned)
             if self.pm_plot is not None:
                 self.pm_plot.set_matrix(cols, rows, unit=self.power_table.unit, target_freqs=target_freqs)
-        if a.connected:
-            u = self.power_table.unit
-            if a.level is None:
-                self.level.setText("WAIT TRIG" if self.proxy.value("meas.armed") is True else "NO DATA")
-            elif u == "dB":
-                src_p = None if a.source is None else a.source.power
-                self.level.setText(_format_power(a.level, "dB", src_p) if src_p is not None else _dbm(a.level))
-            else:
-                self.level.setText(_format_power(a.level, u))
+        u = self.power_table.unit if self.power_table is not None else "dBm"
+        if a.level is None:
+            return "WAIT TRIG" if self.proxy.value("meas.armed") is True else "NO DATA"
+        if u == "dB":
+            src_p = None if a.source is None else a.source.power
+            return _format_power(a.level, "dB", src_p) if src_p is not None else _dbm(a.level)
+        return _format_power(a.level, u)
 
 
 class MainWindow(Window):
@@ -1882,30 +2232,62 @@ class MainWindow(Window):
         live = QVBoxLayout(self.live_page)
         live.setContentsMargins(0, 0, 0, 0)
         live.setSpacing(8)
-        self._live_host = QWidget()
-        self._live_host.setObjectName("liveHost")
-        self.live_layout = QVBoxLayout(self._live_host)
-        self.live_layout.setContentsMargins(0, 0, 0, 0)
-        self.live_layout.setSpacing(0)
-        self.live_scroll = QScrollArea()
-        self.live_scroll.setWidgetResizable(True)
-        self.live_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.live_scroll.setWidget(self._live_host)
-        self.live_scroll.setStyleSheet(render_qss("""
-            QScrollArea, QWidget#liveHost { background: $UI_COLOR_BACKGROUND; border: none; }
+
+        # Двухпанельный экран LIVE:
+        # Слева (50%, без прокрутки) — активный прибор по видеоуровню (или VNA по умолчанию);
+        # Справа (50%, вертикальная прокрутка) — все остальные выбранные графики и таблицы.
+        self._active_host = QWidget()
+        self._active_host.setObjectName("activeHost")
+        self.active_layout = QVBoxLayout(self._active_host)
+        self.active_layout.setContentsMargins(0, 0, 0, 0)
+        self.active_layout.setSpacing(0)
+
+        self._right_host = QWidget()
+        self._right_host.setObjectName("rightHost")
+        self.right_layout = QVBoxLayout(self._right_host)
+        self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_layout.setSpacing(8)
+
+        self.right_scroll = QScrollArea()
+        self.right_scroll.setObjectName("rightScroll")
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.right_scroll.setWidget(self._right_host)
+
+        self.live_splitter = GraphSplitter(Qt.Orientation.Horizontal)
+        self.live_splitter.addWidget(self._active_host)
+        self.live_splitter.addWidget(self.right_scroll)
+        self.live_splitter.setStretchFactor(0, 1)
+        self.live_splitter.setStretchFactor(1, 1)
+        self.live_splitter.splitterMoved.connect(lambda _p, _i: self._save_live_split())
+        self.live_splitter.equalized.connect(self._save_live_split)
+        self.live_splitter.setStyleSheet(render_qss("""
+            QScrollArea#rightScroll, QWidget#activeHost, QWidget#rightHost { background: $UI_COLOR_BACKGROUND; border: none; }
             QSplitter { background: $UI_COLOR_BACKGROUND; }
             QSplitter::handle { background: transparent; }
-            QSplitter::handle:vertical { height: 8px; }
             QSplitter::handle:horizontal { width: 8px; }
-        """))
-        live.addWidget(self.live_scroll, 1)
+        """) + "\n" + scrollbar_qss("QScrollArea#rightScroll "))
+        self._restore_live_split()
+
+        # Алиасы для совместимости
+        self._live_host = self._active_host
+        self.live_layout = self.active_layout
+        self.live_scroll = self.live_splitter
+        self._active_panel_key: str | None = None
+        self._right_panel_keys: list[str] = []
+
+        live.addWidget(self.live_splitter, 1)
         live.addWidget(self.idle)
 
-        # вкладки: LIVE - что измеряется, SET - пороги; справа - восстановление панелей, раскладка, ALL
+        # вкладки: LIVE - что измеряется, SET - пороги; справа - восстановление панелей, DOCK, CURR, ALL
         self.tabs = PTabBar()
         for title in self.TABS:
             self.tabs.addTab(title)
         self.tabs.setTabToolTip(1, "Thresholds and displayed graphs settings")
+        self.layout_button.hide()
+        self.split_menu_button.hide()
         tabs_bar = QWidget()
         tabs_lay = QHBoxLayout(tabs_bar)
         tabs_lay.setContentsMargins(0, 0, 0, 0)
@@ -1914,8 +2296,6 @@ class MainWindow(Window):
         tabs_lay.addLayout(self.restore_layout)
         tabs_lay.addWidget(self.dock_button)
         tabs_lay.addWidget(self.current_button)
-        tabs_lay.addWidget(self.layout_button)
-        tabs_lay.addWidget(self.split_menu_button)
         tabs_lay.addWidget(self.all_button)
         self.tabs_panel = Panel(tabs_bar)
         self.tabs_panel.setStyleSheet(
@@ -2085,8 +2465,11 @@ class MainWindow(Window):
         self._dirty_panels.add(proxy)
         vis_changed = (proxy in self._visible_proxies) != self._should_show(proxy)
         meas_changed = (proxy in self._measuring_proxies) != self.monitor.activity(proxy).measuring
-        if vis_changed or meas_changed:
-            if vis_changed:
+        visible_widgets = [p for p in self._ordered_all_panels() if self._panel_visible(p)]
+        new_active = self._pick_active_panel(visible_widgets)
+        active_changed = (new_active.panel_key if new_active is not None else None) != self._active_panel_key
+        if vis_changed or meas_changed or active_changed:
+            if vis_changed or active_changed:
                 self._dirty_vis = True
             self._flush_panels()
         elif not self._refresh_timer.isActive():
@@ -2161,7 +2544,26 @@ class MainWindow(Window):
     def _on_runs(self, *_args) -> None:
         if sip.isdeleted(self):
             return
-        self.scenario_chip.show_runs(self.coord.runs())
+        runs = self.coord.runs()
+        self.scenario_chip.show_runs(runs)
+        # Пробросить текущий процесс сценария прямо в заголовок участвующих панелей
+        proc_by_proxy: dict[object, str] = {}
+        for run in runs:
+            prog = f"{run.done}/{run.total}" if run.total else "RUN"
+            detail = f" · {run.text}" if run.text else ""
+            txt = f"{run.name} {prog}{detail}"
+            for dev in (run.devices or {}).values():
+                proc_by_proxy[dev.instrument] = txt
+        for proxy, panel in self.panels.items():
+            if not sip.isdeleted(panel):
+                panel.set_process_text(proc_by_proxy.get(proxy, ""))
+                if not proc_by_proxy.get(proxy):
+                    panel.refresh(self.monitor.activity(proxy))
+        for (proxy, _ch), cpanel in self.current_panels.items():
+            if not sip.isdeleted(cpanel):
+                cpanel.set_process_text(proc_by_proxy.get(proxy, ""))
+                if not proc_by_proxy.get(proxy):
+                    cpanel.refresh()
 
     def _open_scenario(self) -> None:
         runs = self.coord.runs()
@@ -2780,6 +3182,81 @@ class MainWindow(Window):
                 self.restore_chips[key] = b
                 self.restore_layout.addWidget(b)
 
+    def _save_live_split(self) -> None:
+        if not hasattr(self, "live_splitter") or sip.isdeleted(self.live_splitter):
+            return
+        if not self.right_scroll.isVisible():
+            return
+        w = self.live_splitter.current_weights()
+        if w is not None and len(w) == 2:
+            self.settings.setValue(f"{self.SETTINGS_GROUP}/LIVE_SPLIT", json.dumps([round(x, 5) for x in w]))
+
+    def _restore_live_split(self) -> None:
+        raw = self.settings.value(f"{self.SETTINGS_GROUP}/LIVE_SPLIT", "", type=str)
+        try:
+            vals = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            vals = []
+        if isinstance(vals, list) and len(vals) == 2 and all(isinstance(x, (int, float)) and x > 0 for x in vals):
+            weights = [float(vals[0]), float(vals[1])]
+        else:
+            weights = [0.5, 0.5]
+        self.live_splitter.apply_weights(weights)
+
+    def _is_actively_measuring_by_level(self, proxy) -> bool:
+        """True, если не-VNA приёмник (SA / PM) сейчас измеряет и его уровень >= порога видеоуровня."""
+        prof = profile_name(proxy)
+        if prof == "network_analyzer":
+            return False
+        if not self.monitor.activity(proxy).measuring:
+            return False
+        lvl = self._receiver_level(proxy)
+        if lvl is None:
+            return False
+        return lvl >= self._display_rule(proxy)["level"]
+
+    def _pick_active_panel(self, visible_widgets: list) -> Any | None:
+        """Выбрать панель для левой половины экрана:
+        1) приёмник (SA / PM), измеряющий выше порога видеоуровня (самый свежий сигнал);
+        2) если никто не измеряет — векторный анализатор (VNA);
+        3) если VNA нет — первая доступная панель.
+        """
+        if not visible_widgets:
+            return None
+        active_non_vna: list[tuple[float, float, int, LivePanel]] = []
+        vna_panel = None
+        for idx, panel in enumerate(visible_widgets):
+            if not isinstance(panel, LivePanel):
+                continue
+            prof = profile_name(panel.proxy)
+            if prof == "network_analyzer":
+                if vna_panel is None:
+                    vna_panel = panel
+            elif self._is_actively_measuring_by_level(panel.proxy):
+                t_sig = float(self.monitor._last_signal.get(panel.proxy, 0.0) or 0.0)
+                t_dat = float(self.monitor._last_data.get(panel.proxy, 0.0) or 0.0)
+                active_non_vna.append((t_sig, t_dat, -idx, panel))
+        if active_non_vna:
+            active_non_vna.sort(reverse=True)
+            return active_non_vna[0][3]
+        if vna_panel is not None:
+            return vna_panel
+        return visible_widgets[0]
+
+    def active_panel(self):
+        """Панель, отображаемая сейчас в левой половине экрана (без скролла)."""
+        if self._active_panel_key is None:
+            return None
+        for p in (*self.panels.values(), *self.current_panels.values()):
+            if p.panel_key == self._active_panel_key:
+                return p
+        return None
+
+    def right_panels(self) -> list:
+        """Панели в правой прокручиваемой колонке."""
+        by_key = {p.panel_key: p for p in (*self.panels.values(), *self.current_panels.values())}
+        return [by_key[k] for k in self._right_panel_keys if k in by_key]
+
     def _update_visibility(self) -> None:
         ordered = self._ordered_receivers()
         self._update_restore_chips(ordered)
@@ -2787,64 +3264,61 @@ class MainWindow(Window):
         self._visible_proxies = set(eligible)
         visible_widgets = [p for p in self._ordered_all_panels() if self._panel_visible(p)]
         by_key = {p.panel_key: p for p in visible_widgets}
-        eligible_keys = [p.panel_key for p in visible_widgets]
 
-        if self._maximized_key is not None and self._maximized_key not in by_key:
-            self._maximized_key = None
+        active = self._pick_active_panel(visible_widgets)
+        active_key = active.panel_key if active is not None else None
+        right_keys = [p.panel_key for p in visible_widgets if p.panel_key != active_key]
 
-        if not eligible_keys:
-            tree: PaneNode | None = None
-        elif self._maximized_key is not None:
-            tree = PaneLeaf(self._maximized_key)
-        elif self.layout_mode == CUSTOM_LAYOUT_MODE and self._custom_tree is not None:
-            tree = project_tree(self._custom_tree, eligible_keys)
-        else:
-            tree = build_preset_tree(self.layout_mode, eligible_keys)
-
-        sig = (self.layout_mode, self._maximized_key, tree_structure_sig(tree))
+        sig = (active_key, tuple(right_keys))
         if sig != self._arranged_sig:
-            self._save_splitters()
+            self._save_live_split()
             self._arranged_sig = sig
-            self._active_tree = tree
-            for panel in (*self.panels.values(), *self.current_panels.values()):
-                panel.setParent(self._live_host)
-                panel.hide()
-            if self._root_widget is not None:
-                self.live_layout.removeWidget(self._root_widget)
-                if isinstance(self._root_widget, GraphSplitter):
-                    self._root_widget.deleteLater()
-                self._root_widget = None
-            self._splitters.clear()
-            if tree is not None:
-                root = self._build_split_widget(tree, by_key)
-                self._root_widget = root
-                self.live_layout.addWidget(root, 1)
+            self._active_panel_key = active_key
+            self._right_panel_keys = right_keys
 
-        shown_keys = leaf_order(self._active_tree)
-        for i, key in enumerate(shown_keys):
-            panel = by_key.get(key)
-            if panel is None:
-                continue
-            is_max = self._maximized_key == key
-            if hasattr(panel, "set_maximized"):
-                panel.set_maximized(is_max)
-            if hasattr(panel, "maximize_button"):
-                panel.maximize_button.setEnabled(len(eligible_keys) > 1 or is_max)
-            panel.move_prev_button.setEnabled(not is_max and i > 0)
-            panel.move_next_button.setEnabled(not is_max and i < len(shown_keys) - 1)
-        for p in self.panels:
-            k = self._panel_key(p)
-            if k not in shown_keys:
-                self.panels[p].set_maximized(False)
-        self.live_scroll.setVisible(bool(shown_keys))
-        self.idle.setVisible(not shown_keys)
+            # Аккуратно убрать все панели из обоих контейнеров без удаления виджетов
+            while self.active_layout.count():
+                self.active_layout.takeAt(0)
+            while self.right_layout.count():
+                item = self.right_layout.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().hide()
+            for panel in (*self.panels.values(), *self.current_panels.values()):
+                panel.setParent(self._active_host)
+                panel.hide()
+
+            if active_key is not None and active_key in by_key:
+                ap = by_key[active_key]
+                ap.setMinimumHeight(0)
+                ap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+                self.active_layout.addWidget(ap, 1)
+                ap.show()
+
+            for k in right_keys:
+                rp = by_key[k]
+                rp.setMinimumHeight(RIGHT_PANEL_MIN_HEIGHT)
+                rp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+                self.right_layout.addWidget(rp)
+                rp.show()
+            if right_keys:
+                self.right_layout.addStretch(1)
+
+            has_right = bool(right_keys)
+            self.right_scroll.setVisible(has_right)
+            if has_right:
+                self._restore_live_split()
+
+        has_any = active_key is not None
+        self.live_splitter.setVisible(has_any)
+        self.idle.setVisible(not has_any)
 
     def visible_panels(self) -> list:
-        visible_widgets = [p for p in self._ordered_all_panels() if self._panel_visible(p)]
-        by_key = {p.panel_key: p for p in visible_widgets}
-        if self._active_tree is not None:
-            return [by_key[k] for k in leaf_order(self._active_tree) if k in by_key]
-        return visible_widgets
+        out = []
+        ap = self.active_panel()
+        if ap is not None:
+            out.append(ap)
+        out.extend(self.right_panels())
+        return out
 
     # ------------------------------------------------------------ во весь экран
     def show_window(self) -> None:
@@ -2973,6 +3447,7 @@ class MainWindow(Window):
         self._dirty_panels.clear()
         self._dirty_current.clear()
         self._save_splitters()
+        self._save_live_split()
         self._save_dock_splitter()
         for panel in self.panels.values():
             if not sip.isdeleted(panel):

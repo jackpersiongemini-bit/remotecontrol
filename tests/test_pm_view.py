@@ -189,37 +189,35 @@ def test_main_window_pm_graph_table_toggles_and_csv_mode(qtbot, tmp_path):
         assert panel.pm_plot.isVisibleTo(panel) and panel.power_table.isVisibleTo(panel)
         assert len(panel.pm_plot._curves) == 2
 
-        # Переключение PLOT / TBL
-        panel.pm_table_button.click()
+        # Переключение Graph / Table во встроенных настройках (открываются вместо графика)
+        panel.settings_button.click()
+        assert panel.stack.currentIndex() == 1
+        panel.pm_table_cb.click()
+        panel.settings_button.click()
+        assert panel.stack.currentIndex() == 0
         assert panel.pm_plot.isVisibleTo(panel) and not panel.power_table.isVisibleTo(panel)
-        panel.pm_plot_button.click()                   # нельзя скрыть оба -> таблица включается сама
+        panel.set_pm_show_plot(False)                   # нельзя скрыть оба -> таблица включается сама
         assert not panel.pm_plot.isVisibleTo(panel) and panel.power_table.isVisibleTo(panel)
-        panel.pm_plot_button.click()
+        panel.set_pm_show_plot(True)
         assert panel.pm_plot.isVisibleTo(panel) and panel.power_table.isVisibleTo(panel)
 
-        # Загрузка CSV-плана (1 GHz, 2 GHz и ещё не измеренный 4 GHz) -> 3 GHz скрыт, 4 GHz показан как "---"
-        csv_path = tmp_path / "targets.csv"
-        save_pm_points_csv(csv_path, [(1e9, -10.0), (1e9, 0.0), (2e9, -10.0), (2e9, 0.0), (4e9, -10.0), (4e9, 0.0)])
-        panel.load_pm_csv(csv_path, enable=True)
-        assert panel.pm_csv_enabled and panel.pm_csv_button.isChecked()
-        assert [f for f, _v in panel.power_table.rows] == [1e9, 2e9, 4e9]
-        assert panel.power_table.item(2, 1).text() == "---"
-        assert len(panel.pm_plot._curves) == 2
+        # Фильтрация диапазонов частот и мощностей строкой {f1}+{[f2,f3]}-{[f4]}
+        assert panel.set_pm_freq_range("{1G}+{[2G,3G]}-{[3G]}")
+        assert [f for f, _v in panel.power_table.rows] == [1e9, 2e9]
         assert all(len(pts) == 2 for _cp, _lbl, pts in panel.pm_plot._curves)
 
-        # Выключаем режим CSV -> 3 GHz возвращается, 4 GHz пропадает
-        panel.pm_csv_button.click()
-        assert not panel.pm_csv_enabled
+        # Сброс диапазона -> 3 GHz возвращается
+        assert panel.set_pm_freq_range("")
         assert [f for f, _v in panel.power_table.rows] == [1e9, 2e9, 3e9]
 
-        # Включаем CSV снова, сохраняем и проверяем восстановление в новом окне
-        panel.pm_csv_button.click()
+        # Сохранение диапазона в ini и восстановление в новом окне
+        assert panel.set_pm_freq_range("{[1G,2G]}")
         settings.sync()
         win2 = MainWindow(QSettings(str(ini), QSettings.Format.IniFormat), mon)
         qtbot.addWidget(win2)
         p2 = win2.panels[pm]
-        assert p2.pm_csv_enabled and p2.pm_csv_path == str(csv_path)
-        assert [f for f, _v in p2.power_table.rows] == [1e9, 2e9, 4e9]
+        assert p2.pm_freq_range.raw == "{[1G,2G]}"
+        assert [f for f, _v in p2.power_table.rows] == [1e9, 2e9]
     finally:
         for p in (gen, pm):
             p.shutdown()

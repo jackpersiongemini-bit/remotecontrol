@@ -161,7 +161,8 @@ def test_main_window_shows_only_measuring(qtbot, lab, tmp_path):
     gen.set("rf.output", True)
     qtbot.waitUntil(lambda: gen.value("rf.output") is True and gen.value("rf.power") == -5.0, timeout=5000)
     bench.step()
-    qtbot.waitUntil(lambda: "← GEN" in win.panels[px["e4446a"]].source.text(), timeout=10000)
+    qtbot.waitUntil(lambda: "dBm" in win.panels[px["e4446a"]].process_label.text()
+                    and not win.panels[px["e4446a"]].process_label.text().startswith("NOISE"), timeout=10000)
     assert [t.text() for t in win.tiles.values()] == ["VNA", "SA", "PM", "GEN"]
     assert not any(t.indicated() or t.error for t in win.tiles.values())   # окон приборов нет, ошибок нет
     pm = px["u2021xa"]
@@ -379,15 +380,13 @@ def test_main_window_widgets_grow_with_window(qtbot, lab, tmp_path):
     win.show()
     win.all_button.setChecked(True)
     qtbot.waitUntil(lambda: len(win.visible_panels()) == 3, timeout=10000)
-    win.resize(720, 900)
+    win.resize(720, 700)
     qtbot.wait(100)
-    plots = [p for panel in win.visible_panels() for p in panel.plots if p.isVisible()]
-    table = next(panel.power_table for panel in win.visible_panels() if panel.power_table is not None)
-    before = [p.height() for p in plots], table.height(), [p.width() for p in plots]
-    win.resize(1120, 1300)
-    qtbot.waitUntil(lambda: all(p.height() > h + 60 for p, h in zip(plots, before[0])), timeout=2000)
-    assert table.height() > before[1] + 60
-    assert all(p.width() > w + 300 for p, w in zip(plots, before[2]))
+    active = win.active_panel()
+    assert active is not None
+    before_a = active.width(), active.height()
+    win.resize(1200, 1000)
+    qtbot.waitUntil(lambda: active.width() > before_a[0] + 150 and active.height() > before_a[1] + 150, timeout=2000)
     win.tabs.setCurrentIndex(1)
     qtbot.wait(100)
     field = win.fields["hold_s"] if "hold_s" in win.fields else next(iter(win.fields.values()))
@@ -395,7 +394,7 @@ def test_main_window_widgets_grow_with_window(qtbot, lab, tmp_path):
 
 
 def test_main_window_panel_close_reorder_and_layout(qtbot, lab, tmp_path):
-    """Панели измерений можно закрывать (и возвращать чипом), переставлять и раскладывать по сетке."""
+    """Панели измерений можно закрывать (и возвращать чипом), а в CW режиме процесс VNA показывает CW P2 и частоту."""
     links, px, _bench = lab
     settings = QSettings(str(tmp_path / "layout.ini"), QSettings.Format.IniFormat)
     win = MainWindow(settings, ActivityMonitor(links))
@@ -403,17 +402,9 @@ def test_main_window_panel_close_reorder_and_layout(qtbot, lab, tmp_path):
     win.show()
     win.all_button.setChecked(True)
     assert [p.title.text() for p in win.visible_panels()] == ["VNA", "SA", "PM"]
-
-    # перестановка: VNA -> вправо
-    win.panels[px["pna"]].move_next_button.click()
-    assert [p.title.text() for p in win.visible_panels()] == ["SA", "VNA", "PM"]
-
-    # смена раскладки: 1 COL -> 2 COL -> ROW
-    assert win.layout_button.text() == "1 COL"
-    win.layout_button.click()
-    assert win.layout_mode == "2 COL" and win.layout_button.text() == "2 COL"
-    win.layout_button.click()
-    assert win.layout_mode == "ROW" and win.layout_button.text() == "ROW"
+    # По умолчанию (никто не превышает видеоуровень) слева VNA, справа SA и PM
+    assert win.active_panel() is win.panels[px["pna"]]
+    assert [p.title.text() for p in win.right_panels()] == ["SA", "PM"]
 
     # закрыть SA -> появляется чип возврата "+ SA"
     win.panels[px["e4446a"]].close_button.click()
@@ -421,21 +412,20 @@ def test_main_window_panel_close_reorder_and_layout(qtbot, lab, tmp_path):
     restore_sa = [b for b in win.restore_chips.values() if b.text() == "+ SA"]
     assert len(restore_sa) == 1
 
-    # перезапуск: порядок, раскладка и скрытая панель восстановились из ini
+    # перезапуск: скрытая панель восстановилась из ini
     win2 = MainWindow(settings, ActivityMonitor(links))
     qtbot.addWidget(win2)
     win2.show()
-    assert win2.layout_mode == "ROW"
     assert [p.title.text() for p in win2.visible_panels()] == ["VNA", "PM"]
     win2.restore_chips[win2._panel_key(px["e4446a"])].click()
-    assert [p.title.text() for p in win2.visible_panels()] == ["SA", "VNA", "PM"]
+    assert {p.title.text() for p in win2.visible_panels()} == {"SA", "VNA", "PM"}
 
-    # В CW режиме с портом P2 панель VNA показывает CW P2 и частоту
+    # В CW режиме с портом P2 процесс над графиком VNA показывает CW P2 и частоту
     vna = px["pna"]
     vna.set("freq.cw", 2.4e9)
     vna.set("gen.port", 2)
     vna.set("gen.state", True)
-    qtbot.waitUntil(lambda: "CW P2" in win2.panels[vna].source.text(), timeout=5000)
+    qtbot.waitUntil(lambda: "CW P2" in win2.panels[vna].process_label.text(), timeout=5000)
 
 
 def test_live_plot_decimation_cache_and_cursor(qtbot):
@@ -640,19 +630,19 @@ def test_pm_table_matrix_and_unit_switch(qtbot, lab, tmp_path):
     # Текущая ячейка (2 GHz, -10 dBm) выделена жирным
     assert tbl.item(1, 0).font().bold() and tbl.item(1, 1).font().bold() and not tbl.item(0, 2).font().bold()
 
-    # Переключение единиц: dBm -> W -> dBW -> V -> dB -> dBm
-    assert panel.unit_button.isVisibleTo(panel) and panel.unit_button.text() == "dBm"
-    panel.unit_button.click()                                   # W
-    assert tbl.unit == "W" and panel.unit_button.text() == "W"
+    # Переключение единиц во встроенных настройках: dBm -> W -> dBW -> V -> dB -> dBm
+    assert panel.pm_unit_buttons["dBm"].isChecked()
+    panel.set_pm_unit("W")
+    assert tbl.unit == "W" and panel.pm_unit_buttons["W"].isChecked()
     assert tbl.horizontalHeaderItem(1).text().endswith("W")
     assert tbl.item(0, 1).text().endswith("W") and panel.level.text().endswith("W")
-    panel.unit_button.click()                                   # dBW
+    panel.set_pm_unit("dBW")
     assert tbl.unit == "dBW" and tbl.horizontalHeaderItem(1).text() == "-40 dBW"
     assert tbl.item(0, 1).text() == "-50.00 dBW"
-    panel.unit_button.click()                                   # V (50 Ω)
+    panel.set_pm_unit("V")
     assert tbl.unit == "V" and tbl.horizontalHeaderItem(1).text().endswith("V")
     assert tbl.item(0, 1).text().endswith("V")
-    panel.unit_button.click()                                   # dB (Pout - Pin = -10.00 dB)
+    panel.set_pm_unit("dB")
     assert tbl.unit == "dB" and tbl.horizontalHeaderItem(1).text() == "-10 dBm"
     assert tbl.item(0, 1).text() == "-10.00 dB" and tbl.item(1, 2).text() == "-10.00 dB"
 
@@ -660,8 +650,8 @@ def test_pm_table_matrix_and_unit_switch(qtbot, lab, tmp_path):
     settings.sync()
     win2 = MainWindow(QSettings(str(ini), QSettings.Format.IniFormat), mon)
     qtbot.addWidget(win2)
-    assert win2.panels[pm].power_table.unit == "dB" and win2.panels[pm].unit_button.text() == "dB"
-    panel.unit_button.click()                                   # обратно в dBm
+    assert win2.panels[pm].power_table.unit == "dB" and win2.panels[pm].pm_unit_buttons["dB"].isChecked()
+    panel.set_pm_unit("dBm")
     assert tbl.unit == "dBm"
     gen.set("rf.output", False)
     qtbot.waitUntil(lambda: gen.value("rf.output") is False, timeout=5000)

@@ -1,29 +1,39 @@
-"""Инструменты графиков: анализ трасс (среднее, мин/макс, СКО, P-P, flatness, нелинейность, наклон,
-RMS, полоса −3 дБ), разность DATA − MEM и всплывающая панель настроек шкалы, памяти и анализа.
+"""Инструменты графиков: анализ трасс, математика (DATA −/+/÷/× MEM и формула f(x, y, mem)),
+векторные иконки заголовка панелей и встроенная/всплывающая панель настроек графика.
 """
 from __future__ import annotations
 
+import ast
 from bisect import bisect_left
 import math
-from typing import Any
+from typing import Any, Callable
 
-from PyQt6.QtCore import QPoint, QRect, Qt
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                              QPushButton, QVBoxLayout, QWidget)
 
 from ..core.trace import Trace
 from ..core.units import si_format, si_parse
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER,
-                    UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL,
-                    UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED, UI_FONT_SIZE_PT,
-                    UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, checkbox_qss, render_qss)
+                    UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER,
+                    UI_COLOR_PANEL, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
+                    UI_FONT_SIZE_PT, UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, checkbox_qss,
+                    render_qss)
 
 __all__ = [
     "ANALYSIS_METRICS",
     "ANALYSIS_KEYS",
+    "MATH_MODES",
+    "MATH_LABELS",
     "analyze_trace",
     "format_analysis",
+    "validate_math_expr",
+    "eval_math_expr",
+    "trace_math",
     "trace_diff",
+    "make_panel_icon",
+    "PlotSettingsWidget",
     "PlotSettingsPopup",
 ]
 
@@ -41,9 +51,154 @@ ANALYSIS_METRICS: tuple[tuple[str, str, str], ...] = (
     ("bw3", "BW-3dB", "-3 dB bandwidth around the peak"),
 )
 ANALYSIS_KEYS: tuple[str, ...] = tuple(k for k, _lbl, _tip in ANALYSIS_METRICS)
+
+MATH_MODES: tuple[str, ...] = ("OFF", "SUB", "ADD", "DIV", "MUL", "EXPR")
+MATH_LABELS: dict[str, str] = {
+    "OFF": "OFF",
+    "SUB": "D−M",
+    "ADD": "D+M",
+    "DIV": "D/M",
+    "MUL": "D×M",
+    "EXPR": "f(x,y)",
+}
+_MATH_TAGS: dict[str, str] = {
+    "SUB": "DATA−MEM",
+    "ADD": "DATA+MEM",
+    "DIV": "DATA/MEM",
+    "MUL": "DATA×MEM",
+    "EXPR": "MATH",
+}
 _SI_UNITS = ("W", "s", "Hz", "V", "A")
 
+# ------------------------------------------------------------ безопасный вычислитель формул MATH
+_SAFE_FUNCS: dict[str, Callable[..., float]] = {
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "round": round,
+    "pow": pow,
+    "sqrt": math.sqrt,
+    "log": math.log,
+    "log10": math.log10,
+    "log2": math.log2,
+    "exp": math.exp,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "asin": math.asin,
+    "acos": math.acos,
+    "atan": math.atan,
+    "atan2": math.atan2,
+    "db": lambda v: 10.0 * math.log10(v) if v > 0 else math.nan,
+    "db20": lambda v: 20.0 * math.log10(abs(v)) if v != 0 else math.nan,
+    "lin": lambda v: 10.0 ** (v / 10.0),
+}
+_SAFE_CONSTS: dict[str, float] = {"pi": math.pi, "e": math.e}
+_SAFE_VARS: frozenset[str] = frozenset(("x", "y", "mem", "m"))
+_BIN_OPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: (a / b) if b != 0 else math.nan,
+    ast.FloorDiv: lambda a, b: (a // b) if b != 0 else math.nan,
+    ast.Mod: lambda a, b: (a % b) if b != 0 else math.nan,
+    ast.Pow: lambda a, b: a ** b,
+}
+_UNARY_OPS = {
+    ast.UAdd: lambda a: +a,
+    ast.USub: lambda a: -a,
+}
 
+
+def _check_ast(node: ast.AST) -> None:
+    if isinstance(node, ast.Expression):
+        _check_ast(node.body)
+    elif isinstance(node, ast.Constant):
+        if not isinstance(node.value, (int, float)) or isinstance(node.value, bool):
+            raise ValueError("Only numeric constants are allowed")
+    elif isinstance(node, ast.Name):
+        name = node.id.lower()
+        if name not in _SAFE_VARS and name not in _SAFE_CONSTS:
+            raise ValueError(f"Unknown symbol: {node.id}")
+    elif isinstance(node, ast.BinOp):
+        if type(node.op) not in _BIN_OPS:
+            raise ValueError("Unsupported operator")
+        _check_ast(node.left)
+        _check_ast(node.right)
+    elif isinstance(node, ast.UnaryOp):
+        if type(node.op) not in _UNARY_OPS:
+            raise ValueError("Unsupported unary operator")
+        _check_ast(node.operand)
+    elif isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id.lower() not in _SAFE_FUNCS:
+            raise ValueError("Unsupported function")
+        if node.keywords:
+            raise ValueError("Keyword arguments are not supported")
+        for arg in node.args:
+            _check_ast(arg)
+    else:
+        raise ValueError(f"Unsupported syntax: {type(node).__name__}")
+
+
+def _eval_node(node: ast.AST, env: dict[str, float]) -> float:
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body, env)
+    if isinstance(node, ast.Constant):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        return env[node.id.lower()]
+    if isinstance(node, ast.UnaryOp):
+        return _UNARY_OPS[type(node.op)](_eval_node(node.operand, env))
+    if isinstance(node, ast.BinOp):
+        a = _eval_node(node.left, env)
+        b = _eval_node(node.right, env)
+        return _BIN_OPS[type(node.op)](a, b)
+    if isinstance(node, ast.Call):
+        fn = _SAFE_FUNCS[node.func.id.lower()]
+        args = [_eval_node(a, env) for a in node.args]
+        return float(fn(*args))
+    return math.nan
+
+
+def validate_math_expr(expr: str) -> tuple[bool, str]:
+    """Проверить математическую формулу для трассы (переменные ``x``, ``y``, ``mem``)."""
+    src = str(expr or "").strip()
+    if not src:
+        return False, "Empty expression"
+    try:
+        tree = ast.parse(src, mode="eval")
+        _check_ast(tree)
+    except (SyntaxError, ValueError) as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def _compile_math_expr(expr: str) -> ast.AST | None:
+    src = str(expr or "").strip()
+    if not src:
+        return None
+    try:
+        tree = ast.parse(src, mode="eval")
+        _check_ast(tree)
+        return tree
+    except (SyntaxError, ValueError):
+        return None
+
+
+def eval_math_expr(expr: str, x: float, y: float, mem: float = math.nan) -> float:
+    """Вычислить формулу ``expr`` в одной точке ``(x, y, mem)``."""
+    tree = _compile_math_expr(expr)
+    if tree is None:
+        return math.nan
+    env = {**_SAFE_CONSTS, "x": float(x), "y": float(y), "mem": float(mem), "m": float(mem)}
+    try:
+        val = float(_eval_node(tree, env))
+        return val if math.isfinite(val) else math.nan
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError):
+        return math.nan
+
+
+# ------------------------------------------------------------ форматирование и анализ трасс
 def _fmt_y(value: float, unit: str, *, diff: bool = False) -> str:
     if not math.isfinite(value):
         return "---"
@@ -239,56 +394,204 @@ def _interp_y(xs, ys, x: float) -> float:
     return float(y0 + t * (y1 - y0))
 
 
-def trace_diff(live: Trace, mem: Trace, y_transform=None) -> Trace:
-    """Вычислить разность ``live − mem`` (при несовпадении сетки X - линейная интерполяция ``mem``)."""
-    same_grid = (len(live.x) == len(mem.x) and len(live.x) > 0
-                 and live.x[0] == mem.x[0] and live.x[-1] == mem.x[-1])
+def trace_math(
+    live: Trace,
+    mem: Trace | None,
+    mode: str,
+    expr: str = "",
+    y_transform=None,
+) -> Trace:
+    """Применить математическую операцию к трассе: ``SUB / ADD / DIV / MUL / EXPR``."""
+    mode = str(mode or "OFF").upper()
+    if mode == "OFF":
+        return live
+    tree = _compile_math_expr(expr) if mode == "EXPR" else None
+    if mode == "EXPR" and tree is None:
+        return live
+    if mode in ("SUB", "ADD", "DIV", "MUL") and mem is None:
+        return live
+
+    same_grid = (
+        mem is not None
+        and len(live.x) == len(mem.x)
+        and len(live.x) > 0
+        and live.x[0] == mem.x[0]
+        and live.x[-1] == mem.x[-1]
+    )
+    mem_xs = list(mem.x) if (mem is not None and not same_grid) else []
+    mem_ys = (
+        [y_transform(v) if (y_transform is not None and math.isfinite(v)) else v for v in mem.y]
+        if (mem is not None and not same_grid)
+        else []
+    )
+
     ys: list[float] = []
-    if same_grid:
-        for yl, ym in zip(live.y, mem.y):
-            if math.isfinite(yl) and math.isfinite(ym):
-                a = y_transform(yl) if y_transform is not None else yl
-                b = y_transform(ym) if y_transform is not None else ym
-                ys.append(a - b if (math.isfinite(a) and math.isfinite(b)) else math.nan)
-            else:
-                ys.append(math.nan)
+    isfinite = math.isfinite
+    for i, (xl, yl) in enumerate(zip(live.x, live.y)):
+        if not (isfinite(xl) and isfinite(yl)):
+            ys.append(math.nan)
+            continue
+        a = y_transform(yl) if y_transform is not None else float(yl)
+        if not isfinite(a):
+            ys.append(math.nan)
+            continue
+        if mem is None:
+            b = math.nan
+        elif same_grid:
+            ym = mem.y[i]
+            b = (y_transform(ym) if (y_transform is not None and isfinite(ym)) else float(ym)) if isfinite(ym) else math.nan
+        else:
+            b = _interp_y(mem_xs, mem_ys, xl)
+
+        if mode == "SUB":
+            v = a - b if isfinite(b) else math.nan
+        elif mode == "ADD":
+            v = a + b if isfinite(b) else math.nan
+        elif mode == "DIV":
+            v = (a / b) if (isfinite(b) and abs(b) > 1e-30) else math.nan
+        elif mode == "MUL":
+            v = a * b if isfinite(b) else math.nan
+        elif mode == "EXPR" and tree is not None:
+            env = {**_SAFE_CONSTS, "x": float(xl), "y": a, "mem": b, "m": b}
+            try:
+                v = float(_eval_node(tree, env))
+            except (ValueError, ZeroDivisionError, OverflowError, TypeError):
+                v = math.nan
+        else:
+            v = a
+        ys.append(v if isfinite(v) else math.nan)
+
+    if mode == "SUB":
+        y_unit = "dB" if live.y_unit in ("dBm", "dB") else live.y_unit
+        prefix = "Δ"
+    elif mode == "ADD":
+        y_unit = live.y_unit
+        prefix = "+"
+    elif mode == "DIV":
+        y_unit = ""
+        prefix = "÷"
+    elif mode == "MUL":
+        y_unit = ""
+        prefix = "×"
     else:
-        mem_xs = list(mem.x)
-        mem_ys = [y_transform(v) if (y_transform is not None and math.isfinite(v)) else v for v in mem.y]
-        for xl, yl in zip(live.x, live.y):
-            if math.isfinite(xl) and math.isfinite(yl):
-                a = y_transform(yl) if y_transform is not None else yl
-                b = _interp_y(mem_xs, mem_ys, xl)
-                ys.append(a - b if (math.isfinite(a) and math.isfinite(b)) else math.nan)
-            else:
-                ys.append(math.nan)
-    y_unit = "dB" if live.y_unit in ("dBm", "dB") else live.y_unit
-    name = f"Δ{live.name}" if live.name else "ΔMEM"
-    return Trace(live.x, tuple(ys), live.x_unit, y_unit, name=name,
-                 timestamp=live.timestamp, meta=dict(live.meta or {}), uniform=live.uniform)
+        y_unit = live.y_unit
+        prefix = "f:"
+    name = f"{prefix}{live.name}" if live.name else _MATH_TAGS.get(mode, "MATH")
+    return Trace(
+        live.x,
+        tuple(ys),
+        live.x_unit,
+        y_unit,
+        name=name,
+        timestamp=live.timestamp,
+        meta=dict(live.meta or {}),
+        uniform=live.uniform,
+    )
 
 
-# ------------------------------------------------------------ всплывающая панель настроек графика
-_POPUP_STYLE = render_qss("""
-    PlotSettingsPopup {
+def trace_diff(live: Trace, mem: Trace, y_transform=None) -> Trace:
+    """Вычислить разность ``live − mem`` (обёртка над :func:`trace_math`)."""
+    return trace_math(live, mem, "SUB", y_transform=y_transform)
+
+
+# ------------------------------------------------------------ векторные иконки кнопок панелей
+def _draw_panel_pixmap(kind: str, size: int, color_hex: str) -> QPixmap:
+    dpr = 2
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    if not p.isActive():
+        return pm
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    col = QColor(color_hex)
+    pen = QPen(col, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    s = float(size)
+    cx, cy = s * 0.5, s * 0.5
+
+    if kind == "settings":
+        # Шестерёнка (6 зубцов + центральное отверстие)
+        r_in = s * 0.16
+        r_mid = s * 0.30
+        r_out = s * 0.41
+        p.drawEllipse(QPointF(cx, cy), r_in, r_in)
+        p.drawEllipse(QPointF(cx, cy), r_mid, r_mid)
+        tooth_pen = QPen(col, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(tooth_pen)
+        for k in range(6):
+            ang = k * math.pi / 3.0
+            ca, sa = math.cos(ang), math.sin(ang)
+            p.drawLine(QPointF(cx + r_mid * ca, cy + r_mid * sa), QPointF(cx + r_out * ca, cy + r_out * sa))
+    elif kind == "clear":
+        # Корзина очистки: крышка + корпус + две вертикальные линии
+        p.drawLine(QPointF(s * 0.22, s * 0.28), QPointF(s * 0.78, s * 0.28))
+        p.drawLine(QPointF(s * 0.38, s * 0.17), QPointF(s * 0.62, s * 0.17))
+        p.drawLine(QPointF(s * 0.38, s * 0.17), QPointF(s * 0.38, s * 0.28))
+        p.drawLine(QPointF(s * 0.62, s * 0.17), QPointF(s * 0.62, s * 0.28))
+        body = QPainterPath()
+        body.moveTo(s * 0.28, s * 0.28)
+        body.lineTo(s * 0.33, s * 0.82)
+        body.lineTo(s * 0.67, s * 0.82)
+        body.lineTo(s * 0.72, s * 0.28)
+        p.drawPath(body)
+        thin = QPen(col, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(thin)
+        p.drawLine(QPointF(s * 0.44, s * 0.42), QPointF(s * 0.45, s * 0.70))
+        p.drawLine(QPointF(s * 0.56, s * 0.42), QPointF(s * 0.55, s * 0.70))
+    elif kind == "close":
+        # Чистый крестик ×
+        m = s * 0.27
+        p.drawLine(QPointF(m, m), QPointF(s - m, s - m))
+        p.drawLine(QPointF(s - m, m), QPointF(m, s - m))
+    elif kind == "back":
+        p.drawLine(QPointF(s * 0.72, cy), QPointF(s * 0.28, cy))
+        p.drawLine(QPointF(s * 0.46, s * 0.30), QPointF(s * 0.28, cy))
+        p.drawLine(QPointF(s * 0.46, s * 0.70), QPointF(s * 0.28, cy))
+    p.end()
+    return pm
+
+
+def make_panel_icon(kind: str, size: int = 16, *, active: bool = False) -> QIcon:
+    """Создать чёткую векторную HiDPI-иконку (settings / clear / close / back) для кнопок панели."""
+    icon = QIcon()
+    normal_col = UI_COLOR_TEXT_INVERSE if active else UI_COLOR_TEXT_MUTED
+    icon.addPixmap(_draw_panel_pixmap(kind, size, normal_col), QIcon.Mode.Normal, QIcon.State.Off)
+    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_TEXT_INVERSE), QIcon.Mode.Normal, QIcon.State.On)
+    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_TEXT_INVERSE), QIcon.Mode.Active, QIcon.State.Off)
+    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_TEXT_INVERSE), QIcon.Mode.Active, QIcon.State.On)
+    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_BORDER), QIcon.Mode.Disabled, QIcon.State.Off)
+    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_BORDER), QIcon.Mode.Disabled, QIcon.State.On)
+    return icon
+
+
+# ------------------------------------------------------------ встроенная и всплывающая панель настроек графика
+_SETTINGS_STYLE = render_qss("""
+    PlotSettingsWidget, PlotSettingsPopup {
         background-color: $UI_COLOR_PANEL;
+    }
+    PlotSettingsPopup {
         border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER_LIGHT;
         border-radius: ${UI_BORDER_RADIUS_PX}px;
     }
-    PlotSettingsPopup QWidget {
+    PlotSettingsWidget QWidget, PlotSettingsPopup QWidget {
         background: transparent;
         font-family: $UI_MONOSPACE_FONT_FAMILY;
         font-size: ${UI_FONT_SIZE_PT}pt;
         color: $UI_COLOR_TEXT_MUTED;
     }
-    PlotSettingsPopup QLabel#sec {
+    PlotSettingsWidget QLabel#sec, PlotSettingsPopup QLabel#sec {
         font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
         color: $UI_COLOR_TEXT;
     }
-    PlotSettingsPopup QLabel#muted {
+    PlotSettingsWidget QLabel#muted, PlotSettingsPopup QLabel#muted {
         color: $UI_COLOR_BORDER_LIGHT;
     }
-    PlotSettingsPopup QLineEdit {
+    PlotSettingsWidget QLabel#err, PlotSettingsPopup QLabel#err {
+        color: $UI_COLOR_ERROR;
+    }
+    PlotSettingsWidget QLineEdit, PlotSettingsPopup QLineEdit {
         background-color: $UI_COLOR_BACKGROUND;
         border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
         border-radius: 4px;
@@ -296,9 +599,12 @@ _POPUP_STYLE = render_qss("""
         min-height: 22px;
         color: $UI_COLOR_TEXT;
     }
-    PlotSettingsPopup QLineEdit:focus { border-color: $UI_COLOR_TEXT_MUTED; }
-    PlotSettingsPopup QLineEdit:disabled { color: $UI_COLOR_BORDER; }
-    PlotSettingsPopup QPushButton {
+    PlotSettingsWidget QLineEdit:focus, PlotSettingsPopup QLineEdit:focus { border-color: $UI_COLOR_TEXT_MUTED; }
+    PlotSettingsWidget QLineEdit:disabled, PlotSettingsPopup QLineEdit:disabled { color: $UI_COLOR_BORDER; }
+    PlotSettingsWidget QLineEdit[invalid="true"], PlotSettingsPopup QLineEdit[invalid="true"] {
+        border-color: $UI_COLOR_ERROR;
+    }
+    PlotSettingsWidget QPushButton, PlotSettingsPopup QPushButton {
         background-color: $UI_COLOR_BACKGROUND;
         border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BACKGROUND;
         border-radius: 4px;
@@ -306,27 +612,27 @@ _POPUP_STYLE = render_qss("""
         min-height: 22px;
         color: $UI_COLOR_TEXT_MUTED;
     }
-    PlotSettingsPopup QPushButton:hover {
+    PlotSettingsWidget QPushButton:hover, PlotSettingsPopup QPushButton:hover {
         background-color: $UI_COLOR_INVERT_HOVER;
         color: $UI_COLOR_TEXT_INVERSE;
         font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
     }
-    PlotSettingsPopup QPushButton:checked {
+    PlotSettingsWidget QPushButton:checked, PlotSettingsPopup QPushButton:checked {
         background-color: $UI_COLOR_INVERT;
         color: $UI_COLOR_TEXT_INVERSE;
         font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
     }
-    PlotSettingsPopup QPushButton:disabled { color: $UI_COLOR_BORDER; }
-    PlotSettingsPopup QCheckBox {
+    PlotSettingsWidget QPushButton:disabled, PlotSettingsPopup QPushButton:disabled { color: $UI_COLOR_BORDER; }
+    PlotSettingsWidget QCheckBox, PlotSettingsPopup QCheckBox {
         spacing: 6px;
         color: $UI_COLOR_TEXT;
     }
-    PlotSettingsPopup QFrame#sep {
+    PlotSettingsWidget QFrame#sep, PlotSettingsPopup QFrame#sep {
         background-color: $UI_COLOR_BORDER;
         max-height: 1px;
         min-height: 1px;
     }
-""") + "\n" + checkbox_qss("PlotSettingsPopup ")
+""") + "\n" + checkbox_qss("PlotSettingsWidget ") + "\n" + checkbox_qss("PlotSettingsPopup ")
 
 
 def _parse_axis_number(text: str, unit: str) -> float | None:
@@ -351,31 +657,52 @@ def _parse_axis_number(text: str, unit: str) -> float | None:
     return None
 
 
-class PlotSettingsPopup(QFrame):
-    """Интерактивная тёмная панель настроек графика: SCALE, MEM и выбор метрик ANALYSIS галочками."""
+class _CommitLineEdit(QLineEdit):
+    """Поле ввода настроек графика: отправка строго по Enter, откат при уходе фокуса / Esc."""
 
-    def __init__(self, plot, parent: QWidget | None = None):
-        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+    def __init__(self, tip: str, on_commit, parent=None):
+        super().__init__(parent)
+        self._committed = ""
+        self._on_commit = on_commit
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setMinimumWidth(82)
+        self.setToolTip(tip)
+        self.returnPressed.connect(self._commit)
+
+    def set_committed(self, text: str) -> None:
+        self._committed = text
+        self.blockSignals(True)
+        self.setText(text)
+        self.setModified(False)
+        self.blockSignals(False)
+
+    def _commit(self) -> None:
+        self._on_commit()
+        self.clearFocus()
+
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        if e.key() == Qt.Key.Key_Escape:
+            self.set_committed(self._committed)
+            self.clearFocus()
+            return
+        super().keyPressEvent(e)
+
+    def focusOutEvent(self, e):  # noqa: N802 - Qt
+        super().focusOutEvent(e)
+        if self.text() != self._committed:
+            self.set_committed(self._committed)
+
+
+class PlotSettingsWidget(QWidget):
+    """Встроенная панель настроек графика: SCALE, MEM, MATH и ANALYSIS (для всех типов графиков)."""
+
+    def __init__(self, plot=None, parent: QWidget | None = None):
+        super().__init__(parent)
         self.plot = plot
-        self.setStyleSheet(_POPUP_STYLE)
+        self.setStyleSheet(_SETTINGS_STYLE)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
-
-        # Заголовок
-        hdr = QHBoxLayout()
-        title = QLabel("PLOT SETTINGS")
-        title.setObjectName("sec")
-        close_btn = QPushButton("×")
-        close_btn.setFixedWidth(24)
-        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setToolTip("Close plot settings (Esc)")
-        close_btn.clicked.connect(self.close)
-        hdr.addWidget(title)
-        hdr.addStretch()
-        hdr.addWidget(close_btn)
-        lay.addLayout(hdr)
 
         # --- SCALE ---
         sec_scale = QLabel("SCALE")
@@ -395,11 +722,11 @@ class PlotSettingsPopup(QFrame):
         scale_grid = QGridLayout()
         scale_grid.setHorizontalSpacing(6)
         scale_grid.setVerticalSpacing(4)
-        self.ref_edit = self._edit("Top of Y scale (REF); Enter to apply", self._apply_scale)
-        self.div_edit = self._edit("Y value per division (DIV); Enter to apply", self._apply_scale)
-        self.divs_edit = self._edit("Number of Y grid divisions (2..20)", self._apply_scale)
-        self.xmin_edit = self._edit("Manual X minimum (leave blank for full span)", self._apply_x)
-        self.xmax_edit = self._edit("Manual X maximum (leave blank for full span)", self._apply_x)
+        self.ref_edit = _CommitLineEdit("Top of Y scale (REF); Enter to apply", self._apply_scale)
+        self.div_edit = _CommitLineEdit("Y value per division (DIV); Enter to apply", self._apply_scale)
+        self.divs_edit = _CommitLineEdit("Number of Y grid divisions (2..20); Enter to apply", self._apply_scale)
+        self.xmin_edit = _CommitLineEdit("Manual X minimum (blank = full span); Enter to apply", self._apply_x)
+        self.xmax_edit = _CommitLineEdit("Manual X maximum (blank = full span); Enter to apply", self._apply_x)
 
         scale_grid.addWidget(self._lbl("REF"), 0, 0)
         scale_grid.addWidget(self.ref_edit, 0, 1)
@@ -456,6 +783,48 @@ class PlotSettingsPopup(QFrame):
 
         lay.addWidget(self._sep())
 
+        # --- MATH ---
+        math_hdr = QHBoxLayout()
+        math_lbl = QLabel("MATH")
+        math_lbl.setObjectName("sec")
+        self.math_status = QLabel("")
+        self.math_status.setObjectName("muted")
+        math_hdr.addWidget(math_lbl)
+        math_hdr.addStretch()
+        math_hdr.addWidget(self.math_status)
+        lay.addLayout(math_hdr)
+
+        math_row = QHBoxLayout()
+        math_row.setSpacing(4)
+        self.math_buttons: dict[str, QPushButton] = {}
+        math_tips = {
+            "OFF": "Disable trace math (show live data)",
+            "SUB": "Live − Memory",
+            "ADD": "Live + Memory",
+            "DIV": "Live / Memory",
+            "MUL": "Live × Memory",
+            "EXPR": "Custom math formula f(x, y, mem)",
+        }
+        for mode in MATH_MODES:
+            b = self._btn(MATH_LABELS[mode], math_tips[mode], lambda _=False, m=mode: self._on_math_mode(m), checkable=True)
+            self.math_buttons[mode] = b
+            math_row.addWidget(b)
+        lay.addLayout(math_row)
+
+        expr_row = QHBoxLayout()
+        expr_row.setSpacing(6)
+        expr_row.addWidget(self._lbl("f(x,y)"))
+        self.math_expr_edit = _CommitLineEdit(
+            "Custom math formula using x, y, mem (e.g. y + 3, y - mem, 10**(y/10)); Enter to apply",
+            self._apply_math_expr,
+        )
+        self.math_expr_edit.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.math_expr_edit.setPlaceholderText("y - mem, y + 3, abs(y) ...")
+        expr_row.addWidget(self.math_expr_edit, 1)
+        lay.addLayout(expr_row)
+
+        lay.addWidget(self._sep())
+
         # --- ANALYSIS ---
         an_hdr = QHBoxLayout()
         an_lbl = QLabel("ANALYSIS")
@@ -482,7 +851,8 @@ class PlotSettingsPopup(QFrame):
             an_grid.addWidget(cb, idx // 2, idx % 2)
         lay.addLayout(an_grid)
 
-        self.sync_from_plot()
+        if self.plot is not None:
+            self.sync_from_plot()
 
     @staticmethod
     def _lbl(text: str) -> QLabel:
@@ -503,22 +873,17 @@ class PlotSettingsPopup(QFrame):
         b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.setToolTip(tip)
-        if checkable:
-            b.clicked.connect(slot)
-        else:
-            b.clicked.connect(slot)
+        b.clicked.connect(slot)
         return b
 
-    @staticmethod
-    def _edit(tip: str, slot) -> QLineEdit:
-        e = QLineEdit()
-        e.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        e.setMinimumWidth(86)
-        e.setToolTip(tip)
-        e.returnPressed.connect(slot)
-        return e
+    def set_plot(self, plot) -> None:
+        self.plot = plot
+        if plot is not None:
+            self.sync_from_plot()
 
     def sync_from_plot(self) -> None:
+        if self.plot is None:
+            return
         st = self.plot.plot_settings_state()
         is_man = bool(st["manual_scale"])
         self.auto_btn.setChecked(not is_man)
@@ -528,27 +893,17 @@ class PlotSettingsPopup(QFrame):
         ref = st.get("ref")
         div = st.get("div")
         divs = st.get("divs_y", 6)
-        self.ref_edit.blockSignals(True)
-        self.div_edit.blockSignals(True)
-        self.divs_edit.blockSignals(True)
-        self.xmin_edit.blockSignals(True)
-        self.xmax_edit.blockSignals(True)
-        self.ref_edit.setText(_fmt_y(ref, yu) if ref is not None else "")
-        self.div_edit.setText(_fmt_y(div, yu, diff=True) if div is not None else "")
-        self.divs_edit.setText(str(int(divs)))
+        self.ref_edit.set_committed(_fmt_y(ref, yu) if ref is not None else "")
+        self.div_edit.set_committed(_fmt_y(div, yu, diff=True) if div is not None else "")
+        self.divs_edit.set_committed(str(int(divs)))
         self.divs_edit.setEnabled(bool(st.get("supports_divs", True)))
         xr = st.get("manual_x_range")
-        self.xmin_edit.setText(_fmt_x(xr[0], xu) if xr else "")
-        self.xmax_edit.setText(_fmt_x(xr[1], xu) if xr else "")
+        self.xmin_edit.set_committed(_fmt_x(xr[0], xu) if xr else "")
+        self.xmax_edit.set_committed(_fmt_x(xr[1], xu) if xr else "")
         self.xmin_edit.setPlaceholderText("auto")
         self.xmax_edit.setPlaceholderText("auto")
         self.xmin_edit.setEnabled(bool(st.get("supports_x_zoom", True)))
         self.xmax_edit.setEnabled(bool(st.get("supports_x_zoom", True)))
-        self.ref_edit.blockSignals(False)
-        self.div_edit.blockSignals(False)
-        self.divs_edit.blockSignals(False)
-        self.xmin_edit.blockSignals(False)
-        self.xmax_edit.blockSignals(False)
 
         self.grid_cb.blockSignals(True)
         self.grid_cb.setChecked(bool(st.get("show_grid", True)))
@@ -565,7 +920,27 @@ class PlotSettingsPopup(QFrame):
         self.mem_diff_btn.setEnabled(has_mem)
         self.mem_clear_btn.setEnabled(has_mem)
         self.mem_show_btn.setChecked(has_mem and bool(st.get("memory_visible", True)))
-        self.mem_diff_btn.setChecked(has_mem and bool(st.get("memory_diff", False)))
+        math_mode = str(st.get("math_mode", "SUB" if st.get("memory_diff", False) else "OFF") or "OFF").upper()
+        math_expr = str(st.get("math_expr", "") or "")
+        self.mem_diff_btn.setChecked(has_mem and math_mode == "SUB")
+
+        for mode, btn in self.math_buttons.items():
+            need_mem = mode in ("SUB", "ADD", "DIV", "MUL")
+            btn.setEnabled(True if not need_mem else has_mem)
+            btn.setChecked(mode == math_mode)
+        self.math_expr_edit.set_committed(math_expr)
+        self.math_expr_edit.setProperty("invalid", False)
+        self.math_expr_edit.style().unpolish(self.math_expr_edit)
+        self.math_expr_edit.style().polish(self.math_expr_edit)
+        if math_mode == "EXPR" and math_expr:
+            self.math_status.setObjectName("muted")
+            self.math_status.setText(f"f = {math_expr}")
+        elif math_mode != "OFF":
+            self.math_status.setObjectName("muted")
+            self.math_status.setText(_MATH_TAGS.get(math_mode, math_mode))
+        else:
+            self.math_status.setObjectName("muted")
+            self.math_status.setText("off")
 
         enabled = set(st.get("analysis_metrics", ()))
         for key, cb in self.analysis_checks.items():
@@ -575,6 +950,8 @@ class PlotSettingsPopup(QFrame):
 
     # ------------------------------------------------------------ обработчики
     def _on_auto(self) -> None:
+        if self.plot is None:
+            return
         self.plot.set_auto_scale()
         self.sync_from_plot()
 
@@ -582,14 +959,20 @@ class PlotSettingsPopup(QFrame):
         self._apply_scale()
 
     def _on_fit(self) -> None:
+        if self.plot is None:
+            return
         self.plot.autoscale_once()
         self.sync_from_plot()
 
     def _on_reset(self) -> None:
+        if self.plot is None:
+            return
         self.plot.reset_view()
         self.sync_from_plot()
 
     def _apply_scale(self) -> None:
+        if self.plot is None:
+            return
         st = self.plot.plot_settings_state()
         yu = st.get("y_unit", "")
         ref = _parse_axis_number(self.ref_edit.text(), yu)
@@ -608,6 +991,8 @@ class PlotSettingsPopup(QFrame):
         self.sync_from_plot()
 
     def _apply_x(self) -> None:
+        if self.plot is None:
+            return
         st = self.plot.plot_settings_state()
         xu = st.get("x_unit", "")
         t0, t1 = self.xmin_edit.text().strip(), self.xmax_edit.text().strip()
@@ -623,33 +1008,130 @@ class PlotSettingsPopup(QFrame):
         self.sync_from_plot()
 
     def _on_grid(self, checked: bool) -> None:
-        self.plot.set_show_grid(checked)
+        if self.plot is not None:
+            self.plot.set_show_grid(checked)
 
     def _on_points(self, checked: bool) -> None:
-        self.plot.set_show_points(checked)
+        if self.plot is not None:
+            self.plot.set_show_points(checked)
 
     def _on_mem_store(self) -> None:
+        if self.plot is None:
+            return
         self.plot.store_memory()
         self.sync_from_plot()
 
     def _on_mem_show(self) -> None:
+        if self.plot is None:
+            return
         self.plot.set_memory_visible(self.mem_show_btn.isChecked())
         self.sync_from_plot()
 
     def _on_mem_diff(self) -> None:
+        if self.plot is None:
+            return
         self.plot.set_memory_diff(self.mem_diff_btn.isChecked())
         self.sync_from_plot()
 
     def _on_mem_clear(self) -> None:
+        if self.plot is None:
+            return
         self.plot.clear_memory()
         self.sync_from_plot()
 
+    def _on_math_mode(self, mode: str) -> None:
+        if self.plot is None:
+            return
+        if mode == "EXPR":
+            expr = self.math_expr_edit.text().strip()
+            if not expr:
+                expr = "y - mem" if self.plot.plot_settings_state().get("has_memory") else "y"
+                self.math_expr_edit.set_committed(expr)
+            ok, err = validate_math_expr(expr)
+            if not ok:
+                self.math_status.setObjectName("err")
+                self.math_status.setText(err)
+                return
+            self.plot.set_math("EXPR", expr)
+        else:
+            self.plot.set_math(mode)
+        self.sync_from_plot()
+
+    def _apply_math_expr(self) -> None:
+        if self.plot is None:
+            return
+        expr = self.math_expr_edit.text().strip()
+        if not expr:
+            self.plot.set_math("OFF", "")
+            self.sync_from_plot()
+            return
+        ok, err = validate_math_expr(expr)
+        if not ok:
+            self.math_expr_edit.setProperty("invalid", True)
+            self.math_expr_edit.style().unpolish(self.math_expr_edit)
+            self.math_expr_edit.style().polish(self.math_expr_edit)
+            self.math_status.setObjectName("err")
+            self.math_status.setText(err)
+            return
+        self.plot.set_math("EXPR", expr)
+        self.sync_from_plot()
+
     def _on_analysis_toggled(self, key: str, checked: bool) -> None:
-        self.plot.toggle_analysis_metric(key, checked)
+        if self.plot is not None:
+            self.plot.toggle_analysis_metric(key, checked)
 
     def _set_all_analysis(self, on: bool) -> None:
+        if self.plot is None:
+            return
         self.plot.set_analysis_metrics(list(ANALYSIS_KEYS) if on else [])
         self.sync_from_plot()
+
+
+class PlotSettingsPopup(QFrame):
+    """Всплывающая обёртка вокруг :class:`PlotSettingsWidget` (для контекстного меню и тестов)."""
+
+    def __init__(self, plot, parent: QWidget | None = None):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.plot = plot
+        self.setStyleSheet(_SETTINGS_STYLE)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        title = QLabel("PLOT SETTINGS")
+        title.setObjectName("sec")
+        close_btn = QPushButton()
+        close_btn.setIcon(make_panel_icon("close", 14))
+        close_btn.setFixedWidth(24)
+        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("Close plot settings (Esc)")
+        close_btn.clicked.connect(self.close)
+        hdr.addWidget(title)
+        hdr.addStretch()
+        hdr.addWidget(close_btn)
+        lay.addLayout(hdr)
+
+        self.widget = PlotSettingsWidget(plot, self)
+        lay.addWidget(self.widget)
+
+        # Проброс полей для совместимости со старым кодом/тестами
+        for attr in ("auto_btn", "man_btn", "fit_btn", "reset_btn",
+                     "ref_edit", "div_edit", "divs_edit", "xmin_edit", "xmax_edit",
+                     "grid_cb", "points_cb",
+                     "mem_info", "mem_store_btn", "mem_show_btn", "mem_diff_btn", "mem_clear_btn",
+                     "math_buttons", "math_expr_edit", "math_status", "analysis_checks"):
+            setattr(self, attr, getattr(self.widget, attr))
+
+    def sync_from_plot(self) -> None:
+        self.widget.sync_from_plot()
+
+    def _apply_scale(self) -> None:
+        self.widget._apply_scale()
+
+    def _apply_x(self) -> None:
+        self.widget._apply_x()
 
     def show_at(self, global_pos: QPoint) -> None:
         self.adjustSize()

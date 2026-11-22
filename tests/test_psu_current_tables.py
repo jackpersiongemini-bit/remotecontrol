@@ -109,11 +109,10 @@ def test_psu_current_tables_matrix_selection_rf_choice_and_persistence(qtbot, be
         assert rows2[0][1][-10.0] == pytest.approx(0.25, abs=0.02)
         assert mon.psu_matrix(psu, 3) == ([], [])
 
-        # Проверяем отображение в CurrentTable и переключение единиц (mA)
+        # Проверяем отображение в CurrentTable и переключение единиц (mA) во встроенных настройках
         qtbot.waitUntil(lambda: cp1.current_table.rowCount() == 2 and cp1.current_table.columnCount() == 3, timeout=5000)
-        assert "← GEN" in cp1.source.text()
         cp1.set_unit("mA")
-        assert cp1.unit_button.text() == "mA"
+        assert cp1.unit_buttons["mA"].isChecked()
         assert "500.00 mA" == cp1.current_table.item(0, 1).text()
         assert "1000.00 mA" == cp1.current_table.item(0, 2).text()
 
@@ -128,7 +127,6 @@ def test_psu_current_tables_matrix_selection_rf_choice_and_persistence(qtbot, be
             lambda: any(abs(f - 3.5e9) < 1.0 for f, _ in mon.psu_matrix(psu, 2)[1]),
             timeout=5000,
         )
-        assert "← GEN2" in cp2.source.text()
 
         # Очистка таблицы CH1 не трогает CH2
         cp1.clear_button.click()
