@@ -124,6 +124,54 @@ def test_pna_connecting_already_in_ext_does_not_emit_pretrigger_trace(make):
     assert rec.values.get("m1.trace") is not None
 
 
+def test_pna_real_hardware_int_trig_and_zero_oper_reads_traces(make):
+    """На реальном PNA-L N5231A TRIG:SOUR? может вернуть 'INT'/'INTERNAL', а STAT:OPER:EVEN? всегда '0':
+    непрерывное чтение трасс и триггерные EXT/MAN (*OPC) должны работать без зависаний."""
+    sim = KeysightPNASim()
+    sim.on("TRIGger[:SEQuence]:SOURce",
+           sim._tenum("sour", {"IMM": "IMM", "IMMEDIATE": "IMM", "INT": "IMM", "INTERNAL": "IMM",
+                               "EXT": "EXT", "EXTERNAL": "EXT", "MAN": "MAN", "MANUAL": "MAN"}),
+           lambda a, g: {"IMM": "INT", "EXT": "EXT", "MAN": "MAN"}[sim.trig["sour"]])
+    sim.on("STATus:OPERation[:EVENt]", get=lambda a, g: "0")
+
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert rec.values["trig.source"] == "IMM"
+    assert not drv.is_triggered_mode()
+    first = rec.values.get("m1.trace")
+    assert first is not None and not rec.errors
+
+    # Повторный опрос в CONT читает новую трассу через фоллбэк даже при STAT:OPER:EVEN? == 0
+    drv._last_cont_read = 0.0
+    drv.poll()
+    assert rec.values["m1.trace"] is not first and not rec.errors
+
+    # В EXT / MAN при STAT:OPER:EVEN? == 0 (но _oper_supported == True!) ждём *OPC, а не застреваем на бите 4
+    assert drv._oper_supported is True
+    assert _setp(drv, rec, "trig.source", "EXT") is PStatus.WRITTEN
+    assert drv.is_triggered_mode()
+    emitted: list = []
+    drv.param_updated.connect(lambda k, v: emitted.append(v) if k == "m1.trace" else None)
+    drv._last_cont_read = 0.0
+    for _ in range(4):
+        drv.poll()
+    assert emitted == []
+    sim.trigger()
+    drv.poll()
+    assert len(emitted) == 1
+
+    assert _setp(drv, rec, "trig.source", "MAN") is PStatus.WRITTEN
+    for _ in range(3):
+        drv.poll()
+    assert len(emitted) == 1
+    drv.run_action("trigger")
+    drv.poll()
+    assert len(emitted) == 2
+
+    # Отсутствующий / None trig.source не должен блокировать непрерывное чтение
+    drv._values["trig.source"] = None
+    assert not drv._is_triggered()
+
+
 # ------------------------------------------------------------------ 2. Ваттметр (Keysight U2021XA)
 def test_pm_continuous_pause_and_level_trigger_fast_opc(make):
     drv, sim, rec = make(KeysightU2021XA, KeysightU2021XASim)
