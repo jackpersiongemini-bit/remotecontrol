@@ -40,7 +40,7 @@ def test_line_edit_and_cycle_button(qtbot, opened):
     ch1 = win.channels[0]
     ch1["high"].setText("1.5 V")
     ch1["high"].setModified(True)
-    ch1["high"].editingFinished.emit()
+    ch1["high"].returnPressed.emit()
     _wait(qtbot, proxy, "ch1.high", lambda v: v == pytest.approx(1.5))
     assert isinstance(ch1["output"], PSButton)
     assert ch1["output"].text() == "CH1 OFF"
@@ -268,7 +268,7 @@ def test_unit_dropdown_value_left(qtbot, opened):
     assert per.text() == "2000" and per.unit_button.text() == "µs"
     per.setText("1500")                                   # ввод - в выбранной единице
     per.setModified(True)
-    per.editingFinished.emit()
+    per.returnPressed.emit()
     _wait(qtbot, proxy, "ch1.period", lambda v: v == pytest.approx(1.5e-3))
 
 

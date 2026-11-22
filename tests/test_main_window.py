@@ -228,14 +228,14 @@ def test_thresholds_in_main_window_settings(qtbot, lab, tmp_path):
     qtbot.waitUntil(lambda: win.monitor.activity(pm).measuring, timeout=10000)
     f = win.fields["pm_floor_dbm"]
     f.setText("-40")
-    f.editingFinished.emit()
+    f.returnPressed.emit()
     assert win.monitor.th.pm_floor_dbm == -40.0 and settings.value("MAIN/THRESHOLDS/pm_floor_dbm", type=float) == -40.0
     assert win.monitor.activity(pm).measuring           # порог не скрывает выдаваемые данные
     f.setText("junk")
-    f.editingFinished.emit()
+    f.returnPressed.emit()
     assert f.text() == "-40 dBm"
     win.fields["freq_tol_rel"].setText("0.5")           # в процентах
-    win.fields["freq_tol_rel"].editingFinished.emit()
+    win.fields["freq_tol_rel"].returnPressed.emit()
     assert win.monitor.th.freq_tol_rel == pytest.approx(0.005)
     win2 = MainWindow(settings, ActivityMonitor(links))   # из ini
     qtbot.addWidget(win2)
@@ -697,7 +697,7 @@ def test_settings_displayed_graphs_and_level_trigger(qtbot, lab, tmp_path):
     # 2) Включили Above level у SA с порогом -30 dBm: при шуме (-90 dBm) SA скрыт
     sa_by_lvl.setChecked(True)
     sa_edit.setText("-30")
-    sa_edit.editingFinished.emit()
+    sa_edit.returnPressed.emit()
     assert win.display_rules[sa_key]["level"] == pytest.approx(-30.0)
     assert win.panels[sa] not in win.visible_panels()
 
@@ -711,13 +711,13 @@ def test_settings_displayed_graphs_and_level_trigger(qtbot, lab, tmp_path):
 
     # Подняли порог до -15 dBm (-20 < -15) -> SA снова скрылся
     sa_edit.setText("-15")
-    sa_edit.editingFinished.emit()
+    sa_edit.returnPressed.emit()
     assert win.panels[sa] not in win.visible_panels()
 
     # 3) Проверим сохранение в ini и восстановление в новом MainWindow
     pm_by_lvl.setChecked(True)
     pm_edit.setText("-25")
-    pm_edit.editingFinished.emit()
+    pm_edit.returnPressed.emit()
     pm_show.setChecked(False)
     settings.sync()
 

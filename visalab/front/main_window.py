@@ -61,12 +61,13 @@ SETTINGS = (
 
 
 class SettingField(QLineEdit):
-    """Порог: число с единицей; Enter / уход фокуса - применить, Esc - вернуть."""
+    """Порог: число с единицей; Enter - применить, Esc / уход фокуса - вернуть."""
 
     def __init__(self, unit: str, scale: float, parent=None):
         super().__init__(parent)
         self.setObjectName("cfg")
         self.unit, self.scale = unit, scale
+        self.value = 0.0
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
@@ -75,6 +76,12 @@ class SettingField(QLineEdit):
             self.clearFocus()
             return
         super().keyPressEvent(e)
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.clearFocus()
+
+    def focusOutEvent(self, e):  # noqa: N802 - Qt
+        super().focusOutEvent(e)
+        self.show_value(self.value)
 
     def show_value(self, v: float) -> None:
         self.value = v
@@ -737,7 +744,7 @@ class MainWindow(Window):
             f.setToolTip(tip)
             f.setMinimumWidth(130)                  # поле тянется с окном, как в окнах приборов
             f.show_value(getattr(self.monitor.th, name))
-            f.editingFinished.connect(lambda n=name: self._apply_setting(n))
+            f.returnPressed.connect(lambda n=name: self._apply_setting(n))
             self.fields[name] = f
             line = PanelLine(label, f)
             line.setToolTip(tip)
@@ -1085,7 +1092,7 @@ class MainWindow(Window):
             level_edit.setToolTip(f"Video / signal level threshold for {name} ({unit}): show when level >= this value")
             show_cb.toggled.connect(lambda checked, k=key: self.set_panel_shown(k, checked))
             level_cb.toggled.connect(lambda checked, k=key: self.set_panel_by_level(k, checked))
-            level_edit.editingFinished.connect(lambda k=key: self._apply_display_level(k))
+            level_edit.returnPressed.connect(lambda k=key: self._apply_display_level(k))
             rl.addWidget(lbl)
             rl.addWidget(show_cb)
             rl.addWidget(level_cb)
@@ -1411,6 +1418,7 @@ class MainWindow(Window):
             for fn in self.before_quit:
                 fn()
         super().closeEvent(event)
+        self.settings.sync()
         if self.quit_on_close:
             self.cleanup()
             QApplication.quit()

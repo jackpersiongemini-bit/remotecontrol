@@ -108,7 +108,7 @@ def _repolish(w: QWidget) -> None:
 
 # ======================================================================= поля
 class SpinField(QDoubleSpinBox):
-    """Число, привязанное к ключу прибора. Отправка по Enter / уходу фокуса, только если изменилось.
+    """Число, привязанное к ключу прибора. Отправка только по Enter и stepBy (стрелки / колесо).
 
     ``scale`` - во сколько раз отображаемая единица больше единицы СИ (MHz -> 1e6).
     """
@@ -132,7 +132,7 @@ class SpinField(QDoubleSpinBox):
         self.setEnabled(False)
         self._shown: float | None = None
         proxy.subscribe(key, self._on_value, self._on_status)
-        self.editingFinished.connect(self._commit)
+        self.lineEdit().returnPressed.connect(self._commit_on_enter)
 
     def _on_value(self, value: Any) -> None:
         if value is None:
@@ -158,7 +158,35 @@ class SpinField(QDoubleSpinBox):
         self._shown = self.value()
         self.proxy.set(self.key, self.value() * self.scale)
 
+    def _commit_on_enter(self) -> None:
+        self.interpretText()
+        self._commit()
+        self.clearFocus()
+
+    def _revert(self) -> None:
+        if self._shown is not None:
+            self.blockSignals(True)
+            self.setValue(self._shown)
+            self.blockSignals(False)
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802 - Qt
+        super().stepBy(steps)
+        self._commit()
+
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        if e.key() == Qt.Key.Key_Escape:
+            self._revert()
+            self.clearFocus()
+            return
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._commit_on_enter()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
     def focusOutEvent(self, e):  # noqa: N802 - Qt
+        if self._shown is not None:
+            self._revert()
         super().focusOutEvent(e)
         v = self.proxy.value(self.key)              # показать актуальное значение прибора
         if v is not None and self._shown is not None and abs(self.value() - self._shown) < 1e-12:

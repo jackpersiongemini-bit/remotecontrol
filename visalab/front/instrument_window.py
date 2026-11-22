@@ -931,7 +931,8 @@ class InstrumentWindow(Window):
         template = all_models(self.settings, kind).get(self.model_choice.value or "")
         self.model_window = ModelWindow(self.settings, kind, template)
         self.model_window.saved.connect(lambda name, k=kind: (not sip.isdeleted(self)) and self._fill_models(k, name))
-        self.model_window.move(self.pos() + self.rect().center() - self.model_window.rect().center())
+        if not self.model_window._pos_restored:
+            self.model_window.move(self.pos() + self.rect().center() - self.model_window.rect().center())
         self.model_window.show()
 
     def show_connection(self) -> None:

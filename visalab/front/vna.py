@@ -1238,15 +1238,15 @@ class VNAWindow(InstrumentWindow):
             save.append(self.preset_line("STAT"))
         if sup("m1.trace"):                           # куда и под каким именем DATA SAVE пишет CSV
             self.dir_edit = QLineEdit(str(self.data_dir()))
-            self.dir_edit.setToolTip("Folder on this PC for DATA SAVE files")
-            self.dir_edit.editingFinished.connect(
+            self.dir_edit.setToolTip("Folder on this PC for DATA SAVE files (Enter to save)")
+            self.dir_edit.returnPressed.connect(
                 lambda: self.settings.setValue(f"{pre}/DATA_DIR", self.dir_edit.text().strip()))
             browse = self._tool("…", "Choose the folder", self._browse_dir)
             browse.setFixedWidth(TRACE_CHIP_HEIGHT)
             self.name_edit = QLineEdit(str(self.settings.value(f"{pre}/DATA_NAME", "")))
             self.name_edit.setPlaceholderText("file name prefix, e.g. DUT")
-            self.name_edit.setToolTip("Prefix of the file name; date and time are added: <prefix>_YYYYMMDD_HHMMSS.csv")
-            self.name_edit.editingFinished.connect(
+            self.name_edit.setToolTip("Prefix of the file name (Enter to save); date and time are added: <prefix>_YYYYMMDD_HHMMSS.csv")
+            self.name_edit.returnPressed.connect(
                 lambda: self.settings.setValue(f"{pre}/DATA_NAME", self.name_edit.text().strip()))
             save += [PanelLine("PC", self.dir_edit, browse), PanelLine("NAME", self.name_edit)]
             export_row = [PanelLine("DATA", self.data_button)]
@@ -1270,7 +1270,7 @@ class VNAWindow(InstrumentWindow):
 
     def open_cal_window(self) -> None:
         w = self.cal_window
-        if not w.isVisible():
+        if not w.isVisible() and not w._pos_restored:
             w.move(self.pos() + QPoint(self.width() + 8, 0))
         w.open()
 

@@ -303,7 +303,7 @@ class RuleRow(PanelLine):
         self.line_layout.setStretchFactor(self.edit, 1)
         self.channels, self.rule, self.error = channels, None, ""
         self._changed = changed
-        self.edit.editingFinished.connect(self.commit)
+        self.edit.returnPressed.connect(self.commit)
         self.toggle.changed.connect(lambda _v: self._changed())
         self.delete.clicked.connect(lambda: remove(self))
         self.parse()

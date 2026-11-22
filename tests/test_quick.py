@@ -38,7 +38,7 @@ def test_rf_window(qtbot, settings, drv, sim_cls):
     proxy, win = _open(qtbot, RFGenWindow, drv, sim_cls(), settings)
     assert win.freq.value() == pytest.approx(1000.0)            # 1 GHz в MHz
     win.freq.setValue(2500.5)
-    win.freq.editingFinished.emit()
+    win.freq.lineEdit().returnPressed.emit()
     _wait_value(qtbot, proxy, "rf.frequency", lambda v: v == pytest.approx(2500.5e6))
     win.mod_buttons["am.state"].click()
     _wait_value(qtbot, proxy, "am.state", lambda v: v is True)

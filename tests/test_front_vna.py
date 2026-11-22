@@ -260,9 +260,9 @@ def test_data_save_csv(qtbot, vna, tmp_path):
     _wait(qtbot, lambda: len(win.read_traces()) == 2 and win.read_traces()[1][1].is_complex)
     out = tmp_path / "data"
     win.dir_edit.setText(str(out))
-    win.dir_edit.editingFinished.emit()
+    win.dir_edit.returnPressed.emit()
     win.name_edit.setText("DUT 1")
-    win.name_edit.editingFinished.emit()
+    win.name_edit.returnPressed.emit()
     assert settings.value(f"{win._prefix}/DATA_DIR") == str(out)
     path = win.save_data()
     assert path is not None and path.parent == out and path.name.startswith("DUT_1_") and path.suffix == ".csv"

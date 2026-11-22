@@ -12,9 +12,9 @@ import textwrap
 from contextlib import contextmanager
 from enum import Enum
 
-from PyQt6.QtCore import (QEasingCurve, QEvent, QLineF, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, Qt,
-                          pyqtProperty, pyqtSignal)
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PyQt6.QtCore import (QEasingCurve, QEvent, QLineF, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSettings,
+                          QSize, Qt, pyqtProperty, pyqtSignal)
+from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QAbstractButton, QApplication, QLabel, QPushButton, QSizePolicy, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
 
@@ -126,7 +126,10 @@ class Window(FramelessWindow):
         self.settings = settings
         name = f"{type(self).__module__}.{type(self).__qualname__}"
         self._size_key = f"WINDOW_SIZE/{name}"
+        self._pos_key = f"WINDOW_POS/{name}"
         self._heights_key = f"WINDOW_HEIGHTS/{name}"
+        self._pos_restored = False
+        self._last_pos: QPoint | None = None
         #: вид окна (``view_key``) -> высота, до которой его растянули руками (ini, при закрытии / выходе)
         try:
             saved = json.loads(settings.value(self._heights_key, "", type=str) or "{}")
@@ -142,11 +145,60 @@ class Window(FramelessWindow):
         self.titleBar.raise_()
         self.windowTitleChanged.connect(self.titleBar.title_label.setText)
 
+    def _clamp_pos(self, pos: QPoint) -> QPoint:
+        """Оставить заголовок окна в пределах доступного экрана (если монитор отключили)."""
+        screens = QGuiApplication.screens()
+        if not screens:
+            return pos
+        bar_w = max(self.width(), 120)
+        bar = QRect(pos.x(), pos.y(), bar_w, WINDOW_BAR_HEIGHT)
+        for scr in screens:
+            inter = scr.availableGeometry().intersected(bar)
+            if inter.width() >= min(40, bar_w) and inter.height() >= min(16, WINDOW_BAR_HEIGHT):
+                return pos
+        avail = (QGuiApplication.primaryScreen() or screens[0]).availableGeometry()
+        x = min(max(pos.x(), avail.left()), max(avail.left(), avail.right() - bar_w + 1))
+        y = min(max(pos.y(), avail.top()), max(avail.top(), avail.bottom() - WINDOW_BAR_HEIGHT + 1))
+        return QPoint(x, y)
+
+    def recall_pos(self) -> bool:
+        """Восстановить сохранённое положение неприкреплённого окна на экране."""
+        if not self.settings.contains(self._pos_key):
+            return False
+        pos = self.settings.value(self._pos_key, None, type=QPoint)
+        if not isinstance(pos, QPoint):
+            return False
+        pos = self._clamp_pos(pos)
+        self.move(pos)
+        self._last_pos = QPoint(pos)
+        self._pos_restored = True
+        return True
+
     def recall_size(self, default: QSize) -> None:
         self.resize(self.settings.value(self._size_key, default, type=QSize))
+        self.recall_pos()
+
+    def save_pos(self) -> None:
+        """Положение неприкреплённого окна на экране - в ini (только если изменилось)."""
+        if not self.isWindow():
+            return
+        pos: QPoint | None = None
+        if self.isFullScreen() or self.isMaximized() or self.isMinimized():
+            ng = self.normalGeometry()
+            pos = ng.topLeft() if (ng.isValid() and not ng.isEmpty()) else self._last_pos
+        elif self.isVisible():
+            pos = self.pos()
+            self._last_pos = QPoint(pos)
+        else:
+            pos = self._last_pos
+        if pos is None:
+            return
+        if not self.settings.contains(self._pos_key) or self.settings.value(self._pos_key, None, type=QPoint) != pos:
+            self.settings.setValue(self._pos_key, pos)
 
     def save_size(self) -> None:
-        """Размер и растянутые высоты видов - в ini (только если изменились: QSettings переписывает файл)."""
+        """Размер, положение и растянутые высоты видов - в ini (только если изменились)."""
+        self.save_pos()
         size = self.size()
         if self.isFullScreen() or self.isMaximized():      # обычный размер, а не размер экрана
             size = self.normalGeometry().size()
@@ -202,7 +254,23 @@ class Window(FramelessWindow):
 
     def showEvent(self, e):  # noqa: N802 - Qt
         super().showEvent(e)
+        if hasattr(self, "_pos_key") and self.isWindow() and not (
+                self.isFullScreen() or self.isMaximized() or self.isMinimized()):
+            self._last_pos = QPoint(self.pos())
         self._ensure_resizable()
+
+    def moveEvent(self, e):  # noqa: N802 - Qt
+        super().moveEvent(e)
+        if hasattr(self, "_pos_key") and self.isWindow() and not (
+                self.isFullScreen() or self.isMaximized() or self.isMinimized()):
+            pos = self.pos()
+            if self.isVisible() or self._pos_restored or not pos.isNull():
+                self._last_pos = QPoint(pos)
+
+    def hideEvent(self, e):  # noqa: N802 - Qt
+        if hasattr(self, "_pos_key") and self.isWindow() and not e.spontaneous():
+            self.save_size()
+        super().hideEvent(e)
 
     def changeEvent(self, e):  # noqa: N802 - Qt
         super().changeEvent(e)

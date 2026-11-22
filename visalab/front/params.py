@@ -143,7 +143,7 @@ class PLineEdit(QLineEdit, _Bound):
                 b.setToolTip(f"Unit: {self.unit}")
             self.unit_button = b
         self.bind(proxy, key)
-        self.editingFinished.connect(self.change_value)
+        self.returnPressed.connect(self.change_value)
         self._update_unit()
 
     @property
@@ -228,8 +228,9 @@ class PLineEdit(QLineEdit, _Bound):
             self.setModified(False)
 
     def focusOutEvent(self, e):  # noqa: N802 - Qt
-        super().focusOutEvent(e)                  # editingFinished -> change_value
+        super().focusOutEvent(e)                  # уход фокуса без Enter: отменить несохранённый ввод
         self.setPlaceholderText("")
+        self.setModified(False)
         self.show_value(self._value, force=True)
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
@@ -301,7 +302,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
     знаками. ``step_changed(шаг или None)`` - окно хранит выбор в ini.
 
     Единица - кнопка слева со списком префиксов (как у PLineEdit). Ввод с клавиатуры пишется
-    по Enter / уходу фокуса, шаг стрелкой или колесом - сразу.
+    только по Enter (уход фокуса отменяет правку), шаг стрелкой или колесом (``stepBy``) - сразу.
     """
 
     setToolTip = _Bound.set_custom_tip
@@ -342,7 +343,7 @@ class PSpinBox(QDoubleSpinBox, _Bound):
                 b.setToolTip(f"Unit: {self.unit}")
             self.unit_button = b
         self.bind(proxy, key)
-        self.editingFinished.connect(self.commit)
+        self.lineEdit().returnPressed.connect(self._commit_on_enter)
         self._update_unit()
 
     @property
@@ -521,15 +522,34 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         if not self.hasFocus():
             self._release_step()
 
+    def _commit_on_enter(self) -> None:
+        """Записать введённое значение по Enter и снять фокус."""
+        was_dirty = self._dirty or self.lineEdit().isModified()
+        self.interpretText()
+        if was_dirty:
+            self._dirty = True
+            self.commit()
+        self.clearFocus()
+
     def focusOutEvent(self, e):  # noqa: N802 - Qt
+        uncommitted = self._dirty or self.lineEdit().isModified()
+        self._dirty = False
+        self.lineEdit().setModified(False)
+        if uncommitted:
+            self.show_value(self._value, force=True)
         super().focusOutEvent(e)
         self._release_step()
 
     def keyPressEvent(self, e):  # noqa: N802 - Qt
         if e.key() == Qt.Key.Key_Escape:
             self._dirty = False
+            self.lineEdit().setModified(False)
             self.show_value(self._value, force=True)
             self.clearFocus()
+            return
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._commit_on_enter()
+            e.accept()
             return
         super().keyPressEvent(e)
         self.lineEdit().update()                  # курсор сдвинулся - подчёркнут другой разряд
