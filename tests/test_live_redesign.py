@@ -24,7 +24,6 @@ from visalab.front.plot_tools import (
     ANALYSIS_KEYS,
     PlotSettingsWidget,
     eval_math_expr,
-    make_panel_icon,
     trace_math,
     validate_math_expr,
 )
@@ -203,10 +202,6 @@ def test_trace_math_operations_and_live_plot_math(qtbot, tmp_path):
     plot._mouse = QPointF(100, 120)
     plot.grab()
 
-    # Иконки кнопок заголовка непустые
-    for kind in ("settings", "clear", "close"):
-        assert not make_panel_icon(kind, 15).isNull()
-
 
 # ------------------------------------------------------------------ 4. Двухпанельный MainWindow + активный по видеоуровню + VNA fallback
 def test_main_window_two_pane_active_by_video_level_and_inline_settings(qtbot, tmp_path):
@@ -243,18 +238,18 @@ def test_main_window_two_pane_active_by_video_level_and_inline_settings(qtbot, t
         assert win.right_scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         assert win.right_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
-        # 2) Облегчённый заголовок: имя + процесс + только 3 векторные кнопки (настройки, clear, close), без нижней строки source
-        from visalab.front.window import PanelClearButton, PanelCloseButton, PanelSettingsButton
+        # 2) Облегчённый заголовок: имя + 2 вкладки (PLOT | SET) + процесс + 2 векторные кнопки (clear, close)
+        from visalab.front.window import PanelClearButton, PanelCloseButton
         for panel in (vna_p, sa_p, pm_p):
             assert not hasattr(panel, "source")
-            assert isinstance(panel.settings_button, PanelSettingsButton)
+            assert [panel.tabs.tabText(i) for i in range(panel.tabs.count())] == ["PLOT", "SET"]
             assert isinstance(panel.clear_button, PanelClearButton)
             assert isinstance(panel.close_button, PanelCloseButton)
-            # Открытие настроек заменяет сам график внутри панели
+            # Переключение вкладок PLOT <-> SET заменяет сам график внутри панели
             assert panel.stack.currentIndex() == 0
-            panel.settings_button.click()
+            panel.tabs.setCurrentIndex(1)
             assert panel.stack.currentIndex() == 1
-            panel.settings_button.click()
+            panel.tabs.setCurrentIndex(0)
             assert panel.stack.currentIndex() == 0
 
         # 3) Включаем генератор на частоте SA (-10 dBm -> на входе SA -20 dBm >= -50 dBm)

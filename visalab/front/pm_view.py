@@ -17,12 +17,12 @@ from PyQt6.QtWidgets import (QAbstractItemView, QDialog, QFileDialog, QHBoxLayou
 from ..core.trace import Trace
 from ..core.units import si_format, si_parse
 from .live_plot import nice_range
-from .plot_tools import (ANALYSIS_KEYS, MATH_MODES, PlotSettingsPopup, analyze_trace, format_analysis, trace_math,
-                         validate_math_expr)
+from .plot_tools import ANALYSIS_KEYS, MATH_MODES, analyze_trace, format_analysis, trace_math, validate_math_expr
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER,
                     UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL,
                     UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED, UI_FONT_SIZE_PT,
-                    UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS, current_theme, render_qss)
+                    UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS, button_qss, current_theme,
+                    input_qss, mono_font, render_qss, table_qss)
 
 __all__ = [
     "parse_freq_hz",
@@ -469,10 +469,8 @@ class PowerCurvePlot(QWidget):
         self._mouse: QPointF | None = None
         self._cache: QPixmap | None = None
         self._cache_key: tuple | None = None
-        self._font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
-        self._font.setPointSizeF(10.0)
-        self._lbl_font = QFont(self._font)
-        self._lbl_font.setPointSizeF(9.5)
+        self._font = mono_font()
+        self._lbl_font = mono_font()
 
         # Настройки шкалы, памяти (MEM), математики (MATH) и анализа
         self.manual_scale: bool = False
@@ -489,7 +487,6 @@ class PowerCurvePlot(QWidget):
         self.analysis_metrics: list[str] = []
         self._settings: QSettings | None = None
         self._settings_key: str = ""
-        self._popup: PlotSettingsPopup | None = None
 
         #: последние нарисованные подписи точек: [(placement "above"|"below", text, pt_x, pt_y, lbl_y)]
         self.point_labels: list[tuple[str, str, float, float, float]] = []
@@ -500,7 +497,7 @@ class PowerCurvePlot(QWidget):
         self.setMinimumHeight(min_height)
         self.setMinimumWidth(200)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setToolTip("Double-click: store / clear MEM · Wheel: zoom Y · Right-click: plot settings")
+        self.setToolTip("Double-click: store / clear MEM · Wheel: zoom Y")
 
     @property
     def memory_diff(self) -> bool:
@@ -867,14 +864,6 @@ class PowerCurvePlot(QWidget):
             lines.append(cur)
         return lines
 
-    def open_settings(self, global_pos: QPoint | None = None) -> PlotSettingsPopup:
-        if self._popup is not None:
-            self._popup.close()
-        self._popup = PlotSettingsPopup(self, self)
-        pos = global_pos if global_pos is not None else self.mapToGlobal(QPoint(self.width() - 280, 24))
-        self._popup.show_at(pos)
-        return self._popup
-
     def plot_settings_state(self) -> dict:
         ref = self._scale[1] if self._scale is not None else None
         div = self._scale[2] if self._scale is not None else None
@@ -978,13 +967,6 @@ class PowerCurvePlot(QWidget):
             center = (lo + hi) * 0.5
             new_hi = center + new_step * divs * 0.5
             self.set_manual_scale(new_hi, new_step, divs)
-        e.accept()
-
-    def contextMenuEvent(self, e):  # noqa: N802 - Qt
-        if self.receivers(self.settings_requested) > 0:
-            self.settings_requested.emit()
-        else:
-            self.open_settings(e.globalPos())
         e.accept()
 
     # ------------------------------------------------------------ рисование
@@ -1262,46 +1244,7 @@ _DIALOG_STYLE = render_qss("""
     }
     PMPointsDialog QLabel#heading { font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT; }
     PMPointsDialog QLabel#muted { color: $UI_COLOR_BORDER_LIGHT; }
-    PMPointsDialog QLineEdit {
-        background-color: $UI_COLOR_BACKGROUND;
-        border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
-        border-radius: 4px;
-        padding: 2px 6px;
-        min-height: 24px;
-        color: $UI_COLOR_TEXT;
-    }
-    PMPointsDialog QPushButton {
-        background-color: $UI_COLOR_BACKGROUND;
-        border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
-        border-radius: 4px;
-        padding: 3px 10px;
-        min-height: 24px;
-        color: $UI_COLOR_TEXT_MUTED;
-    }
-    PMPointsDialog QPushButton:hover {
-        background-color: $UI_COLOR_INVERT_HOVER;
-        color: $UI_COLOR_TEXT_INVERSE;
-        font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-    }
-    PMPointsDialog QTableWidget {
-        background-color: $UI_COLOR_BACKGROUND;
-        color: $UI_COLOR_TEXT;
-        border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
-        border-radius: ${UI_BORDER_RADIUS_PX}px;
-    }
-    PMPointsDialog QTableWidget::item {
-        border: none;
-        border-bottom: 1px solid $UI_COLOR_BORDER;
-        padding: 2px 8px;
-    }
-    PMPointsDialog QHeaderView::section {
-        background-color: $UI_COLOR_BACKGROUND;
-        color: $UI_COLOR_BORDER_LIGHT;
-        border: none;
-        border-bottom: 1px solid $UI_COLOR_BORDER;
-        padding: 4px 8px;
-    }
-""")
+""") + "\n" + input_qss("PMPointsDialog") + "\n" + button_qss("PMPointsDialog") + "\n" + table_qss("PMPointsDialog")
 
 
 class PMPointsDialog(QDialog):

@@ -469,13 +469,17 @@ def test_dark_theme_indicators_panel_icons_hover_and_uniform_fonts(qtbot, tmp_pa
     from visalab.front import theme
     from visalab.front.favorites import FavoritesPopup
     from visalab.front.instrument_dock import InstrumentDock
+    from visalab.front.plot_tools import _SETTINGS_STYLE
+    from visalab.front.pm_view import _DIALOG_STYLE
     from visalab.front.psu import SourceTile
     from visalab.front.window import IconButtonBase, PanelClearButton, PanelCloseButton, PanelSettingsButton
 
-    # 1. Стандартизация шрифта: нигде в InstrumentDock / FavoritesPopup / SourceTile нет 9pt или 13pt
-    for sheet in (InstrumentDock.STYLE_SHEET, FavoritesPopup.STYLE_SHEET, SourceTile.STYLE):
+    # 1. Стандартизация шрифта и радиусов: единый 10pt и 6px без 9pt / 13pt / 4px / 22px
+    for sheet in (InstrumentDock.STYLE_SHEET, FavoritesPopup.STYLE_SHEET, SourceTile.STYLE, _SETTINGS_STYLE, _DIALOG_STYLE):
         assert "9pt" not in sheet
         assert "13pt" not in sheet
+        assert "border-radius: 4px" not in sheet
+        assert "min-height: 22px" not in sheet
 
     s = QSettings(str(tmp_path / "dark_icons.ini"), QSettings.Format.IniFormat)
     links = ProxyLinks()
@@ -487,8 +491,8 @@ def test_dark_theme_indicators_panel_icons_hover_and_uniform_fonts(qtbot, tmp_pa
     qtbot.addWidget(mw)
     try:
         panel = mw.panels[p_sa]
+        assert [panel.tabs.tabText(i) for i in range(panel.tabs.count())] == ["PLOT", "SET"]
         for btn, cls in (
-            (panel.settings_button, PanelSettingsButton),
             (panel.clear_button, PanelClearButton),
             (panel.close_button, PanelCloseButton),
         ):
@@ -514,7 +518,9 @@ def test_dark_theme_indicators_panel_icons_hover_and_uniform_fonts(qtbot, tmp_pa
         # Наведение на кнопки панелей в тёмной теме инвертирует цвет иконки на чёрный (#222222)
         dark_inv = QColor(theme.DARK_COLORS["UI_COLOR_TEXT_INVERSE"])
         dark_muted = QColor(theme.DARK_COLORS["UI_COLOR_TEXT_MUTED"])
-        for btn in (panel.settings_button, panel.clear_button, panel.close_button):
+        extra_set_btn = PanelSettingsButton()
+        qtbot.addWidget(extra_set_btn)
+        for btn in (extra_set_btn, panel.clear_button, panel.close_button):
             assert btn._icon_color == dark_muted
             btn.enterEvent(QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5)))
             assert btn._icon_color == dark_inv
@@ -522,10 +528,10 @@ def test_dark_theme_indicators_panel_icons_hover_and_uniform_fonts(qtbot, tmp_pa
             assert btn._icon_color == dark_muted
 
         # Выбор (checked) кнопки настроек тоже инвертирует цвет иконки
-        panel.settings_button.setChecked(True)
-        assert panel.settings_button._icon_color == dark_inv
-        panel.settings_button.setChecked(False)
-        assert panel.settings_button._icon_color == dark_muted
+        extra_set_btn.setChecked(True)
+        assert extra_set_btn._icon_color == dark_inv
+        extra_set_btn.setChecked(False)
+        assert extra_set_btn._icon_color == dark_muted
     finally:
         theme.apply_theme("light")
         w_sa.cleanup()

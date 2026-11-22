@@ -1,5 +1,5 @@
-"""Инструменты графиков: анализ трасс, математика (DATA −/+/÷/× MEM и формула f(x, y, mem)),
-векторные иконки заголовка панелей и встроенная/всплывающая панель настроек графика.
+"""Инструменты графиков: анализ трасс, математика (DATA −/+/÷/× MEM и формула f(x, y, mem))
+и встроенная панель настроек графика (вкладка SET).
 """
 from __future__ import annotations
 
@@ -8,18 +8,17 @@ from bisect import bisect_left
 import math
 from typing import Any, Callable
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                             QPushButton, QVBoxLayout, QWidget)
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget)
 
 from ..core.trace import Trace
 from ..core.units import si_format, si_parse
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER,
                     UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER,
                     UI_COLOR_PANEL, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
-                    UI_FONT_SIZE_PT, UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, checkbox_qss,
-                    render_qss)
+                    UI_FONT_SIZE_PT, UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, button_qss, checkbox_qss,
+                    input_qss, render_qss)
+from .widgets import CommitLineEdit
 
 __all__ = [
     "ANALYSIS_METRICS",
@@ -32,9 +31,7 @@ __all__ = [
     "eval_math_expr",
     "trace_math",
     "trace_diff",
-    "make_panel_icon",
     "PlotSettingsWidget",
-    "PlotSettingsPopup",
 ]
 
 #: (ключ, короткая подпись, подсказка)
@@ -494,145 +491,39 @@ def trace_diff(live: Trace, mem: Trace, y_transform=None) -> Trace:
     return trace_math(live, mem, "SUB", y_transform=y_transform)
 
 
-# ------------------------------------------------------------ векторные иконки кнопок панелей
-def _draw_panel_pixmap(kind: str, size: int, color_hex: str) -> QPixmap:
-    dpr = 2
-    pm = QPixmap(size * dpr, size * dpr)
-    pm.setDevicePixelRatio(dpr)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    if not p.isActive():
-        return pm
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    col = QColor(color_hex)
-    pen = QPen(col, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    s = float(size)
-    cx, cy = s * 0.5, s * 0.5
-
-    if kind == "settings":
-        # Шестерёнка (6 зубцов + центральное отверстие)
-        r_in = s * 0.16
-        r_mid = s * 0.30
-        r_out = s * 0.41
-        p.drawEllipse(QPointF(cx, cy), r_in, r_in)
-        p.drawEllipse(QPointF(cx, cy), r_mid, r_mid)
-        tooth_pen = QPen(col, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        p.setPen(tooth_pen)
-        for k in range(6):
-            ang = k * math.pi / 3.0
-            ca, sa = math.cos(ang), math.sin(ang)
-            p.drawLine(QPointF(cx + r_mid * ca, cy + r_mid * sa), QPointF(cx + r_out * ca, cy + r_out * sa))
-    elif kind == "clear":
-        # Корзина очистки: крышка + корпус + две вертикальные линии
-        p.drawLine(QPointF(s * 0.22, s * 0.28), QPointF(s * 0.78, s * 0.28))
-        p.drawLine(QPointF(s * 0.38, s * 0.17), QPointF(s * 0.62, s * 0.17))
-        p.drawLine(QPointF(s * 0.38, s * 0.17), QPointF(s * 0.38, s * 0.28))
-        p.drawLine(QPointF(s * 0.62, s * 0.17), QPointF(s * 0.62, s * 0.28))
-        body = QPainterPath()
-        body.moveTo(s * 0.28, s * 0.28)
-        body.lineTo(s * 0.33, s * 0.82)
-        body.lineTo(s * 0.67, s * 0.82)
-        body.lineTo(s * 0.72, s * 0.28)
-        p.drawPath(body)
-        thin = QPen(col, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        p.setPen(thin)
-        p.drawLine(QPointF(s * 0.44, s * 0.42), QPointF(s * 0.45, s * 0.70))
-        p.drawLine(QPointF(s * 0.56, s * 0.42), QPointF(s * 0.55, s * 0.70))
-    elif kind == "close":
-        # Чистый крестик ×
-        m = s * 0.27
-        p.drawLine(QPointF(m, m), QPointF(s - m, s - m))
-        p.drawLine(QPointF(s - m, m), QPointF(m, s - m))
-    elif kind == "back":
-        p.drawLine(QPointF(s * 0.72, cy), QPointF(s * 0.28, cy))
-        p.drawLine(QPointF(s * 0.46, s * 0.30), QPointF(s * 0.28, cy))
-        p.drawLine(QPointF(s * 0.46, s * 0.70), QPointF(s * 0.28, cy))
-    p.end()
-    return pm
-
-
-def make_panel_icon(kind: str, size: int = 16, *, active: bool = False) -> QIcon:
-    """Создать чёткую векторную HiDPI-иконку (settings / clear / close / back) для кнопок панели."""
-    icon = QIcon()
-    normal_col = UI_COLOR_TEXT_INVERSE if active else UI_COLOR_TEXT_MUTED
-    icon.addPixmap(_draw_panel_pixmap(kind, size, normal_col), QIcon.Mode.Normal, QIcon.State.Off)
-    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_TEXT_INVERSE), QIcon.Mode.Normal, QIcon.State.On)
-    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_TEXT_INVERSE), QIcon.Mode.Active, QIcon.State.Off)
-    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_TEXT_INVERSE), QIcon.Mode.Active, QIcon.State.On)
-    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_BORDER), QIcon.Mode.Disabled, QIcon.State.Off)
-    icon.addPixmap(_draw_panel_pixmap(kind, size, UI_COLOR_BORDER), QIcon.Mode.Disabled, QIcon.State.On)
-    return icon
-
-
-# ------------------------------------------------------------ встроенная и всплывающая панель настроек графика
+# ------------------------------------------------------------ встроенная панель настроек графика (вкладка SET)
 _SETTINGS_STYLE = render_qss("""
-    PlotSettingsWidget, PlotSettingsPopup {
+    PlotSettingsWidget {
         background-color: $UI_COLOR_PANEL;
     }
-    PlotSettingsPopup {
-        border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER_LIGHT;
-        border-radius: ${UI_BORDER_RADIUS_PX}px;
-    }
-    PlotSettingsWidget QWidget, PlotSettingsPopup QWidget {
+    PlotSettingsWidget QWidget {
         background: transparent;
         font-family: $UI_MONOSPACE_FONT_FAMILY;
         font-size: ${UI_FONT_SIZE_PT}pt;
         color: $UI_COLOR_TEXT_MUTED;
     }
-    PlotSettingsWidget QLabel#sec, PlotSettingsPopup QLabel#sec {
+    PlotSettingsWidget QLabel#sec {
         font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
         color: $UI_COLOR_TEXT;
     }
-    PlotSettingsWidget QLabel#muted, PlotSettingsPopup QLabel#muted {
+    PlotSettingsWidget QLabel#muted {
         color: $UI_COLOR_BORDER_LIGHT;
     }
-    PlotSettingsWidget QLabel#err, PlotSettingsPopup QLabel#err {
+    PlotSettingsWidget QLabel#err {
         color: $UI_COLOR_ERROR;
     }
-    PlotSettingsWidget QLineEdit, PlotSettingsPopup QLineEdit {
-        background-color: $UI_COLOR_BACKGROUND;
-        border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
-        border-radius: 4px;
-        padding: 2px 6px;
-        min-height: 22px;
-        color: $UI_COLOR_TEXT;
-    }
-    PlotSettingsWidget QLineEdit:focus, PlotSettingsPopup QLineEdit:focus { border-color: $UI_COLOR_TEXT_MUTED; }
-    PlotSettingsWidget QLineEdit:disabled, PlotSettingsPopup QLineEdit:disabled { color: $UI_COLOR_BORDER; }
-    PlotSettingsWidget QLineEdit[invalid="true"], PlotSettingsPopup QLineEdit[invalid="true"] {
-        border-color: $UI_COLOR_ERROR;
-    }
-    PlotSettingsWidget QPushButton, PlotSettingsPopup QPushButton {
-        background-color: $UI_COLOR_BACKGROUND;
-        border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BACKGROUND;
-        border-radius: 4px;
-        padding: 3px 8px;
-        min-height: 22px;
-        color: $UI_COLOR_TEXT_MUTED;
-    }
-    PlotSettingsWidget QPushButton:hover, PlotSettingsPopup QPushButton:hover {
-        background-color: $UI_COLOR_INVERT_HOVER;
-        color: $UI_COLOR_TEXT_INVERSE;
-        font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-    }
-    PlotSettingsWidget QPushButton:checked, PlotSettingsPopup QPushButton:checked {
-        background-color: $UI_COLOR_INVERT;
-        color: $UI_COLOR_TEXT_INVERSE;
-        font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-    }
-    PlotSettingsWidget QPushButton:disabled, PlotSettingsPopup QPushButton:disabled { color: $UI_COLOR_BORDER; }
-    PlotSettingsWidget QCheckBox, PlotSettingsPopup QCheckBox {
+    PlotSettingsWidget QCheckBox {
         spacing: 6px;
         color: $UI_COLOR_TEXT;
     }
-    PlotSettingsWidget QFrame#sep, PlotSettingsPopup QFrame#sep {
+    PlotSettingsWidget QFrame#sep {
         background-color: $UI_COLOR_BORDER;
         max-height: 1px;
         min-height: 1px;
     }
-""") + "\n" + checkbox_qss("PlotSettingsWidget ") + "\n" + checkbox_qss("PlotSettingsPopup ")
+""") + "\n" + input_qss("PlotSettingsWidget") + "\n" + button_qss(
+    "PlotSettingsWidget", border_token="UI_COLOR_BACKGROUND"
+) + "\n" + checkbox_qss("PlotSettingsWidget ")
 
 
 def _parse_axis_number(text: str, unit: str) -> float | None:
@@ -655,48 +546,6 @@ def _parse_axis_number(text: str, unit: str) -> float | None:
         except (TypeError, ValueError):
             pass
     return None
-
-
-class _CommitLineEdit(QLineEdit):
-    """Поле ввода настроек графика: отправка по Enter и уходу фокуса, откат по Esc."""
-
-    def __init__(self, tip: str, on_commit, parent=None):
-        super().__init__(parent)
-        self._committed = ""
-        self._escaped = False
-        self._on_commit = on_commit
-        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.setMinimumWidth(82)
-        self.setToolTip(tip)
-        self.returnPressed.connect(self._commit)
-
-    def set_committed(self, text: str) -> None:
-        self._committed = text
-        self.blockSignals(True)
-        self.setText(text)
-        self.setModified(False)
-        self.blockSignals(False)
-
-    def _commit(self) -> None:
-        self._escaped = False
-        self._on_commit()
-        self.clearFocus()
-
-    def keyPressEvent(self, e):  # noqa: N802 - Qt
-        if e.key() == Qt.Key.Key_Escape:
-            self._escaped = True
-            self.set_committed(self._committed)
-            self.clearFocus()
-            return
-        self._escaped = False
-        super().keyPressEvent(e)
-
-    def focusOutEvent(self, e):  # noqa: N802 - Qt
-        escaped = self._escaped
-        self._escaped = False
-        super().focusOutEvent(e)
-        if not escaped and self.text() != self._committed:
-            self._on_commit()
 
 
 class PlotSettingsWidget(QWidget):
@@ -728,11 +577,13 @@ class PlotSettingsWidget(QWidget):
         scale_grid = QGridLayout()
         scale_grid.setHorizontalSpacing(6)
         scale_grid.setVerticalSpacing(4)
-        self.ref_edit = _CommitLineEdit("Top of Y scale (REF); Enter to apply", self._apply_scale)
-        self.div_edit = _CommitLineEdit("Y value per division (DIV); Enter to apply", self._apply_scale)
-        self.divs_edit = _CommitLineEdit("Number of Y grid divisions (2..20); Enter to apply", self._apply_scale)
-        self.xmin_edit = _CommitLineEdit("Manual X minimum (blank = full span); Enter to apply", self._apply_x)
-        self.xmax_edit = _CommitLineEdit("Manual X maximum (blank = full span); Enter to apply", self._apply_x)
+        self.ref_edit = CommitLineEdit("Top of Y scale (REF); Enter to apply", self._apply_scale)
+        self.div_edit = CommitLineEdit("Y value per division (DIV); Enter to apply", self._apply_scale)
+        self.divs_edit = CommitLineEdit("Number of Y grid divisions (2..20); Enter to apply", self._apply_scale)
+        self.xmin_edit = CommitLineEdit("Manual X minimum (blank = full span); Enter to apply", self._apply_x)
+        self.xmax_edit = CommitLineEdit("Manual X maximum (blank = full span); Enter to apply", self._apply_x)
+        for ed in (self.ref_edit, self.div_edit, self.divs_edit, self.xmin_edit, self.xmax_edit):
+            ed.setMinimumWidth(82)
 
         scale_grid.addWidget(self._lbl("REF"), 0, 0)
         scale_grid.addWidget(self.ref_edit, 0, 1)
@@ -820,12 +671,13 @@ class PlotSettingsWidget(QWidget):
         expr_row = QHBoxLayout()
         expr_row.setSpacing(6)
         expr_row.addWidget(self._lbl("f(x,y)"))
-        self.math_expr_edit = _CommitLineEdit(
+        self.math_expr_edit = CommitLineEdit(
             "Custom math formula using x, y, mem (e.g. y + 3, y - mem, 10**(y/10)); Enter to apply",
             self._apply_math_expr,
+            placeholder="y - mem, y + 3, abs(y) ...",
+            align=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
         )
-        self.math_expr_edit.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.math_expr_edit.setPlaceholderText("y - mem, y + 3, abs(y) ...")
+        self.math_expr_edit.setMinimumWidth(82)
         expr_row.addWidget(self.math_expr_edit, 1)
         lay.addLayout(expr_row)
 
@@ -882,12 +734,13 @@ class PlotSettingsWidget(QWidget):
         b.clicked.connect(slot)
         return b
 
-    def set_plot(self, plot) -> None:
+    def set_plot(self, plot, *, force: bool = True) -> None:
+        changed = plot is not self.plot
         self.plot = plot
         if plot is not None:
-            self.sync_from_plot()
+            self.sync_from_plot(force=force or changed)
 
-    def sync_from_plot(self) -> None:
+    def sync_from_plot(self, *, force: bool = False) -> None:
         if self.plot is None:
             return
         st = self.plot.plot_settings_state()
@@ -899,13 +752,13 @@ class PlotSettingsWidget(QWidget):
         ref = st.get("ref")
         div = st.get("div")
         divs = st.get("divs_y", 6)
-        self.ref_edit.set_committed(_fmt_y(ref, yu) if ref is not None else "")
-        self.div_edit.set_committed(_fmt_y(div, yu, diff=True) if div is not None else "")
-        self.divs_edit.set_committed(str(int(divs)))
+        self.ref_edit.set_committed(_fmt_y(ref, yu) if ref is not None else "", force=force)
+        self.div_edit.set_committed(_fmt_y(div, yu, diff=True) if div is not None else "", force=force)
+        self.divs_edit.set_committed(str(int(divs)), force=force)
         self.divs_edit.setEnabled(bool(st.get("supports_divs", True)))
         xr = st.get("manual_x_range")
-        self.xmin_edit.set_committed(_fmt_x(xr[0], xu) if xr else "")
-        self.xmax_edit.set_committed(_fmt_x(xr[1], xu) if xr else "")
+        self.xmin_edit.set_committed(_fmt_x(xr[0], xu) if xr else "", force=force)
+        self.xmax_edit.set_committed(_fmt_x(xr[1], xu) if xr else "", force=force)
         self.xmin_edit.setPlaceholderText("auto")
         self.xmax_edit.setPlaceholderText("auto")
         self.xmin_edit.setEnabled(bool(st.get("supports_x_zoom", True)))
@@ -934,10 +787,7 @@ class PlotSettingsWidget(QWidget):
             need_mem = mode in ("SUB", "ADD", "DIV", "MUL")
             btn.setEnabled(True if not need_mem else has_mem)
             btn.setChecked(mode == math_mode)
-        self.math_expr_edit.set_committed(math_expr)
-        self.math_expr_edit.setProperty("invalid", False)
-        self.math_expr_edit.style().unpolish(self.math_expr_edit)
-        self.math_expr_edit.style().polish(self.math_expr_edit)
+        self.math_expr_edit.set_committed(math_expr, invalid=False, force=force)
         if math_mode == "EXPR" and math_expr:
             self.math_status.setObjectName("muted")
             self.math_status.setText(f"f = {math_expr}")
@@ -959,7 +809,7 @@ class PlotSettingsWidget(QWidget):
         if self.plot is None:
             return
         self.plot.set_auto_scale()
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_man(self) -> None:
         self._apply_scale()
@@ -968,13 +818,13 @@ class PlotSettingsWidget(QWidget):
         if self.plot is None:
             return
         self.plot.autoscale_once()
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_reset(self) -> None:
         if self.plot is None:
             return
         self.plot.reset_view()
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _apply_scale(self) -> None:
         if self.plot is None:
@@ -994,7 +844,7 @@ class PlotSettingsWidget(QWidget):
             divs = int(st.get("divs_y", 6))
         if ref is not None and div is not None and div > 0:
             self.plot.set_manual_scale(ref, div, divs)
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _apply_x(self) -> None:
         if self.plot is None:
@@ -1004,14 +854,14 @@ class PlotSettingsWidget(QWidget):
         t0, t1 = self.xmin_edit.text().strip(), self.xmax_edit.text().strip()
         if not t0 and not t1:
             self.plot.set_x_zoom(None, None)
-            self.sync_from_plot()
+            self.sync_from_plot(force=True)
             return
         cur = st.get("x_bounds", (0.0, 1.0))
         x0 = _parse_axis_number(t0, xu) if t0 else cur[0]
         x1 = _parse_axis_number(t1, xu) if t1 else cur[1]
         if x0 is not None and x1 is not None and x1 > x0:
             self.plot.set_x_zoom(x0, x1)
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_grid(self, checked: bool) -> None:
         if self.plot is not None:
@@ -1025,25 +875,25 @@ class PlotSettingsWidget(QWidget):
         if self.plot is None:
             return
         self.plot.store_memory()
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_mem_show(self) -> None:
         if self.plot is None:
             return
         self.plot.set_memory_visible(self.mem_show_btn.isChecked())
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_mem_diff(self) -> None:
         if self.plot is None:
             return
         self.plot.set_memory_diff(self.mem_diff_btn.isChecked())
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_mem_clear(self) -> None:
         if self.plot is None:
             return
         self.plot.clear_memory()
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_math_mode(self, mode: str) -> None:
         if self.plot is None:
@@ -1052,7 +902,7 @@ class PlotSettingsWidget(QWidget):
             expr = self.math_expr_edit.text().strip()
             if not expr:
                 expr = "y - mem" if self.plot.plot_settings_state().get("has_memory") else "y"
-                self.math_expr_edit.set_committed(expr)
+                self.math_expr_edit.set_committed(expr, force=True)
             ok, err = validate_math_expr(expr)
             if not ok:
                 self.math_status.setObjectName("err")
@@ -1061,7 +911,7 @@ class PlotSettingsWidget(QWidget):
             self.plot.set_math("EXPR", expr)
         else:
             self.plot.set_math(mode)
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _apply_math_expr(self) -> None:
         if self.plot is None:
@@ -1069,18 +919,16 @@ class PlotSettingsWidget(QWidget):
         expr = self.math_expr_edit.text().strip()
         if not expr:
             self.plot.set_math("OFF", "")
-            self.sync_from_plot()
+            self.sync_from_plot(force=True)
             return
         ok, err = validate_math_expr(expr)
         if not ok:
-            self.math_expr_edit.setProperty("invalid", True)
-            self.math_expr_edit.style().unpolish(self.math_expr_edit)
-            self.math_expr_edit.style().polish(self.math_expr_edit)
+            self.math_expr_edit.set_invalid(True)
             self.math_status.setObjectName("err")
             self.math_status.setText(err)
             return
         self.plot.set_math("EXPR", expr)
-        self.sync_from_plot()
+        self.sync_from_plot(force=True)
 
     def _on_analysis_toggled(self, key: str, checked: bool) -> None:
         if self.plot is not None:
@@ -1090,64 +938,4 @@ class PlotSettingsWidget(QWidget):
         if self.plot is None:
             return
         self.plot.set_analysis_metrics(list(ANALYSIS_KEYS) if on else [])
-        self.sync_from_plot()
-
-
-class PlotSettingsPopup(QFrame):
-    """Всплывающая обёртка вокруг :class:`PlotSettingsWidget` (для контекстного меню и тестов)."""
-
-    def __init__(self, plot, parent: QWidget | None = None):
-        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        self.plot = plot
-        self.setStyleSheet(_SETTINGS_STYLE)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 8, 10, 10)
-        lay.setSpacing(6)
-
-        hdr = QHBoxLayout()
-        title = QLabel("PLOT SETTINGS")
-        title.setObjectName("sec")
-        close_btn = QPushButton()
-        close_btn.setIcon(make_panel_icon("close", 14))
-        close_btn.setFixedWidth(24)
-        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setToolTip("Close plot settings (Esc)")
-        close_btn.clicked.connect(self.close)
-        hdr.addWidget(title)
-        hdr.addStretch()
-        hdr.addWidget(close_btn)
-        lay.addLayout(hdr)
-
-        self.widget = PlotSettingsWidget(plot, self)
-        lay.addWidget(self.widget)
-
-        # Проброс полей для совместимости со старым кодом/тестами
-        for attr in ("auto_btn", "man_btn", "fit_btn", "reset_btn",
-                     "ref_edit", "div_edit", "divs_edit", "xmin_edit", "xmax_edit",
-                     "grid_cb", "points_cb",
-                     "mem_info", "mem_store_btn", "mem_show_btn", "mem_diff_btn", "mem_clear_btn",
-                     "math_buttons", "math_expr_edit", "math_status", "analysis_checks"):
-            setattr(self, attr, getattr(self.widget, attr))
-
-    def sync_from_plot(self) -> None:
-        self.widget.sync_from_plot()
-
-    def _apply_scale(self) -> None:
-        self.widget._apply_scale()
-
-    def _apply_x(self) -> None:
-        self.widget._apply_x()
-
-    def show_at(self, global_pos: QPoint) -> None:
-        self.adjustSize()
-        sz = self.sizeHint()
-        screen = QApplication.screenAt(global_pos) or QApplication.primaryScreen()
-        x, y = global_pos.x(), global_pos.y()
-        if screen is not None:
-            avail: QRect = screen.availableGeometry()
-            x = max(avail.left() + 4, min(x, avail.right() - sz.width() - 4))
-            y = max(avail.top() + 4, min(y, avail.bottom() - sz.height() - 4))
-        self.move(x, y)
-        self.show()
-        self.raise_()
+        self.sync_from_plot(force=True)

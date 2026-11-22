@@ -15,11 +15,10 @@ from PyQt6.QtWidgets import QWidget
 
 from ..core.units import si_format
 from ..core.trace import Trace
-from .plot_tools import (ANALYSIS_KEYS, MATH_MODES, PlotSettingsPopup, analyze_trace, format_analysis, trace_math,
-                         validate_math_expr)
+from .plot_tools import ANALYSIS_KEYS, MATH_MODES, analyze_trace, format_analysis, trace_math, validate_math_expr
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
                     UI_COLOR_ERROR, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS,
-                    current_theme)
+                    current_theme, mono_font)
 
 __all__ = ["LivePlot", "nice_range", "decimate_trace_polygon", "nearest_index"]
 
@@ -219,18 +218,16 @@ class LivePlot(QWidget):
         self.analysis_metrics: list[str] = []
         self._settings: QSettings | None = None
         self._settings_key: str = ""
-        self._popup: PlotSettingsPopup | None = None
         self._math_cache: dict[tuple, Trace] = {}
 
         self._mouse: QPointF | None = None
         self._cache: QPixmap | None = None
         self._cache_key: tuple | None = None
-        self._font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
-        self._font.setPointSizeF(10.0)
+        self._font = mono_font()
         self.setMouseTracking(True)
         self.setMinimumHeight(min_height)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setToolTip("Double-click: store / clear MEM · Wheel: zoom Y · Right-click: plot settings")
+        self.setToolTip("Double-click: store / clear MEM · Wheel: zoom Y")
 
     @property
     def memory_diff(self) -> bool:
@@ -559,14 +556,6 @@ class LivePlot(QWidget):
             cur.discard(key)
         self.set_analysis_metrics(list(cur))
 
-    def open_settings(self, global_pos: QPoint | None = None) -> PlotSettingsPopup:
-        if self._popup is not None:
-            self._popup.close()
-        self._popup = PlotSettingsPopup(self, self)
-        pos = global_pos if global_pos is not None else self.mapToGlobal(QPoint(self.width() - 280, 24))
-        self._popup.show_at(pos)
-        return self._popup
-
     def plot_settings_state(self) -> dict:
         eff, _yt = self._effective_traces()
         first = eff[0][1] if eff else (self.traces[0][1] if self.traces else None)
@@ -738,13 +727,6 @@ class LivePlot(QWidget):
             center = (lo + hi) * 0.5
             new_hi = center + new_step * divs * 0.5
             self.set_manual_scale(new_hi, new_step, divs)
-        e.accept()
-
-    def contextMenuEvent(self, e):  # noqa: N802 - Qt
-        if self.receivers(self.settings_requested) > 0:
-            self.settings_requested.emit()
-        else:
-            self.open_settings(e.globalPos())
         e.accept()
 
     # ------------------------------------------------------------ рисование

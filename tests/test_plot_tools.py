@@ -5,7 +5,7 @@ import math
 
 import pytest
 from PyQt6.QtCore import QPoint, QSettings, Qt
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtGui import QContextMenuEvent, QWheelEvent
 
 from conftest import sim_of
 from visalab.coord import ActivityMonitor, Instrument, ProxyLinks
@@ -15,7 +15,7 @@ from visalab.front.live_plot import LivePlot
 from visalab.front.main_window import MainWindow
 from visalab.front.plot_tools import (
     ANALYSIS_KEYS,
-    PlotSettingsPopup,
+    PlotSettingsWidget,
     analyze_trace,
     format_analysis,
     trace_diff,
@@ -116,11 +116,16 @@ def test_live_plot_double_click_mem_diff_scale_and_popup(qtbot, tmp_path):
     qtbot.mouseDClick(plot, Qt.MouseButton.LeftButton, pos=QPoint(200, 120))
     assert not plot.memory and not plot.memory_diff
 
-    # 2) Всплывающая панель настроек: галочки анализа и ручная шкала
-    popup = plot.open_settings()
-    assert isinstance(popup, PlotSettingsPopup)
+    # 2) Встроенная панель настроек: галочки анализа, ручная шкала и отсутствие ПКМ
+    from PyQt6.QtWidgets import QApplication
+    top_before = set(QApplication.topLevelWidgets())
+    plot.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Reason.Mouse, QPoint(100, 100)))
+    assert set(QApplication.topLevelWidgets()) == top_before
+
+    panel_w = PlotSettingsWidget(plot)
+    qtbot.addWidget(panel_w)
     for k in ("mean", "min", "max", "std", "pp", "flatness", "nonlin"):
-        popup.analysis_checks[k].setChecked(True)
+        panel_w.analysis_checks[k].setChecked(True)
     assert set(plot.analysis_metrics) == {"mean", "min", "max", "std", "pp", "flatness", "nonlin"}
     lines = plot.analysis_lines()
     joined = " ".join(lines)
@@ -129,17 +134,17 @@ def test_live_plot_double_click_mem_diff_scale_and_popup(qtbot, tmp_path):
     plot.grab()
 
     # Ручная шкала, X-зум, скрытие сетки, точки
-    popup.ref_edit.setText("0")
-    popup.div_edit.setText("2")
-    popup.divs_edit.setText("8")
-    popup._apply_scale()
+    panel_w.ref_edit.setText("0")
+    panel_w.div_edit.setText("2")
+    panel_w.divs_edit.setText("8")
+    panel_w._apply_scale()
     assert plot.manual_scale and plot._scale == pytest.approx((-16.0, 0.0, 2.0)) and plot._divs_y == 8
     plot.set_x_zoom(1.5e9, 2.5e9)
     assert plot._x_bounds() == pytest.approx((1.5e9, 2.5e9))
-    popup.grid_cb.setChecked(False)
-    popup.points_cb.setChecked(True)
+    panel_w.grid_cb.setChecked(False)
+    panel_w.points_cb.setChecked(True)
     plot.grab()
-    popup.close()
+    panel_w.close()
 
     # 3) Сохранение и восстановление из QSettings
     settings.sync()
@@ -171,11 +176,18 @@ def test_trace_plot_and_cal_plot_support_mem_scale_and_analysis(qtbot):
     assert any("MEAN" in ln for ln in tp.analysis_lines())
     tp.grab()
 
-    popup = tp.open_settings()
-    popup.mem_diff_btn.click()
+    # ПКМ на TracePlot ничего не открывает; PlotSettingsWidget работает с TracePlot
+    from PyQt6.QtWidgets import QApplication
+    top_before = set(QApplication.topLevelWidgets())
+    tp.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Reason.Mouse, QPoint(100, 100)))
+    assert set(QApplication.topLevelWidgets()) == top_before
+
+    w = PlotSettingsWidget(tp)
+    qtbot.addWidget(w)
+    w.mem_diff_btn.click()
     assert tp.memory_diff
     tp.grab()
-    popup.close()
+    w.close()
 
     # CalPlot также поддерживает ручную шкалу и MEM
     cp = CalPlot()
@@ -224,20 +236,29 @@ def test_main_window_source_below_graph_and_mem_scale_controls(qtbot, tmp_path):
         qtbot.waitUntil(lambda: "dBm" in sa_panel.process_label.text() and not sa_panel.process_label.text().startswith("NOISE"),
                         timeout=10000)
 
-        # Заголовок облегчён: векторные кнопки настроек, очистки и закрытия; настройки открываются вместо графика
-        from visalab.front.window import PanelClearButton, PanelCloseButton, PanelSettingsButton
-        assert isinstance(sa_panel.settings_button, PanelSettingsButton)
+        # Заголовок облегчён: 2 вкладки PLOT | SET, кнопки очистки и закрытия; настройки не сбрасываются при обновлении
+        from visalab.front.window import PanelClearButton, PanelCloseButton
+        assert [sa_panel.tabs.tabText(i) for i in range(sa_panel.tabs.count())] == ["PLOT", "SET"]
         assert isinstance(sa_panel.clear_button, PanelClearButton)
         assert isinstance(sa_panel.close_button, PanelCloseButton)
         assert sa_panel.stack.currentIndex() == 0
-        sa_panel.settings_button.click()
+        sa_panel.tabs.setCurrentIndex(1)
         assert sa_panel.stack.currentIndex() == 1
+
+        # Пользователь вводит значение в REF во время обновления графика -> ввод НЕ перезаписывается!
+        ref_ed = sa_panel.plot_settings_widget.ref_edit
+        ref_ed.setText("-12.3")
+        ref_ed.setModified(True)
+        sa_panel.refresh(win.monitor.activity(proxies["e4446a"]))
+        sa_panel.plot_settings_widget.sync_from_plot(force=False)
+        assert ref_ed.text() == "-12.3"
+
         assert not sa_panel.plots[0].memory
         sa_panel.plot_settings_widget.mem_store_btn.click()
         assert bool(sa_panel.plots[0].memory)
         sa_panel.clear_button.click()
         assert not sa_panel.plots[0].memory
-        sa_panel.settings_button.click()
+        sa_panel.tabs.setCurrentIndex(0)
         assert sa_panel.stack.currentIndex() == 0
 
         # Анализ и ручная шкала на панели SA сохраняются и восстанавливаются при перезапуске

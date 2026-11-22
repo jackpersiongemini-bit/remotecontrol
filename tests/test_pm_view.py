@@ -189,11 +189,11 @@ def test_main_window_pm_graph_table_toggles_and_csv_mode(qtbot, tmp_path):
         assert panel.pm_plot.isVisibleTo(panel) and panel.power_table.isVisibleTo(panel)
         assert len(panel.pm_plot._curves) == 2
 
-        # Переключение Graph / Table во встроенных настройках (открываются вместо графика)
-        panel.settings_button.click()
+        # Переключение Graph / Table на вкладке SET (открываются вместо графика)
+        panel.tabs.setCurrentIndex(1)
         assert panel.stack.currentIndex() == 1
         panel.pm_table_cb.click()
-        panel.settings_button.click()
+        panel.tabs.setCurrentIndex(0)
         assert panel.stack.currentIndex() == 0
         assert panel.pm_plot.isVisibleTo(panel) and not panel.power_table.isVisibleTo(panel)
         panel.set_pm_show_plot(False)                   # нельзя скрыть оба -> таблица включается сама

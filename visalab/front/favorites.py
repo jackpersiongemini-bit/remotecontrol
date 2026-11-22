@@ -376,8 +376,8 @@ class FavoritesPopup(QFrame):
             font-size: ${UI_FONT_SIZE_PT}pt;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             padding: 2px 8px;
-            min-height: 22px;
-            max-height: 22px;
+            min-height: ${UI_COMPACT_HEIGHT_PX}px;
+            max-height: ${UI_COMPACT_HEIGHT_PX}px;
         }
         FavoritesPopup QPushButton#favReset:hover {
             background-color: $UI_COLOR_INVERT_HOVER;

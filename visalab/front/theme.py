@@ -28,6 +28,7 @@ BASE_METRICS = {
     "UI_SWITCH_MARGIN_PX": 3,
     "UI_SWITCH_WIDTH_PX": 38,              # переключатель связи в заголовке: ниже кнопок (Алексей 2026-11-14)
     "UI_SWITCH_HEIGHT_PX": 18,
+    "UI_COMPACT_HEIGHT_PX": 24,            # компактные кнопки/поля в настройках графиков и всплывающих панелях
     "UI_CONTROL_HEIGHT_PX": 28,
     "UI_COLUMN_WIDTH_PX": 84,
     "UI_SCROLLBAR_WIDTH_PX": 8,            # полоса прокрутки: дорожка без фона, ручка - тонкая скруглённая
@@ -210,6 +211,108 @@ def checkbox_qss(scope: str = "") -> str:
     """Чекбоксы в стиле «кружок с внутренним кружком при выборе»."""
     parts = (("cb", scope),)
     return _ThemedQSS(_eval_parts(parts), parts)
+
+
+def mono_font(pt: float | None = None, *, bold: bool = False):
+    """Стандартный моноширинный шрифт интерфейса (по умолчанию ``UI_FONT_SIZE_PT`` = 10pt)."""
+    from PyQt6.QtGui import QFont
+    family = str(TOKENS["UI_MONOSPACE_FONT_FAMILY"]).split(",")[0].strip(' "')
+    f = QFont(family)
+    f.setPointSizeF(float(TOKENS["UI_FONT_SIZE_PT"]) if pt is None else float(pt))
+    if bold:
+        f.setBold(True)
+    return f
+
+
+def button_qss(scope: str = "", *, height_token: str = "UI_COMPACT_HEIGHT_PX", border_token: str = "UI_COLOR_BORDER") -> str:
+    """Стандартные кнопки в едином стиле темы (высота, скругление, инверсия при наведении/выборе)."""
+    s = scope.strip()
+    sel = f"{s} " if s else ""
+    return render_qss(f"""
+        {sel}QPushButton {{
+            background-color: $UI_COLOR_BACKGROUND;
+            border: ${{UI_BORDER_WIDTH_PX}}px solid ${border_token};
+            border-radius: ${{UI_BORDER_RADIUS_PX}}px;
+            font-family: $UI_MONOSPACE_FONT_FAMILY;
+            font-size: ${{UI_FONT_SIZE_PT}}pt;
+            padding: 2px 8px;
+            min-height: ${{{height_token}}}px;
+            color: $UI_COLOR_TEXT_MUTED;
+        }}
+        {sel}QPushButton:hover {{
+            background-color: $UI_COLOR_INVERT_HOVER;
+            border-color: $UI_COLOR_INVERT_HOVER;
+            color: $UI_COLOR_TEXT_INVERSE;
+            font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+        }}
+        {sel}QPushButton:checked {{
+            background-color: $UI_COLOR_INVERT;
+            border-color: $UI_COLOR_INVERT;
+            color: $UI_COLOR_TEXT_INVERSE;
+            font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+        }}
+        {sel}QPushButton:checked:hover {{
+            background-color: $UI_COLOR_INVERT_HOVER;
+            border-color: $UI_COLOR_INVERT_HOVER;
+            color: $UI_COLOR_TEXT_INVERSE;
+        }}
+        {sel}QPushButton:disabled {{
+            color: $UI_COLOR_BORDER;
+            border-color: $UI_COLOR_BORDER;
+        }}
+    """)
+
+
+def input_qss(scope: str = "", *, height_token: str = "UI_COMPACT_HEIGHT_PX") -> str:
+    """Стандартные поля ввода ``QLineEdit`` (фокус, ошибка ``[invalid="true"]``, disabled)."""
+    s = scope.strip()
+    sel = f"{s} " if s else ""
+    return render_qss(f"""
+        {sel}QLineEdit {{
+            background-color: $UI_COLOR_BACKGROUND;
+            border: ${{UI_BORDER_WIDTH_PX}}px solid $UI_COLOR_BORDER;
+            border-radius: ${{UI_BORDER_RADIUS_PX}}px;
+            font-family: $UI_MONOSPACE_FONT_FAMILY;
+            font-size: ${{UI_FONT_SIZE_PT}}pt;
+            padding: 2px 6px;
+            min-height: ${{{height_token}}}px;
+            color: $UI_COLOR_TEXT;
+        }}
+        {sel}QLineEdit:focus {{ border-color: $UI_COLOR_TEXT_MUTED; }}
+        {sel}QLineEdit:disabled {{ color: $UI_COLOR_BORDER; }}
+        {sel}QLineEdit[invalid="true"] {{ border-color: $UI_COLOR_ERROR; }}
+    """)
+
+
+def table_qss(scope: str = "") -> str:
+    """Стандартная таблица ``QTableWidget`` с горизонтальными разделителями."""
+    s = scope.strip()
+    sel = f"{s} " if s else ""
+    return render_qss(f"""
+        {sel}QTableWidget, {sel}QTableWidget QWidget {{
+            background-color: $UI_COLOR_BACKGROUND;
+            color: $UI_COLOR_TEXT;
+        }}
+        {sel}QTableWidget {{
+            border: ${{UI_BORDER_WIDTH_PX}}px solid $UI_COLOR_BORDER;
+            border-radius: ${{UI_BORDER_RADIUS_PX}}px;
+            gridline-color: transparent;
+        }}
+        {sel}QTableWidget::item {{
+            border: none;
+            border-bottom: ${{UI_BORDER_WIDTH_PX}}px solid $UI_COLOR_BORDER;
+            padding: 2px 8px;
+        }}
+        {sel}QTableWidget QHeaderView::section {{
+            background-color: $UI_COLOR_BACKGROUND;
+            color: $UI_COLOR_BORDER_LIGHT;
+            border: none;
+            border-bottom: ${{UI_BORDER_WIDTH_PX}}px solid $UI_COLOR_BORDER;
+            padding: 3px 8px;
+            font-weight: normal;
+        }}
+        {sel}QTableWidget QTableCornerButton::section {{ background: transparent; border: none; }}
+    """)
 
 
 def current_theme() -> str:

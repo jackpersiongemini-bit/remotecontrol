@@ -43,9 +43,10 @@ from . import instrument_window as _iw
 from .instrument_window import WINDOW_EVENTS, InstrumentWindow
 from .live_plot import decimate_trace_polygon, nearest_index, nice_range
 from .params import IndicatorButton, PChoice, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _repolish
-from .plot_tools import ANALYSIS_KEYS, PlotSettingsPopup, analyze_trace, format_analysis, trace_diff
+from .plot_tools import ANALYSIS_KEYS, analyze_trace, format_analysis, trace_diff
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT,
-                    UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, render_qss)
+                    UI_COLOR_TEXT, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, UI_MONOSPACE_FONT_FAMILY, mono_font,
+                    render_qss)
 from .window import mark_growing
 
 __all__ = ["PowerMeterWindow", "PowerReadout", "TracePlot", "CalPlot", "load_csv", "save_csv", "saved_connection",
@@ -364,7 +365,7 @@ class PowerReadout(QFrame):
     STYLE = render_qss("""
         PowerReadout { background-color: $UI_COLOR_BACKGROUND; border: none; border-radius: ${UI_BORDER_RADIUS_PX}px; }
         PowerReadout QLabel, PowerReadout QPushButton { background: transparent; border: none; padding: 0 4px;
-            border-radius: 4px; color: $UI_COLOR_TEXT_MUTED; text-align: left; min-height: 0; max-height: 1000px; }
+            border-radius: ${UI_BORDER_RADIUS_PX}px; color: $UI_COLOR_TEXT_MUTED; text-align: left; min-height: 0; max-height: 1000px; }
         PowerReadout QPushButton:hover { background-color: $UI_COLOR_INVERT_HOVER; color: $UI_COLOR_TEXT_INVERSE; }
         PowerReadout QPushButton:disabled, PowerReadout QLabel:disabled { color: $UI_COLOR_BORDER_LIGHT; }
         PowerReadout QLabel#main { font-size: 24pt; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; color: $UI_COLOR_TEXT;
@@ -490,7 +491,7 @@ class PowerReadout(QFrame):
 
 # ---------------------------------------------------------------- график временной области
 class TracePlot(QWidget):
-    """Мощность от времени: сетка, трасса, строб, курсор, память MEM (2× клик), анализ и настройки шкалы (ПКМ)."""
+    """Мощность от времени: сетка, трасса, строб, курсор, память MEM (2× ЛКМ) и анализ."""
 
     DIVS_X, DIVS_Y = 10, 6
     DB_PER_DIV = 10.0
@@ -509,12 +510,10 @@ class TracePlot(QWidget):
         self.memory_visible = True
         self.memory_diff = False
         self.analysis_metrics: list[str] = []
-        self._popup: PlotSettingsPopup | None = None
         self._mouse: QPointF | None = None
         self._cache: QPixmap | None = None
         self._cache_key: tuple | None = None
-        self._font = QFont(UI_MONOSPACE_FONT_FAMILY.split(",")[0].strip('" '))
-        self._font.setPointSizeF(8)
+        self._font = mono_font()
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
         mark_growing(self)                        # растянули окно - график выше
@@ -617,14 +616,6 @@ class TracePlot(QWidget):
         else:
             cur.discard(key)
         self.set_analysis_metrics(list(cur))
-
-    def open_settings(self, global_pos: QPoint | None = None) -> PlotSettingsPopup:
-        if self._popup is not None:
-            self._popup.close()
-        self._popup = PlotSettingsPopup(self, self)
-        pos = global_pos if global_pos is not None else self.mapToGlobal(QPoint(self.width() - 280, 20))
-        self._popup.show_at(pos)
-        return self._popup
 
     def plot_settings_state(self) -> dict:
         lo, hi = self.y_range()
@@ -761,10 +752,6 @@ class TracePlot(QWidget):
             new_step = max(1e-12, step * factor)
             center = (lo + hi) * 0.5
             self.set_manual_scale(center + new_step * self.DIVS_Y * 0.5, new_step)
-        e.accept()
-
-    def contextMenuEvent(self, e):  # noqa: N802 - Qt
-        self.open_settings(e.globalPos())
         e.accept()
 
     def _render_base(self, mk: float | None) -> QPixmap:
