@@ -22,10 +22,11 @@ from .follow import FrequencyFollow, source_frequency
 from .instrument import Instrument
 from .registry import LINKS, ProxyLinks, profile_name
 from .scenario import Device, Run, Scenario, ScenarioError, Stopped
-from .scenarios import (AcalResult, AutoCalibration, FrequencySweep, SourceAutoCalibration,
-                        acal_file_name, frequency_points)
+from .scenarios import (AcalResult, AutoCalibration, FrequencySweep, PowerMeterSweep, SourceAutoCalibration,
+                        SpectrumSweep, SweepPoint, SweepResult, acal_file_name, frequency_points, sweep_points)
 
 __all__ = ["COORD", "Coordinator", "FrequencyFollow", "source_frequency", "Instrument", "LINKS", "ProxyLinks", "profile_name", "ActivityMonitor", "Activity",
            "Source", "Thresholds", "Scenario", "Run", "Device", "ScenarioError", "Stopped",
            "FrequencySweep", "AutoCalibration", "SourceAutoCalibration", "AcalResult", "acal_file_name", "frequency_points",
+           "sweep_points", "SweepPoint", "SweepResult", "PowerMeterSweep", "SpectrumSweep",
            "load_csv", "save_csv", "interpolate", "fit_gain_table"]

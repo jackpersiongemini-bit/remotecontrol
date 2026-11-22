@@ -263,9 +263,27 @@ class SpectrumWindow(InstrumentWindow):
                     extra_ws = [cont]
                     if "single" in proxy.actions:
                         extra_ws.append(ActionButton(proxy, "single", "SWEEP", "Single sweep"))
+                    if "abort" in proxy.actions:
+                        extra_ws.append(ActionButton(proxy, "abort", "STOP", "Abort current sweep"))
                     lines.append(PanelLine("MODE", *extra_ws))
+                from .sweep import SweepController
+                self.sweep = SweepController(self, proxy, self.settings, self._prefix, "spectrum_analyzer")
+                self.sweep.running_changed.connect(lambda _on: self._update_tabs())
+                lines.extend(self.sweep.lines())
             if lines:
                 self.page_specs.append((title_, (), PanelTable(*lines)))
+
+    def _update_tabs(self) -> None:
+        super()._update_tabs()
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "SWP" and hasattr(self, "sweep"):
+                self.tabs.set_on(i, self.sweep.running)
+                break
+
+    def cleanup(self) -> None:
+        if hasattr(self, "sweep"):
+            self.sweep.cleanup()
+        super().cleanup()
 
     def restore_rank(self, key: str) -> int:
         return 1 if key.endswith(("_auto", "_state")) else 0

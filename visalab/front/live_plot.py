@@ -405,10 +405,19 @@ class LivePlot(QWidget):
             scale = f"{top_s}  {div_s}"
         p.drawText(QRectF(r.left(), 3, r.width(), 14), Qt.AlignmentFlag.AlignRight, scale)
         bottom = QRectF(r.left(), r.bottom() + 3, r.width(), 14)
-        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, si_format(x0, xu, 4))
+        if xu in self._SI_UNITS:
+            x0_s = si_format(x0, xu, 4)
+            x1_s = si_format(x1, xu, 4)
+            dx_s = f"{si_format((x1 - x0) / self.DIVS_X, xu, 3)}/div"
+        else:
+            dx_u = "dB" if xu == "dBm" else xu
+            x0_s = f"{x0:g} {xu}" if xu else f"{x0:g}"
+            x1_s = f"{x1:g} {xu}" if xu else f"{x1:g}"
+            dx_s = f"{(x1 - x0) / self.DIVS_X:.3g} {dx_u}/div" if dx_u else f"{(x1 - x0) / self.DIVS_X:.3g}/div"
+        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, x0_s)
         if x1 != x0:
-            p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{si_format((x1 - x0) / self.DIVS_X, xu, 3)}/div")
-        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, si_format(x1, xu, 4))
+            p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, dx_s)
+        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, x1_s)
         p.end()
         return pm
 
@@ -454,6 +463,8 @@ class LivePlot(QWidget):
             p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)
             p.setPen(QColor(UI_COLOR_TEXT))
             yu = self._y_unit if self._y_unit is not None else first.y_unit
+            xu = first.x_unit
+            x_txt = si_format(first.x[i], xu, 5) if xu in self._SI_UNITS else (f"{first.x[i]:.2f} {xu}" if xu else f"{first.x[i]:.4g}")
             y_txt = si_format(yi, yu, 4) if yu in self._SI_UNITS else (f"{yi:.2f} {yu}" if yu else f"{yi:.3g}")
             p.drawText(QRectF(r.left(), r.top() + 2, r.width() - 4, 14), Qt.AlignmentFlag.AlignRight,
-                       f"{si_format(first.x[i], first.x_unit, 5)}  {y_txt}")
+                       f"{x_txt}  {y_txt}")

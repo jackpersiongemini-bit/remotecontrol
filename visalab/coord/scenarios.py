@@ -20,13 +20,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
+from typing import Callable
 
+from ..core.trace import Trace
 from ..core.units import si_format
 from .calibration import fit_gain_table, save_csv
 from .scenario import MEASURE_TIMEOUT_S, Device, Run, Scenario, ScenarioError, Stopped
 
-__all__ = ["frequency_points", "FrequencySweep", "AutoCalibration", "SourceAutoCalibration",
-           "AcalResult", "acal_file_name"]
+__all__ = ["frequency_points", "sweep_points", "FrequencySweep", "AutoCalibration", "SourceAutoCalibration",
+           "AcalResult", "acal_file_name", "SweepPoint", "SweepResult", "PowerMeterSweep", "SpectrumSweep"]
 
 
 def frequency_points(start: float, stop: float, points: int) -> list[float]:
@@ -35,6 +37,25 @@ def frequency_points(start: float, stop: float, points: int) -> list[float]:
     start_f, stop_f = float(start), float(stop)
     if points < 2 or not (math.isfinite(start_f) and math.isfinite(stop_f)) or not stop_f > start_f:
         raise ValueError("need START < STOP and PTS >= 2")
+    step = (stop_f - start_f) / (points - 1)
+    return [start_f + i * step for i in range(points - 1)] + [stop_f]
+
+
+def sweep_points(start: float, stop: float, points: int, *, log: bool = False) -> list[float]:
+    """Сетка точек для sweep-режимов (линейная или логарифмическая, допускает убывание)."""
+    points = int(points)
+    start_f, stop_f = float(start), float(stop)
+    if not (math.isfinite(start_f) and math.isfinite(stop_f)):
+        raise ValueError("START and STOP must be finite")
+    if points == 1 and start_f == stop_f:
+        return [start_f]
+    if points < 2 or start_f == stop_f:
+        raise ValueError("need START != STOP and PTS >= 2")
+    if log:
+        if start_f <= 0.0 or stop_f <= 0.0:
+            raise ValueError("LOG sweep requires START > 0 and STOP > 0")
+        ratio = stop_f / start_f
+        return [start_f * (ratio ** (i / (points - 1))) for i in range(points - 1)] + [stop_f]
     step = (stop_f - start_f) / (points - 1)
     return [start_f + i * step for i in range(points - 1)] + [stop_f]
 
@@ -321,3 +342,365 @@ class SourceAutoCalibration(AutoCalibration):
         if self.source_profile == "network_analyzer" and gen.supports("gen.state"):
             yield from self.change(saved, gen, "gen.state", True)
         yield from FrequencySweep.prepare(self, run, gen, pm, saved)
+
+
+# ===================================================================== Sweep-режимы (ваттметр и спектр)
+@dataclass(frozen=True)
+class SweepPoint:
+    """Одна измеренная точка sweep-сценария."""
+
+    freq: float                         # Hz
+    src_power: float                    # dBm (уровень источника)
+    power: float                        # dBm (измеренная мощность)
+    gain: float                         # dB (power - src_power)
+    floor: float | None = None          # dBm (шумовая дорожка спектра, если есть)
+    peak_freq: float | None = None      # Hz (частота пика спектра, если есть)
+
+
+@dataclass
+class SweepResult:
+    """Результат sweep-сценария: точки, трассы для графиков/CSV и краткая сводка."""
+
+    mode: str                           # "FREQ" | "POW" | "2D"
+    receiver: str                       # "power_meter" | "spectrum_analyzer"
+    points: list[SweepPoint] = field(default_factory=list)
+
+    def traces(self, view: str = "POUT") -> list[tuple[str, Trace]]:
+        """Построить ``[(подпись, Trace)]`` для отображения (``view`` = ``POUT`` или ``GAIN``)."""
+        if not self.points:
+            return []
+        use_gain = (view == "GAIN")
+        y_unit = "dB" if use_gain else "dBm"
+        y_name = "Gain" if use_gain else "Power"
+
+        def val(pt: SweepPoint) -> float:
+            return pt.gain if use_gain else pt.power
+
+        if self.mode == "POW":
+            pairs = sorted((pt.src_power, val(pt)) for pt in self.points if math.isfinite(val(pt)))
+            if not pairs:
+                return []
+            xs, ys = zip(*pairs)
+            f0 = self.points[0].freq
+            label = f"{y_name} @ {si_format(f0, 'Hz', 4)}"
+            return [(label, Trace(tuple(xs), tuple(ys), x_unit="dBm", y_unit=y_unit, name=label, uniform=False))]
+
+        if self.mode == "2D":
+            groups: dict[float, list[tuple[float, float]]] = {}
+            for pt in self.points:
+                v = val(pt)
+                if math.isfinite(v):
+                    pk = round(pt.src_power, 3)
+                    groups.setdefault(pk, []).append((pt.freq, v))
+            out: list[tuple[str, Trace]] = []
+            for pk, pairs in groups.items():
+                pairs.sort(key=lambda xy: xy[0])
+                xs, ys = zip(*pairs)
+                label = f"{pk:g} dBm"
+                out.append((label, Trace(tuple(xs), tuple(ys), x_unit="Hz", y_unit=y_unit, name=label, uniform=False)))
+            return out
+
+        # FREQ
+        pairs = sorted((pt.freq, val(pt)) for pt in self.points if math.isfinite(val(pt)))
+        if not pairs:
+            return []
+        xs, ys = zip(*pairs)
+        p0 = self.points[0].src_power
+        label = f"{y_name} ({p0:g} dBm)"
+        return [(label, Trace(tuple(xs), tuple(ys), x_unit="Hz", y_unit=y_unit, name=label, uniform=False))]
+
+    def p1db(self) -> tuple[float, float, float] | None:
+        """Для режима ``POW``: точка 1 дБ компрессии ``(P_in_1dB, P_out_1dB, G0)`` или None."""
+        if self.mode != "POW" or len(self.points) < 3:
+            return None
+        pts = sorted((pt for pt in self.points if math.isfinite(pt.gain) and math.isfinite(pt.src_power)),
+                     key=lambda pt: pt.src_power)
+        if len(pts) < 3:
+            return None
+        g0 = (pts[0].gain + pts[1].gain) / 2.0 if abs(pts[0].gain - pts[1].gain) <= 0.2 else pts[0].gain
+        target = g0 - 1.0
+        for i in range(1, len(pts)):
+            prev, cur = pts[i - 1], pts[i]
+            if cur.gain <= target and prev.gain > target and prev.gain != cur.gain:
+                t = (prev.gain - target) / (prev.gain - cur.gain)
+                pin = prev.src_power + t * (cur.src_power - prev.src_power)
+                return pin, pin + target, g0
+        return None
+
+    def summary(self, view: str = "POUT") -> str:
+        """Краткая строка сводки для UI и журнала."""
+        if not self.points:
+            return "NO DATA"
+        use_gain = (view == "GAIN")
+        unit = "dB" if use_gain else "dBm"
+        vals = [pt.gain if use_gain else pt.power for pt in self.points if math.isfinite(pt.gain if use_gain else pt.power)]
+        if not vals:
+            return "NO DATA"
+        lo, hi = min(vals), max(vals)
+        if self.mode == "POW":
+            comp = self.p1db()
+            base = f"{len(vals)} pts  MIN {lo:+.2f} / MAX {hi:+.2f} {unit}"
+            if comp is not None:
+                return f"{base}  P1dB {comp[0]:+.1f} in / {comp[1]:+.1f} out dBm"
+            return base
+        if self.mode == "2D":
+            n_curves = len({round(pt.src_power, 3) for pt in self.points})
+            return f"{n_curves} lvl · {len(vals)} pts  MIN {lo:+.2f} / MAX {hi:+.2f} {unit}"
+        return f"{len(vals)} pts  MIN {lo:+.2f} / MAX {hi:+.2f} {unit}  Δ {hi - lo:.2f} dB"
+
+
+class _CoordinatedSweep(Scenario):
+    """Общая база для sweep-сценариев «источник СВЧ (генератор / ВАЦ в CW) + приёмник (PM / SA)»."""
+
+    receiver_profile: str = ""
+    SETTLE_S = 0.2
+
+    def __init__(self, mode: str = "FREQ", *, freqs=(), powers=(), settle_s: float | None = None,
+                 repeat: bool = False, timeout_s: float = MEASURE_TIMEOUT_S):
+        mode = str(mode).upper()
+        if mode not in ("FREQ", "POW", "2D"):
+            raise ValueError(f"unknown sweep mode: {mode!r}")
+        self.mode = mode
+        self.freqs = [float(f) for f in freqs]
+        self.powers = [float(p) for p in powers]
+        if mode in ("FREQ", "2D") and not self.freqs:
+            raise ValueError("need frequency points for FREQ / 2D sweep")
+        if mode in ("POW", "2D") and not self.powers:
+            raise ValueError("need power points for POW / 2D sweep")
+        self.settle_s = self.SETTLE_S if settle_s is None else max(0.0, float(settle_s))
+        self.repeat = bool(repeat)
+        self.timeout_s = float(timeout_s)
+        self.points: list[SweepPoint] = []
+
+    def _schedule(self) -> list[tuple[float | None, float | None]]:
+        if self.mode == "FREQ":
+            return [(f, None) for f in self.freqs]
+        if self.mode == "POW":
+            return [(None, p) for p in self.powers]
+        return [(f, p) for p in self.powers for f in self.freqs]
+
+    def _validate_devices(self, gen: Device, rx: Device) -> None:
+        gen.require("rf.frequency", "rf.power", "rf.output")
+        for f in self.freqs:
+            gen.check("rf.frequency", f)
+        for p in self.powers:
+            gen.check("rf.power", p)
+        if self.mode == "FREQ" and gen.value("rf.power") is None:
+            raise ScenarioError(f"{gen.name}: level (rf.power) unknown - sync the source")
+        if self.mode == "POW" and gen.value("rf.frequency") is None:
+            raise ScenarioError(f"{gen.name}: frequency (rf.frequency) unknown - sync the source")
+
+    def _prepare_receiver(self, run: Run, gen: Device, rx: Device, saved: list):
+        raise NotImplementedError
+
+    def _measure_point(self, run: Run, gen: Device, rx: Device, target_f: float | None,
+                       target_p: float | None, first: bool):
+        raise NotImplementedError
+
+    def steps(self, run: Run):
+        gen = run.device("signal_generator")
+        rx = run.device(self.receiver_profile)
+        self._validate_devices(gen, rx)
+        schedule = self._schedule()
+        saved: list[tuple[Device, str, object]] = []
+        self.points = []
+        try:
+            FrequencySweep.remember(saved, gen, "rf.frequency")
+            FrequencySweep.remember(saved, gen, "rf.power")
+            yield from self._prepare_receiver(run, gen, rx, saved)
+            yield from FrequencySweep.change(self, saved, gen, "rf.output", True)
+            n = len(schedule)
+            cycle = 0
+            while True:
+                if cycle > 0:
+                    self.points = []
+                for i, (f, p) in enumerate(schedule):
+                    if not gen.connected:
+                        raise ScenarioError(f"{gen.name}: connection lost during {self.NAME}")
+                    if gen.value("rf.output") is False:
+                        raise ScenarioError(f"{gen.name} RF output was switched off during {self.NAME}")
+                    label = si_format(f, "Hz", 5) if f is not None else f"{p:g} dBm"
+                    if f is not None and p is not None:
+                        label = f"{p:g} dBm · {si_format(f, 'Hz', 4)}"
+                    run.report(i, n, label)
+                    pt = yield from self._measure_point(run, gen, rx, f, p, first=(i == 0 and cycle == 0))
+                    self.points.append(pt)
+                    run.add_point({
+                        "freq": pt.freq, "src_power": pt.src_power, "power": pt.power,
+                        "gain": pt.gain, "floor": pt.floor, "peak_freq": pt.peak_freq,
+                        "index": i, "total": n, "cycle": cycle,
+                    })
+                run.report(n, n, "done" if not self.repeat else f"cycle {cycle + 1}")
+                if not self.repeat:
+                    break
+                cycle += 1
+            res = SweepResult(mode=self.mode, receiver=self.receiver_profile, points=list(self.points))
+            run.log(f"{self.mode} done: {res.summary('POUT')}")
+            return res
+        finally:
+            yield from FrequencySweep.restore(run, saved)
+
+
+class PowerMeterSweep(_CoordinatedSweep):
+    """Sweep-режим ваттметра: перебор частоты (FREQ), мощности источника (POW) или 2D (FREQ × POW).
+
+    В отличие от ACAL сохраняет действующую калибровку ваттметра (и при наличии ``offset_fn`` обновляет
+    табличную поправку CAL(f) на каждой частоте) и не обрывает измерение на слабом сигнале.
+    """
+
+    NAME = "PM SWP"
+    needs = ("signal_generator", "power_meter")
+    receiver_profile = "power_meter"
+    SETTLE_S = 0.2
+    STABLE_DB = 0.05
+    MAX_READINGS = 4
+
+    def __init__(self, mode: str = "FREQ", *, freqs=(), powers=(), settle_s: float | None = None,
+                 skip: int = 1, count: int = 1, stable_db: float | None = None,
+                 max_readings: int | None = None, repeat: bool = False,
+                 offset_fn: Callable[[float], float | None] | None = None,
+                 timeout_s: float = MEASURE_TIMEOUT_S):
+        super().__init__(mode, freqs=freqs, powers=powers, settle_s=settle_s, repeat=repeat, timeout_s=timeout_s)
+        self.skip = max(0, int(skip))
+        self.count = max(1, int(count))
+        self.stable_db = self.STABLE_DB if stable_db is None else float(stable_db)
+        self.max_readings = self.MAX_READINGS if max_readings is None else max(1, int(max_readings))
+        self.offset_fn = offset_fn
+
+    def _validate_devices(self, gen: Device, rx: Device) -> None:
+        super()._validate_devices(gen, rx)
+        rx.require("meas.power")
+        if rx.supports("freq"):
+            for f in self.freqs:
+                rx.check("freq", f)
+
+    def _prepare_receiver(self, run: Run, gen: Device, pm: Device, saved: list):
+        if pm.supports("freq"):
+            FrequencySweep.remember(saved, pm, "freq")
+        if self.offset_fn is not None:
+            if pm.supports("offset"):
+                FrequencySweep.remember(saved, pm, "offset")
+            if pm.supports("offset.state"):
+                FrequencySweep.remember(saved, pm, "offset.state")
+        if pm.supports("trig.source"):
+            yield from FrequencySweep.change(self, saved, pm, "trig.source", "IMM")
+        yield from FrequencySweep.change(self, saved, pm, "meas.continuous", True)
+
+    def _read_settled(self, run: Run, pm: Device):
+        prev = float((yield pm.measure("meas.power", self.skip, self.count, self.timeout_s)))
+        if self.max_readings <= 1:
+            return prev
+        cur = prev
+        prev_ = prev
+        for _ in range(self.max_readings - 1):
+            cur = float((yield pm.measure("meas.power", 0, self.count, self.timeout_s)))
+            if abs(cur - prev) <= self.stable_db:
+                return (cur + prev) / 2.0
+            prev_, prev = prev, cur
+        return (cur + prev_) / 2.0
+
+    def _measure_point(self, run: Run, gen: Device, pm: Device, target_f: float | None,
+                       target_p: float | None, first: bool):
+        sets = []
+        actual_f = target_f if target_f is not None else float(gen.value("rf.frequency"))
+        if target_f is not None:
+            sets.append(gen.set("rf.frequency", target_f))
+            if pm.supports("freq"):
+                sets.append(pm.set("freq", target_f))
+        elif first and pm.supports("freq"):
+            sets.append(pm.set("freq", actual_f))
+        if target_p is not None:
+            sets.append(gen.set("rf.power", target_p))
+        if self.offset_fn is not None and (target_f is not None or first):
+            off = self.offset_fn(actual_f)
+            if off is not None:
+                if pm.supports("offset"):
+                    sets.append(pm.set("offset", off))
+                if pm.supports("offset.state"):
+                    sets.append(pm.set("offset.state", abs(off) > 5e-4))
+        if sets:
+            yield sets
+        if self.settle_s > 0:
+            yield run.sleep(self.settle_s)
+        power = yield from self._read_settled(run, pm)
+        src_p = float(target_p if target_p is not None else gen.value("rf.power"))
+        return SweepPoint(freq=actual_f, src_power=src_p, power=power, gain=power - src_p)
+
+
+class SpectrumSweep(_CoordinatedSweep):
+    """Sweep-режим анализатора спектра: перебор частоты (FREQ), мощности (POW) или 2D (FREQ × POW).
+
+    В режиме слежения (``track_center=True``) центр анализатора перестраивается синхронно с генератором,
+    на каждой точке выполняется свежая однократная развёртка (``single``) и берётся пик (или среднее в
+    нулевой полосе ``track_span=0``) и шумовая дорожка.
+    """
+
+    NAME = "SA SWP"
+    needs = ("signal_generator", "spectrum_analyzer")
+    receiver_profile = "spectrum_analyzer"
+    SETTLE_S = 0.05
+
+    def __init__(self, mode: str = "FREQ", *, freqs=(), powers=(), settle_s: float | None = None,
+                 track_center: bool = True, track_span: float | None = None,
+                 repeat: bool = False, timeout_s: float = MEASURE_TIMEOUT_S):
+        super().__init__(mode, freqs=freqs, powers=powers, settle_s=settle_s, repeat=repeat, timeout_s=timeout_s)
+        self.track_center = bool(track_center)
+        self.track_span = None if track_span is None else float(track_span)
+
+    def _validate_devices(self, gen: Device, sa: Device) -> None:
+        super()._validate_devices(gen, sa)
+        sa.require("trace", "freq.center")
+        if self.track_center:
+            for f in self.freqs:
+                sa.check("freq.center", f)
+        if self.track_span is not None:
+            sa.check("freq.span", self.track_span)
+
+    def _prepare_receiver(self, run: Run, gen: Device, sa: Device, saved: list):
+        FrequencySweep.remember(saved, sa, "freq.center")
+        if sa.supports("freq.span"):
+            FrequencySweep.remember(saved, sa, "freq.span")
+        if sa.supports("meas.continuous"):
+            yield from FrequencySweep.change(self, saved, sa, "meas.continuous", False)
+        if sa.supports("trace.mode"):
+            yield from FrequencySweep.change(self, saved, sa, "trace.mode", "WRITE")
+        if self.track_span is not None and sa.supports("freq.span"):
+            yield from FrequencySweep.change(self, saved, sa, "freq.span", self.track_span)
+
+    def _measure_point(self, run: Run, gen: Device, sa: Device, target_f: float | None,
+                       target_p: float | None, first: bool):
+        actual_f = target_f if target_f is not None else float(gen.value("rf.frequency"))
+        sets = []
+        if target_f is not None:
+            sets.append(gen.set("rf.frequency", target_f))
+            if self.track_center:
+                sets.append(sa.set("freq.center", target_f))
+        elif first and self.track_center:
+            sets.append(sa.set("freq.center", actual_f))
+        if target_p is not None:
+            sets.append(gen.set("rf.power", target_p))
+        if sets:
+            yield sets
+        if self.settle_s > 0:
+            yield run.sleep(self.settle_s)
+        # Сначала подписываемся на trace, одновременно запускаем single - без гонки на быстром симуляторе
+        tr, _act = yield (
+            sa.measure("trace", skip=0, count=1, timeout_s=self.timeout_s),
+            sa.action("single", timeout_s=self.timeout_s),
+        )
+        if not isinstance(tr, Trace) or len(tr) == 0:
+            raise ScenarioError(f"{sa.name}: empty trace during {self.NAME}")
+        finite = [float(y) for y in tr.y if math.isfinite(y)]
+        if not finite:
+            raise ScenarioError(f"{sa.name}: non-finite trace during {self.NAME}")
+        if tr.x_unit == "s":
+            power = sum(finite) / len(finite)
+            floor = None
+            peak_freq = actual_f
+        else:
+            peak_freq, power = tr.peak()
+            finite_sorted = sorted(finite)
+            floor = finite_sorted[len(finite_sorted) // 2]
+        src_p = float(target_p if target_p is not None else gen.value("rf.power"))
+        return SweepPoint(freq=actual_f, src_power=src_p, power=float(power),
+                          gain=float(power) - src_p, floor=floor, peak_freq=peak_freq)
