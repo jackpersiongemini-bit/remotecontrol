@@ -635,7 +635,7 @@ class LivePanel(Panel):
         if a.connected:
             u = self.power_table.unit
             if a.level is None:
-                self.level.setText("NO DATA")
+                self.level.setText("WAIT TRIG" if self.proxy.value("meas.armed") is True else "NO DATA")
             elif u == "dB":
                 src_p = None if a.source is None else a.source.power
                 self.level.setText(_format_power(a.level, "dB", src_p) if src_p is not None else _dbm(a.level))

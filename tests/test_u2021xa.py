@@ -173,7 +173,7 @@ def test_time_domain_trace(pm):
 def test_level_mode_stops_free_run_and_disables_auto_level(pm):
     """Переход FREE RUN -> LEVEL сначала выключает INIT:CONT; запись trig.level выключает TRIG:LEV:AUTO."""
     drv, sim, rec = pm
-    sim.cfg["tlev_auto"] = True
+    sim.cfg["lev_auto"] = True
     del sim.history[:]
     assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
     i_off = sim.history.index("INIT:CONT OFF")
@@ -185,6 +185,82 @@ def test_level_mode_stops_free_run_and_disables_auto_level(pm):
     i_lev = next(i for i, c in enumerate(sim.history) if c.startswith("TRIG:LEV "))
     assert i_auto < i_lev and rec.values["trig.level"] == pytest.approx(-12.0)
     assert rec.values["trig.level_auto"] is False and not rec.errors
+
+
+def test_level_mode_rearms_after_readbacks_and_clears_stale_reading(pm):
+    """Переход FREE -> LEVEL и смена порога сбрасывают старое показание, а INIT;*OPC идёт ПОСЛЕ обратного чтения."""
+    drv, sim, rec = pm
+    sim.set_signal(on_dbm=-10.0, width=None)           # CW: в FREE RUN даёт -10 dBm, в LEVEL фронта нет
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(-10.0, abs=0.05)
+
+    del sim.history[:]
+    assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
+    # Старое показание FREE RUN сброшено до прихода запуска
+    assert rec.values["meas.power"] is None and rec.values["meas.armed"] is True
+    # INIT и *OPC — в самом конце, после всех обратных запросов (TRIG:SOUR?, TRIG:LEV?, ...)
+    i_init = sim.history.index("INIT")
+    assert sim.history[i_init:] == ["INIT", "*OPC"]
+    assert not rec.errors
+
+    # Появились импульсы -> сработал запуск по уровню
+    sim.set_signal(on_dbm=0.0, width=200e-6, period=1e-3, off_dbm=-60.0)
+    assert setp(drv, rec, "trig.level", -10.0) is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(0.0, abs=0.05)
+
+    # Подняли порог выше импульса -> старый результат сброшен, датчик ждёт
+    del sim.history[:]
+    assert setp(drv, rec, "trig.level", 10.0) is PStatus.WRITTEN
+    assert rec.values["meas.power"] is None and rec.values["meas.armed"] is True
+    i_init2 = sim.history.index("INIT")
+    assert sim.history[i_init2:] == ["INIT", "*OPC"]
+
+
+def test_level_auto_triggers_and_updates_detected_level(pm):
+    """В режиме LEVEL AUTO датчик сам подбирает порог и после измерения обновляет trig.level в GUI."""
+    drv, sim, rec = pm
+    sim.set_signal(on_dbm=-10.0, width=200e-6, period=1e-3, off_dbm=-60.0)
+    assert setp(drv, rec, "trig.level_auto", True) is PStatus.WRITTEN
+    assert setp(drv, rec, "gate.start", 20e-6) is PStatus.WRITTEN
+    assert setp(drv, rec, "gate.length", 100e-6) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(-10.0, abs=0.05)
+    assert rec.values["trig.level"] < -10.0 and rec.values["trig.level"] > -40.0
+    assert not rec.errors
+
+
+def test_level_negative_slope_triggers_on_falling_edge(pm):
+    """Фронт NEG запускает строб от спада импульса (сразу после спада — уровень паузы)."""
+    drv, sim, rec = pm
+    sim.set_signal(on_dbm=0.0, width=200e-6, period=1e-3, off_dbm=-60.0)
+    for k, v in (("trig.level", -10.0), ("gate.start", 20e-6), ("gate.length", 50e-6), ("trig.source", "INT")):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(0.0, abs=0.05)
+    assert setp(drv, rec, "trig.slope", "NEG") is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(-60.0, abs=0.5)
+
+
+def test_batch_write_arms_once_and_resync_aborts_before_init(pm):
+    """Пачка параметров в _pending взводит INIT один раз в конце; after_resync / timeout делают ABOR до INIT."""
+    drv, sim, rec = pm
+    sim.set_signal(on_dbm=0.0, width=None)
+    del sim.history[:]
+    drv.set_param("trig.level", -15.0)
+    drv.set_param("gate.start", 10e-6)
+    drv.set_param("gate.length", 80e-6)
+    drv.set_param("trig.source", "INT")
+    flush(drv)
+    assert sim.history.count("INIT") == 1
+    assert sim.history[-2:] == ["INIT", "*OPC"]
+
+    del sim.history[:]
+    drv.after_resync(cleared=True)
+    assert sim.history.index("ABOR") < sim.history.index("INIT")
+    assert not rec.errors
 
 
 @pytest.mark.parametrize("hw_shifts", [False, True])

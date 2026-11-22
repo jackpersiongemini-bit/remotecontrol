@@ -45,6 +45,9 @@ FEEDS = {1: ("meas.power", "POW:AVER"),
 #: по мануалу ``... ON SWEEP<n>`` (строб) разрешён только при TRIG:SOUR INT или EXT, иначе -221
 GATED_SOURCES = ("INT", "EXT")
 RESULT_KEYS = tuple(k for k, _ in FEEDS.values()) + ("trace",)
+#: параметры запуска / строба: их смена в триггерном режиме делает прежний результат неактуальным
+TRIG_REARM_CLEAR_KEYS = frozenset(("trig.level", "trig.level_auto", "trig.slope", "trig.delay", "trig.holdoff",
+                                   "gate.start", "gate.length"))
 TRACE_RES = "MRES"                     # 1000 точек
 CAL_TIMEOUT_MS = 30000
 
@@ -62,8 +65,11 @@ class KeysightU2021XA(VISAInstrument):
         #: границы TRIG:LEV прибора и сдвигает ли датчик TRIG:LEV на CORR:GAIN2 сам (определяется по TRIG:LEV? MAX)
         self._trig_level_min = -40.0
         self._trig_level_max = 20.0
+        self._hw_base_max = 20.0
         self._trig_level_offset_in_hw: bool | None = None
         self._bounds_dirty = True
+        self._batch_active = False
+        self._batch_mode_changed = False
         super().__init__(transport, parent, command_delay_s)
 
     # ------------------------------------------------------------ описание
@@ -77,9 +83,10 @@ class KeysightU2021XA(VISAInstrument):
             Param("meas.armed", "Ждём запуск", B, section=meas, query="<virtual>"),
             Param("meas.continuous", "Непрерывно", B, section=trig, query="<virtual>", write="<virtual>"),
             # offset / offset.state читаются до trig.level, чтобы сразу учесть поправку в шкале уровня запуска
+            # CORR:GAIN2 на реальных U2020X может сам включить CORR:GAIN2:STAT - перечитываем offset.state до trig.level
             Param("offset", "Поправка", F, "dB", section=sens, query="CORR:GAIN2?",
                   write="CORR:GAIN2 {value}", minimum=-100.0, maximum=100.0, tolerance=1e-3,
-                  also_read=("trig.level",)),
+                  also_read=("offset.state", "trig.level")),
             Param("offset.state", "Поправка вкл.", B, section=sens, query="CORR:GAIN2:STAT?",
                   write="CORR:GAIN2:STAT {value}", also_read=("trig.level",)),
             Param("trig.source", "Запуск", E, section=trig, query="TRIG:SOUR?", write="TRIG:SOUR {value}",
@@ -141,8 +148,11 @@ class KeysightU2021XA(VISAInstrument):
         self._results = dict.fromkeys(RESULT_KEYS)
         self._trig_level_min = -40.0
         self._trig_level_max = 20.0
+        self._hw_base_max = 20.0
         self._trig_level_offset_in_hw = None
         self._bounds_dirty = True
+        self._batch_active = False
+        self._batch_mode_changed = False
         self.write("INIT:CONT OFF")
         self.write("ABOR")
         for n in FEEDS:
@@ -160,8 +170,11 @@ class KeysightU2021XA(VISAInstrument):
         self._results = dict.fromkeys(RESULT_KEYS)
         self._trig_level_min = -40.0
         self._trig_level_max = 20.0
+        self._hw_base_max = 20.0
         self._trig_level_offset_in_hw = None
         self._bounds_dirty = True
+        self._batch_active = False
+        self._batch_mode_changed = False
 
     def on_disconnecting(self) -> None:
         if self._armed:
@@ -213,17 +226,52 @@ class KeysightU2021XA(VISAInstrument):
         """Узнать у прибора границы TRIG:LEV? MIN/MAX и понять, сдвигает ли датчик TRIG:LEV на CORR:GAIN2 сам."""
         self._bounds_dirty = False
         off = self._active_offset()
-        lo, hi = -40.0, 20.0
+        lo, hi = self._trig_level_min, self._trig_level_max
+        queried = False
         try:
             q_lo = self.query_float("TRIG:LEV? MIN")
             q_hi = self.query_float("TRIG:LEV? MAX")
             if math.isfinite(q_lo) and math.isfinite(q_hi) and q_lo < q_hi:
                 lo, hi = q_lo, q_hi
+                queried = True
         except ValueError:
             self._check_errors(context="trig.level bounds")
-        self._trig_level_min, self._trig_level_max = lo, hi
-        if abs(off) >= 0.1:
-            self._trig_level_offset_in_hw = abs(hi - (20.0 + off)) < abs(hi - 20.0)
+        if queried:
+            self._trig_level_min, self._trig_level_max = lo, hi
+            if abs(off) < 0.1:
+                self._hw_base_max = hi
+            else:
+                base_max = self._hw_base_max
+                self._trig_level_offset_in_hw = abs(hi - (base_max + off)) < abs(hi - base_max)
+
+    def _clear_results(self) -> None:
+        """Сбросить устаревшие результаты измерения и уведомить GUI (до нового запуска - пусто)."""
+        self._results = dict.fromkeys(RESULT_KEYS)
+        for k in RESULT_KEYS:
+            if self._values.get(k) is not None:
+                self._publish(k, None)
+
+    def _flush_pending(self) -> None:
+        if self._state is not ConnectionState.CONNECTED or not self._pending:
+            super()._flush_pending()
+            return
+        # Останавливаем измерение один раз на всю пачку: validate_param, write_param, проверка ошибок
+        # (*ESR?) и обратное чтение (_read_keys / TRIG:LEV? MIN/MAX) идут при остановленном датчике,
+        # без гонки с активным INIT / *OPC.
+        was_armed, was_cont_free = self._stop_acquisition()
+        self._batch_active = True
+        self._batch_mode_changed = False
+        try:
+            super()._flush_pending()
+        finally:
+            self._batch_active = False
+            mode_changed = self._batch_mode_changed
+            self._batch_mode_changed = False
+            if self._state is ConnectionState.CONNECTED and not self._stopping:
+                if mode_changed or was_cont_free:
+                    self._apply_run_mode()
+                elif was_armed:
+                    self._arm()
 
     def _trig_level_bounds(self) -> tuple[float, float]:
         """Допустимый диапазон trig.level в шкале показаний (с учётом активной поправки)."""
@@ -249,14 +297,21 @@ class KeysightU2021XA(VISAInstrument):
         key = spec.key
         if key == "meas.continuous":
             self._continuous = bool(value)
-            self._apply_run_mode()
+            if self._batch_active:
+                self._batch_mode_changed = True
+            else:
+                self._apply_run_mode()
             return
-        was_armed, was_cont_free = self._stop_acquisition()   # настройки меняем при остановленном измерении
+        was_armed, was_cont_free = (False, False) if self._batch_active else self._stop_acquisition()
         if key in ("trig.source", "detector"):
-            self._change_mode(spec, value)
+            self._change_mode(spec, value, rearm=not self._batch_active)
+            if self._batch_active:
+                self._batch_mode_changed = True
             return
         if key == "trace.state":
-            self._set_tracing(bool(value))
+            self._set_tracing(bool(value), rearm=not self._batch_active)
+            if self._batch_active:
+                self._batch_mode_changed = True
             return
         try:
             if key == "trig.level":
@@ -270,13 +325,16 @@ class KeysightU2021XA(VISAInstrument):
                 super().write_param(spec, value)
                 if key in ("offset", "offset.state"):
                     self._bounds_dirty = True
+            if not self._free_run and key in TRIG_REARM_CLEAR_KEYS:
+                self._clear_results()
         finally:
-            if was_cont_free:
-                self._apply_run_mode()
-            elif was_armed:
-                self._arm()
+            if not self._batch_active:
+                if was_cont_free:
+                    self._apply_run_mode()
+                elif was_armed:
+                    self._arm()
 
-    def _set_tracing(self, on: bool) -> None:
+    def _set_tracing(self, on: bool, rearm: bool = True) -> None:
         """Трасса требует DET NORM и INIT:CONT OFF: режим датчика переключается сам."""
         try:
             if on and not self._normal:
@@ -290,7 +348,8 @@ class KeysightU2021XA(VISAInstrument):
                 self._results["trace"] = None
                 self._publish("trace", None)
         finally:
-            self._apply_run_mode()
+            if rearm:
+                self._apply_run_mode()
 
     def _change_mode(self, spec: Param, value: Any, rearm: bool = True) -> None:
         """Смена запуска/режима в порядке, при котором прибор не даёт -221:
@@ -317,7 +376,7 @@ class KeysightU2021XA(VISAInstrument):
             super().write_param(spec, value)
             self._values["detector"], self._values["trig.source"] = new_det, new_src
             self._configure_feeds(new_det, new_src)
-            self._results = dict.fromkeys(RESULT_KEYS)
+            self._clear_results()
         finally:
             if rearm:
                 self._apply_run_mode()
@@ -393,6 +452,13 @@ class KeysightU2021XA(VISAInstrument):
         self._results = out
         for k, v in out.items():
             self._publish(k, v)
+        if self._values.get("trig.source") == "INT" and self._values.get("trig.level_auto") is True:
+            try:
+                lvl = self.read_param_raw(self._params["trig.level"])
+                if not self._params["trig.level"].same(lvl, self._values.get("trig.level")):
+                    self._publish("trig.level", lvl)
+            except ValueError:
+                pass
 
     def _read_trace(self) -> Trace | None:
         y = self.query_float_block(f"TRAC:DATA? {TRACE_RES}")
@@ -405,9 +471,20 @@ class KeysightU2021XA(VISAInstrument):
                 "gate": (self._values.get("gate.start"), self._values.get("gate.length"))}
         return Trace.linear(start, start + length, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
 
+    def after_resync(self, cleared: bool) -> None:
+        """После Device Clear перезапустить взведённое измерение через ABOR + INIT;*OPC."""
+        if cleared and self._armed:
+            self.write("ABOR")
+            self._opc_pending = False
+            self.opc_latched = False
+            self._arm()
+            return
+        super().after_resync(cleared)
+
     def after_poll_timeout(self) -> None:
-        """Чтение результата прервал таймаут (обмен уже восстановлен): взвести измерение снова."""
+        """Чтение результата прервал таймаут (обмен уже восстановлен): сбросить и взвести снова."""
         if self._continuous and not self._armed and not (self._free_run and not self._tracing):
+            self.write("ABOR")
             self._arm()
 
     def poll(self) -> None:
@@ -438,6 +515,7 @@ class KeysightU2021XA(VISAInstrument):
                 self.query("*OPC?")
                 self._fetch()
             else:
+                self._clear_results()
                 self._arm()
             return None
         if name == "abort":
@@ -446,6 +524,7 @@ class KeysightU2021XA(VISAInstrument):
             self._abort()
             self.write("INIT:CONT OFF")
             self.write("ABOR")
+            self._clear_results()
             return None
         if name == "restart":
             was_armed, was_cont_free = self._stop_acquisition()
