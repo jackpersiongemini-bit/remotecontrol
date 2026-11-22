@@ -104,7 +104,8 @@ def remember_windows(opened: list[dict], settings: QSettings) -> None:
         win = cur.get("win")
         if win is None or sip.isdeleted(win):
             continue
-        key, visible = f"WINDOWS/{cur['lab_key']}/VISIBLE", bool(win.isVisible())
+        visible = bool(not win.isHidden()) if getattr(win, "is_docked", False) else bool(win.isVisible())
+        key = f"WINDOWS/{cur['lab_key']}/VISIBLE"
         if settings.value(key, None, type=bool) != visible or settings.value(key) is None:
             settings.setValue(key, visible)
         win.save_size()
@@ -160,7 +161,10 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
     def reconnect(kind: str, address: str, model: str) -> None:
         nonlocal delay, poll_pause
         old_proxy, old_win = current["proxy"], current["win"]
-        pos, visible = old_win.pos(), old_win.isVisible()
+        was_docked = bool(getattr(old_win, "is_docked", False))
+        old_dock = getattr(old_win, "_dock", None) if was_docked else None
+        pos = old_win._floating_pos if was_docked else old_win.pos()
+        visible = bool(not old_win.isHidden()) if was_docked else old_win.isVisible()
         old_win.save_size()
         old_win.presets.save()
         old_win.hide()
@@ -171,7 +175,9 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
         delay = saved_delay(settings, window_cls.CONNECTION_GROUP)
         poll_pause = saved_poll_pause(settings, window_cls.CONNECTION_GROUP)
         try:
-            build(kind, address, model or None, pos, visible)
+            build(kind, address, model or None, pos, visible and not was_docked)
+            if was_docked and old_dock is not None and not sip.isdeleted(old_dock):
+                old_dock.attach(current["win"], show=visible, save=True)
         except Exception:  # noqa: BLE001 - не оставлять в current удалённое окно
             current["win"] = None
             logging.getLogger("visalab").exception("ошибка пересоздания окна %s", window_cls.__name__)

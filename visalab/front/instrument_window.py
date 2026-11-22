@@ -30,15 +30,17 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdi
 from ..coord import COORD, Instrument
 from ..core.params import ConnectionState, PStatus
 from ..core.units import si_format, si_parse
+from .favorites import FavoritesManager, FavoritesPopup
+from .instrument_dock import active_dock
 from .models import ModelWindow, all_models, model_class
 from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
-from .window import (AddressLabel, CustomExpandButton, CustomInitButton, CustomSyncButton, ErrorIndicator, Switch,
-                     Window, WriteState, mark_growing)
+from .window import (AddressLabel, CustomDockButton, CustomExpandButton, CustomFavButton, CustomInitButton,
+                     CustomSyncButton, ErrorIndicator, Switch, Window, WriteState, mark_growing)
 
 __all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay",
            "saved_poll_pause", "parse_power_list",
-           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "WINDOW_EVENTS", "window_for"]
+           "PRESET_HEIGHT", "PRESET_GAP", "DEFAULT_POWER_LIST", "WINDOW_EVENTS", "window_for", "all_instrument_windows"]
 
 PRESET_SETTLE_S = 5.0      # после клика по пресету: столько ждать, пока прибор примет все значения
 COMPACT_PADDING_PX = 9     # кнопка у спинбокса: поля по бокам от подписи
@@ -393,9 +395,20 @@ class WindowEvents(QObject):
 
 WINDOW_EVENTS = WindowEvents()
 
+_INSTRUMENT_WINDOWS: list["InstrumentWindow"] = []
+
+
+def all_instrument_windows() -> list["InstrumentWindow"]:
+    """Все живые окна приборов в процессе (и плавающие, и прикреплённые к доку)."""
+    _INSTRUMENT_WINDOWS[:] = [w for w in _INSTRUMENT_WINDOWS if not sip.isdeleted(w)]
+    return list(_INSTRUMENT_WINDOWS)
+
 
 def window_for(proxy) -> "InstrumentWindow | None":
-    """Окно прибора в этом процессе (может быть скрыто) или None."""
+    """Окно прибора в этом процессе (может быть скрыто или прикреплено к доку) или None."""
+    for w in all_instrument_windows():
+        if w.proxy is proxy:
+            return w
     for w in QApplication.topLevelWidgets():
         if isinstance(w, InstrumentWindow) and not sip.isdeleted(w) and w.proxy is proxy:
             return w
@@ -456,9 +469,14 @@ class InstrumentWindow(Window):
         self._saved: dict[str, Any] = {}        # что уже записано в ini (ключ -> значение)
         self._expanded = False
         self._overlay: str | None = None        # вместо таблицы: "errors" / "connection"
+        self._dock = None
+        self._floating_pos = None
+        self._floating_size = None
+        self._fav_popup: FavoritesPopup | None = None
         self.saved_widgets: list = []
         self.top_lines: list[PanelLine] = []
         self.page_specs: list[tuple[str, tuple[str, ...], PanelTable]] = []
+        _INSTRUMENT_WINDOWS.append(self)
 
         # ---------------------------------------------------------- заголовок
         bar = self.titleBar
@@ -483,6 +501,10 @@ class InstrumentWindow(Window):
         bar.insert_widget(self.address, 4, stretch=1)
         bar.hBoxLayout.setAlignment(self.on_button, Qt.AlignmentFlag.AlignVCenter)   # он ниже кнопок
         bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает имя драйвера
+        self.dock_button = CustomDockButton()
+        self.dock_button.setToolTip("Attach into the instrument dock")
+        self.dock_button.clicked.connect(self.toggle_dock)
+        bar.insert_control_widget(self.dock_button)
         self.expand_button = CustomExpandButton()
         self.expand_button.setToolTip("Show / hide all parameters")
         self.expand_button.clicked.connect(lambda: self.set_expanded(not self.expand_button.expanded))
@@ -523,7 +545,15 @@ class InstrumentWindow(Window):
         bl = QVBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(8)
-        bl.addWidget(self.tabs)
+        self.fav_button = CustomFavButton()
+        self.fav_button.setToolTip("Configure favorites (choose what is shown in the top panel)")
+        self.fav_button.clicked.connect(self.show_favorites_editor)
+        tabs_row = QHBoxLayout()
+        tabs_row.setContentsMargins(0, 0, 0, 0)
+        tabs_row.setSpacing(4)
+        tabs_row.addWidget(self.tabs, 1)
+        tabs_row.addWidget(self.fav_button)
+        bl.addLayout(tabs_row)
         for page in self.pages:
             bl.addWidget(page)
         self.error_page = self._build_error_page()
@@ -543,6 +573,12 @@ class InstrumentWindow(Window):
         lay.addWidget(self.preset_panel)
         lay.addWidget(self.parameter_panel, 1)    # растянули окно - панель растёт (график в ней - вместе с ней)
         self._layout = lay
+
+        # ---------------------------------------------------------- настраиваемое избранное
+        self.favorites = FavoritesManager(self, settings, self._prefix)
+        self.favorites.discover()
+        self.favorites.attach_to_panel()
+        self.favorites.load()
 
         # ---------------------------------------------------------- состояние
         keys = list(dict.fromkeys(w.key for w in self.bound_widgets()))
@@ -587,6 +623,14 @@ class InstrumentWindow(Window):
 
     def cleanup(self) -> None:
         """Отключить глобальные сигналы и закрыть дочерние окна перед заменой/удалением."""
+        if self.is_docked:
+            self._dock.detach(self, show=False, save=False)
+        if getattr(self, "_fav_popup", None) is not None and not sip.isdeleted(self._fav_popup):
+            self._fav_popup.close()
+            self._fav_popup.deleteLater()
+            self._fav_popup = None
+        if hasattr(self, "favorites"):
+            self.favorites.cleanup()
         mw = getattr(self, "model_window", None)
         if mw is not None and not sip.isdeleted(mw):
             mw.close()
@@ -596,6 +640,86 @@ class InstrumentWindow(Window):
             COORD.links.changed.disconnect(self._update_name)
         except (TypeError, RuntimeError):
             pass
+
+    # ------------------------------------------------------------ избранное и док
+    def show_favorites_editor(self) -> FavoritesPopup:
+        """Открыть всплывающую панель настройки избранного под кнопкой ★."""
+        prev = self._fav_popup
+        if prev is not None and not sip.isdeleted(prev):
+            if prev.isVisible():
+                prev.close()
+                return prev
+            prev.deleteLater()
+        popup = FavoritesPopup(self.favorites, self)
+        self._fav_popup = popup
+        popup.show_under(self.fav_button)
+        return popup
+
+    def set_favorite_enabled(self, item_id: str, enabled: bool) -> None:
+        self.favorites.set_enabled(item_id, enabled)
+
+    def reset_favorites(self) -> None:
+        self.favorites.reset()
+
+    @property
+    def is_docked(self) -> bool:
+        return self._dock is not None and not sip.isdeleted(self._dock)
+
+    def want_docked(self) -> bool:
+        """Было ли окно прикреплено к доку в предыдущем сеансе (ini)."""
+        return bool(self.settings.value(f"{self._prefix}/DOCKED", False, type=bool))
+
+    def dock_into(self, dock=None, *, show: bool = True, save: bool = True) -> None:
+        """Прикрепить окно прибора в указанный или активный док."""
+        target = dock if dock is not None else active_dock(self.settings, create=True)
+        if target is not None:
+            target.attach(self, show=show, save=save)
+
+    def undock(self, *, show: bool = True, save: bool = True) -> None:
+        """Открепить окно прибора обратно в плавающее окно."""
+        if self.is_docked:
+            self._dock.detach(self, show=show, save=save)
+
+    def toggle_dock(self) -> None:
+        if self.is_docked:
+            self.undock(show=True, save=True)
+        else:
+            self.dock_into(show=True, save=True)
+
+    def _on_dock_attached(self, dock, *, save: bool = True) -> None:
+        self._dock = dock
+        self.dock_button.set_docked(True)
+        self.dock_button.setToolTip("Detach into a floating window")
+        self.titleBar.minimized_button.hide()
+        if save:
+            self.settings.setValue(f"{self._prefix}/DOCKED", True)
+        WINDOW_EVENTS.changed.emit(self.proxy)
+
+    def _on_dock_detached(self, *, show: bool = True, save: bool = True, fallback_pos=None) -> None:
+        self._dock = None
+        self.dock_button.set_docked(False)
+        self.dock_button.setToolTip("Attach into the instrument dock")
+        self.titleBar.minimized_button.show()
+        self.hide()
+        self.setParent(None, Qt.WindowType.Window)
+        if hasattr(self, "updateFrameless"):
+            try:
+                self.updateFrameless()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._floating_size is not None and self._floating_size.isValid():
+            self.resize(max(self.minimumWidth(), self._floating_size.width()), self._floating_size.height())
+        pos = self._floating_pos if self._floating_pos is not None else fallback_pos
+        if pos is not None:
+            self.move(pos)
+        if save:
+            self.settings.setValue(f"{self._prefix}/DOCKED", False)
+        if show:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self._fit_height()
+        WINDOW_EVENTS.changed.emit(self.proxy)
 
     def bound_widgets(self) -> list:
         """Все виджеты, привязанные к ключам (для журнала ошибок)."""
@@ -1187,9 +1311,15 @@ class InstrumentWindow(Window):
             self.restore()
 
     def closeEvent(self, event):  # noqa: N802 - Qt
+        if self._fav_popup is not None and not sip.isdeleted(self._fav_popup):
+            self._fav_popup.close()
         mw = getattr(self, "model_window", None)
         if mw is not None and not sip.isdeleted(mw):
             mw.close()
         self.presets.save()
         self.settings.sync()
+        if self.is_docked:
+            self.hide()
+            event.accept()
+            return
         super().closeEvent(event)

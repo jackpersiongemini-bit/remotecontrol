@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -27,7 +28,7 @@ from ..coord import Instrument
 from ..core.units import SI_PREFIXES, si_format, si_parse
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER_LIGHT, UI_COLOR_INDICATOR, UI_COLOR_INDICATOR_FRAME, UI_COLOR_INVERT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
-                    UI_CONTROL_HEIGHT_PX, render_qss, scrollbar_qss)
+                    UI_CONTROL_HEIGHT_PX, checkbox_qss, render_qss, scrollbar_qss)
 from .help import param_help
 from .window import WriteState
 
@@ -58,9 +59,26 @@ class _Bound:
         self._value: Any = None
         self._status_message = ""
         proxy.subscribe(key, self._on_value, self._on_status)
-        proxy.state_changed.connect(lambda _s: (self._update_enabled(), self.refresh_tip()))
+        proxy.state_changed.connect(self._on_proxy_state)
         self.refresh_tip()
         self._update_enabled()
+
+    def _on_proxy_state(self, _s) -> None:
+        if sip.isdeleted(self):
+            return
+        self._update_enabled()
+        self.refresh_tip()
+
+    def unbind(self) -> None:
+        """Отписаться от прокси (для временных / дублирующих виджетов в избранном)."""
+        proxy = getattr(self, "proxy", None)
+        key = getattr(self, "key", None)
+        if proxy is not None and not sip.isdeleted(proxy) and key:
+            proxy.unsubscribe(key, self._on_value, self._on_status)
+            try:
+                proxy.state_changed.disconnect(self._on_proxy_state)
+            except (TypeError, RuntimeError):
+                pass
 
     def how(self) -> str:
         return self.HOW
@@ -1167,20 +1185,13 @@ class Panel(QFrame):
         }
         Panel PLineEdit:focus, Panel PSpinBox:focus { border-color: $UI_COLOR_TEXT_MUTED; }
         Panel PSpinBox { padding: 0 0 0 0; }
-        Panel CustomLockButton {
+        Panel CustomLockButton, Panel CustomFavButton {
             min-width: ${UI_CONTROL_HEIGHT_PX}px; max-width: ${UI_CONTROL_HEIGHT_PX}px;
             min-height: ${UI_CONTROL_HEIGHT_PX}px; max-height: ${UI_CONTROL_HEIGHT_PX}px;
             background-color: $UI_COLOR_BACKGROUND; border: none; border-radius: ${UI_BORDER_RADIUS_PX}px; padding: 0;
         }
-        Panel CustomLockButton:hover { background-color: $UI_COLOR_INVERT_HOVER; }
+        Panel CustomLockButton:hover, Panel CustomFavButton:hover { background-color: $UI_COLOR_INVERT_HOVER; }
         Panel CustomLockButton:checked { background-color: $UI_COLOR_INVERT; }
-        Panel QCheckBox { spacing: 0; padding: 0; color: $UI_COLOR_TEXT_MUTED; }
-        Panel QCheckBox::indicator {
-            width: 14px; height: 14px; border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER_LIGHT;
-            border-radius: 3px; background: $UI_COLOR_BACKGROUND;
-        }
-        Panel QCheckBox::indicator:hover { border-color: $UI_COLOR_TEXT; }
-        Panel QCheckBox::indicator:checked { background: $UI_COLOR_INVERT; border-color: $UI_COLOR_INVERT; }
         Panel PSpinBox::up-button, Panel PSpinBox::down-button {
             subcontrol-origin: border; width: 16px; border: none; background: transparent;
         }
@@ -1245,7 +1256,7 @@ class Panel(QFrame):
             border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER; padding: 3px 8px; font-weight: normal;
         }
         Panel QTableWidget#pmTable QTableCornerButton::section { background: transparent; border: none; }
-    """) + scrollbar_qss("Panel ")
+    """) + scrollbar_qss("Panel ") + "\n" + checkbox_qss("Panel ")
 
     def __init__(self, table: QWidget, column_width: int | None = None, parent=None):
         """``table`` - PanelTable (будет выровнена) или любой виджет со своими таблицами."""

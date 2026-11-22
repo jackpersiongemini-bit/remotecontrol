@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import sys
 import textwrap
 from contextlib import contextmanager
@@ -21,11 +22,11 @@ from qframelesswindow import FramelessWindow, TitleBar
 from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_CONTROL, UI_COLOR_ERROR,
                     UI_COLOR_PANEL, UI_SWITCH_HEIGHT_PX, UI_SWITCH_MARGIN_PX, UI_SWITCH_WIDTH_PX,
                     UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
-                    UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss, scrollbar_qss)
+                    UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, checkbox_qss, render_qss, scrollbar_qss)
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
-           "CustomExpandButton", "CustomFullButton", "CustomLockButton", "Switch",
-           "CustomOnButton", "CustomSyncButton", "CustomInitButton", "mark_growing", "QWIDGETSIZE_MAX"]
+           "CustomExpandButton", "CustomFullButton", "CustomLockButton", "CustomDockButton", "CustomFavButton",
+           "Switch", "CustomOnButton", "CustomSyncButton", "CustomInitButton", "mark_growing", "QWIDGETSIZE_MAX"]
 
 QWIDGETSIZE_MAX = (1 << 24) - 1
 
@@ -79,20 +80,23 @@ class WindowBar(TitleBar):
             b.hide()
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setFixedHeight(WINDOW_BAR_HEIGHT)
-        self.hBoxLayout.setContentsMargins(7, 7, 7, 7)
-        self.hBoxLayout.setSpacing(5)
+        self.hBoxLayout.setContentsMargins(6, 7, 6, 7)
+        self.hBoxLayout.setSpacing(3)
         self.setDoubleClickEnabled(False)
         self.title_label = QLabel(self)
         self.title_label.setObjectName("windowTitle")
         self.minimized_button = CustomMinButton()
         self.minimized_button.setToolTip("Minimize")
-        self.minimized_button.clicked.connect(lambda: self.window().showMinimized())
+        self.minimized_button.clicked.connect(lambda: self._owner_window().showMinimized())
         self.close_button = CustomCloseButton()
         self.close_button.setToolTip("Close")
-        self.close_button.clicked.connect(lambda: self.window().close())
+        self.close_button.clicked.connect(lambda: self._owner_window().close())
         self.hBoxLayout.insertWidget(0, self.title_label)
         self.hBoxLayout.addWidget(self.minimized_button)
         self.hBoxLayout.addWidget(self.close_button)
+
+    def _owner_window(self) -> QWidget:
+        return self.parentWidget() or self.window()
 
     def insert_widget(self, widget, index: int = 0, stretch: int = 0) -> None:
         if stretch > 0:
@@ -110,7 +114,10 @@ class WindowBar(TitleBar):
         self.hBoxLayout.insertWidget(self.hBoxLayout.indexOf(anchor), widget)
 
     def canDrag(self, pos):  # noqa: N802 - qframelesswindow
-        return not self.window().isFullScreen() and super().canDrag(pos)     # во весь экран окно не таскается
+        owner = self._owner_window()
+        if not owner.isWindow():
+            return False
+        return not owner.isFullScreen() and super().canDrag(pos)     # во весь экран окно не таскается
 
 
 class Window(FramelessWindow):
@@ -119,7 +126,7 @@ class Window(FramelessWindow):
                   font-size: ${UI_FONT_SIZE_PT}pt; color: $UI_COLOR_TEXT; }
         QToolTip { padding: 3px 6px; color: $UI_COLOR_TEXT; background-color: $UI_COLOR_PANEL;
                    border: 1px solid $UI_COLOR_BORDER; border-radius: ${UI_BORDER_RADIUS_PX}px; }
-    """) + scrollbar_qss()
+    """) + scrollbar_qss() + "\n" + checkbox_qss()
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -198,14 +205,15 @@ class Window(FramelessWindow):
 
     def save_size(self) -> None:
         """Размер, положение и растянутые высоты видов - в ini (только если изменились)."""
-        self.save_pos()
-        size = self.size()
-        if self.isFullScreen() or self.isMaximized():      # обычный размер, а не размер экрана
-            size = self.normalGeometry().size()
-            if not size.isValid() or size.isEmpty():
-                return
-        if self.settings.value(self._size_key, None, type=QSize) != size:
-            self.settings.setValue(self._size_key, size)
+        if self.isWindow():
+            self.save_pos()
+            size = self.size()
+            if self.isFullScreen() or self.isMaximized():      # обычный размер, а не размер экрана
+                size = self.normalGeometry().size()
+                if not size.isValid() or size.isEmpty():
+                    return
+            if self.settings.value(self._size_key, None, type=QSize) != size:
+                self.settings.setValue(self._size_key, size)
         if self.view_heights != self._saved_heights:
             self.settings.setValue(self._heights_key, json.dumps(self.view_heights, sort_keys=True))
             self._saved_heights = dict(self.view_heights)
@@ -252,7 +260,16 @@ class Window(FramelessWindow):
             except Exception:  # noqa: BLE001
                 pass
 
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        if not self.isWindow():
+            QWidget.paintEvent(self, e)
+            return
+        super().paintEvent(e)
+
     def showEvent(self, e):  # noqa: N802 - Qt
+        if not self.isWindow():
+            QWidget.showEvent(self, e)
+            return
         super().showEvent(e)
         if hasattr(self, "_pos_key") and self.isWindow() and not (
                 self.isFullScreen() or self.isMaximized() or self.isMinimized()):
@@ -273,6 +290,9 @@ class Window(FramelessWindow):
         super().hideEvent(e)
 
     def changeEvent(self, e):  # noqa: N802 - Qt
+        if not self.isWindow():
+            QWidget.changeEvent(self, e)
+            return
         super().changeEvent(e)
         if e.type() == QEvent.Type.WindowStateChange:
             self._ensure_resizable()
@@ -288,6 +308,12 @@ class Window(FramelessWindow):
         with self.fitting():                           # setMinimumHeight сам меняет высоту окна
             self._fit_hint, self._fit_grows = hint, grows
             self.setMinimumHeight(minimum)
+            if not self.isWindow():
+                self.setMaximumHeight(want)
+                self.setMaximumWidth(QWIDGETSIZE_MAX)
+                self._fit_target = want
+                self.updateGeometry()
+                return
             self.setMaximumHeight(QWIDGETSIZE_MAX)
             self.setMaximumWidth(QWIDGETSIZE_MAX)
             if self.isMaximized() or self.isFullScreen():
@@ -298,6 +324,10 @@ class Window(FramelessWindow):
         self._ensure_resizable()
 
     def resizeEvent(self, e):  # noqa: N802 - Qt
+        if not self.isWindow():
+            QWidget.resizeEvent(self, e)
+            self.titleBar.resize(self.width(), self.titleBar.height())
+            return
         super().resizeEvent(e)
         h = e.size().height()
         if (self._fit_target is not None and not self._fitting and self.isVisible() and e.oldSize().height() > 0
@@ -627,6 +657,69 @@ class CustomExpandButton(IconButtonBase):
         d = -a / 2 if self.expanded else a / 2
         p.drawLine(QLineF(cx - a, cy - d, cx, cy + d))
         p.drawLine(QLineF(cx, cy + d, cx + a, cy - d))
+
+
+class CustomDockButton(IconButtonBase):
+    """Прикрепить окно прибора к панели (dock) / открепить в отдельное окно."""
+
+    docked = False
+
+    def set_docked(self, on: bool) -> None:
+        self.docked = bool(on)
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy = self.width() / 2, self.height() / 2
+        if self.docked:
+            # Открепить: рамка окна + стрелка наружу вправо-вверх
+            p.drawLine(QLineF(cx - 4.5, cy - 4.5, cx - 1.0, cy - 4.5))
+            p.drawLine(QLineF(cx - 4.5, cy - 4.5, cx - 4.5, cy + 4.5))
+            p.drawLine(QLineF(cx - 4.5, cy + 4.5, cx + 4.5, cy + 4.5))
+            p.drawLine(QLineF(cx + 4.5, cy + 4.5, cx + 4.5, cy + 1.0))
+            p.drawLine(QLineF(cx - 0.5, cy + 0.5, cx + 4.5, cy - 4.5))
+            p.drawLine(QLineF(cx + 1.2, cy - 4.5, cx + 4.5, cy - 4.5))
+            p.drawLine(QLineF(cx + 4.5, cy - 4.5, cx + 4.5, cy - 1.2))
+        else:
+            # Прикрепить: вертикальная панель справа + стрелка внутрь
+            p.drawRoundedRect(QRectF(cx + 1.2, cy - 4.5, 3.6, 9.0), 1.0, 1.0)
+            p.drawLine(QLineF(cx - 5.0, cy, cx - 0.6, cy))
+            p.drawLine(QLineF(cx - 3.0, cy - 2.5, cx - 0.6, cy))
+            p.drawLine(QLineF(cx - 3.0, cy + 2.5, cx - 0.6, cy))
+
+
+class CustomFavButton(IconButtonBase):
+    """Звёздочка «избранное»: открыть выбор параметров в верхней панели."""
+
+    customized = False
+
+    def set_customized(self, on: bool) -> None:
+        self.customized = bool(on)
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy = self.width() / 2, self.height() / 2 + 0.3
+        r_out, r_in = 5.4, 2.3
+        path = QPainterPath()
+        for i in range(10):
+            ang = math.radians(-90 + i * 36)
+            r = r_out if i % 2 == 0 else r_in
+            pt = QPointF(cx + r * math.cos(ang), cy + r * math.sin(ang))
+            if i == 0:
+                path.moveTo(pt)
+            else:
+                path.lineTo(pt)
+        path.closeSubpath()
+        if self.customized:
+            p.setBrush(self._icon_color)
+        else:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
 
 
 def short_address(address: str) -> str:
