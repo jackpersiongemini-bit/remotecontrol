@@ -268,7 +268,8 @@ def test_power_meter_close_reopen_keeps_links(qtbot, tmp_path: Path):
         win.show()
         COORD.follow._sources[pm] = gen
         COORD.follow.changed.emit(pm)
-        assert win.follow_button.text().startswith("← ")
+        assert win.follow_button.text().startswith("GEN")
+        assert "←" not in win.follow_button.text()
         COORD.follow._sources.pop(pm, None)
         COORD.follow.changed.emit(pm)
         assert win.follow_button.text() == "FOLW"

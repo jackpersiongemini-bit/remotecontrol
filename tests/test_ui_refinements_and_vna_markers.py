@@ -161,3 +161,96 @@ def test_vna_markers_shown_on_live_plot(qtbot, tmp_path):
         mw.cleanup()
         mw.close()
         p_vna.shutdown()
+
+
+def test_panel_line_input_priority_and_no_arrow_on_pm_follow(qtbot, tmp_path):
+    """В строках «поле + кнопка» (например FREQ + GEN у PM, POW + RF + PRST у GEN) кнопка имеет
+    нулевой приоритет (stretch=0, Fixed), а весь приоритет по ширине у поля ввода; на GEN нет стрелки ←."""
+    from PyQt6.QtWidgets import QSizePolicy
+    s = QSettings(str(tmp_path / "prio.ini"), QSettings.Format.IniFormat)
+    p_pm = _proxy("u2021xa")
+    p_gen = _proxy("e8267d")
+    w_pm = PowerMeterWindow(p_pm, s)
+    w_gen = RFGenWindow(p_gen, s)
+    qtbot.addWidget(w_pm)
+    qtbot.addWidget(w_gen)
+    try:
+        freq_line = next(ln for ln in w_pm.pages[0].lines if ln.name == "FREQ")
+        freq_spin = w_pm.widgets["freq"]
+        folw = w_pm.follow_button
+        assert freq_line.line_layout.stretch(freq_line.line_layout.indexOf(freq_spin)) == 1
+        assert freq_line.line_layout.stretch(freq_line.line_layout.indexOf(folw)) == 0
+        assert folw.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Fixed
+        assert "←" not in folw.text()
+
+        w_pm.show()
+        w_pm.set_expanded(True)
+        qtbot.waitExposed(w_pm)
+        assert freq_spin.width() > folw.width() * 2
+
+        # И в строке POW у генератора: спинбокс stretch=1, кнопки RF/PRST stretch=0
+        pow_line = next(ln for ln in w_gen.top_lines if ln.name == "POW")
+        assert pow_line.line_layout.stretch(pow_line.line_layout.indexOf(w_gen.power_spin)) == 1
+        assert pow_line.line_layout.stretch(pow_line.line_layout.indexOf(w_gen.prst_button)) == 0
+    finally:
+        w_pm.cleanup()
+        w_gen.cleanup()
+        w_pm.close()
+        w_gen.close()
+        p_pm.shutdown()
+        p_gen.shutdown()
+
+
+def test_psu_voltage_units_channel_power_and_total_power(qtbot, tmp_path):
+    """PSU: 500 mV -> '500 mV', 10 000 mV -> '10 V', при уставке в вольтах - вольты;
+    отображается мощность каждого канала (P) и суммарная мощность (TOTAL)."""
+    from visalab.front import PSUWindow
+    s = QSettings(str(tmp_path / "psu_pwr.ini"), QSettings.Format.IniFormat)
+    p = _proxy("it6300")
+    w = PSUWindow(p, s)
+    qtbot.addWidget(w)
+    try:
+        with qtbot.waitSignal(p.sync_done, timeout=5000):
+            p.open()
+
+        # 500 mV на CH2 (10 Ом нагрузка -> 50 mA, 25 mW)
+        p.set("ch2.voltage", 0.5)
+        p.set("ch2.current", 1.0)
+        p.set("ch2.output", True)
+        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "500 mV", timeout=5000)
+        qtbot.waitUntil(lambda: w.tiles[2].fields["P"].text() == "25 mW", timeout=5000)
+
+        # Выключили выход при уставке 500 mV -> остаётся в mV ('0 mV')
+        p.set("ch2.output", False)
+        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "0 mV", timeout=5000)
+
+        # Ввод 10000 в единицах mV в настройках CH -> должно показывать 10 V!
+        v2_edit = w.setpoint_fields[2]["V"]
+        v2_edit.set_prefix("m")
+        v2_edit.setText("10000")
+        v2_edit.setModified(True)
+        v2_edit.returnPressed.emit()
+        qtbot.waitUntil(lambda: p.value("ch2.voltage") == pytest.approx(10.0), timeout=5000)
+        qtbot.waitUntil(lambda: v2_edit.unit_button.text() == "V" and v2_edit.text() == "10", timeout=5000)
+        p.set("ch2.current", 2.0)
+        p.set("ch2.output", True)
+        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "10 V", timeout=5000)
+        # 10 V на 10 Ом -> 1 A, 10 W
+        qtbot.waitUntil(lambda: w.tiles[2].fields["P"].text() == "10 W", timeout=5000)
+
+        # При выключении канала с уставкой 10 V -> показывает '0 V' (в вольтах!)
+        p.set("ch2.output", False)
+        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "0 V", timeout=5000)
+
+        # Включаем два канала: CH2 = 5 V (2.5 W) и CH3 = 5 V (2.5 W) -> TOTAL = 5 W
+        p.set("ch2.voltage", 5.0)
+        p.set("ch2.output", True)
+        p.set("ch3.voltage", 5.0)
+        p.set("ch3.current", 2.0)
+        p.set("ch3.output", True)
+        qtbot.waitUntil(lambda: w.total_power == pytest.approx(5.0, abs=0.05), timeout=5000)
+        qtbot.waitUntil(lambda: w.total_power_label.text() == "TOTAL 5 W", timeout=5000)
+    finally:
+        w.cleanup()
+        w.close()
+        p.shutdown()

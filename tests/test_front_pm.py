@@ -285,7 +285,8 @@ def test_follow_button_shows_source(qtbot, tmp_path):
         assert win.follow_button in freq_line.widgets and win.follow_button.isChecked()
         gen.set("rf.frequency", 2.2e9)
         _wait(qtbot, pm, "freq", lambda v: v == pytest.approx(2.2e9))
-        qtbot.waitUntil(lambda: win.follow_button.text().startswith("← GEN"), timeout=2000)
+        qtbot.waitUntil(lambda: win.follow_button.text().startswith("GEN"), timeout=2000)
+        assert "←" not in win.follow_button.text()
         win.follow_button.setChecked(False)
         assert settings.value(f"{win._prefix}/FREQ_FOLLOW", type=bool) is False
         assert win.follow_button.text() == "FOLW" and not COORD.follow.enabled(pm)

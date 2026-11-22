@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from PyQt6.QtCore import QRectF, QSettings, Qt, pyqtSignal
@@ -130,6 +131,25 @@ class SourceField(PLineEdit):
         self.show_value(self._value)               # подсказка - уставка, слева - измерение
 
 
+def _fmt_psu_value(value: float | None, unit: str, ref: float | None = None) -> str:
+    """Формат показания ИП: ≥ 1 всегда в базовой единице (10 000 mV -> 10 V); < 1 следует масштабу уставки."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "---"
+    val = float(value)
+    if abs(val) >= 1.0 - 1e-9:
+        return f"{val:.4g} {unit}"
+    has_ref = isinstance(ref, (int, float)) and not isinstance(ref, bool) and math.isfinite(ref) and abs(ref) > 1e-12
+    if has_ref and abs(float(ref)) >= 1.0 - 1e-9:
+        return f"0 {unit}" if abs(val) < 1e-9 else f"{val:.4g} {unit}"
+    if has_ref and 1e-3 - 1e-12 <= abs(float(ref)) < 1.0:
+        return f"0 m{unit}" if abs(val) < 1e-9 else f"{val * 1e3:.4g} m{unit}"
+    if abs(val) < 1e-9:
+        return f"0 {unit}"
+    if abs(val) >= 1e-3 - 1e-12:
+        return f"{val * 1e3:.4g} m{unit}"
+    return si_format(val, unit, 4)
+
+
 class SourceReadout(QLabel):
     """Только чтение: текущее измеренное напряжение / ток на плитке избранного (клики проходят плитке)."""
 
@@ -157,23 +177,66 @@ class SourceReadout(QLabel):
     def setpoint(self) -> float | None:
         return self._setpoint
 
-    def _fmt(self, value: float | None) -> str:
-        if not isinstance(value, (int, float)):
-            return "---"
-        if abs(value) < 1e-9:
-            return f"0 {self.unit}"
-        return si_format(float(value), self.unit, 4)
+    def _refresh(self) -> None:
+        self.setText(_fmt_psu_value(self._meas, self.unit, self._setpoint))
 
     def _on_meas(self, value: Any) -> None:
         self._meas = float(value) if isinstance(value, (int, float)) else None
-        self.setText(self._fmt(self._meas))
+        self._refresh()
 
     def _on_setpoint(self, value: Any) -> None:
         self._setpoint = float(value) if isinstance(value, (int, float)) else None
+        self._refresh()
+
+
+class PowerReadoutTile(QLabel):
+    """Только чтение: измеренная мощность канала ИП (meas_p или meas_v × meas_i)."""
+
+    def __init__(self, proxy: Instrument, n: int, parent=None):
+        super().__init__("---", parent)
+        self.proxy, self.n = proxy, n
+        self._meas_p: float | None = None
+        self._meas_v: float | None = None
+        self._meas_i: float | None = None
+        self.setObjectName("measPower")
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if proxy.supports(f"ch{n}.meas_p"):
+            proxy.subscribe(f"ch{n}.meas_p", self._on_p)
+        if proxy.supports(f"ch{n}.meas_v"):
+            proxy.subscribe(f"ch{n}.meas_v", self._on_v)
+        if proxy.supports(f"ch{n}.meas_i"):
+            proxy.subscribe(f"ch{n}.meas_i", self._on_i)
+
+    @property
+    def measured(self) -> float | None:
+        if self._meas_p is not None:
+            return self._meas_p
+        if self._meas_v is not None and self._meas_i is not None:
+            return self._meas_v * self._meas_i
+        return None
+
+    def _refresh(self) -> None:
+        self.setText(_fmt_psu_value(self.measured, "W"))
+
+    def _on_p(self, value: Any) -> None:
+        self._meas_p = float(value) if isinstance(value, (int, float)) else None
+        self._refresh()
+
+    def _on_v(self, value: Any) -> None:
+        self._meas_v = float(value) if isinstance(value, (int, float)) else None
+        if self._meas_p is None:
+            self._refresh()
+
+    def _on_i(self, value: Any) -> None:
+        self._meas_i = float(value) if isinstance(value, (int, float)) else None
+        if self._meas_p is None:
+            self._refresh()
 
 
 class SourceTile(QFrame):
-    """Плитка канала в избранном: только индикация текущего напряжения/тока и вкл/выкл по клику.
+    """Плитка канала в избранном: только индикация текущих V / I / P и вкл/выкл по клику.
 
     Ведёт себя как привязанный к ``chN.output`` виджет (key / proxy / spec / set_value),
     поэтому журнал ошибок и цвет рамки при записи работают как у кнопок.
@@ -200,6 +263,13 @@ class SourceTile(QFrame):
         SourceTile QLabel#measSecondary {
             background-color: $UI_COLOR_PANEL;
             color: $UI_COLOR_BORDER_LIGHT;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
+            font-size: 10pt;
+            padding: 2px 8px;
+        }
+        SourceTile QLabel#measPower {
+            background-color: $UI_COLOR_PANEL;
+            color: $UI_COLOR_TEXT_MUTED;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
             font-size: 10pt;
             padding: 2px 8px;
@@ -234,7 +304,7 @@ class SourceTile(QFrame):
         lay.setContentsMargins(8, 6, 8, 10)
         lay.setSpacing(4)
         lay.addLayout(self.head)
-        self.fields: dict[str, SourceReadout] = {}
+        self.fields: dict[str, QLabel] = {}
         for q, set_key, meas_key, unit, primary in (
             ("V", "voltage", "meas_v", "V", True),
             ("I", "current", "meas_i", "A", False),
@@ -242,6 +312,9 @@ class SourceTile(QFrame):
             r = SourceReadout(proxy, f"ch{n}.{set_key}", f"ch{n}.{meas_key}", unit, primary=primary)
             self.fields[q] = r
             lay.addWidget(r)
+        p_lbl = PowerReadoutTile(proxy, n)
+        self.fields["P"] = p_lbl
+        lay.addWidget(p_lbl)
 
         proxy.subscribe(self.key, self._on_value, self._on_status)
         for k in (f"ch{n}.mode", f"ch{n}.ovp_tripped"):
@@ -446,12 +519,14 @@ class PSUWindow(InstrumentWindow):
 
     def __init__(self, proxy: Instrument, settings: QSettings, title: str = "Power supply", parent=None):
         super().__init__(proxy, settings, title, parent)
+        if hasattr(self, "all_off"):
+            self.all_off.setMinimumWidth(0)
         for n in self.tiles:
             for k in ("output", "meas_v", "meas_i", "meas_p"):
                 if proxy.supports(f"ch{n}.{k}"):
-                    proxy.subscribe(f"ch{n}.{k}", lambda _v: self.apply_rules())
-        proxy.state_changed.connect(lambda _s: self.apply_rules())
-        self.apply_rules()
+                    proxy.subscribe(f"ch{n}.{k}", lambda _v: self._on_meas_update())
+        proxy.state_changed.connect(lambda _s: self._on_meas_update())
+        self._on_meas_update()
 
     # ------------------------------------------------------------ сборка
     def build(self) -> None:
@@ -464,11 +539,22 @@ class PSUWindow(InstrumentWindow):
         grid_line = PanelLine("", self.grid)
         grid_line._name.hide()
         self.top_lines = [grid_line]
+
+        self.total_power_label = QLabel("TOTAL ---")
+        self.total_power_label.setObjectName("heading")
+        self.total_power_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.total_power_label.setToolTip("Total measured output power across all channels")
+        footer_ws: list[QWidget] = [self.total_power_label]
         if "all_off" in proxy.actions:
             self.all_off = ActionButton(proxy, "all_off", "OFF ALL", "Switch all outputs off")
-            line = PanelLine("", self.all_off)
-            line._name.hide()
-            self.top_lines.append(line)
+            self.all_off.setSizePolicy(QSizePolicy.Policy.Fixed, self.all_off.sizePolicy().verticalPolicy())
+            footer_ws.append(self.all_off)
+        footer_line = PanelLine("", *footer_ws)
+        footer_line._name.hide()
+        footer_line.line_layout.setStretchFactor(self.total_power_label, 1)
+        if "all_off" in proxy.actions:
+            footer_line.line_layout.setStretchFactor(self.all_off, 0)
+        self.top_lines.append(footer_line)
 
         chans = sorted(self.tiles)
 
@@ -562,8 +648,31 @@ class PSUWindow(InstrumentWindow):
             if n in self.tiles and self.proxy.value(f"ch{n}.output") is False:
                 self.proxy.set(f"ch{n}.output", True)
 
+    @property
+    def total_power(self) -> float | None:
+        """Суммарная измеренная мощность по всем каналам, Вт (или None если нет измерений)."""
+        if not self.proxy.is_connected:
+            return None
+        total = 0.0
+        any_val = False
+        for tile in self.tiles.values():
+            p_field = tile.fields.get("P")
+            val = getattr(p_field, "measured", None)
+            if isinstance(val, (int, float)) and math.isfinite(val):
+                total += float(val)
+                any_val = True
+        return total if any_val else None
+
+    def _update_total_power(self) -> None:
+        if hasattr(self, "total_power_label"):
+            self.total_power_label.setText(f"TOTAL {_fmt_psu_value(self.total_power, 'W')}")
+
+    def _on_meas_update(self) -> None:
+        self._update_total_power()
+        self.apply_rules()
+
     def _on_state(self, state: ConnectionState) -> None:
         super()._on_state(state)
-        self.apply_rules()
+        self._on_meas_update()
         for t in (self.grid.tiles if hasattr(self, "grid") else ()):
             t._update_tip()

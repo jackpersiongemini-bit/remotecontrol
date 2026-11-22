@@ -1524,7 +1524,7 @@ class PowerMeterWindow(InstrumentWindow):
         src = COORD.follow.source(self.proxy)
         on = self.follow_button.isChecked()
         name = COORD.display_name(src) if src is not None else ""
-        self.follow_button.setText(f"← {name}" if on and name else "FOLW")
+        self.follow_button.setText(name if on and name else "FOLW")
         self.follow_button.setToolTip(
             ("FREQ follows " + (f"{name}: " if name else "the generator: ") if on else "FREQ does not follow: ")
             + "a new generator frequency (GEN, or VNA in CW) is set on the sensor.\nClick - on / off")

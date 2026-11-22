@@ -174,7 +174,11 @@ class PLineEdit(QLineEdit, _Bound):
         return SI_PREFIXES[self.prefix] if self.prefix else 1.0
 
     def _auto_prefix(self, value) -> None:
-        if self.pinned or not isinstance(value, (int, float)) or isinstance(value, bool) or not value:
+        if self.pinned or not isinstance(value, (int, float)) or isinstance(value, bool):
+            return
+        if not value:
+            if "" in self.prefixes:
+                self.prefix = ""
             return
         chosen = self.prefixes[0]
         for p in self.prefixes:
@@ -279,6 +283,7 @@ class PLineEdit(QLineEdit, _Bound):
             self._on_status(PStatus.INVALID, str(exc))
             self.show_value(self._value)
             return
+        self.pinned = False
         self.set_value(value)
         self.show_value(self._value)
 
@@ -373,7 +378,11 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         return SI_PREFIXES[self.prefix] if self.prefix else 1.0
 
     def _auto_prefix(self, value) -> None:
-        if self.pinned or not isinstance(value, (int, float)) or isinstance(value, bool) or not value:
+        if self.pinned or not isinstance(value, (int, float)) or isinstance(value, bool):
+            return
+        if not value:
+            if "" in self.prefixes:
+                self.prefix = ""
             return
         chosen = self.prefixes[0]
         for p in self.prefixes:
@@ -1095,12 +1104,23 @@ class PanelTable(QWidget):
     def _is_fixed_width(w: QWidget) -> bool:
         return (w.minimumWidth() == w.maximumWidth() and w.minimumWidth() > 0) or w.objectName() == "tool"
 
+    @staticmethod
+    def _is_value_input(w: QWidget) -> bool:
+        return isinstance(w, (QLineEdit, QAbstractSpinBox))
+
     def _append_group(self, group: tuple[PanelLine, ...]) -> None:
         box = QWidget(self)
         lay = QHBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(self.ROW_SPACING)
-        flexes = [sum(1 for w in ln.widgets if not self._is_fixed_width(w)) for ln in group]
+        flexes = [
+            sum(
+                1 for w in ln.widgets
+                if not self._is_fixed_width(w)
+                and not (any(self._is_value_input(x) for x in ln.widgets) and isinstance(w, QPushButton))
+            )
+            for ln in group
+        ]
         any_flex = any(flexes)
         for line, flex in zip(group, flexes):
             self.lines.append(line)
@@ -1125,7 +1145,11 @@ class PanelTable(QWidget):
         for row in self._rows:
             multi = len(row) > 1
             flex_total = sum(
-                sum(1 for w in ln.widgets if not self._is_fixed_width(w))
+                sum(
+                    1 for w in ln.widgets
+                    if not self._is_fixed_width(w)
+                    and not (any(self._is_value_input(x) for x in ln.widgets) and isinstance(w, QPushButton))
+                )
                 for ln in row
             )
             if column_width:
@@ -1135,12 +1159,25 @@ class PanelTable(QWidget):
             for col, line in enumerate(row):
                 if not line._name.isHidden() and col in col_widths:
                     line.set_label_width(col_widths[col])
+                has_input = any(self._is_value_input(w) for w in line.widgets)
                 for w in line.widgets:
                     if self._is_fixed_width(w):
+                        line.line_layout.setStretchFactor(w, 0)
+                        continue
+                    if has_input and isinstance(w, QPushButton):
+                        # В строке с полем ввода вспомогательные кнопки (GEN/FOLW, AUTO, RF, PRST...)
+                        # имеют нулевой приоритет в лейауте — весь приоритет у поля ввода.
+                        w.setMinimumWidth(0)
+                        w.setSizePolicy(QSizePolicy.Policy.Fixed, w.sizePolicy().verticalPolicy())
+                        line.line_layout.setStretchFactor(w, 0)
                         continue
                     if min_w:
                         w.setMinimumWidth(min_w)
-                    if multi:
+                    if has_input and self._is_value_input(w):
+                        hp = QSizePolicy.Policy.Ignored if multi else QSizePolicy.Policy.Expanding
+                        w.setSizePolicy(hp, w.sizePolicy().verticalPolicy())
+                        line.line_layout.setStretchFactor(w, 1)
+                    elif multi:
                         w.setSizePolicy(QSizePolicy.Policy.Ignored, w.sizePolicy().verticalPolicy())
                         line.line_layout.setStretchFactor(w, 1)
 
