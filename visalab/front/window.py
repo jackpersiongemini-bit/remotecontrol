@@ -115,9 +115,14 @@ class WindowBar(TitleBar):
 
     def canDrag(self, pos):  # noqa: N802 - qframelesswindow
         owner = self._owner_window()
-        if not owner.isWindow():
+        if not owner.isWindow() or owner.isFullScreen():
             return False
-        return not owner.isFullScreen() and super().canDrag(pos)     # во весь экран окно не таскается
+        child = self.childAt(pos)
+        while child is not None and child is not self:
+            if isinstance(child, QAbstractButton):
+                return False
+            child = child.parentWidget()
+        return super().canDrag(pos)     # во весь экран, в доке и по кнопкам окно не таскается
 
 
 class Window(FramelessWindow):
