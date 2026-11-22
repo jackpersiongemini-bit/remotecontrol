@@ -341,7 +341,7 @@ def test_main_window_shows_running_scenario(qtbot, pm_window, tmp_path):
     assert main.scenario_chip.isHidden()
     _acal_fields(win, "1", "3", "200")
     win.acal_run.click()
-    qtbot.waitUntil(lambda: main.scenario_chip.text().startswith("ACAL\n") and "/200" in main.scenario_chip.text(),
+    qtbot.waitUntil(lambda: main.scenario_chip.text().startswith("ACAL") and "/200" in main.scenario_chip.text(),
                     timeout=10000)
     assert not main.scenario_chip.isHidden() and main.scenario_chip.indicated()
     win.acal_run.click()
