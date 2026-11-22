@@ -24,6 +24,7 @@ from ..core.units import si_format
 from .instrument_window import InstrumentWindow
 from .live_plot import LivePlot
 from .params import PanelLine
+from .theme import render_qss
 from .window import mark_growing
 
 __all__ = ["SweepController", "SWEEP_MODES"]
@@ -161,7 +162,7 @@ class SweepController(QObject):
 
         self.status = QLabel("READY")
         self.status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.status.setStyleSheet("color: #8a8a8a;")
+        self.status.setStyleSheet(render_qss("color: $UI_COLOR_BORDER_LIGHT;"))
         self.status.setMinimumWidth(0)
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.status.setToolTip("Sweep progress and summary (min / max / flatness / P1dB)")

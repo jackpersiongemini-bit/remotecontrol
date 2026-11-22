@@ -322,3 +322,48 @@ def test_vna_limit_lines_read_and_displayed(qtbot, tmp_path):
         mw.cleanup()
         mw.close()
         p_vna.shutdown()
+
+
+def test_light_and_dark_theme_live_switch(qtbot, tmp_path):
+    """По умолчанию активна светлая тема; кнопка DARK/LIGHT переключает тему на лету по всем окнам
+    и сохраняет выбор в QSettings."""
+    from PyQt6.QtGui import QColor
+    from visalab.front import theme
+
+    s = QSettings(str(tmp_path / "theme.ini"), QSettings.Format.IniFormat)
+    links = ProxyLinks()
+    p_gen = _proxy("e8267d")
+    links.add(p_gen)
+    w_gen = RFGenWindow(p_gen, s)
+    mw = MainWindow(s, ActivityMonitor(links))
+    qtbot.addWidget(w_gen)
+    qtbot.addWidget(mw)
+    try:
+        # По умолчанию - светлая тема
+        assert theme.current_theme() == "light"
+        assert QColor(theme.UI_COLOR_BACKGROUND).lightness() > 220
+        assert mw.theme_button.text() == "DARK"
+        assert theme.LIGHT_COLORS["UI_COLOR_BACKGROUND"] in mw.styleSheet()
+
+        # Переключаем на тёмную тему на лету
+        mw.theme_button.click()
+        assert theme.current_theme() == "dark"
+        assert QColor(theme.UI_COLOR_BACKGROUND).lightness() < 60
+        assert mw.theme_button.text() == "LIGHT"
+        assert s.value("MAIN/THEME") == "dark"
+        assert theme.DARK_COLORS["UI_COLOR_BACKGROUND"] in mw.styleSheet()
+        assert theme.DARK_COLORS["UI_COLOR_BACKGROUND"] in w_gen.styleSheet()
+
+        # Переключаем обратно на светлую тему
+        mw.theme_button.click()
+        assert theme.current_theme() == "light"
+        assert s.value("MAIN/THEME") == "light"
+        assert theme.LIGHT_COLORS["UI_COLOR_BACKGROUND"] in mw.styleSheet()
+        assert theme.LIGHT_COLORS["UI_COLOR_BACKGROUND"] in w_gen.styleSheet()
+    finally:
+        theme.apply_theme("light")
+        w_gen.cleanup()
+        w_gen.close()
+        mw.cleanup()
+        mw.close()
+        p_gen.shutdown()

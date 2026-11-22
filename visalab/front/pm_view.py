@@ -22,7 +22,7 @@ from .plot_tools import (ANALYSIS_KEYS, MATH_MODES, PlotSettingsPopup, analyze_t
 from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER,
                     UI_COLOR_BORDER_LIGHT, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL,
                     UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED, UI_FONT_SIZE_PT,
-                    UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS, render_qss)
+                    UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS, current_theme, render_qss)
 
 __all__ = [
     "parse_freq_hz",
@@ -1193,7 +1193,7 @@ class PowerCurvePlot(QWidget):
             tuple((n, id(t)) for n, t in self.memory),
             self.memory_visible, self.math_mode, self.math_expr,
             self.show_grid, self.show_points, self.manual_scale, self.manual_x_range,
-            tuple(self.target_freqs), self._scale, self._divs_y, tuple(self.analysis_metrics),
+            tuple(self.target_freqs), self._scale, self._divs_y, tuple(self.analysis_metrics), current_theme(),
         )
         if self._cache is None or self._cache_key != key:
             self._cache = self._render_base()

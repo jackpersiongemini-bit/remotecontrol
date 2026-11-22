@@ -328,10 +328,14 @@ def test_window_stays_resizable_after_expand_collapse_and_hide(qtbot, opened):
 
 def test_indicator_colors_are_toned_down():
     from PyQt6.QtGui import QColor
-    from visalab.front.theme import UI_COLOR_INDICATOR, UI_COLOR_INVERT, UI_COLOR_TEXT_MUTED
-    # Индикатор включённого прибора и инверсия должны быть заметно темнее почти-белого текста
-    assert QColor(UI_COLOR_INDICATOR).lightness() < QColor(UI_COLOR_TEXT_MUTED).lightness() - 50
-    assert QColor(UI_COLOR_INVERT).lightness() < 165
+    from visalab.front.theme import DARK_COLORS, LIGHT_COLORS
+    # В тёмной теме индикатор и инверсия заметно темнее почти-белого текста
+    assert QColor(DARK_COLORS["UI_COLOR_INDICATOR"]).lightness() < QColor(DARK_COLORS["UI_COLOR_TEXT_MUTED"]).lightness() - 50
+    assert QColor(DARK_COLORS["UI_COLOR_INVERT"]).lightness() < 165
+    # В светлой теме фон светлый, текст и инверсия тёмные и контрастные
+    assert QColor(LIGHT_COLORS["UI_COLOR_BACKGROUND"]).lightness() > 220
+    assert QColor(LIGHT_COLORS["UI_COLOR_TEXT"]).lightness() < 50
+    assert QColor(LIGHT_COLORS["UI_COLOR_INVERT"]).lightness() < 110
 
 
 def test_clickable_widgets_have_pointer_cursor(qtbot, opened):

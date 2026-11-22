@@ -49,7 +49,7 @@ from .split_layout import (CUSTOM_LAYOUT_MODE, DROP_ZONES, LAYOUT_DESCRIPTIONS, 
                            tree_structure_sig, tree_to_dict)
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT, UI_COLOR_ERROR,
                     UI_COLOR_INDICATOR, UI_COLOR_TEXT, UI_COLOR_TEXT_MUTED, UI_TITLE_BAR_ITEM_SIZE_PX,
-                    WINDOW_BAR_HEIGHT, checkbox_qss, render_qss, scrollbar_qss)
+                    WINDOW_BAR_HEIGHT, apply_theme, checkbox_qss, current_theme, render_qss, scrollbar_qss)
 from .window import CustomFullButton, Window, WindowBar, mark_growing, short_address
 
 __all__ = ["MainWindow", "SincEmblem", "InstrumentTile", "LivePanel", "CurrentPanel", "ScenarioChip", "PowerTable",
@@ -401,6 +401,12 @@ class PowerTable(QTableWidget):
         self.unit = unit
         self._render(force=True)
 
+    def refresh_theme(self) -> None:
+        self._cur_color = QColor(UI_COLOR_TEXT)
+        self._muted_color = QColor(UI_COLOR_TEXT_MUTED)
+        self._dim_color = QColor(UI_COLOR_BORDER_LIGHT)
+        self._render(force=True)
+
     def _style_cell(self, row: int, col: int, active: bool, dim: bool = False) -> None:
         item = self.item(row, col)
         if item is not None:
@@ -576,6 +582,11 @@ class CurrentTable(QTableWidget):
         self.unit = unit
         self._render(force=True)
 
+    def refresh_theme(self) -> None:
+        self._cur_color = QColor(UI_COLOR_TEXT)
+        self._muted_color = QColor(UI_COLOR_TEXT_MUTED)
+        self._render(force=True)
+
     def _style_cell(self, row: int, col: int, active: bool) -> None:
         item = self.item(row, col)
         if item is not None:
@@ -656,6 +667,7 @@ def _icon_btn(kind: str, tip: str, slot, *, checkable: bool = False) -> QPushBut
     """Компактная кнопка заголовка панели с векторной HiDPI-иконкой."""
     b = QPushButton()
     b.setObjectName("tool")
+    b.setProperty("_icon_kind", kind)
     b.setIcon(make_panel_icon(kind, 15))
     b.setIconSize(QSize(15, 15))
     b.setFixedSize(26, 24)
@@ -664,6 +676,7 @@ def _icon_btn(kind: str, tip: str, slot, *, checkable: bool = False) -> QPushBut
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     b.setToolTip(tip)
     b.clicked.connect(slot)
+    b.refresh_theme = lambda b=b, k=kind: b.setIcon(make_panel_icon(k, 15))  # type: ignore[attr-defined]
     return b
 
 
@@ -2095,6 +2108,8 @@ class MainWindow(Window):
 
     def __init__(self, settings: QSettings, monitor: ActivityMonitor | None = None, parent=None,
                  coordinator: Coordinator | None = None):
+        saved_theme = str(settings.value(f"{self.SETTINGS_GROUP}/THEME", "light", type=str) or "light")
+        apply_theme(saved_theme)
         super().__init__(settings, parent)
         self.setWindowTitle("LAB")
         self.monitor = monitor or ActivityMonitor(parent=self)
@@ -2143,7 +2158,7 @@ class MainWindow(Window):
             InstrumentTile, ScenarioChip {
                 background-color: $UI_COLOR_BACKGROUND;
                 color: $UI_COLOR_TEXT_MUTED;
-                border: ${UI_BORDER_WIDTH_PX}px solid #3c3c3c;
+                border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
                 border-radius: ${UI_BORDER_RADIUS_PX}px;
                 font-family: $UI_MONOSPACE_FONT_FAMILY;
                 font-size: ${UI_FONT_SIZE_PT}pt;
@@ -2230,6 +2245,13 @@ class MainWindow(Window):
         self.dock_button.setMinimumHeight(28)
         self.dock_button.setToolTip("Show / hide the instrument dock panel (attach or detach instrument windows)")
         self.dock_button.clicked.connect(self._on_dock_button)
+        self.theme_button = QPushButton("DARK" if current_theme() == "light" else "LIGHT")
+        self.theme_button.setObjectName("chip")
+        self.theme_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.theme_button.setMinimumHeight(28)
+        self.theme_button.setToolTip("Switch between light and dark theme")
+        self.theme_button.clicked.connect(self.toggle_theme)
         self.current_button = QPushButton("CURR")
         self.current_button.setObjectName("chip")
         self.current_button.setCheckable(True)
@@ -2297,7 +2319,7 @@ class MainWindow(Window):
 
         self.idle = QLabel("NOTHING IS MEASURING")
         self.idle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.idle.setStyleSheet("color: #8a8a8a; padding: 24px;")
+        self.idle.setStyleSheet(render_qss("color: $UI_COLOR_BORDER_LIGHT; padding: 24px;"))
         self.live_page = QWidget()
         live = QVBoxLayout(self.live_page)
         live.setContentsMargins(0, 0, 0, 0)
@@ -2365,6 +2387,7 @@ class MainWindow(Window):
         tabs_lay.addWidget(self.tabs, 1)
         tabs_lay.addLayout(self.restore_layout)
         tabs_lay.addWidget(self.dock_button)
+        tabs_lay.addWidget(self.theme_button)
         tabs_lay.addWidget(self.current_button)
         tabs_lay.addWidget(self.all_button)
         self.tabs_panel = Panel(tabs_bar)
@@ -2708,7 +2731,7 @@ class MainWindow(Window):
         receivers = self._ordered_receivers()
         if not receivers:
             empty = QLabel("No receivers connected")
-            empty.setStyleSheet("color: #8a8a8a;")
+            empty.setStyleSheet(render_qss("color: $UI_COLOR_BORDER_LIGHT;"))
             self.display_layout.addWidget(empty)
             self._rebuild_current_settings()
             return
@@ -3391,6 +3414,16 @@ class MainWindow(Window):
 
     def toggle_full_screen(self) -> None:
         self.set_full_screen(not self.isFullScreen())
+
+    # ------------------------------------------------------------ тема оформления (LIGHT / DARK)
+    def set_theme(self, name: str, *, save: bool = True) -> None:
+        theme = apply_theme(name)
+        if save:
+            self.settings.setValue(f"{self.SETTINGS_GROUP}/THEME", theme)
+        self.theme_button.setText("DARK" if theme == "light" else "LIGHT")
+
+    def toggle_theme(self) -> None:
+        self.set_theme("dark" if current_theme() == "light" else "light")
 
     # ------------------------------------------------------------ док приборов (отдельное окно)
     def set_dock_visible(self, on: bool, *, save: bool = True) -> None:

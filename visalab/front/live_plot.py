@@ -18,7 +18,8 @@ from ..core.trace import Trace
 from .plot_tools import (ANALYSIS_KEYS, MATH_MODES, PlotSettingsPopup, analyze_trace, format_analysis, trace_math,
                          validate_math_expr)
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
-                    UI_COLOR_ERROR, UI_COLOR_TEXT, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS)
+                    UI_COLOR_ERROR, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_MONOSPACE_FONT_FAMILY, UI_TRACE_COLORS,
+                    current_theme)
 
 __all__ = ["LivePlot", "nice_range", "decimate_trace_polygon", "nearest_index"]
 
@@ -1003,7 +1004,7 @@ class LivePlot(QWidget):
         if not self._math_active() and self.limit_lines and self.limit_fail is not None:
             fm_l = QFontMetrics(self._font)
             badge_txt = "FAIL" if self.limit_fail else "PASS"
-            badge_col = QColor(UI_COLOR_ERROR if self.limit_fail else "#4ec970")
+            badge_col = QColor(UI_COLOR_ERROR if self.limit_fail else UI_COLOR_SUCCESS)
             bw_l = fm_l.horizontalAdvance(badge_txt) + 14
             bh_l = fm_l.height() + 4
             lbox = QRectF(r.left() + 6, r.top() + 5, bw_l, bh_l)
@@ -1038,7 +1039,7 @@ class LivePlot(QWidget):
                self.marker, tuple(self.markers), tuple(self.limit_lines), self.limit_fail,
                self.x_range, self.manual_x_range,
                self.manual_scale, self._scale, self._divs_y, self._y_unit, self._y_transform,
-               tuple(self.analysis_metrics))
+               tuple(self.analysis_metrics), current_theme())
         if self._cache is None or self._cache_key != key:
             self._cache = self._render_base()
             self._cache_key = key

@@ -19,6 +19,7 @@ from ..applog import close_logging, default_ini_path, default_log_path, setup_lo
 from ..coord import COORD
 from .instrument_window import saved_connection, saved_delay, saved_poll_pause
 from .models import all_models
+from .theme import apply_theme
 
 __all__ = ["run_window", "run_windows", "remember_windows", "connection_for", "lab_entry"]
 
@@ -75,6 +76,7 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None 
     sys.excepthook = _log_exception
     app = QApplication.instance() or QApplication(sys.argv[:1])
     settings = QSettings(args.ini, QSettings.Format.IniFormat)
+    apply_theme(str(settings.value("MAIN/THEME", "light", type=str) or "light"))
     opened: list[dict] = []
     for n, (window_cls, lab_key) in enumerate(specs):
         visible = settings.value(f"WINDOWS/{lab_key}/VISIBLE", False, type=bool) if show is None else show

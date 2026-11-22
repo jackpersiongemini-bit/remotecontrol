@@ -397,8 +397,13 @@ class WriteIndicator(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         d = min(self.width(), self.height()) - 8
+        state_colors = {
+            WriteState.OK: UI_COLOR_SUCCESS,
+            WriteState.PROCESS: UI_COLOR_PROCESS,
+            WriteState.ERROR: UI_COLOR_ERROR,
+        }
         p.setPen(QPen(QColor(UI_COLOR_PANEL), 1))
-        p.setBrush(QColor(self.STATE_COLORS[self.state]))
+        p.setBrush(QColor(state_colors[self.state]))
         p.drawEllipse(QRectF((self.width() - d) / 2, (self.height() - d) / 2, d, d))
 
 
@@ -460,6 +465,17 @@ class IconButtonBase(QPushButton):
     def leaveEvent(self, e):  # noqa: N802 - Qt
         super().leaveEvent(e)
         self._icon_color = self._rest_color
+        self.update()
+
+    def refresh_theme(self) -> None:
+        self.icon_color_normal = QColor(UI_COLOR_TEXT_MUTED)
+        self.icon_color_hover = QColor(UI_COLOR_TEXT_INVERSE)
+        st = self.property("status")
+        if hasattr(self, "state") and getattr(self, "state", None) is WriteState.ERROR:
+            self._rest_color = QColor(UI_COLOR_TEXT)
+        else:
+            self._rest_color = self.icon_color_normal if st in (None, "", "ok", OFF) else self.icon_color_hover
+        self._icon_color = self.icon_color_hover if self.underMouse() else self._rest_color
         self.update()
 
     def set_status(self, status: str) -> None:
@@ -817,7 +833,14 @@ class Switch(QAbstractButton):
     def paintEvent(self, event):  # noqa: N802 - Qt
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor(self.COLORS.get(self._status, UI_COLOR_ERROR))
+        colors = {
+            OFF: UI_COLOR_ERROR,
+            ON: UI_COLOR_SUCCESS,
+            "process": UI_COLOR_PROCESS,
+            "error": UI_COLOR_ERROR,
+            "retry": UI_COLOR_ERROR,
+        }
+        color = QColor(colors.get(self._status, UI_COLOR_ERROR))
         if self.underMouse() and self.isEnabled():
             color = color.lighter(112)
         if not self.isEnabled():
@@ -828,6 +851,6 @@ class Switch(QAbstractButton):
         p.drawRoundedRect(track, track.height() / 2.0, track.height() / 2.0)
         margin = float(UI_SWITCH_MARGIN_PX)
         d = max(0.0, self.height() - 2.0 * margin)
-        p.setPen(QPen(self.HANDLE_BORDER_COLOR, 0.75))
-        p.setBrush(self.HANDLE_COLOR)
+        p.setPen(QPen(QColor(UI_COLOR_BORDER), 0.75))
+        p.setBrush(QColor(UI_COLOR_CONTROL))
         p.drawEllipse(QRectF(self._handle_position, margin, d, d))
