@@ -17,8 +17,7 @@ from visalab.instruments import InstrumentProxy
 from visalab.transport import SimTransport
 from visalab.transport import PyVisaTransport, lan_endpoint
 from visalab.drivers import KeysightE8267D
-from visalab.front import RFGenWindow
-from visalab.front.main_window import MainWindow
+from visalab.front import InstrumentsWindow, RFGenWindow
 from visalab.sim import KeysightE8267DSim
 
 FAST = (0.05, 0.1)
@@ -162,23 +161,27 @@ def test_window_switch_shows_retry_and_click_stops(qtbot, gen, tmp_path):
     assert proxy.state is ConnectionState.DISCONNECTED
 
 
-def test_main_window_tile_shows_retry(qtbot, gen, tmp_path):
+def test_instruments_window_card_shows_retry(qtbot, gen, tmp_path):
     proxy, sim, tr, _comm, _pending = gen()
-    links = ProxyLinks()
     inst = Instrument(proxy)
-    links.add(inst)
-    win = MainWindow(QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat), ActivityMonitor(links))
-    qtbot.addWidget(win)
-    with qtbot.waitSignal(proxy.sync_done, timeout=5000):
-        proxy.open()
-    tile = win.tiles[inst]
-    assert not tile.error
-    _power_off(sim, tr)                                 # связь потеряна: плитка красная, в подсказке - почему
-    qtbot.waitUntil(lambda: tile.error and "reconnecting" in tile.toolTip(), timeout=5000)
-    assert tile.text() == "GEN"                         # на плитке только имя (Алексей 2026-11-14)
-    _power_on(sim, tr)
-    qtbot.waitUntil(lambda: proxy.is_connected, timeout=5000)
-    qtbot.waitUntil(lambda: not tile.error, timeout=5000)
+    settings = QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat)
+    rf_win = RFGenWindow(inst, settings)
+    iw = InstrumentsWindow(settings, instruments=("GEN",))
+    iw.attach_instrument("GEN", rf_win)
+    qtbot.addWidget(iw)
+    try:
+        with qtbot.waitSignal(proxy.sync_done, timeout=5000):
+            proxy.open()
+        card = iw.cards["GEN"]
+        assert card.on_button.isChecked()
+        _power_off(sim, tr)
+        qtbot.waitUntil(lambda: card.on_button.status() == "retry", timeout=5000)
+        assert "Click - stop" in card.on_button.toolTip()
+        _power_on(sim, tr)
+        qtbot.waitUntil(lambda: proxy.is_connected, timeout=5000)
+        qtbot.waitUntil(lambda: card.on_button.status() != "retry", timeout=5000)
+    finally:
+        iw.cleanup()
 
 
 # ------------------------------------------------------------------ проверка доступности узла LAN

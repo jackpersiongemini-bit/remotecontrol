@@ -119,13 +119,28 @@ def slot_magnitude_db(trace: Trace) -> list[float] | None:
     return None
 
 
+_VNA_SPARAM_RE = re.compile(r"^S([1-4])([1-4])$")
+_VNA_SPARAM_KEYS = tuple(f"s{r}{c}" for r in range(1, 5) for c in range(1, 5))
+
+
+def _sparam_kind(sparam: str | None) -> str | None:
+    """``'thru'`` для передачи Sij (i != j), ``'refl'`` для отражения Sii, иначе ``None``."""
+    if not sparam:
+        return None
+    m = _VNA_SPARAM_RE.match(str(sparam).strip().upper())
+    if not m:
+        return None
+    return "refl" if m.group(1) == m.group(2) else "thru"
+
+
 def vna_signal(sparam: str | None, mag_db: list[float], thru_db: float, refl_db: float) -> bool:
-    """Есть ли что-то на портах ВАЦ по уровню одного S-параметра."""
+    """Есть ли что-то на портах ВАЦ по уровню одного S-параметра (1..4 порта)."""
     if not mag_db:
         return False
-    if sparam in ("S21", "S12"):
+    kind = _sparam_kind(sparam)
+    if kind == "thru":
         return max(mag_db) >= thru_db
-    if sparam in ("S11", "S22"):
+    if kind == "refl":
         return min(mag_db) <= refl_db
     return False
 
@@ -150,9 +165,10 @@ def magnitude_db(trace: Trace) -> Trace:
 
 def _trace_has_signal(trace: Trace, sparam: str | None, thru_db: float, refl_db: float) -> bool:
     """Быстрая проверка уровня без конвертации всех 32k точек в dB."""
-    if sparam not in ("S21", "S12", "S11", "S22") or not len(trace):
+    kind = _sparam_kind(sparam)
+    if kind is None or not len(trace):
         return False
-    is_thru = sparam in ("S21", "S12")
+    is_thru = kind == "thru"
     fmt = (trace.meta or {}).get("format")
     if trace.is_complex:
         thr = thru_db if is_thru else refl_db
@@ -229,6 +245,8 @@ class ActivityMonitor(QObject):
         self.pm_points: dict[Any, dict[tuple[float, float | None], tuple[float, float]]] = {}
         #: (источник питания, канал) -> {(частота генератора Hz, мощность генератора dBm | None): (время, ток A)}
         self.psu_points: dict[tuple[Any, int], dict[tuple[float, float | None], tuple[float, float]]] = {}
+        #: (источник питания, канал) -> история по времени [(monotonic_s, V | None, I | None, P | None)]
+        self.psu_history: dict[tuple[Any, int], deque[tuple[float, float | None, float | None, float | None]]] = {}
         #: (источник питания, канал) -> выбранный RF-источник (None = AUTO)
         self.psu_rf_source: dict[tuple[Any, int], Any] = {}
         self._mag_cache: dict[tuple[Any, str], tuple[Trace, Trace]] = {}
@@ -302,6 +320,8 @@ class ActivityMonitor(QObject):
                 d.pop(p, None)
             for k in [k for k in self.psu_points if k[0] is p]:
                 self.psu_points.pop(k, None)
+            for k in [k for k in self.psu_history if k[0] is p]:
+                self.psu_history.pop(k, None)
             for k in [k for k in self.psu_rf_source if k[0] is p or self.psu_rf_source[k] is p]:
                 self.psu_rf_source.pop(k, None)
             self._purge_mag_cache(p)
@@ -346,6 +366,8 @@ class ActivityMonitor(QObject):
             self._sa.pop(proxy, None)
             if proxy in self.history:
                 self.history[proxy].clear()
+            for k in [k for k in self.psu_history if k[0] is proxy]:
+                self.psu_history[k].clear()
             self._purge_mag_cache(proxy)
         if profile_name(proxy) in ("signal_generator", "network_analyzer"):
             for r in self.receivers():
@@ -372,6 +394,7 @@ class ActivityMonitor(QObject):
                 cur = _num(value)
                 self._updated[proxy] = now
                 self._last_data[proxy] = now
+                self._record_psu_sample(proxy, ch, now)
                 if cur is not None and proxy.value(f"ch{ch}.output") is not False:
                     src = self.psu_source(proxy, ch)
                     if src is not None:
@@ -384,7 +407,16 @@ class ActivityMonitor(QObject):
                             points.pop(next(iter(points)))
                 self.changed.emit(proxy)
                 return
-            if _PSU_LIVE_RE.match(key) or key == "output_all":
+            m_live = _PSU_LIVE_RE.match(key)
+            if m_live:
+                if m_live.group(2) in ("meas_v", "meas_p"):
+                    ch = int(m_live.group(1))
+                    self._updated[proxy] = now
+                    self._last_data[proxy] = now
+                    self._record_psu_sample(proxy, ch, now)
+                self.changed.emit(proxy)
+                return
+            if key == "output_all":
                 self.changed.emit(proxy)
                 return
             return
@@ -430,20 +462,19 @@ class ActivityMonitor(QObject):
             self._emit(proxy)
         elif prof == "spectrum_analyzer" and key in ("ref_level", "scale_div"):
             self._emit(proxy)
-        elif prof == "network_analyzer" and key == "trace":
-            self._updated[proxy] = now                # ``trace`` публикуется последним в развёртке
+        elif prof == "network_analyzer" and key in ("meas.count", "trace"):
+            self._updated[proxy] = now
             if self._has_vna_traces(proxy):
                 self._last_data[proxy] = now
             else:
                 self._last_data.pop(proxy, None)
             if proxy.value("rf.output") is not False and self.vna_has_signal(proxy):
                 self._last_signal[proxy] = now
-            self._emit(proxy)                         # одна перерисовка на развёртку
+            self._emit(proxy)
         elif prof == "network_analyzer" and (
-            (key.startswith("m") and key.endswith((".enabled", ".trace")))
-            or key in ("scale.div", "scale.ref", "scale.rpos",
-                       "mark.state", "mark.x", "mark.y", "mark.n",
-                       "marker.state", "marker.freq", "marker.value", "trace.sel")
+            key == "s.active"
+            or (key.startswith("s") and key.endswith((".enabled", ".trace")))
+            or (key.startswith("m") and key.endswith((".enabled", ".trace")))
         ):
             if self._has_vna_traces(proxy):
                 self._last_data[proxy] = now
@@ -456,6 +487,14 @@ class ActivityMonitor(QObject):
 
     def _has_vna_traces(self, proxy) -> bool:
         """Есть ли хотя бы одна непустая трасса у ВАЦ (без конвертации в dB)."""
+        if proxy.supports("s.active"):
+            for sp in _VNA_SPARAM_KEYS:
+                if proxy.value(f"{sp}.enabled") is not True:
+                    continue
+                tr = proxy.value(f"{sp}.trace")
+                if isinstance(tr, Trace) and len(tr) >= 2:
+                    return True
+            return False
         has_slots = False
         for n in range(1, 17):
             if proxy.supports(f"m{n}.enabled"):
@@ -471,8 +510,16 @@ class ActivityMonitor(QObject):
         return isinstance(tr, Trace) and len(tr) > 1
 
     def vna_has_signal(self, proxy) -> bool:
-        """Хоть один включённый слот показывает по уровню, что на портах что-то есть. Слот, у которого
-        модуля нет (фаза, групповая задержка...), по уровню не судится: он сам - «измеряет»."""
+        """Хоть один активный S-параметр показывает по уровню, что на портах что-то есть."""
+        if proxy.supports("s.active"):
+            for sp in _VNA_SPARAM_KEYS:
+                if proxy.value(f"{sp}.enabled") is not True:
+                    continue
+                tr = proxy.value(f"{sp}.trace")
+                if isinstance(tr, Trace) and len(tr):
+                    if _trace_has_signal(tr, sp.upper(), self.th.vna_thru_db, self.th.vna_refl_db):
+                        return True
+            return False
         for n in range(1, 17):
             if not proxy.value(f"m{n}.enabled"):
                 continue
@@ -490,7 +537,7 @@ class ActivityMonitor(QObject):
                     if _trace_has_signal(tr, sp, self.th.vna_thru_db, self.th.vna_refl_db):
                         return True
                     break
-            if not has_mag and seen:                 # фаза / задержка: данные идут - значит, измеряет
+            if not has_mag and seen:
                 return True
         return False
 
@@ -672,6 +719,36 @@ class ActivityMonitor(QObject):
             by_freq.setdefault(f, {})[p] = v
         return cols, sorted(by_freq.items())
 
+    def _record_psu_sample(self, proxy, channel: int, now: float) -> None:
+        v = _num(proxy.value(f"ch{channel}.meas_v"))
+        i = _num(proxy.value(f"ch{channel}.meas_i"))
+        p = _num(proxy.value(f"ch{channel}.meas_p"))
+        if p is None and v is not None and i is not None:
+            p = v * i
+        if v is None and i is None and p is None:
+            return
+        hist = self.psu_history.setdefault((proxy, int(channel)), deque(maxlen=HISTORY))
+        if hist and abs(now - hist[-1][0]) < 0.05:
+            prev_t, prev_v, prev_i, prev_p = hist[-1]
+            nv = v if v is not None else prev_v
+            ni = i if i is not None else prev_i
+            np = p if p is not None else (nv * ni if nv is not None and ni is not None else prev_p)
+            hist[-1] = (prev_t, nv, ni, np)
+        else:
+            hist.append((now, v, i, p))
+
+    def psu_time_series(self, proxy, channel: int) -> list[tuple[float, float | None, float | None, float | None]]:
+        """История измерений канала ИП во времени: ``[(t_rel_s, V, I, P), ...]``."""
+        hist = self.psu_history.get((proxy, int(channel)))
+        if not hist:
+            return []
+        t0 = hist[0][0]
+        return [(t - t0, v, i, p) for t, v, i, p in hist]
+
+    def clear_psu_history(self, proxy, channel: int) -> None:
+        self.psu_history.pop((proxy, int(channel)), None)
+        self.changed.emit(proxy)
+
     def clear_psu_table(self, proxy, channel: int) -> None:
         self.psu_points.pop((proxy, int(channel)), None)
         self.changed.emit(proxy)
@@ -688,8 +765,19 @@ class ActivityMonitor(QObject):
         return res
 
     def vna_traces(self, proxy) -> list[tuple[str, Trace]]:
-        """Трейсы включённых слотов ВАЦ: [(«1·S21 MLOG», трасса)]."""
+        """Трейсы активных S-параметров ВАЦ: [(«1·S41», трасса в dB)]."""
         out = []
+        if proxy.supports("s.active"):
+            for sp in _VNA_SPARAM_KEYS:
+                if proxy.value(f"{sp}.enabled") is not True:
+                    continue
+                tr = proxy.value(f"{sp}.trace")
+                if not isinstance(tr, Trace) or len(tr) < 2:
+                    continue
+                meta = tr.meta or {}
+                ch = meta.get("channel", proxy.value("stim.channel") or 1)
+                out.append((f"{ch}·{sp.upper()}", self._magnitude_db_cached(proxy, f"{sp}.trace", tr)))
+            return out
         for n in range(1, 17):
             if not proxy.value(f"m{n}.enabled"):
                 continue
@@ -705,5 +793,5 @@ class ActivityMonitor(QObject):
         if not out:
             tr = proxy.value("trace")
             if isinstance(tr, Trace) and len(tr) > 1:
-                out.append((str(proxy.value("sparam") or "TRACE"), self._magnitude_db_cached(proxy, "trace", tr)))
+                out.append((str(tr.name or "TRACE"), self._magnitude_db_cached(proxy, "trace", tr)))
         return out

@@ -25,7 +25,7 @@ from ..coord import Instrument
 from ..core.units import si_format
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow, PresetGroup
-from .params import IndicatorButton, PLineEdit, PSButton, PanelLine, PanelTable
+from .params import IndicatorButton, PLineEdit, PSButton, PSpinEdit, PanelLine, PanelTable
 from .power_meter import ActionButton
 
 __all__ = ["SpectrumWindow", "ZeroSpan", "StatePresets", "saved_connection", "compact_si"]
@@ -231,6 +231,8 @@ class SpectrumWindow(InstrumentWindow):
                 return PSButton(proxy, key, ONOFF)
             if spec.kind is Kind.ENUM:
                 return PSButton(proxy, key, [(c, c) for c in spec.choices])
+            if spec.kind in (Kind.FLOAT, Kind.INT):
+                return PSpinEdit(proxy, key)
             return PLineEdit(proxy, key)
 
         for title_, groups in PAGES:

@@ -73,12 +73,12 @@ def test_spectrum_sweeps_continue_after_trace_timeout(make):
 def test_vna_sweeps_continue_after_trace_timeout(make):
     drv, sim, rec = make(KeysightPNA, KeysightPNASim)
     drv.poll()
-    first = rec.values["m1.trace"]
-    drv.transport.late = {"CALC1:DATA? FDATA"}
+    first = rec.values["s11.trace"]
+    drv.transport.late = {"CALC1:DATA? SDATA"}
     drv._on_poll()
     assert drv.state is ConnectionState.CONNECTED and rec.values["meas.armed"] is True
     drv._on_poll()
-    assert rec.values["m1.trace"] is not first and len(rec.values["m1.trace"]) == len(first)
+    assert rec.values["s11.trace"] is not first and len(rec.values["s11.trace"]) == len(first)
 
 
 def test_device_clear_rearms_opc(make):

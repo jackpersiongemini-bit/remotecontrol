@@ -1,15 +1,14 @@
-"""Тесты разделителей ``GraphSplitter`` и внутренней раскладки графиков ВАЦ (``PLOT_LAYOUT_MODES``)."""
+"""Тесты разделителей ``GraphSplitter`` и раскладки ``GraphsWindow``."""
 from __future__ import annotations
 
 import pytest
 from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import QWidget
 
-from conftest import sim_of
 from visalab.coord import ActivityMonitor, Instrument, ProxyLinks
 from visalab.drivers import DRIVERS
-from visalab.front.main_window import MainWindow
-from visalab.front.split_layout import PLOT_LAYOUT_MODES, GraphSplitter, PaneLeaf, PaneSplit, build_preset_tree
+from visalab.front import GraphsWindow
+from visalab.front.split_layout import GraphSplitter, PaneLeaf, PaneSplit, build_preset_tree
 from visalab.instruments import InstrumentProxy
 from visalab.transport import SimTransport
 
@@ -49,72 +48,51 @@ def test_graph_splitter_weights_and_equalize(qtbot):
     assert w2 is not None and w2[0] == pytest.approx(0.5, abs=0.05)
 
 
-def test_vna_panel_split_traces_and_internal_plot_layout(qtbot, tmp_path):
-    drv, sim_cls = DRIVERS["pna"]
-    vna = Instrument(InstrumentProxy(drv, SimTransport(sim_cls())))
+def test_graphs_window_splitter_and_vna_live_traces(qtbot, tmp_path):
+    drv_vna, sim_vna = DRIVERS["pna"]
+    drv_sa, sim_sa = DRIVERS["e4446a"]
+    vna = Instrument(InstrumentProxy(drv_vna, SimTransport(sim_vna())))
+    sa = Instrument(InstrumentProxy(drv_sa, SimTransport(sim_sa())))
     links = ProxyLinks()
     links.add(vna)
+    links.add(sa)
     with qtbot.waitSignal(vna.sync_done, timeout=10000):
         vna.open()
+    with qtbot.waitSignal(sa.sync_done, timeout=10000):
+        sa.open()
     try:
-        sim = sim_of(vna)
-        sim.meas["CH1_S21_2"] = {"s": "S21", "fmt": "MLOG", "ch": 1, "pdiv": 10.0, "rlev": 0.0, "rpos": 5.0}
-        sim.meas["CH1_S22_3"] = {"s": "S22", "fmt": "MLOG", "ch": 1, "pdiv": 10.0, "rlev": 0.0, "rpos": 5.0}
-        sim.windows[1][2] = "CH1_S21_2"
-        sim.windows[1][3] = "CH1_S22_3"
-        vna.set("m2.channel", 1)
-        vna.set("m2.name", "CH1_S21_2")
-        vna.set("m2.enabled", True)
-        vna.set("m3.channel", 1)
-        vna.set("m3.name", "CH1_S22_3")
-        vna.set("m3.enabled", True)
-
-        ini = tmp_path / "vna_split.ini"
+        vna.set("s21.enabled", True)
+        ini = tmp_path / "graphs_split.ini"
         settings = QSettings(str(ini), QSettings.Format.IniFormat)
-        win = MainWindow(settings, ActivityMonitor(links))
+        mon = ActivityMonitor(links)
+        win = GraphsWindow(settings, mon)
         qtbot.addWidget(win)
-        win.resize(1000, 800)
+        win.resize(1000, 700)
         win.show()
-        panel = win.panels[vna]
-        qtbot.waitUntil(lambda: len(win.monitor.vna_traces(vna)) == 3, timeout=10000)
-        qtbot.waitUntil(lambda: len(panel.plots[0].traces) == 3, timeout=5000)
+        qtbot.waitExposed(win)
 
-        assert len([p for p in panel.plots if p.isVisibleTo(panel)]) == 1
-        assert panel.split_traces_cb is not None and not panel.split_traces_cb.isChecked()
-        assert tuple(panel.plot_layout_buttons) == PLOT_LAYOUT_MODES
+        qtbot.waitUntil(lambda: len(win.card("VNA").plot.series) >= 2, timeout=10000)
+        assert win.main_card.graph_name == "VNA"
+        assert "SA" in win.side_cards
 
-        # Включаем Split each trace во вкладке SET -> 3 отдельных графика
-        panel.tabs.setCurrentIndex(1)
-        panel.split_traces_cb.click()
-        panel.tabs.setCurrentIndex(0)
-        assert len([p for p in panel.plots if p.isVisibleTo(panel)]) == 3
-        assert all(len(panel.plots[i].traces) == 1 for i in range(3))
-        assert isinstance(panel._plot_root, GraphSplitter) and panel._plot_root.orientation() == Qt.Orientation.Vertical
-
-        # Переключаем внутреннюю раскладку: 2 COL и ROW
-        panel.plot_layout_buttons["2 COL"].click()
-        assert panel.plot_layout_mode == "2 COL"
-        assert isinstance(panel._plot_root, GraphSplitter) and panel._plot_root.orientation() == Qt.Orientation.Vertical
-        assert isinstance(panel._plot_root.widget(0), GraphSplitter)
-        assert panel._plot_root.widget(0).orientation() == Qt.Orientation.Horizontal
-
-        panel.plot_layout_buttons["ROW"].click()
-        assert panel.plot_layout_mode == "ROW"
-        assert isinstance(panel._plot_root, GraphSplitter) and panel._plot_root.orientation() == Qt.Orientation.Horizontal
-
-        # Настройки сохраняются и восстанавливаются в новом окне
+        win.splitter.apply_weights([0.65, 0.35])
+        win._save_split()
         settings.sync()
-        win2 = MainWindow(QSettings(str(ini), QSettings.Format.IniFormat), ActivityMonitor(links))
+        win.cleanup()
+        win.close()
+
+        win2 = GraphsWindow(QSettings(str(ini), QSettings.Format.IniFormat), ActivityMonitor(links))
         qtbot.addWidget(win2)
+        win2.resize(1000, 700)
+        win2.show()
+        qtbot.waitExposed(win2)
         try:
-            panel2 = win2.panels[vna]
-            assert panel2.split_traces_cb.isChecked()
-            assert panel2.plot_layout_mode == "ROW"
-            assert len([p for p in panel2.plots if p.isVisibleTo(panel2)]) == 3
+            w = win2.splitter.current_weights()
+            assert w is not None and w[0] == pytest.approx(0.65, abs=0.05)
         finally:
             win2.cleanup()
             win2.close()
-        win.cleanup()
-        win.close()
+        mon.stop()
     finally:
         vna.shutdown()
+        sa.shutdown()

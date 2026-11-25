@@ -9,13 +9,15 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 
 from ..applog import Throttle
 from ..core.params import Action, ConnectionState, Param, PStatus
+from ..core.trace import Trace
 from ..drivers import VISAInstrument, kind_of
 
 log = logging.getLogger(__name__)
@@ -23,6 +25,14 @@ log = logging.getLogger(__name__)
 __all__ = ["InstrumentProxy"]
 
 _Q = Qt.ConnectionType.QueuedConnection
+_SPARAM_RE = re.compile(r"^S([1-4])([1-4])$")
+
+
+def _norm_sparam(name: str) -> str:
+    sp = str(name).strip().upper()
+    if not _SPARAM_RE.match(sp):
+        raise ValueError(f"некорректный S-параметр: {name!r} (ожидается S11..S44)")
+    return sp
 
 
 class InstrumentProxy(QObject):
@@ -55,6 +65,8 @@ class InstrumentProxy(QObject):
     raw_response = pyqtSignal(str, str)
     #: связи нет, прибор переподключится сам через столько секунд; 0 - не ждём (см. ``reconnecting``)
     reconnect_pending = pyqtSignal(float)
+    #: завершена развёртка ВАЦ: ``{sparam: Trace(комплексная)}`` для всех активных S-параметров
+    sweep_updated = pyqtSignal(dict)
 
     def __init__(self, driver: VISAInstrument | type[VISAInstrument], transport=None,
                  parent: QObject | None = None, kind: str | None = None, **driver_kwargs):
@@ -80,6 +92,7 @@ class InstrumentProxy(QObject):
         #: класс прибора и поддерживаемые ключи профиля - то, на что опирается GUI
         self.profile = self._worker.PROFILE
         self.channels = self._worker.channels
+        self._default_ports = int(getattr(self._worker, "ports", 0) or 0)
         self.capabilities: frozenset[str] = self._worker.capabilities
         self.state = ConnectionState.DISCONNECTED
         #: связь потеряна, прибор переподключается сам (выключатель окна - отменить: ``close()``)
@@ -173,6 +186,10 @@ class InstrumentProxy(QObject):
             return False
         if key == "cal.set" and value and self._values.get("cal.state") is not True:
             return False                              # повторный выбор cal set включает коррекцию
+        if key == "s.active":
+            wanted = {t.strip().upper() for t in re.split(r"[,\s;]+", str(value or "").strip()) if t.strip()}
+            cur_set = {t.strip().upper() for t in re.split(r"[,\s;]+", str(current or "").strip()) if t.strip()}
+            return wanted == cur_set
         try:
             val = spec.validate(value)
         except (TypeError, ValueError):
@@ -247,6 +264,65 @@ class InstrumentProxy(QObject):
             self._subs[key] = [cb for cb in self._subs[key] if cb != on_value]
         if on_status is not None and key in self._status_subs:
             self._status_subs[key] = [cb for cb in self._status_subs[key] if cb != on_status]
+
+    # ------------------------------------------------------------ S-параметры ВАЦ
+    @property
+    def ports(self) -> int:
+        """Число физических портов ВАЦ (2 или 4; 0 для остальных приборов)."""
+        v = self._values.get("ports")
+        return int(v) if isinstance(v, int) and v > 0 else self._default_ports
+
+    def active_sparams(self) -> list[str]:
+        """Активные (читаемые) S-параметры ВАЦ в каноническом порядке, например ``['S11', 'S41']``."""
+        raw = self._values.get("s.active")
+        if isinstance(raw, str):
+            return [t.strip().upper() for t in re.split(r"[,\s;]+", raw.strip()) if t.strip()]
+        out: list[str] = []
+        for r in range(1, 5):
+            for c in range(1, 5):
+                if self._values.get(f"s{r}{c}.enabled") is True:
+                    out.append(f"S{r}{c}")
+        return out
+
+    def sparam_trace(self, name: str) -> Trace | None:
+        """Последняя комплексная трасса указанного S-параметра (``'S11'``, ``'S41'``...) или ``None``."""
+        sp = _norm_sparam(name)
+        tr = self._values.get(f"{sp.lower()}.trace")
+        return tr if isinstance(tr, Trace) else None
+
+    def sparam_traces(self) -> dict[str, Trace]:
+        """Последний снимок комплексных трасс всех активных S-параметров: ``{'S11': Trace, 'S41': Trace}``."""
+        out: dict[str, Trace] = {}
+        for sp in self.active_sparams():
+            tr = self._values.get(f"{sp.lower()}.trace")
+            if isinstance(tr, Trace):
+                out[sp] = tr
+        return out
+
+    def set_sparams(self, sparams: Iterable[str] | str) -> None:
+        """Задать набор S-параметров для измерения и чтения (напр. ``['S11', 'S41']`` или ``'S11,S41'``)."""
+        if isinstance(sparams, str):
+            items = [t for t in re.split(r"[,\s;]+", sparams.strip()) if t]
+        else:
+            items = list(sparams)
+        norm = [_norm_sparam(s) for s in items]
+        ordered = [f"S{r}{c}" for r in range(1, 5) for c in range(1, 5) if f"S{r}{c}" in norm]
+        self.set("s.active", ",".join(ordered))
+
+    def enable_sparam(self, name: str, enabled: bool = True) -> None:
+        """Включить или выключить измерение и чтение одного S-параметра (напр. ``enable_sparam('S41', True)``)."""
+        sp = _norm_sparam(name)
+        self.set(f"{sp.lower()}.enabled", bool(enabled))
+
+    def subscribe_sparam(self, name: str, on_value: Callable[[Trace | None], None]) -> None:
+        """Подписаться на обновления комплексной трассы S-параметра (напр. ``'S41'``)."""
+        sp = _norm_sparam(name)
+        self.subscribe(f"{sp.lower()}.trace", on_value)
+
+    def unsubscribe_sparam(self, name: str, on_value: Callable[[Trace | None], None]) -> None:
+        """Снять подписку на обновления комплексной трассы S-параметра."""
+        sp = _norm_sparam(name)
+        self.unsubscribe(f"{sp.lower()}.trace", on_value)
 
     def request_shutdown(self) -> None:
         """Попросить поток прибора закрыть ресурс и завершиться (не ждать). Запросы после этого
@@ -380,6 +456,8 @@ class InstrumentProxy(QObject):
         if dead and key in self._subs:
             self._subs[key] = [cb for cb in self._subs[key] if cb not in dead]
         self.param_updated.emit(key, value)
+        if key == "meas.count" and self.supports("s.active"):
+            self.sweep_updated.emit(self.sparam_traces())
 
     def _on_status(self, key: str, status: PStatus, message: str) -> None:
         if self._shut_down:

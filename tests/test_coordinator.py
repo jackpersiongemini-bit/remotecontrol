@@ -334,19 +334,22 @@ def test_window_does_not_write_correction_during_scenario(qtbot, pm_window):
 
 def test_main_window_shows_running_scenario(qtbot, pm_window, tmp_path):
     from visalab.coord import ActivityMonitor
-    from visalab.front.main_window import MainWindow
+    from visalab.front import GraphsWindow
     gen, pm, win, _settings = pm_window
-    main = MainWindow(QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat), ActivityMonitor())
+    main = GraphsWindow(QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat), ActivityMonitor())
     qtbot.addWidget(main)
-    assert main.scenario_chip.isHidden()
-    _acal_fields(win, "1", "3", "200")
-    win.acal_run.click()
-    qtbot.waitUntil(lambda: main.scenario_chip.text().startswith("ACAL") and "/200" in main.scenario_chip.text(),
-                    timeout=10000)
-    assert not main.scenario_chip.isHidden() and main.scenario_chip.indicated()
-    win.acal_run.click()
-    qtbot.waitUntil(lambda: main.scenario_chip.isHidden(), timeout=10000)
-    main.monitor.stop()
+    try:
+        assert main.scenario_chip.isHidden()
+        _acal_fields(win, "1", "3", "200")
+        win.acal_run.click()
+        qtbot.waitUntil(lambda: main.scenario_chip.text().startswith("ACAL") and "/200" in main.scenario_chip.text(),
+                        timeout=10000)
+        assert not main.scenario_chip.isHidden() and main.scenario_chip.indicated()
+        win.acal_run.click()
+        qtbot.waitUntil(lambda: main.scenario_chip.isHidden(), timeout=10000)
+    finally:
+        main.cleanup()
+        main.monitor.stop()
 
 
 # ------------------------------------------------------------------ ACAL на стенде: что бывает на железе

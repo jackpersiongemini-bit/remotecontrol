@@ -11,8 +11,8 @@ from conftest import sim_of
 from visalab.coord import ActivityMonitor, Instrument, ProxyLinks
 from visalab.core.trace import Trace
 from visalab.drivers import DRIVERS
+from visalab.front import GraphsWindow
 from visalab.front.live_plot import LivePlot
-from visalab.front.main_window import MainWindow
 from visalab.front.plot_tools import (
     ANALYSIS_KEYS,
     PlotSettingsWidget,
@@ -37,16 +37,22 @@ def test_analyze_trace_all_metrics_and_window():
     assert st["min"] == pytest.approx(-14.0) and st["min_x"] == pytest.approx(3e9)
     assert st["max"] == pytest.approx(-10.0) and st["max_x"] == pytest.approx(1e9)
     assert st["pp"] == pytest.approx(4.0)
-    assert st["flatness"] == pytest.approx(2.0)
+    assert st["flatness"] == pytest.approx(0.0, abs=1e-9)
     assert st["std"] == pytest.approx(math.sqrt(2.0))
-    assert st["rms"] == pytest.approx(math.sqrt((100 + 121 + 144 + 169 + 196) / 5))
+    expected_dbm_rms = 10.0 * math.log10(sum(10.0 ** (y / 10.0) for y in ys_lin) / len(ys_lin))
+    assert st["rms"] == pytest.approx(expected_dbm_rms, abs=1e-6)
     assert st["slope"] == pytest.approx(-2e-9)
     assert st["nonlin"] == pytest.approx(0.0, abs=1e-9)
 
-    # С нелинейностью +0.5 dB на средней точке
+    # Для линейных единиц (V) RMS остаётся классическим sqrt(mean(y^2))
+    tr_v = Trace((0.0, 1.0, 2.0), (3.0, 4.0, 5.0), x_unit="s", y_unit="V")
+    assert analyze_trace(tr_v)["rms"] == pytest.approx(math.sqrt((9 + 16 + 25) / 3))
+
+    # С нелинейностью +0.5 dB на средней точке: остатки [-0.1, -0.1, +0.4, -0.1, -0.1]
     tr_nl = Trace(tuple(xs), (-10.0, -11.0, -11.5, -13.0, -14.0), x_unit="Hz", y_unit="dBm")
     st_nl = analyze_trace(tr_nl)
     assert st_nl["nonlin"] == pytest.approx(0.4, abs=1e-6)
+    assert st_nl["flatness"] == pytest.approx(0.25, abs=1e-6)
 
     # Окно по X: только [1e9, 2e9] -> -10, -11, -12
     st_win = analyze_trace(tr_lin, x_range=(1e9, 2e9))
@@ -61,7 +67,7 @@ def test_analyze_trace_all_metrics_and_window():
     formatted = format_analysis(st, ["mean", "std", "pp", "flatness", "nonlin", "slope"], "Hz", "dBm")
     assert formatted[0] == "MEAN -12.00 dBm"
     assert formatted[1].endswith(" dB") and formatted[2] == "P-P 4.00 dB"
-    assert formatted[3] == "FLAT ±2.00 dB" and formatted[4] == "NONLIN 0.00 dB"
+    assert formatted[3] == "FLAT ±0.00 dB" and formatted[4] == "NONLIN 0.00 dB"
     assert formatted[5] == "SLOPE -2.00 dB/GHz"
 
 
@@ -207,7 +213,7 @@ def _proxy(kind):
     return Instrument(InstrumentProxy(drv, SimTransport(sim_cls())))
 
 
-def test_main_window_source_below_graph_and_mem_scale_controls(qtbot, tmp_path):
+def test_graphs_window_sa_plot_mem_analysis_and_settings_persist(qtbot, tmp_path):
     links = ProxyLinks()
     proxies = {k: _proxy(k) for k in ("pna", "e4446a", "u2021xa", "e8267d")}
     sa_sim = sim_of(proxies["e4446a"])
@@ -226,51 +232,46 @@ def test_main_window_source_below_graph_and_mem_scale_controls(qtbot, tmp_path):
         qtbot.waitUntil(lambda: gen.value("rf.output") is True, timeout=5000)
         bench.step()
 
-        ini = tmp_path / "mw_plot.ini"
+        ini = tmp_path / "gw_plot.ini"
         settings = QSettings(str(ini), QSettings.Format.IniFormat)
-        win = MainWindow(settings, ActivityMonitor(links))
+        mon = ActivityMonitor(links)
+        win = GraphsWindow(settings, mon)
         qtbot.addWidget(win)
-        win.resize(900, 760)
+        win.resize(1100, 760)
         win.show()
-        sa_panel = win.panels[proxies["e4446a"]]
-        qtbot.waitUntil(lambda: "dBm" in sa_panel.process_label.text() and not sa_panel.process_label.text().startswith("NOISE"),
-                        timeout=10000)
 
-        # Заголовок облегчён: 2 вкладки PLOT | SET, кнопки очистки и закрытия; настройки не сбрасываются при обновлении
-        from visalab.front.window import PanelClearButton, PanelCloseButton
-        assert [sa_panel.tabs.tabText(i) for i in range(sa_panel.tabs.count())] == ["PLOT", "SET"]
-        assert isinstance(sa_panel.clear_button, PanelClearButton)
-        assert isinstance(sa_panel.close_button, PanelCloseButton)
-        assert sa_panel.stack.currentIndex() == 0
-        sa_panel.tabs.setCurrentIndex(1)
-        assert sa_panel.stack.currentIndex() == 1
+        sa_card = win.card("SA")
+        assert sa_card is not None
+        qtbot.waitUntil(lambda: len(sa_card.plot.series) == 1 and len(sa_card.plot.series[0].x) > 10, timeout=10000)
 
-        # Пользователь вводит значение в REF во время обновления графика -> ввод НЕ перезаписывается!
-        ref_ed = sa_panel.plot_settings_widget.ref_edit
-        ref_ed.setText("-12.3")
-        ref_ed.setModified(True)
-        sa_panel.refresh(win.monitor.activity(proxies["e4446a"]))
-        sa_panel.plot_settings_widget.sync_from_plot(force=False)
-        assert ref_ed.text() == "-12.3"
+        # DATA -> MEM и локальный анализ на PlotWidget
+        assert not sa_card.plot.memory
+        sa_card.plot.store_memory()
+        assert bool(sa_card.plot.memory)
+        sa_card.plot.set_math_mode("SUB")
+        sa_card.plot.set_analysis_metrics(["mean", "min", "max", "flatness", "nonlin"])
+        sa_card.plot.set_y_range(-90.0, 10.0)
 
-        assert not sa_panel.plots[0].memory
-        sa_panel.plot_settings_widget.mem_store_btn.click()
-        assert bool(sa_panel.plots[0].memory)
-        sa_panel.clear_button.click()
-        assert not sa_panel.plots[0].memory
-        sa_panel.tabs.setCurrentIndex(0)
-        assert sa_panel.stack.currentIndex() == 0
+        # Открытие плавающего окна настроек графика PlotSettingsWindow
+        win.open_plot_settings("SA")
+        assert win.plot_settings_window is not None and win.plot_settings_window.isVisible()
+        assert win.plot_settings_window.current_name == "SA"
+        sa_card.plot.grab()
 
-        # Анализ и ручная шкала на панели SA сохраняются и восстанавливаются при перезапуске
-        sa_panel.plots[0].set_analysis_metrics(["mean", "min", "max", "flatness", "nonlin"])
-        sa_panel.plots[0].set_manual_scale(10.0, 5.0, 10)
-        settings.sync()
+        # Сохранение и восстановление настроек PlotWidget при перезапуске
+        win.cleanup()
+        win.close()
 
-        win2 = MainWindow(QSettings(str(ini), QSettings.Format.IniFormat), ActivityMonitor(links))
+        win2 = GraphsWindow(QSettings(str(ini), QSettings.Format.IniFormat), ActivityMonitor(links))
         qtbot.addWidget(win2)
-        p2 = win2.panels[proxies["e4446a"]].plots[0]
-        assert p2.manual_scale and p2._scale == pytest.approx((-40.0, 10.0, 5.0))
-        assert set(p2.analysis_metrics) == {"mean", "min", "max", "flatness", "nonlin"}
+        try:
+            p2 = win2.card("SA").plot
+            assert set(p2.analysis_metrics) == {"mean", "min", "max", "flatness", "nonlin"}
+            assert not p2.is_y_auto()
+        finally:
+            win2.cleanup()
+            win2.close()
+        mon.stop()
     finally:
         for p in proxies.values():
             p.shutdown()

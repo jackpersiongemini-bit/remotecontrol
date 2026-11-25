@@ -31,11 +31,11 @@ from ..coord import COORD, Instrument
 from ..core.params import ConnectionState, PStatus
 from ..core.units import si_format, si_parse
 from .favorites import FavoritesManager, FavoritesPopup
-from .instrument_dock import active_dock
 from .models import ModelWindow, all_models, model_class
-from .params import IndicatorButton, PBGroup, PChoice, PSpinBox, PTabBar, Panel, PanelLine, PanelTable, WriteTracker
+from .params import (IndicatorButton, PBGroup, PChoice, PSpinBox, PSpinEdit, PTabBar, Panel, PanelLine, PanelTable,
+                     WriteTracker)
 from .theme import OFF, ON, UI_COLUMN_WIDTH_PX, UI_CONTROL_HEIGHT_PX, WINDOW_BAR_HEIGHT
-from .window import (AddressLabel, CustomDockButton, CustomExpandButton, CustomFavButton, CustomInitButton,
+from .window import (AddressLabel, CustomExpandButton, CustomFavButton, CustomInitButton,
                      CustomSyncButton, ErrorIndicator, Switch, Window, WriteState, mark_growing)
 
 __all__ = ["InstrumentWindow", "PresetGroup", "PowerLevels", "PowerSpin", "HScrollArea", "saved_connection", "saved_delay",
@@ -481,10 +481,6 @@ class InstrumentWindow(Window):
         self._saved: dict[str, Any] = {}        # что уже записано в ini (ключ -> значение)
         self._expanded = False
         self._overlay: str | None = None        # вместо таблицы: "errors" / "connection"
-        self._dock = None
-        self._dock_view_mode: str | None = None  # None (плавающее) | "fav" | "all"
-        self._floating_pos = None
-        self._floating_size = None
         self._fav_popup: FavoritesPopup | None = None
         self.saved_widgets: list = []
         self.top_lines: list[PanelLine] = []
@@ -514,10 +510,6 @@ class InstrumentWindow(Window):
         bar.insert_widget(self.address, 4, stretch=1)
         bar.hBoxLayout.setAlignment(self.on_button, Qt.AlignmentFlag.AlignVCenter)   # он ниже кнопок
         bar.title_label.hide()                    # заголовок - в панели задач; в окне место занимает имя драйвера
-        self.dock_button = CustomDockButton()
-        self.dock_button.setToolTip("Attach into the instrument dock")
-        self.dock_button.clicked.connect(self.toggle_dock)
-        bar.insert_control_widget(self.dock_button)
         self.expand_button = CustomExpandButton()
         self.expand_button.setToolTip("Show / hide all parameters")
         self.expand_button.clicked.connect(lambda: self.set_expanded(not self.expand_button.expanded))
@@ -533,7 +525,7 @@ class InstrumentWindow(Window):
         self.preset_panel = Panel(top)
         top.build()
         for line in self.top_lines:                   # кнопки рядом со спинбоксом - по тексту, не шире него
-            if any(isinstance(w, PSpinBox) for w in line.widgets):
+            if any(isinstance(w, (PSpinBox, PSpinEdit)) for w in line.widgets):
                 for w in line.widgets:
                     if isinstance(w, QPushButton):
                         compact_button(w)
@@ -587,6 +579,21 @@ class InstrumentWindow(Window):
         lay.addWidget(self.parameter_panel, 1)    # растянули окно - панель растёт (график в ней - вместе с ней)
         self._layout = lay
 
+        # ---------------------------------------------------------- сохранённое состояние виджетов (шаг, размерность, значение)
+        self._primary_bound_widgets = list(self.bound_widgets())
+        for w in self._primary_bound_widgets:
+            if hasattr(w, "attach_settings"):
+                w.attach_settings(settings, self._prefix)
+            if isinstance(w, (PSpinBox, PSpinEdit)):
+                if w.step_setting is None:
+                    raw = settings.value(self._step_key(w.key), None)
+                    try:
+                        if raw not in (None, ""):
+                            w.set_step(float(raw), emit=False)
+                    except (TypeError, ValueError):
+                        pass
+                w.step_changed.connect(lambda step, k=w.key: self._save_step(k, step))
+
         # ---------------------------------------------------------- настраиваемое избранное
         self.favorites = FavoritesManager(self, settings, self._prefix)
         self.favorites.discover()
@@ -598,15 +605,6 @@ class InstrumentWindow(Window):
         names = {k: k.upper().replace(".", " ") for k in keys}
         names["instrument"] = "INSTRUMENT"
         self.tracker = WriteTracker(proxy, keys, names, self)
-        for w in self.bound_widgets():                # шаг спинбоксов (правый клик) - в ini
-            if isinstance(w, PSpinBox):
-                raw = settings.value(self._step_key(w.key), None)
-                try:
-                    if raw not in (None, ""):
-                        w.set_step(float(raw), emit=False)
-                except (TypeError, ValueError):
-                    pass
-                w.step_changed.connect(lambda step, k=w.key: self._save_step(k, step))
         self.tracker.changed.connect(self.error_indicator.set_items)
         self.tracker.changed.connect(lambda *_a: WINDOW_EVENTS.changed.emit(self.proxy))
         self.error_indicator.clicked.connect(self.show_errors)
@@ -635,11 +633,13 @@ class InstrumentWindow(Window):
         WINDOW_EVENTS.changed.emit(proxy)
 
     def cleanup(self) -> None:
-        """Отключить глобальные сигналы и закрыть дочерние окна перед заменой/удалением."""
+        """Сохранить состояние виджетов, отключить глобальные сигналы и закрыть дочерние окна."""
+        for w in getattr(self, "_primary_bound_widgets", self.bound_widgets()):
+            if not sip.isdeleted(w) and hasattr(w, "save_state"):
+                w.save_state()
+        self.settings.sync()
         if self in _INSTRUMENT_WINDOWS:
             _INSTRUMENT_WINDOWS.remove(self)
-        if self.is_docked:
-            self._dock.detach(self, show=False, save=False)
         if getattr(self, "_fav_popup", None) is not None and not sip.isdeleted(self._fav_popup):
             self._fav_popup.close()
             self._fav_popup.deleteLater()
@@ -675,69 +675,6 @@ class InstrumentWindow(Window):
 
     def reset_favorites(self) -> None:
         self.favorites.reset()
-
-    @property
-    def is_docked(self) -> bool:
-        return self._dock is not None and not sip.isdeleted(self._dock)
-
-    def want_docked(self) -> bool:
-        """Было ли окно прикреплено к доку в предыдущем сеансе (ini)."""
-        return bool(self.settings.value(f"{self._prefix}/DOCKED", False, type=bool))
-
-    def dock_into(self, dock=None, *, show: bool = True, save: bool = True) -> None:
-        """Прикрепить окно прибора в указанный или активный док."""
-        target = dock if dock is not None else active_dock(self.settings, create=True)
-        if target is not None:
-            target.attach(self, show=show, save=save)
-
-    def undock(self, *, show: bool = True, save: bool = True) -> None:
-        """Открепить окно прибора обратно в плавающее окно."""
-        if self.is_docked:
-            self._dock.detach(self, show=show, save=save)
-
-    def toggle_dock(self) -> None:
-        if self.is_docked:
-            self.undock(show=True, save=True)
-        else:
-            self.dock_into(show=True, save=True)
-
-    def _on_dock_attached(self, dock, *, save: bool = True) -> None:
-        self._dock = dock
-        self.dock_button.set_docked(True)
-        self.dock_button.setToolTip("Detach into a floating window")
-        self.titleBar.minimized_button.hide()
-        self.set_dock_view_mode(getattr(dock, "view_mode", "fav"))
-        if save:
-            self.settings.setValue(f"{self._prefix}/DOCKED", True)
-        WINDOW_EVENTS.changed.emit(self.proxy)
-
-    def _on_dock_detached(self, *, show: bool = True, save: bool = True, fallback_pos=None) -> None:
-        self._dock = None
-        self.dock_button.set_docked(False)
-        self.dock_button.setToolTip("Attach into the instrument dock")
-        self.titleBar.minimized_button.show()
-        self.set_dock_view_mode(None)
-        self.hide()
-        self.setParent(None, Qt.WindowType.Window)
-        if hasattr(self, "updateFrameless"):
-            try:
-                self.updateFrameless()
-            except Exception:  # noqa: BLE001
-                pass
-        if self._floating_size is not None and self._floating_size.isValid():
-            self.resize(max(self.minimumWidth(), self._floating_size.width()), self._floating_size.height())
-        if self._floating_pos is not None:
-            self.move(self._clamp_pos(self._floating_pos))
-        elif not self.recall_pos() and fallback_pos is not None:
-            self.move(self._clamp_pos(fallback_pos))
-        if save:
-            self.settings.setValue(f"{self._prefix}/DOCKED", False)
-        if show:
-            self.show()
-            self.raise_()
-            self.activateWindow()
-            self._fit_height()
-        WINDOW_EVENTS.changed.emit(self.proxy)
 
     def bound_widgets(self) -> list:
         """Все виджеты, привязанные к ключам (для журнала ошибок)."""
@@ -833,30 +770,10 @@ class InstrumentWindow(Window):
         super().hideEvent(e)
         WINDOW_EVENTS.changed.emit(self.proxy)
 
-    def set_dock_view_mode(self, mode: str | None) -> None:
-        """Режим отображения внутри приборной панели (дока): ``'fav'`` (только избранное),
-        ``'all'`` (только вкладки настроек) или ``None`` (обычное плавающее окно)."""
-        mode = mode if mode in ("fav", "all") else None
-        self._dock_view_mode = mode
-        if mode == "fav":
-            self.preset_panel.setVisible(True)
-            self.parameter_panel.setVisible(self._overlay == "errors")
-            self.expand_button.hide()
-        elif mode == "all":
-            self.preset_panel.setVisible(False)
-            self.parameter_panel.setVisible(True)
-            self.expand_button.hide()
-        else:
-            self.preset_panel.setVisible(True)
-            self.parameter_panel.setVisible(True)
-            self.expand_button.show()
-        self._show_pages()
-        self._fit_height()
-
     def _show_pages(self) -> None:
-        show_body = True if self._dock_view_mode == "all" else (
-            self._overlay == "errors" if self._dock_view_mode == "fav" else self._expanded
-        )
+        if getattr(self, "_hosted_in_sections", False):
+            return
+        show_body = self._expanded
         overlay = self._overlay if show_body else None
         for i, page in enumerate(self.pages):
             page.setVisible(show_body and overlay is None and i == self.tabs.currentIndex())
@@ -868,10 +785,6 @@ class InstrumentWindow(Window):
         """Клик по вкладке: из журнала - обратно к таблице; в свёрнутом окне - развернуть;
         повторный клик по уже открытой вкладке - свернуть."""
         if index < 0:
-            return
-        if self._dock_view_mode == "all":
-            self._overlay = None
-            self.set_page(index, fit=True)
             return
         if self._overlay:
             self._overlay = None
@@ -888,12 +801,7 @@ class InstrumentWindow(Window):
 
     def _show_overlay(self, name: str) -> None:
         self._overlay = name
-        if self._dock_view_mode == "fav":
-            self.parameter_panel.setVisible(True)
-            self._show_pages()
-            self._fit_height()
-            return
-        if self._dock_view_mode == "all" or self._expanded:
+        if self._expanded:
             self._show_pages()
             self._fit_height()
         else:
@@ -901,8 +809,6 @@ class InstrumentWindow(Window):
 
     def _close_overlay(self) -> None:
         self._overlay = None
-        if self._dock_view_mode == "fav":
-            self.parameter_panel.setVisible(False)
         self._show_pages()
         self._fit_height()
 
@@ -918,6 +824,8 @@ class InstrumentWindow(Window):
     def _fit_height(self, again: bool = True) -> None:
         """Высота окна - по содержимому (вложенные раскладки пересчитываются не сразу). Окно можно
         растянуть: лишняя высота - графику / журналу, а если их нет - панели параметров."""
+        if getattr(self, "_hosted_in_sections", False):
+            return
         with self.fitting():
             QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
             for w in self.findChildren(QWidget):          # вложенные раскладки хранят старые размеры
@@ -1057,11 +965,19 @@ class InstrumentWindow(Window):
 
     def show_errors(self) -> None:
         """Клик по индикатору ошибок: вместо таблицы - журнал (выход - вкладка или CLEAR)."""
+        cb = getattr(self, "_hosted_errors_cb", None)
+        if cb is not None:
+            cb(True)
+            return
         self._show_overlay("errors")
 
     def clear_errors(self) -> None:
         self.error_log.clear()
         self.tracker.clear_errors()
+        cb = getattr(self, "_hosted_errors_cb", None)
+        if cb is not None:
+            cb(False)
+            return
         self._close_overlay()
 
     # ------------------------------------------------------------ подключение
@@ -1372,8 +1288,4 @@ class InstrumentWindow(Window):
             mw.close()
         self.presets.save()
         self.settings.sync()
-        if self.is_docked:
-            self.hide()
-            event.accept()
-            return
         super().closeEvent(event)

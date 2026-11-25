@@ -246,18 +246,22 @@ class VISAInstrument(QObject):
             self.scpi_log.emit("<<", answer)
         return answer
 
-    def query_float_block(self, command: str) -> list[float]:
-        """Запрос двоичного блока float32 (трасса); в журнал - только число точек."""
+    def query_binary_floats(self, command: str, datatype: str = "d", big_endian: bool = True) -> list[float]:
+        """Запрос двоичного блока IEEE 488.2 float32 (``"f"``) или float64 (``"d"``); в журнал - только число значений."""
         if not self._quiet:
             self.scpi_log.emit(">>", command)
         self._pace()
         try:
-            values = self.transport.query_float_block(command)
+            values = self.transport.query_binary_floats(command, datatype=datatype, big_endian=big_endian)
         finally:
             self._last_io = time.monotonic()
         if not self._quiet:
             self.scpi_log.emit("<<", f"<{len(values)} points>")
         return values
+
+    def query_float_block(self, command: str) -> list[float]:
+        """Запрос двоичного блока float32 (трасса); в журнал - только число точек."""
+        return self.query_binary_floats(command, datatype="f", big_endian=True)
 
     def query_float(self, command: str) -> float:
         return parse_number(self.query(command))

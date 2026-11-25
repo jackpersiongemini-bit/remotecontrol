@@ -17,16 +17,27 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from ..core.params import Action, ConnectionState, Param, PStatus
+from ..core.trace import Trace
 
 log = logging.getLogger(__name__)
 
 __all__ = ["Instrument"]
+
+_SPARAM_RE = re.compile(r"^S([1-4])([1-4])$")
+
+
+def _norm_sparam(name: str) -> str:
+    sp = str(name).strip().upper()
+    if not _SPARAM_RE.match(sp):
+        raise ValueError(f"некорректный S-параметр: {name!r} (ожидается S11..S44)")
+    return sp
 
 
 class Instrument(QObject):
@@ -43,12 +54,14 @@ class Instrument(QObject):
     raw_response = pyqtSignal(str, str)
     #: связи нет, прибор переподключится сам через столько секунд; 0 - не ждём (см. ``reconnecting``)
     reconnect_pending = pyqtSignal(float)
+    #: завершена развёртка ВАЦ: ``{sparam: Trace(комплексная)}`` для всех активных S-параметров
+    sweep_updated = pyqtSignal(dict)
     #: действие или команда SCPI от UI не отправлены: прибор ведёт сценарий координатора (текст - для журнала
     #: окна); отказ записи ключа приходит как ``param_status`` ERROR этого ключа
     refused = pyqtSignal(str)
 
     _FORWARDED = ("state_changed", "identified", "instrument_error", "comm_error", "scpi_log", "action_done",
-                  "sync_done", "raw_response", "reconnect_pending")
+                  "sync_done", "raw_response", "reconnect_pending", "sweep_updated")
 
     def __init__(self, proxy, owner=None, parent: QObject | None = None):
         """``proxy`` - абстрактный прибор слоя 3; ``owner`` - координатор, который его выдал (реестр,
@@ -98,6 +111,48 @@ class Instrument(QObject):
     @property
     def idn(self) -> str:
         return self._proxy.idn
+
+    @property
+    def ports(self) -> int:
+        """Число физических портов ВАЦ (2 или 4; 0 для остальных приборов)."""
+        return int(getattr(self._proxy, "ports", 0) or 0)
+
+    def active_sparams(self) -> list[str]:
+        """Активные (читаемые) S-параметры ВАЦ в каноническом порядке."""
+        return self._proxy.active_sparams()
+
+    def sparam_trace(self, name: str) -> Trace | None:
+        """Последняя комплексная трасса указанного S-параметра (``'S11'``, ``'S41'``...) или ``None``."""
+        return self._proxy.sparam_trace(name)
+
+    def sparam_traces(self) -> dict[str, Trace]:
+        """Последний снимок комплексных трасс всех активных S-параметров."""
+        return self._proxy.sparam_traces()
+
+    def set_sparams(self, sparams: Iterable[str] | str) -> None:
+        """Задать набор S-параметров для измерения и чтения (через арбитраж координатора)."""
+        if isinstance(sparams, str):
+            items = [t for t in re.split(r"[,\s;]+", sparams.strip()) if t]
+        else:
+            items = list(sparams)
+        norm = [_norm_sparam(s) for s in items]
+        ordered = [f"S{r}{c}" for r in range(1, 5) for c in range(1, 5) if f"S{r}{c}" in norm]
+        self.set("s.active", ",".join(ordered))
+
+    def enable_sparam(self, name: str, enabled: bool = True) -> None:
+        """Включить или выключить измерение и чтение одного S-параметра (через арбитраж координатора)."""
+        sp = _norm_sparam(name)
+        self.set(f"{sp.lower()}.enabled", bool(enabled))
+
+    def subscribe_sparam(self, name: str, on_value: Callable[[Trace | None], None]) -> None:
+        """Подписаться на обновления комплексной трассы S-параметра (напр. ``'S41'``)."""
+        sp = _norm_sparam(name)
+        self.subscribe(f"{sp.lower()}.trace", on_value)
+
+    def unsubscribe_sparam(self, name: str, on_value: Callable[[Trace | None], None]) -> None:
+        """Снять подписку на обновления комплексной трассы S-параметра."""
+        sp = _norm_sparam(name)
+        self.unsubscribe(f"{sp.lower()}.trace", on_value)
 
     def supports(self, key: str) -> bool:
         """Есть ли у прибора этот параметр/действие (стандартный ключ профиля или x.*)."""

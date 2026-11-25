@@ -1,11 +1,17 @@
-"""ВАЦ N5231A: измерения пользователя не трогаются, форматы, маркер, целые развёртки."""
+"""ВАЦ Keysight PNA / PNA-L: 4-портовое двоичное чтение комплексных S-параметров (SDATA + SENS:X?),
+настройка стимула, мощности, CW, триггеров, калибровки, состояний, Touchstone и работа через Proxy / Instrument."""
+import cmath
 import math
 
 import pytest
 
-from visalab.core import PStatus, Trace
-from visalab.drivers import KeysightPNA
+from visalab.coord import COORD, ActivityMonitor, Instrument
+from visalab.core import ConnectionState, PStatus, Trace
+from visalab.core.export import write_touchstone
+from visalab.drivers import KeysightPNA, PNA_MODELS
+from visalab.instruments import InstrumentProxy
 from visalab.sim import KeysightPNASim
+from visalab.transport import SimTransport, binary_block, parse_binary_block
 
 from conftest import flush
 
@@ -16,67 +22,239 @@ def vna(make):
 
 
 def setp(drv, rec, key, value):
-    drv.set_param(key, value); flush(drv)
+    drv.set_param(key, value)
+    flush(drv)
     return rec.last_status(key)[0]
 
 
-def test_uses_existing_measurement(vna):
+def _wait(qtbot, cond, timeout=4000):
+    qtbot.waitUntil(cond, timeout=timeout)
+
+
+# ============================================================ 1. Транспорт: двоичные блоки
+def test_binary_block_float32_and_float64_roundtrip():
+    vals = [1e9, 10.123456789012e9, -0.123456789012345, 0.0, 19.999999999e9]
+    for be in (True, False):
+        raw64 = binary_block(vals, datatype="d", big_endian=be).encode("latin-1")
+        out64 = parse_binary_block(raw64, datatype="d", big_endian=be)
+        assert out64 == pytest.approx(vals, rel=1e-15, abs=0.0)
+        raw32 = binary_block([1.5, -2.25, 0.0], datatype="f", big_endian=be).encode("latin-1")
+        assert parse_binary_block(raw32, datatype="f", big_endian=be) == pytest.approx([1.5, -2.25, 0.0], rel=1e-6)
+    # неопределённая длина #0...
+    indef = b"#0" + binary_block([1.25, -3.5], datatype="d", big_endian=True).encode("latin-1")[4:] + b"\n"
+    assert parse_binary_block(indef, datatype="d", big_endian=True) == pytest.approx([1.25, -3.5])
+
+
+# ============================================================ 2. Порты, двоичный формат, отсутствие дисплея
+def test_connect_detects_4_ports_and_uses_binary_without_display_queries(vna):
     drv, sim, rec = vna
-    assert drv.meas_name == "CH1_S11_1" and list(sim.meas) == ["CH1_S11_1"]
-    assert "*RST" not in sim.history and rec.values["sparam"] == "S11"
+    assert drv.ports == 4
+    assert rec.values["ports"] == 4
+    assert sim.form_data == ("REAL", 64)
+    assert sim.form_bord == "NORM"
+    assert "*RST" not in sim.history
+    assert rec.values["s.active"] == "S11"
+    assert rec.values["s11.enabled"] is True
+    assert rec.values["s41.enabled"] is False
+    assert not rec.errors and not rec.comm
+
+    drv.poll()
+    # Никаких дисплейных запросов (шкалы, маркеры, лимиты, форматы, FDATA)
+    forbidden = ("WNUM", "TNUM", "PDIV", "RLEV", "RPOS", "MARK", "LIM:", "FDATA", "MATH:", "FORM?")
+    assert not any(any(tok in cmd.upper() for tok in forbidden) for cmd in sim.history)
+    assert any("DATA? SDATA" in cmd.upper() for cmd in sim.history)
+    assert any("SENS1:X?" in cmd.upper() for cmd in sim.history)
+
+
+def test_2_port_vna_rejects_ports_3_and_4_cleanly(make):
+    sim = KeysightPNASim(ports=2)
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim, driver_kw={"model": PNA_MODELS["N5231A"]})
+    assert drv.ports == 2
+    assert rec.values["ports"] == 2
+    assert not rec.errors and not rec.comm  # _sync_all не слал SOUR1:POW3?/POW4? на 2-портовый прибор
+
+    assert setp(drv, rec, "s41.enabled", True) is PStatus.INVALID
+    assert setp(drv, rec, "s.active", "S11,S41") is PStatus.INVALID
+    assert setp(drv, rec, "gen.port", 3) is PStatus.INVALID
+    assert setp(drv, rec, "source.power_p3", -10.0) is PStatus.INVALID
+    assert setp(drv, rec, "s21.enabled", True) is PStatus.WRITTEN
+    assert rec.values["s.active"] == "S11,S21"
     assert not rec.errors
 
 
-def test_creates_measurement_when_none(make):
-    sim = KeysightPNASim()
+def test_creates_default_s11_when_catalog_empty(make):
+    sim = KeysightPNASim(ports=4)
     sim.meas.clear()
+    sim.windows[1].clear()
     drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert drv.meas_name == "VL_MEAS" and sim.meas["VL_MEAS"]["s"] == "S11" and not rec.errors
+    assert rec.values["s.active"] == "S11"
+    assert "VL_CH1_S11" in sim.meas and sim.meas["VL_CH1_S11"]["s"] == "S11"
+    assert "VL_CH1_S11" in sim.windows[1].values()  # тихо привязано к окну, чтобы PNA свипировал
+    assert not rec.errors
 
 
-def test_s21_filter_trace_and_marker(vna):
-    drv, sim, rec = vna
-    for k, v in (("freq.start", 1e9), ("freq.stop", 3e9), ("sweep.points", 401), ("sparam", "S21")):
-        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
-    assert sim.meas["CH1_S11_1"]["s"] == "S21"          # то же измерение, другой S-параметр
+def test_ascii_fallback_when_binary_rejected(make):
+    sim = KeysightPNASim(ports=4)
+    from visalab.sim.base import ESR_EXE, SimError
+
+    def reject_real(a, g):
+        if "REAL" in a.upper():
+            raise SimError(-224, "Binary not supported", ESR_EXE)
+        sim._form_set(a, g)
+
+    sim._handlers = [(p, s, g) for p, s, g in sim._handlers if p != "FORMat[:DATA]"]
+    sim.on("FORMat[:DATA]", reject_real, sim._form_get)
+    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
+    assert drv._binary is False
+    assert sim.form_data == ("ASC", 0)
     drv.poll()
-    t = rec.values["trace"]
-    assert isinstance(t, Trace) and len(t) == 401 and t.y_unit == "dB" and t.name == "S21"
-    f, y = t.peak()
-    assert f == pytest.approx(2e9, rel=1e-2) and y == pytest.approx(-1.0, abs=0.05)
-    drv.run_action("marker_peak")
-    assert rec.values["marker.freq"] == pytest.approx(2e9, rel=1e-2)
-    assert rec.values["marker.value"] == pytest.approx(-1.0, abs=0.05)
+    tr = rec.values["s11.trace"]
+    assert isinstance(tr, Trace) and tr.is_complex and len(tr) == 201
+    assert not rec.errors and not rec.comm
 
 
-def test_format_changes_trace_units(vna):
+# ============================================================ 3. Чтение S11, S41 и других S-параметров
+def test_read_s11_and_s41_complex_accuracy_and_lifecycle(vna):
     drv, sim, rec = vna
-    for fmt, unit in (("PHASE", "deg"), ("GDELAY", "s"), ("SWR", ""), ("MLOG", "dB")):
-        assert setp(drv, rec, "format", fmt) is PStatus.WRITTEN
-        drv.poll()
-        assert rec.values["trace"].y_unit == unit and rec.values["trace"].meta["format"] == fmt
-    assert sim.meas["CH1_S11_1"]["fmt"] == "MLOG"
+    for k, v in (("freq.start", 1e9), ("freq.stop", 3e9), ("sweep.points", 401)):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
+
+    assert setp(drv, rec, "s41.enabled", True) is PStatus.WRITTEN
+    assert rec.values["s.active"] == "S11,S41"
+    assert "VL_CH1_S41" in sim.meas and sim.meas["VL_CH1_S41"]["s"] == "S41"
+    assert "VL_CH1_S41" in sim.windows[1].values()
+
+    drv.poll()
+    t11 = rec.values["s11.trace"]
+    t41 = rec.values["s41.trace"]
+    assert isinstance(t11, Trace) and t11.is_complex and t11.name == "S11" and len(t11) == 401
+    assert isinstance(t41, Trace) and t41.is_complex and t41.name == "S41" and len(t41) == 401
+    assert rec.values["meas.count"] == 2
+    assert rec.values["trace"] is t11
+    assert rec.values.get("s21.trace") is None
+
+    # Точность комплексных Re/Im (float64) относительно физики симулятора
+    for sp, tr in (("S11", t11), ("S41", t41)):
+        for idx in (0, 200, 400):
+            expected = sim.s(sp, tr.x[idx])
+            got = complex(tr.y[idx], tr.im[idx])
+            assert got.real == pytest.approx(expected.real, rel=1e-12, abs=1e-15)
+            assert got.imag == pytest.approx(expected.imag, rel=1e-12, abs=1e-15)
+
+    # S41 физически отличается от S21 (другие потери/фаза)
+    assert setp(drv, rec, "s21.enabled", True) is PStatus.WRITTEN
+    drv.poll()
+    t21 = rec.values["s21.trace"]
+    assert abs(complex(t21.y[200], t21.im[200])) > abs(complex(t41.y[200], t41.im[200]))
+
+    # Выключаем S41 -> трасса обнуляется и наше временное измерение удаляется (пользовательское CH1_S11_1 не трогаем)
+    assert setp(drv, rec, "s41.enabled", False) is PStatus.WRITTEN
+    assert rec.values["s41.trace"] is None
+    assert "VL_CH1_S41" not in sim.meas
+    assert "CH1_S11_1" in sim.meas
+    assert not rec.errors and not rec.comm
 
 
-def test_calc_commands_select_measurement_first(vna):
+def test_sparam_actions_set_all_none(vna):
     drv, sim, rec = vna
-    sim.selected = ""
-    setp(drv, rec, "format", "PHASE")
-    i = sim.history.index("CALC1:FORM PHAS")
-    assert sim.history[i - 1] == "CALC1:PAR:SEL 'CH1_S11_1'" and not rec.errors
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+
+    drv.run_action("sparam_set", ("S41", "S11", "S34"))
+    assert actions[-1] == ("sparam_set", ["S11", "S34", "S41"])
+    assert rec.values["s.active"] == "S11,S34,S41"
+    drv.poll()
+    assert rec.values["meas.count"] == 3
+    assert all(rec.values[f"{sp.lower()}.trace"].is_complex for sp in ("S11", "S34", "S41"))
+
+    drv.run_action("sparam_all")
+    assert len(actions[-1][1]) == 16
+    drv.poll()
+    assert rec.values["meas.count"] == 16
+
+    drv.run_action("sparam_none")
+    assert actions[-1] == ("sparam_none", [])
+    assert rec.values["s.active"] == ""
+    assert rec.values["meas.count"] == 0
+    assert rec.values["trace"] is None
+    assert not rec.errors
 
 
-def test_only_complete_sweeps(vna):
+# ============================================================ 4. Точная ось X (LIN, LOG, CW, POWER + кэш)
+def test_exact_x_axis_for_lin_log_cw_power_and_cache(vna):
+    drv, sim, rec = vna
+    assert setp(drv, rec, "freq.start", 1e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "freq.stop", 9e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "sweep.points", 101) is PStatus.WRITTEN
+    sim.history.clear()
+
+    # LIN: SENS1:X? читается один раз и кэшируется между развёртками
+    drv.poll()
+    tr_lin = rec.values["s11.trace"]
+    assert tr_lin.x_unit == "Hz" and tr_lin.uniform is True
+    assert tr_lin.x[50] == pytest.approx(5e9)
+    x_reads = sum(1 for c in sim.history if c.upper() == "SENS1:X?")
+    assert x_reads == 1
+    drv.poll()
+    assert sum(1 for c in sim.history if c.upper() == "SENS1:X?") == 1  # из кэша!
+
+    # LOG: геометрическая середина sqrt(1e9 * 9e9) = 3e9 Hz!
+    assert setp(drv, rec, "sweep.type", "LOG") is PStatus.WRITTEN
+    drv.poll()
+    tr_log = rec.values["s11.trace"]
+    assert tr_log.x_unit == "Hz" and tr_log.uniform is False
+    assert tr_log.x[50] == pytest.approx(3e9, rel=1e-9)
+
+    # CW: ось X — время 0..sweep.time в секундах
+    assert setp(drv, rec, "sweep.type", "CW") is PStatus.WRITTEN
+    assert setp(drv, rec, "sweep.time", 0.5) is PStatus.WRITTEN
+    drv.poll()
+    tr_cw = rec.values["s11.trace"]
+    assert tr_cw.x_unit == "s" and tr_cw.uniform is True
+    assert tr_cw.x[0] == pytest.approx(0.0) and tr_cw.x[-1] == pytest.approx(0.5)
+
+    # POWER: ось X — мощность в dBm
+    assert setp(drv, rec, "sweep.type", "POWER") is PStatus.WRITTEN
+    drv.poll()
+    tr_pow = rec.values["s11.trace"]
+    assert tr_pow.x_unit == "dBm" and tr_pow.uniform is False
+    assert tr_pow.x[0] == pytest.approx(-20.0) and tr_pow.x[-1] == pytest.approx(0.0)
+
+    # Изменение числа точек на передней панели прибора (в обход драйвера) автоматически обновляет ось X
+    assert setp(drv, rec, "sweep.type", "LIN") is PStatus.WRITTEN
+    drv.poll()
+    assert len(rec.values["s11.trace"]) == 101
+    sim.c["poin"] = 51
+    drv.poll()
+    assert len(rec.values["s11.trace"]) == 51
+    assert not rec.errors
+
+
+# ============================================================ 5. Стимул, усреднение (GRO), развёртки
+def test_only_complete_sweeps_and_group_averaging_on_single(vna):
     drv, sim, rec = vna
     sim.hold_sweeps = True
     drv.poll()
-    first = rec.values["trace"]
+    first = rec.values["s11.trace"]
     for _ in range(3):
         drv._on_poll()
-    assert rec.values["trace"] is first and rec.values["meas.armed"] is True and not rec.comm
+    assert rec.values["s11.trace"] is first and rec.values["meas.armed"] is True
     sim.finish_sweep()
     drv.poll()
-    assert rec.values["trace"] is not first
+    assert rec.values["s11.trace"] is not first
+
+    # В режиме SINGLE с включённым усреднением используется GRO + GRO:COUN
+    assert setp(drv, rec, "avg.state", True) is PStatus.WRITTEN
+    assert setp(drv, rec, "avg.count", 8) is PStatus.WRITTEN
+    sim.history.clear()
+    drv.run_action("single")
+    assert "SENS1:SWE:GRO:COUN 8" in sim.history
+    assert any("SWE:MODE GRO" in c for c in sim.history)
+    assert rec.values["meas.armed"] is True
+    sim.finish_sweep()
+    drv.poll()
+    assert rec.values["meas.armed"] is False
+    assert not rec.errors
 
 
 def test_ifbw_rounded_is_coerced(vna):
@@ -85,792 +263,178 @@ def test_ifbw_rounded_is_coerced(vna):
     assert rec.values["bw.if"] == 1000
 
 
-def test_s11_return_loss_at_resonance(vna):
+# ============================================================ 6. 4-портовая мощность и CW-генератор
+def test_4_port_decoupled_power_and_cw_generator(vna):
     drv, sim, rec = vna
-    setp(drv, rec, "freq.start", 1.5e9); setp(drv, rec, "freq.stop", 2.5e9)
-    drv.poll()
-    t = rec.values["trace"]
-    f, y = min(zip(t.x, t.y), key=lambda p: p[1])
-    assert f == pytest.approx(2e9, rel=1e-2) and y < -20
-    assert math.isfinite(y)
+    assert setp(drv, rec, "source.power_coupled", False) is PStatus.WRITTEN
+    for p, lvl in ((1, -10.0), (2, -5.0), (3, 0.0), (4, -15.0)):
+        assert setp(drv, rec, f"source.power_p{p}", lvl) is PStatus.WRITTEN
+        assert rec.values[f"source.power_p{p}"] == pytest.approx(lvl)
+    assert sim.c["pow_levels"] == {1: -10.0, 2: -5.0, 3: 0.0, 4: -15.0}
 
-
-def _meas(s, fmt="MLOG", ch=1):
-    return {"s": s, "fmt": fmt, "ch": ch}
-
-
-def test_only_selected_measurements_are_read(make):
-    sim = KeysightPNASim()
-    sim.meas["USER_S21"] = _meas("S21", "PHAS")
-    sim.meas["USER_S12"] = _meas("S12", "MLIN")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    drv.poll()
-    # по умолчанию слоты - измерения канала 1 по порядку, читается только m1
-    assert [rec.values[f"m{n}.name"] for n in (1, 2, 3, 4)] == ["CH1_S11_1", "USER_S21", "USER_S12", None]
-    assert [rec.values[f"m{n}.enabled"] for n in (1, 2, 3)] == [True, False, False]
-    assert rec.values["meas.count"] == 1 and rec.values["m1.trace"] is not None
-    assert rec.values["m2.trace"] is None and rec.values["m2.sdata"] is None
-    assert not any("USER_S21" in c and "SEL" in c for c in sim.history[-12:])      # лишнее не запрашивалось
-    assert setp(drv, rec, "m3.enabled", True) is PStatus.WRITTEN                    # пользователь включил m3
-    drv.poll()
-    assert rec.values["meas.count"] == 2 and rec.values["m3.trace"].y_unit == "" and rec.values["m2.trace"] is None
-    assert setp(drv, rec, "m1.enabled", False) is PStatus.WRITTEN
-    drv.poll()
-    assert rec.values["m1.trace"] is None and rec.values["trace"] is None and rec.values["m3.trace"] is not None
-
-
-def test_all_measurements_formatted_and_complex(make):
-    sim = KeysightPNASim()
-    sim.meas["USER_S21"] = _meas("S21", "PHAS")
-    sim.meas["USER_S12"] = _meas("S12", "MLIN")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert setp(drv, rec, "meas.complex", True) is PStatus.WRITTEN               # SDATA - по запросу
-    for k, v in (("freq.start", 1e9), ("freq.stop", 3e9), ("sweep.points", 201)):
-        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
-    drv.run_action("meas_all")
-    drv.poll()
-    assert rec.values["meas.count"] == 3 and not rec.errors and not rec.comm
-    assert [rec.values[f"m{n}.sparam"] for n in (1, 2, 3)] == ["S11", "S21", "S12"]
-    assert [rec.values[f"m{n}.format"] for n in (1, 2, 3)] == ["MLOG", "PHASE", "LIN_MAG"]
-    assert rec.values["m4.trace"] is None and rec.values["m4.sdata"] is None
-    assert [rec.values[f"m{n}.trace"].y_unit for n in (1, 2, 3)] == ["dB", "deg", ""]
-    assert all(len(rec.values[f"m{n}.trace"]) == 201 for n in (1, 2, 3))
-    assert rec.values["trace"] is rec.values["m1.trace"]
-    s21 = rec.values["m2.sdata"]                                    # комплексные: Re в y, Im в im
-    assert s21.is_complex and len(s21.im) == 201 and s21.meta["format"] == "SDATA"
-    z = s21.complex_y()
-    assert math.degrees(__import__("cmath").phase(z[100])) == pytest.approx(rec.values["m2.trace"].y[100], abs=1e-6)
-    assert 20 * math.log10(abs(rec.values["m3.sdata"].complex_y()[100])) == pytest.approx(
-        20 * math.log10(rec.values["m3.trace"].y[100]), abs=1e-6)
-    drv.run_action("meas_none")
-    drv.poll()
-    assert rec.values["meas.count"] == 0 and rec.values["m1.trace"] is None
-
-
-def test_other_channels(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
-    sim.stim(2).update(start=2e9, stop=4e9, poin=51)                # у канала 2 свой стимул
-    sim.meas["CH2_S11"] = _meas("S11", "PHAS", 2)
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert setp(drv, rec, "meas.complex", True) is PStatus.WRITTEN               # SDATA - по запросу
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    drv.run_action("meas_catalog")
-    assert actions[-1] == ("meas_catalog", [(1, "CH1_S11_1", "S11"), (2, "CH2_S21", "S21"), (2, "CH2_S11", "S11")])
-    # слот m2 -> канал 2, измерение CH2_S21
-    assert setp(drv, rec, "m2.channel", 2) is PStatus.WRITTEN
-    assert setp(drv, rec, "m2.name", "CH2_S21") is PStatus.WRITTEN
-    assert rec.values["m2.sparam"] == "S21" and rec.values["m2.format"] == "MLOG"
-    assert setp(drv, rec, "m2.enabled", True) is PStatus.WRITTEN
-    drv.poll()
-    t1, t2 = rec.values["m1.trace"], rec.values["m2.trace"]
-    assert len(t2) == 51 and t2.x[0] == pytest.approx(2e9) and t2.x[-1] == pytest.approx(4e9)     # ось канала 2
-    assert t2.meta["channel"] == 2 and t2.name == "S21" and len(t1) == 201 and t1.meta["channel"] == 1
-    assert "SENS2:SWE:MODE SING" not in sim.history and "CALC2:PAR:SEL 'CH2_S21'" in sim.history
-    assert sim.stim(2)["mode"] == "CONT"
-    assert len(rec.values["m2.sdata"]) == 51 and not rec.errors and not rec.comm
-    # формат и S-параметр меняются у измерения своего канала
-    assert setp(drv, rec, "m2.format", "PHASE") is PStatus.WRITTEN and sim.meas["CH2_S21"]["fmt"] == "PHAS"
-    assert sim.meas["CH2_S11"]["fmt"] == "PHAS" and sim.meas["CH1_S11_1"]["fmt"] == "MLOG"
-    # выключили m1: канал 1 больше не читается, но прибору не шлются SING/HOLD
-    assert setp(drv, rec, "m1.enabled", False) is PStatus.WRITTEN
-    del sim.history[:]
-    drv.poll()
-    assert not any("SWE:MODE SING" in c for c in sim.history)
-    assert rec.values["m1.trace"] is None and rec.values["m2.trace"] is not None
-    # meas_all берёт измерения всех каналов
-    drv.run_action("meas_all")
-    drv.poll()
-    assert rec.values["meas.count"] == 3 and [rec.values[f"m{n}.channel"] for n in (1, 2, 3)] == [1, 2, 2]
-
-
-def test_slot_errors_and_deleted_measurement(make):
-    sim = KeysightPNASim()
-    sim.meas["B"] = _meas("S21")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert setp(drv, rec, "m2.format", "PHASE") is PStatus.WRITTEN
-    assert sim.meas["B"]["fmt"] == "PHAS" and sim.meas["CH1_S11_1"]["fmt"] == "MLOG"       # первое не тронуто
-    assert setp(drv, rec, "m2.sparam", "S12") is PStatus.WRITTEN and sim.meas["B"]["s"] == "S12"
-    assert setp(drv, rec, "m5.format", "PHASE") is PStatus.ERROR                           # слот не назначен
-    assert setp(drv, rec, "m2.name", "NO_SUCH") is PStatus.ERROR                           # нет такого измерения
-    assert rec.values["m2.name"] == "B" and not rec.comm
-    drv.run_action("meas_all")
-    drv.poll()
-    assert rec.values["meas.count"] == 2 and rec.values["m2.trace"].y_unit == "deg"
-    del sim.meas["B"]                                                                      # удалили на приборе
-    drv.poll()
-    assert rec.values["meas.count"] == 1 and rec.values["m2.trace"] is None and not rec.comm
-    assert setp(drv, rec, "meas.complex", False) is PStatus.WRITTEN
-    drv.poll()
-    assert rec.values["m1.sdata"] is None and rec.values["m1.trace"] is not None
-
-
-def test_memory_and_math(make):
-    sim = KeysightPNASim()
-    sim.meas["USER_S21"] = _meas("S21")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert setp(drv, rec, "meas.complex", True) is PStatus.WRITTEN               # SDATA - по запросу
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    drv.run_action("meas_all")
-    assert setp(drv, rec, "m2.math", "DIV") is not PStatus.WRITTEN      # памяти ещё нет - прибор отказал
-    assert rec.values["m2.math"] == "NORM" and "math" not in sim.meas["USER_S21"]
-    drv.run_action("mem_store")                                         # все включённые слоты
-    assert actions[-1] == ("mem_store", [1, 2]) and sim.meas["USER_S21"]["mem"] is not None
-    assert setp(drv, rec, "m2.math", "DIV") is PStatus.WRITTEN and sim.meas["USER_S21"]["math"] == "DIV"
-    drv.poll()
-    t = rec.values["m2.trace"]
-    assert max(abs(v) for v in t.y) < 1e-6 and t.meta["math"] == "DIV"   # данные / та же память = 0 dB
-    assert rec.values["m1.trace"].meta["math"] == "NORM"
-    assert rec.values["m2.sdata"].meta["math"] == "NORM" and abs(rec.values["m2.sdata"].complex_y()[100]) < 1
-    sim.dut["il_db"] = 3.0                                              # DUT изменился: видно отличие от памяти
-    drv.poll()
-    assert rec.values["m2.trace"].y[100] == pytest.approx(-2.0, abs=0.01)
-    assert setp(drv, rec, "m2.math", "NORM") is PStatus.WRITTEN
-    drv.run_action("mem_store", 1)
-    assert actions[-1] == ("mem_store", [1])
-    drv.run_action("mem_store", 5)                                      # не назначен - отказ, в прибор не ушло
-    assert len(rec.comm) == 1 and "m5" in rec.comm[0] and actions[-1] == ("mem_store", [1])
-
-
-def test_state_save_recall(make):
-    sim = KeysightPNASim()
-    sim.meas["USER_S21"] = _meas("S21")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    drv.run_action("state_list")
-    assert actions[-1] == ("state_list", [])
-    assert setp(drv, rec, "freq.start", 1.5e9) is PStatus.WRITTEN
-    drv.run_action("state_save", "filt_a")
-    assert 'MMEM:STOR "filt_a.csa"' in sim.history and rec.values["meas.armed"] is True
-    sim.files["notes.txt"] = ()
-    drv.run_action("state_list")
-    assert actions[-1] == ("state_list", ["filt_a"])                    # только имена состояний
-    # на приборе всё поменяли: другое измерение, другая частота
-    assert setp(drv, rec, "freq.start", 1e9) is PStatus.WRITTEN
-    del sim.meas["USER_S21"]
-    sim.meas["OTHER"] = _meas("S12")
-    drv.run_action("state_recall", "filt_a")
-    assert rec.values["freq.start"] == pytest.approx(1.5e9)
-    assert rec.values["m2.name"] == "USER_S21" and rec.values["m1.enabled"] and not rec.values["m2.enabled"]
-    drv.poll()
-    assert rec.values["m1.trace"].x[0] == pytest.approx(1.5e9) and not rec.errors and not rec.comm
-    drv.run_action("state_recall", "bad name")                          # недопустимое имя в прибор не уходит
-    assert "bad name" not in " ".join(sim.history)
-    drv.run_action("state_recall", "nope")
-    assert any("state_recall" in m for _, m in rec.errors)              # нет файла - ошибка прибора
-    drv.run_action("state_delete", "filt_a")
-    assert "filt_a.csa" not in sim.files
-
-
-def test_cw_mode_as_generator(vna):
-    drv, sim, rec = vna
-    assert rec.values["sweep.type"] == "LIN"
-    for k, v in (("sweep.type", "CW"), ("freq.cw", 2e9), ("source.power", 0.0), ("rf.output", True),
-                 ("cal.state", False)):
-        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
-    assert sim.c["type"] == "CW" and sim.c["cw"] == 2e9 and sim.c["outp"] and not sim.c["corr"]
-    drv.poll()
-    t = rec.values["m1.trace"]
-    assert t.x_unit == "s" and t.x[0] == 0 and t.x[-1] == pytest.approx(rec.values["sweep.time"])
-    assert max(t.y) - min(t.y) < 1e-9                                     # одна частота во всех точках
-    assert setp(drv, rec, "sweep.type", "LIN") is PStatus.WRITTEN
-    drv.poll()
-    assert rec.values["m1.trace"].x_unit == "Hz" and not rec.errors and not rec.comm
-
-
-def test_measurement_table_create_config_delete(make):
-    sim = KeysightPNASim()
-    sim.meas["USER_S21"] = _meas("S21", "PHAS")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    drv.run_action("meas_table")
-    assert actions[-1] == ("meas_table", [(1, "CH1_S11_1", "S11", "MLOG", "NORM"), (1, "USER_S21", "S21", "PHASE", "NORM")])
-    # настройка измерения, которое не читается (не в слоте... m2 занят им по умолчанию - тоже обновится)
-    drv.run_action("meas_config", (1, "USER_S21", "format", "SWR"))
-    assert sim.meas["USER_S21"]["fmt"] == "SWR" and rec.values["m2.format"] == "SWR"
-    drv.run_action("meas_config", (1, "USER_S21", "sparam", "S12"))
-    assert sim.meas["USER_S21"]["s"] == "S12" and actions[-1][1][1][2] == "S12"
-    # создать на канале 2 (новый канал) и на канале 1
-    drv.run_action("meas_create", (2, "S21"))
-    drv.run_action("meas_create", (1, "S21"))
-    table = actions[-1][1]
-    assert (2, "CH2_S21_1", "S21", "MLOG", "NORM") in table and (1, "CH1_S21_1", "S21", "MLOG", "NORM") in table
-    assert sim.windows[2] == {1: "CH2_S21_1"} and sim.windows[1] == {1: "CH1_S11_1", 2: "CH1_S21_1"}
-    assert not rec.errors and not rec.comm
-    # удалить измерение, которое читается в слоте: слот освобождается
-    drv.run_action("meas_delete", (1, "CH1_S11_1"))
-    assert "CH1_S11_1" not in sim.meas and rec.values["m1.name"] is None and rec.values["m1.enabled"] is False
-    drv.poll()
-    assert rec.values["meas.count"] == 0 and not rec.errors and not rec.comm
-    drv.run_action("meas_config", (1, "NOPE", "format", "SWR"))
-    drv.run_action("meas_create", (1, "S99"))
-    assert len(rec.comm) == 2
-
-
-def test_measurement_move_to_other_channel(make):
-    sim = KeysightPNASim()
-    sim.meas["USER_S21"] = _meas("S21", "PHAS")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    assert setp(drv, rec, "m2.enabled", True) is PStatus.WRITTEN          # USER_S21 читается в m2
-    drv.run_action("meas_move", (1, "USER_S21", 3))
-    assert "USER_S21" not in sim.meas and sim.meas["CH3_S21_1"] == {"s": "S21", "fmt": "PHAS", "ch": 3}
-    assert actions[-1][1] == [(1, "CH1_S11_1", "S11", "MLOG", "NORM"), (3, "CH3_S21_1", "S21", "PHASE", "NORM")]
-    assert rec.values["m2.channel"] == 3 and rec.values["m2.name"] == "CH3_S21_1" and rec.values["m2.enabled"]
-    drv.poll()
-    assert rec.values["m2.trace"].meta["channel"] == 3 and not rec.errors and not rec.comm
-
-
-def test_complex_formats_and_sdata_off_by_default(vna):
-    drv, sim, rec = vna
-    drv.poll()
-    assert rec.values["meas.complex"] is False and rec.values["m1.sdata"] is None
-    assert not any("SDATA" in c for c in sim.history)                       # лишнего не читаем
-    for fmt in ("POLAR", "SMITH"):
-        assert setp(drv, rec, "m1.format", fmt) is PStatus.WRITTEN
-        drv.poll()
-        t = rec.values["m1.trace"]
-        assert t.is_complex and len(t.im) == len(t) == 201 and t.meta["format"] == fmt and t.y_unit == ""
-    z = t.complex_y()
-    assert abs(z[0]) == pytest.approx(1.0, abs=0.05)                         # S11 вне полосы ~ 1
-    drv.run_action("marker_peak")
-    assert not rec.errors and not rec.comm
-
-
-def test_stimulus_of_selected_channel(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert rec.values["stim.channel"] == 1 and rec.values["freq.start"] == pytest.approx(10e6)
-    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN
-    assert rec.values["freq.start"] == pytest.approx(1e9) and rec.values["sweep.points"] == 101   # канал 2 перечитан
-    for k, v in (("freq.start", 3e9), ("freq.stop", 4e9), ("sweep.points", 11), ("bw.if", 1e3), ("avg.state", True),
-                 ("source.power", -20.0), ("sweep.type", "CW"), ("freq.cw", 3.5e9)):
-        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
-    st2 = sim.stim(2)
-    assert (st2["start"], st2["stop"], st2["poin"], st2["bwid"], st2["aver"], st2["pow"], st2["type"], st2["cw"]) == \
-        (3e9, 4e9, 11, 1e3, True, -20.0, "CW", 3.5e9)
-    assert (sim.c["start"], sim.c["poin"], sim.c["pow"], sim.c["type"]) == (10e6, 201, -5.0, "LIN")   # канал 1 не тронут
-    assert "SENS2:FREQ:STAR 3000000000" in sim.history and "SOUR2:POW1 -20" in sim.history
-    assert setp(drv, rec, "stim.channel", 7) is PStatus.ERROR                      # нет такого канала
-    assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN
-    assert rec.values["freq.start"] == pytest.approx(10e6) and rec.values["sweep.type"] == "LIN"
-    assert not rec.comm
-
-
-def test_generator_mode_stops_other_channels_and_restores(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    drv.run_action("meas_all")
-    drv.poll()
-    assert rec.values["m2.trace"] is not None and rec.values["gen.state"] is False
-    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN
-    for k, v in (("sweep.type", "LOG"), ("source.power", -15.0), ("rf.output", False), ("avg.state", True),
-                 ("bw.if", 10e3)):
-        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
-    before = dict(sim.stim(2))
+    # Включаем CW-генератор на порту 4
+    assert setp(drv, rec, "gen.port", 4) is PStatus.WRITTEN
     assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN
-    assert sim.stim(2)["type"] == "CW" and rec.values["sweep.type"] == "CW" and rec.values["gen.channel"] == 2
-    # в генераторе меняем что угодно
-    for k, v in (("freq.cw", 3e9), ("source.power", 5.0), ("rf.output", True), ("avg.state", False),
-                 ("bw.if", 1e3), ("sweep.points", 3)):
-        assert setp(drv, rec, k, v) is PStatus.WRITTEN, k
-    assert setp(drv, rec, "stim.channel", 1) is PStatus.ERROR            # канал закреплён
-    del sim.history[:]
-    drv.poll()
-    assert sim.stim(1)["mode"] == "HOLD" and sim.stim(2)["mode"] == "CONT"
-    assert "SENS1:SWE:MODE SING" not in sim.history and "SENS2:SWE:MODE SING" not in sim.history
-    assert rec.values["m1.trace"] is None and rec.values["m2.trace"].x_unit == "s"   # канал 1 стоит
-    # выключили - всё как было, частота CW осталась
+    assert rec.values["gen.state"] is True and rec.values["gen.channel"] == 1
+    assert sim.c["type"] == "CW"
+    assert sim.c["pow_modes"] == {1: "OFF", 2: "OFF", 3: "OFF", 4: "ON"}
+    assert rec.values["source.power"] == pytest.approx(-15.0)
+
+    # Переключаем CW на порт 3
+    assert setp(drv, rec, "gen.port", 3) is PStatus.WRITTEN
+    assert sim.c["pow_modes"] == {1: "OFF", 2: "OFF", 3: "ON", 4: "OFF"}
+    assert rec.values["source.power"] == pytest.approx(0.0)
+
+    # Выключаем CW -> возвращаются прежние настройки и уровни всех 4 портов
     assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
-    after = sim.stim(2)
-    for k in ("type", "start", "stop", "poin", "bwid", "pow", "aver", "coun", "swt_auto", "corr"):
-        assert after[k] == before[k], k
-    assert after["cw"] == 3e9 and sim.c["outp"] is False
-    assert rec.values["sweep.type"] == "LOG" and rec.values["source.power"] == pytest.approx(-15.0)
-    assert rec.values["gen.channel"] is None and rec.values["stim.channel"] == 2
-    del sim.history[:]
-    drv.poll()
-    assert sim.stim(1)["mode"] == "CONT" and rec.values["m1.trace"] is not None
-    assert "SENS1:SWE:MODE SING" not in sim.history
-    assert not rec.comm
-
-
-def test_generator_mode_restored_on_disconnect(vna):
-    drv, sim, rec = vna
-    assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN and sim.c["type"] == "CW"
-    drv.close_connection()
     assert sim.c["type"] == "LIN"
-
-
-def test_generator_mode_keeps_sweep_modes_of_other_channels(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)           # не читается, на приборе CONT
-    sim.meas["CH3_S11"] = _meas("S11", "MLOG", 3)
-    sim.stim(3)["mode"] = "HOLD"                             # пользователь остановил канал 3
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert sim.stim(2)["mode"] == "CONT"
-    assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN
-    assert (sim.stim(2)["mode"], sim.stim(3)["mode"], sim.c["type"]) == ("HOLD", "HOLD", "CW")
-    del sim.history[:]
-    drv.poll()
-    assert not any(c.startswith(("SENS2:SWE:MODE", "SENS3:SWE:MODE")) for c in sim.history)
-    assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
-    assert (sim.stim(2)["mode"], sim.stim(3)["mode"], sim.c["type"]) == ("CONT", "HOLD", "LIN")
-    assert not rec.comm
-
-
-def test_generator_port_routing_and_continuous_source(vna):
-    drv, sim, rec = vna
-    sim.c["cset"] = "CAL_FULL"
-    assert setp(drv, rec, "cal.state", True) is PStatus.WRITTEN
-    assert setp(drv, rec, "trig.source", "EXT") is PStatus.WRITTEN
-    assert setp(drv, rec, "source.power", -12.0) is PStatus.WRITTEN
-    assert rec.values["gen.port"] == 1
-    assert setp(drv, rec, "gen.state", True) is PStatus.WRITTEN
-    assert sim.c["type"] == "CW" and sim.c["corr"] is False and sim.trig["sour"] == "IMM"
-    assert sim.c["pow_coup"] is False
-    assert sim.c["pow_mode1"] == "ON" and sim.c["pow_mode2"] == "OFF"
-    # переключение на порт 2: источник держится на порту 2, мощность читается/пишется для порта 2
-    assert setp(drv, rec, "gen.port", 2) is PStatus.WRITTEN
-    assert sim.c["pow_mode1"] == "OFF" and sim.c["pow_mode2"] == "ON"
-    assert setp(drv, rec, "source.power", 3.0) is PStatus.WRITTEN
-    assert sim.c["pow2"] == pytest.approx(3.0) and sim.c["pow"] == pytest.approx(-12.0)
-    # выход из генератора: возвращает триггер, калибровку, связь мощностей и режимы источников
-    assert setp(drv, rec, "gen.state", False) is PStatus.WRITTEN
-    assert sim.c["type"] == "LIN" and sim.c["corr"] is True and sim.trig["sour"] == "EXT"
-    assert sim.c["pow_coup"] is True and sim.c["pow_mode1"] == "AUTO" and sim.c["pow_mode2"] == "AUTO"
-    assert sim.c["pow"] == pytest.approx(-12.0) and sim.c["pow2"] == pytest.approx(-12.0)
-    assert not rec.comm
-
-
-def test_trigger_settings_external_and_manual(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    v = rec.values
-    assert (v["trig.source"], v["trig.scope"], v["trig.mode"], v["trig.slope"], v["trig.type"], v["trig.delay"]) == \
-        ("IMM", "ALL", "CHANNEL", "POS", "EDGE", 0.0)
-    for k, val in (("trig.slope", "NEG"), ("trig.type", "LEVEL"), ("trig.delay", 0.01), ("trig.scope", "CURRENT")):
-        assert setp(drv, rec, k, val) is PStatus.WRITTEN, k
-    assert sim.trig == {"sour": "IMM", "scop": "CURR", "slop": "NEG", "type": "LEV", "del": 0.01}
-    # режим запуска - у канала CH
-    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN
-    assert setp(drv, rec, "trig.mode", "POINT") is PStatus.WRITTEN
-    assert sim.stim(2)["tmode"] == "POIN" and sim.c["tmode"] == "CHAN"
-    assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN and v["trig.mode"] == "CHANNEL"
-    # внешний: развёртка ждёт импульса на входе
-    assert setp(drv, rec, "trig.source", "EXT") is PStatus.WRITTEN and sim.trig["sour"] == "EXT"
-    done = sim.sweeps_done
-    for _ in range(3):
-        drv.poll()
-    assert sim.sweeps_done == done and v["meas.armed"] is True and not rec.comm     # ждём, без таймаута
-    sim.trigger()
-    drv.poll()
-    assert sim.sweeps_done == done + 1 and v["m1.trace"] is not None
-    # ручной + по точке: каждый TRIG - одна точка
-    assert setp(drv, rec, "sweep.points", 3) is PStatus.WRITTEN
-    assert setp(drv, rec, "trig.mode", "POINT") is PStatus.WRITTEN
-    assert setp(drv, rec, "trig.source", "MAN") is PStatus.WRITTEN
-    done = sim.sweeps_done
-    for i in range(3):
-        drv.poll()
-        assert sim.sweeps_done == done
-        drv.run_action("trigger")
-    assert "INIT1:IMM" in sim.history
-    drv.poll()
-    assert sim.sweeps_done == done + 1 and len(v["m1.trace"]) == 3 and not rec.comm
-
-
-def test_scale_and_processing_of_selected_trace(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "PHAS", 2)
-    sim.windows[2] = {1: "CH2_S21"}
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    v = rec.values
-    assert v["trace.sel"] == "1:CH1_S11_1" and v["scale.div"] == 10.0 and v["scale.rpos"] == 5.0
-    assert v["smooth.state"] is False and v["scale.edel"] == 0.0
-    assert setp(drv, rec, "trace.sel", "2:CH2_S21") is PStatus.WRITTEN
-    for k, val in (("scale.div", 45.0), ("scale.ref", -90.0), ("scale.rpos", 8.0)):
-        assert setp(drv, rec, k, val) is PStatus.WRITTEN, k
-    m = sim.meas["CH2_S21"]
-    assert (m["pdiv"], m["rlev"], m["rpos"]) == (45.0, -90.0, 8.0) and "pdiv" not in sim.meas["CH1_S11_1"]
-    assert "DISP:WIND2:TRAC1:Y:PDIV 45" in sim.history
-    drv.run_action("autoscale")
-    assert m["pdiv"] != 45.0 and v["scale.div"] == m["pdiv"] and v["scale.rpos"] == 5.0
-    # задержка и сглаживание меняют читаемые данные
-    assert setp(drv, rec, "m2.channel", 2) is PStatus.WRITTEN and setp(drv, rec, "m2.name", "CH2_S21") is PStatus.WRITTEN
-    assert setp(drv, rec, "m2.enabled", True) is PStatus.WRITTEN
-    drv.poll()
-    raw = list(v["m2.trace"].y)
-    assert setp(drv, rec, "scale.edel", 1e-9) is PStatus.WRITTEN and m["edel"] == 1e-9
-    drv.poll()
-    assert list(v["m2.trace"].y) != raw
-    assert setp(drv, rec, "scale.edel", 0.0) is PStatus.WRITTEN
-    assert setp(drv, rec, "smooth.aper", 10.0) is PStatus.WRITTEN
-    assert setp(drv, rec, "smooth.state", True) is PStatus.WRITTEN and m["smo"] and m["aper"] == 10.0
-    drv.poll()
-    sm = list(v["m2.trace"].y)
-    assert sm != raw and max(sm) - min(sm) < max(raw) - min(raw)          # сглаженная - ровнее
-    assert setp(drv, rec, "smooth.aper", 50.0) is not PStatus.WRITTEN      # больше 25 % нельзя
-    assert setp(drv, rec, "trace.sel", "2:NOPE") is PStatus.ERROR
-    assert not rec.comm
-
-
-def test_cal_set_per_channel(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    v = rec.values
-    assert v["cal.set"] == "" and v["cal.state"] is False and v["cal.stim"] is True and v["cal.interp"] is True
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    drv.run_action("cal_list")
-    assert actions[-1] == ("cal_list", ["CAL_1-3G", "CAL_FULL"])
-    assert setp(drv, rec, "cal.state", True) is not PStatus.WRITTEN and v["cal.state"] is False   # без cal set
-    # cal set со стимулом: канал 1 берёт частоты / точки / полосу / мощность калибровки
-    assert setp(drv, rec, "cal.set", "CAL_1-3G") is PStatus.WRITTEN
-    assert v["cal.set"] == "CAL_1-3G" and v["cal.state"] is True
-    assert (v["freq.start"], v["freq.stop"], v["sweep.points"], v["bw.if"]) == (1e9, 3e9, 201, 1e3)
-    # канал 2: без стимула, обзор внутри калибровки - интерполяция
-    assert setp(drv, rec, "stim.channel", 2) is PStatus.WRITTEN and v["cal.set"] == ""
-    assert setp(drv, rec, "cal.stim", False) is PStatus.WRITTEN
-    assert setp(drv, rec, "cal.set", "CAL_FULL") is PStatus.WRITTEN
-    assert v["cal.set"] == "CAL_FULL" and v["cal.state"] is True and v["freq.start"] == pytest.approx(1e9)
-    assert 'SENS2:CORR:CSET:ACT "CAL_FULL",0' in sim.history
-    assert setp(drv, rec, "cal.set", "NOPE") is PStatus.ERROR
-    assert setp(drv, rec, "cal.set", "") is PStatus.WRITTEN               # снять
-    assert v["cal.set"] == "" and v["cal.state"] is False and sim.stim(2)["cset"] == ""
-    assert sim.c["cset"] == "CAL_1-3G"                                     # канал 1 не тронут
-    # удаление cal set снимает его с канала
-    assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN and v["cal.set"] == "CAL_1-3G"
-    drv.run_action("cal_delete", "CAL_1-3G")
-    assert actions[-1] == ("cal_delete", ["CAL_FULL"])
-    assert v["cal.set"] == "" and v["cal.state"] is False
-    assert not rec.comm
-
-
-def test_guided_calibration(make):
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
-    v = rec.values
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    drv.run_action("cal_conns")
-    assert actions[-1][1] == ["APC 3.5 female", "APC 3.5 male", "Type N (50) female", "Type N (50) male"]
-    drv.run_action("cal_kits", "APC 3.5 female")
-    assert actions[-1][1][0] == "Ideal 3.5mm"                  # идеальный набор - первым
-    with pytest.raises(ValueError):
-        drv.run_custom_action("cal_measure", (1,))             # калибровка не начата
-    drv.run_action("cal_start", ("APC 3.5 female", "Ideal 3.5mm", "Type N (50) male", "Ideal Type N"))
-    steps, done = actions[-1][1]
-    assert len(steps) == 7 and steps[0] == "Connect APC 3.5 female OPEN to port 1" and done == []
-    assert "THRU" in steps[-1] and not drv._armed               # развёртки стоят
-    with pytest.raises(ValueError):
-        drv.run_custom_action("cal_save", ("MYCAL",))           # не все стандарты
-    for k in range(1, 8):
-        drv.run_action("cal_measure", k)
-        assert v["cal.busy"] is True
-        drv.poll()
-        assert v["cal.busy"] is False
-    drv.run_action("cal_status")
-    assert actions[-1][1] == (steps, list(range(1, 8)))
-    drv.run_action("cal_save", "MYCAL")
-    assert "MYCAL" in actions[-1][1] and sim.c["cset"] == "MYCAL" and sim.c["corr"]
-    assert v["cal.set"] == "MYCAL" and v["cal.state"] is True and drv._armed      # развёртки снова идут
-    # ECal на одном порту: один шаг; прервать
-    drv.run_action("cal_start", ("APC 3.5 male", "N4691-60004 ECal", "", ""))
-    assert actions[-1][1][0] == ["Connect ECal module to port 1"]
-    drv.run_action("cal_abort")
-    assert drv._cal is None and drv._armed and not rec.comm
-
-
-def test_snp_read_for_touchstone(make, tmp_path):
-    from visalab.core.export import write_touchstone
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
-    for k, v in (("freq.start", 1e9), ("freq.stop", 3e9), ("sweep.points", 11)):
-        assert setp(drv, rec, k, v) is PStatus.WRITTEN
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    drv.run_action("snp_read", "1,2")
-    sp = actions[-1][1]
-    assert list(sp) == ["S11", "S21", "S12", "S22"] and sim.snp_form == "RI"
-    s21 = sp["S21"]
-    assert s21.is_complex and len(s21) == 11 and s21.x[0] == 1e9 and s21.x[-1] == 3e9
-    assert s21.complex_y()[5] == pytest.approx(sim.s("S21", 2e9))
-    path = write_touchstone(tmp_path / "dut.s2p", sp, ["test"])
-    lines = path.read_text().splitlines()
-    assert lines[0] == "! test" and "# HZ S RI R 50" in lines and len(lines) == 3 + 11
-    assert len(lines[-1].split()) == 9
-    drv.run_action("snp_read", "2")
-    assert list(actions[-1][1]) == ["S22"]
-    assert drv._armed and not rec.comm
-
-
-def test_thru_response_calibration(make):
-    sim = KeysightPNASim()
-    sim.meas["CH1_S21"] = _meas("S21", "MLOG", 1)
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    with pytest.raises(ValueError):
-        drv.run_custom_action("cal_start_thru", ())          # выбран S11 - не перемычка
-    assert setp(drv, rec, "trace.sel", "1:CH1_S21") is PStatus.WRITTEN
-    drv.run_action("cal_start_thru")
-    steps, done = actions[-1][1]
-    assert steps == ["Connect THRU between port 1 and port 2 (S21 CH1_S21)"] and done == [] and not drv._armed
-    drv.run_action("cal_measure", 1)
-    drv.poll()
-    assert rec.values["cal.busy"] is False
-    drv.run_action("cal_save", "THRU_CAL")
-    assert "THRU_CAL" in actions[-1][1] and sim.c["cset"] == "THRU_CAL" and sim.c["corr"]
-    assert "SENS1:CORR:COLL:METH TRAN1" in sim.history and drv._armed and not rec.comm
-
-
-def test_markers_of_selected_trace(make):
-    sim = KeysightPNASim()
-    sim.meas["CH2_S21"] = _meas("S21", "MLOG", 2)
-    sim.windows[2] = {1: "CH2_S21"}
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    v = rec.values
-    assert v["mark.n"] == 1 and v["mark.state"] is False and v["mark.y"] is None
-    actions = []
-    drv.action_done.connect(lambda n, r: actions.append((n, r)))
-    assert setp(drv, rec, "trace.sel", "2:CH2_S21") is PStatus.WRITTEN
-    drv.run_action("mark_peak")                                 # M1 на максимум S21 канала 2 (1..2 ГГц)
-    assert v["mark.state"] is True and v["mark.x"] == pytest.approx(2e9, rel=1e-2)
-    assert v["mark.y"] == pytest.approx(-1.0, abs=0.1) and actions[-1][1][0][0] == 1
-    assert setp(drv, rec, "mark.n", 3) is PStatus.WRITTEN and v["mark.state"] is False
-    assert setp(drv, rec, "mark.x", 1.5e9) is PStatus.WRITTEN and v["mark.state"] is True
-    assert sim.meas["CH2_S21"]["marks"][3]["x"] == 1.5e9 and not any(m["on"] for m in sim.meas["CH1_S11_1"].get("marks", {}).values())
-    drv.run_action("mark_table")
-    assert [n for n, _x, _y in actions[-1][1]] == [1, 3]
-    assert setp(drv, rec, "mark.state", False) is PStatus.WRITTEN and v["mark.y"] is None
-    assert setp(drv, rec, "trace.sel", "1:CH1_S11_1") is PStatus.WRITTEN and v["mark.state"] is False  # свои маркеры
-    assert setp(drv, rec, "trace.sel", "2:CH2_S21") is PStatus.WRITTEN
-    drv.run_action("mark_aoff")
-    assert not any(m["on"] for m in sim.meas["CH2_S21"]["marks"].values()) and actions[-1] == ("mark_aoff", [])
-    assert setp(drv, rec, "mark.n", 11) is not PStatus.WRITTEN
-    assert not rec.comm
-
-
-def test_serial_poll_not_supported_falls_back_to_stb_query(qapp):
-    """VI_ERROR_NSUP_OPER на read_stb (LAN): дальше статус через *STB?, без ошибки связи."""
-    from visalab.transport import SimTransport
-    from visalab.transport import TransportNotSupported
-    from visalab.drivers import DRIVERS
-    drv_cls, sim_cls = DRIVERS["pna"]
-
-    class NoPoll(SimTransport):
-        def read_stb(self):
-            raise TransportNotSupported("The given session or object reference does not support this operation")
-
-    t = NoPoll(sim_cls())
-    drv = drv_cls(t)
-    comm = []
-    drv.comm_error.connect(comm.append)
-    drv.open_connection()
-    drv._on_poll()
-    drv._on_poll()
-    assert not comm and t.supports_serial_poll is False
-    drv.close_connection()
-
-
-def test_stimulus_changed_on_the_pna_screen(vna):
-    """Стимул поменяли на экране PNA: ось трассы и ключи стимула - по прибору, без SYNC."""
-    drv, sim, rec = vna
-    drv.poll()
-    assert rec.values["trace"].x[-1] == pytest.approx(13.5e9)
-    sim.stim(1).update(start=1e9, stop=3e9, poin=201)          # не через драйвер
-    drv.poll()
-    drv.poll()
-    t = rec.values["trace"]
-    assert t.x[0] == pytest.approx(1e9) and t.x[-1] == pytest.approx(3e9)
-    assert rec.values["freq.start"] == pytest.approx(1e9) and rec.values["freq.stop"] == pytest.approx(3e9)
-    assert rec.values["freq.center"] == pytest.approx(2e9) and rec.values["freq.span"] == pytest.approx(2e9)
-    assert not rec.errors and not rec.comm
-
-
-def test_continuous_mode_never_sends_sing_and_keeps_cont_on_disconnect(make):
-    """В непрерывном режиме CONT не посылаются SING/HOLD при опросе, настройке и отключении."""
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
-    assert rec.values["meas.continuous"] is True and sim.c["mode"] == "CONT"
-    setp(drv, rec, "freq.start", 1e9)
-    setp(drv, rec, "format", "PHASE")
-    drv.poll()
-    drv.poll()
-    assert rec.values["m1.trace"] is not None
-    assert not any("SWE:MODE SING" in c or "SWE:MODE HOLD" in c for c in sim.history)
-    drv.close_connection()
-    assert sim.c["mode"] == "CONT"
-
-
-def test_single_and_abort_use_sing_only_on_request(make):
-    sim = KeysightPNASim()
-    sim.c["mode"] = "HOLD"                                  # прибор был в HOLD -> при подключении запускается CONT
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert sim.c["mode"] == "CONT" and rec.values["meas.continuous"] is True and rec.values["meas.armed"] is True
-    drv.run_action("abort")
-    assert sim.c["mode"] == "HOLD" and rec.values["meas.continuous"] is False and rec.values["meas.armed"] is False
-    sim.hold_sweeps = True
-    drv.run_action("single")
-    assert "SENS1:SWE:MODE SING" in sim.history and rec.values["meas.armed"] is True
-    sim.finish_sweep()
-    drv.poll()
-    assert rec.values["meas.armed"] is False and rec.values["m1.trace"] is not None
-    assert sim.c["mode"] == "HOLD"                          # после single снова ждёт в HOLD
-    # включили CONT -> перешёл в CONT; abort -> HOLD
-    assert setp(drv, rec, "meas.continuous", True) is PStatus.WRITTEN
-    assert sim.c["mode"] == "CONT" and rec.values["meas.armed"] is True
-    drv.run_action("abort")
-    assert sim.c["mode"] == "HOLD" and rec.values["meas.continuous"] is False and rec.values["meas.armed"] is False
-
-
-def test_app_data_dir_uses_appdata_when_set(monkeypatch, tmp_path):
-    from visalab.applog import app_data_dir, default_ini_path, default_log_path
-    monkeypatch.setenv("APPDATA", str(tmp_path))
-    assert app_data_dir() == tmp_path / "visalab"
-    assert default_ini_path() == tmp_path / "visalab" / "visalab_front.ini"
-    assert default_log_path(default_ini_path()) == tmp_path / "visalab" / "logs" / "visalab.log"
-
-
-def test_full_scpi_trig_immediate_and_no_oper_bit_still_reads_traces(make):
-    """На реальном PNA TRIG:SOUR? может вернуть 'IMMEDIATE', а STAT:OPER:EVEN? - 0: фоллбэк читает трассу."""
-    sim = KeysightPNASim()
-    sim.on("TRIGger[:SEQuence]:SOURce",
-           sim._tenum("sour", {"IMM": "IMM", "IMMEDIATE": "IMM", "EXT": "EXT", "EXTERNAL": "EXT",
-                               "MAN": "MAN", "MANUAL": "MAN"}),
-           lambda a, g: {"IMM": "IMMEDIATE", "EXT": "EXTERNAL", "MAN": "MANUAL"}[sim.trig["sour"]])
-    sim.on("STATus:OPERation[:EVENt]", get=lambda a, g: "0")
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim, sim=sim)
-    assert rec.values["trig.source"] == "IMM"
-    assert rec.values["m1.trace"] is not None and not rec.errors
-    first = rec.values["m1.trace"]
-    drv._last_cont_read = 0.0
-    drv.poll()
-    assert rec.values["m1.trace"] is not first and not rec.errors
-    assert drv._cont_fallback_s() <= 2.0
-
-
-def test_strict_markers_off_do_not_error(make):
-    """Выключенный маркер не запрашивает :X? (нет -221); mark_x и mark_peak включают его без ошибок."""
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
-    assert rec.values["mark.state"] is False
-    assert rec.values["mark.x"] is None and rec.values["mark.y"] is None
-    assert not rec.errors and not rec.comm
-    assert setp(drv, rec, "mark.n", 2) is PStatus.WRITTEN
-    assert rec.values["mark.state"] is False and rec.values["mark.x"] is None
+    assert sim.c["pow_modes"] == {1: "AUTO", 2: "AUTO", 3: "AUTO", 4: "AUTO"}
+    assert sim.c["pow_levels"] == {1: -10.0, 2: -5.0, 3: 0.0, 4: -15.0}
     assert not rec.errors
-    assert setp(drv, rec, "mark.x", 2e9) is PStatus.WRITTEN
-    assert rec.values["mark.state"] is True and rec.values["mark.x"] == pytest.approx(2e9)
-    assert not rec.errors
-    drv.run_action("mark_aoff")
-    assert rec.values["mark.state"] is False and rec.values["mark.x"] is None
-    drv.run_action("mark_peak")
-    assert rec.values["mark.state"] is True and rec.values["mark.x"] is not None
-    assert not rec.errors and not rec.comm
 
 
-def test_trace_meta_includes_device_scale_and_tracks_changes(vna):
-    """Метаданные трассы содержат масштаб экрана (PDIV/RLEV/RPOS) и обновляются с прибора и через драйвер."""
+def test_power_offset_calibration(vna):
     drv, sim, rec = vna
-    drv.poll()
-    t = rec.values["m1.trace"]
-    assert t.meta["scale_div"] == pytest.approx(10.0)
-    assert t.meta["scale_ref"] == pytest.approx(0.0)
-    assert t.meta["scale_rpos"] == pytest.approx(5.0)
-    # Изменение масштаба на экране прибора
-    sim.meas["CH1_S11_1"].update(pdiv=5.0, rlev=-20.0, rpos=8.0)
-    drv.poll()
-    drv.poll()
-    t2 = rec.values["m1.trace"]
-    assert t2.meta["scale_div"] == pytest.approx(5.0)
-    assert t2.meta["scale_ref"] == pytest.approx(-20.0)
-    assert t2.meta["scale_rpos"] == pytest.approx(8.0)
-    assert rec.values["scale.div"] == pytest.approx(5.0)
-    # Изменение масштаба через драйвер в HOLD сразу обновляет метаданные трассы
-    drv.run_action("abort")
-    assert setp(drv, rec, "scale.div", 2.0) is PStatus.WRITTEN
-    assert rec.values["m1.trace"].meta["scale_div"] == pytest.approx(2.0)
-    assert not rec.errors and not rec.comm
-
-
-def test_trace_reads_even_when_wnum_or_scale_queries_unsupported(make):
-    """Если прошивка PNA не поддерживает WNUM?/TNUM? или Y:SCAL:PDIV? (-113, нет ответа), трасса всё равно читается."""
-    # 1) Нет WNUM?/TNUM?, но DISP:WIND1:TRAC1:Y:SCAL:* работает -> фоллбэк (1, 1) читает масштаб
-    sim1 = KeysightPNASim()
-    sim1.meas["CH1_S11_1"].update(pdiv=5.0, rlev=-10.0, rpos=8.0)
-    sim1._handlers = [h for h in sim1._handlers if "WNUM" not in h[0] and "TNUM" not in h[0]]
-    drv1, _s1, rec1 = make(KeysightPNA, KeysightPNASim, sim=sim1)
-    assert drv1._wnum_supported is False
-    drv1.poll()
-    t1 = rec1.values["m1.trace"]
-    assert isinstance(t1, Trace) and len(t1) > 1 and not rec1.comm
-    assert t1.meta["scale_div"] == pytest.approx(5.0)
-    assert t1.meta["scale_ref"] == pytest.approx(-10.0)
-    assert t1.meta["scale_rpos"] == pytest.approx(8.0)
-
-    # 2) Нет и WNUM?/TNUM?, и PDIV? -> трасса всё равно читается (без масштаба, без зависаний и обрыва)
-    sim2 = KeysightPNASim()
-    sim2._handlers = [h for h in sim2._handlers
-                      if "WNUM" not in h[0] and "TNUM" not in h[0] and "PDIV" not in h[0]]
-    drv2, _s2, rec2 = make(KeysightPNA, KeysightPNASim, sim=sim2)
-    drv2.poll()
-    t2 = rec2.values["m1.trace"]
-    assert isinstance(t2, Trace) and len(t2) > 1 and not rec2.comm
-    assert drv2._scale_read_supported is False
-    assert "scale_div" not in t2.meta
-    # Повторный опрос уже не шлёт неподдерживаемый PDIV? и WNUM?
-    before = len(sim2.history)
-    drv2.poll()
-    assert not any("PDIV" in c or "WNUM" in c for c in sim2.history[before:])
-    assert not rec2.comm
-
-
-def test_continuous_poll_recovers_when_oper_bit_fires_once_then_stops(make):
-    """Если STAT:OPER:EVEN? вернул бит 4 один раз (_oper_seen=True), а затем в CONT возвращает 0,
-    фоллбэк по времени всё равно продолжает читать трассы."""
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
-    drv.poll()
-    assert drv._oper_seen is True
-    first = rec.values["m1.trace"]
-    # Теперь прибор больше не взводит бит 4 в STAT:OPER:EVEN? в свободном CONT
-    sim.on("STATus:OPERation[:EVENt]", get=lambda a, g: "0")
-    drv._last_cont_read = 0.0
-    drv.poll()
-    assert rec.values["m1.trace"] is not first and not rec.errors and not rec.comm
-
-
-def test_source_power_calibration(make):
-    """Калибровка выходного тракта ВАЦ: power.offset / power.offset_state."""
-    drv, sim, rec = make(KeysightPNA, KeysightPNASim)
-    assert setp(drv, rec, "source.power", -10.0) is PStatus.WRITTEN
-    assert sim.c["pow"] == pytest.approx(-10.0)
-    # Внешний усилитель +20 дБ (поправка −20 дБ): включение не дёргает порт прибора
-    assert setp(drv, rec, "power.offset", -20.0) is PStatus.WRITTEN
-    assert setp(drv, rec, "power.offset_state", True) is PStatus.WRITTEN
-    assert sim.c["pow"] == pytest.approx(-10.0)
-    assert rec.values["source.power"] == pytest.approx(10.0)       # на DUT +10 дБм
-    # Задание +5 дБм на DUT -> порт ставит −15 дБм
-    assert setp(drv, rec, "source.power", 5.0) is PStatus.WRITTEN
-    assert sim.c["pow"] == pytest.approx(-15.0)
-    assert rec.values["source.power"] == pytest.approx(5.0)
-    # Новая частота: усиление 18.5 дБ (поправка −18.5 дБ) -> порт подстраивается до −13.5 дБм, DUT остаётся +5 дБм
+    assert setp(drv, rec, "source.power", 0.0) is PStatus.WRITTEN
+    assert sim.c["pow"] == pytest.approx(0.0)
     assert setp(drv, rec, "power.offset", -18.5) is PStatus.WRITTEN
+    assert setp(drv, rec, "power.offset_state", True) is PStatus.WRITTEN
+    # включение поправки не меняет физический выход до новой записи
+    assert sim.c["pow"] == pytest.approx(0.0)
+    assert rec.values["source.power"] == pytest.approx(18.5)
+    assert setp(drv, rec, "source.power", 5.0) is PStatus.WRITTEN
     assert sim.c["pow"] == pytest.approx(-13.5)
     assert rec.values["source.power"] == pytest.approx(5.0)
-    # Предел мощности источника сдвинут на −off: максимум на DUT = 20 − (−18.5) = +38.5 дБм
-    assert setp(drv, rec, "source.power", 35.0) is PStatus.WRITTEN
-    assert sim.c["pow"] == pytest.approx(16.5)
-    assert setp(drv, rec, "source.power", 40.0) is PStatus.INVALID
-    assert sim.c["pow"] == pytest.approx(16.5)
-    # Выключение калибровки не меняет мощность на порту
-    assert setp(drv, rec, "power.offset_state", False) is PStatus.WRITTEN
-    assert sim.c["pow"] == pytest.approx(16.5)
-    assert rec.values["source.power"] == pytest.approx(16.5)
-    assert not rec.comm
+
+
+# ============================================================ 7. Touchstone 1..4 порта (snp_read + write_touchstone)
+def test_snp_read_and_write_touchstone_1_2_4_ports(vna, tmp_path):
+    drv, sim, rec = vna
+    assert setp(drv, rec, "freq.start", 1e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "freq.stop", 3e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "sweep.points", 11) is PStatus.WRITTEN
+
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+
+    # По умолчанию на 4-портовом ВАЦ — все 4 порта (16 параметров)
+    drv.run_action("snp_read")
+    sp4 = actions[-1][1]
+    assert len(sp4) == 16 and "S41" in sp4 and "S44" in sp4
+    assert all(tr.is_complex and len(tr) == 11 for tr in sp4.values())
+    s4p = write_touchstone(tmp_path / "dut.s4p", sp4, comments=["4-port test"])
+    lines4 = [ln for ln in s4p.read_text(encoding="utf-8").splitlines() if ln and not ln.startswith(("!", "#"))]
+    assert len(lines4) == 11 * 4  # по 4 строки на частоту по стандарту Touchstone 1.x
+
+    # 2-портовое подмножество портов 1 и 4 -> .s2p
+    drv.run_action("snp_read", "1,4")
+    sp14 = actions[-1][1]
+    assert list(sp14) == ["S11", "S41", "S14", "S44"]
+    s2p = write_touchstone(tmp_path / "p14.s2p", sp14)
+    lines2 = [ln for ln in s2p.read_text(encoding="utf-8").splitlines() if ln and not ln.startswith(("!", "#"))]
+    assert len(lines2) == 11
+
+    # 1 порт -> .s1p
+    drv.run_action("snp_read", "4")
+    sp1 = actions[-1][1]
+    assert list(sp1) == ["S44"]
+    s1p = write_touchstone(tmp_path / "p4.s1p", sp1)
+    assert s1p.exists()
+    assert not rec.errors
+
+
+# ============================================================ 8. Калибровка (4-портовая guided и THRU S41)
+def test_4_port_guided_and_thru_s41_calibration(vna):
+    drv, sim, rec = vna
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+
+    # Guided-калибровка всех 4 портов (механический набор: 4*3 OSL + 3 THRU = 15 шагов)
+    drv.run_action(
+        "cal_start",
+        ("APC 3.5 female", "85052D",
+         "APC 3.5 female", "85052D",
+         "APC 3.5 female", "85052D",
+         "APC 3.5 female", "85052D"),
+    )
+    steps, done = actions[-1][1]
+    assert len(steps) == 15 and done == []
+    for k in range(1, 16):
+        drv.run_action("cal_measure", k)
+        drv.poll()
+    drv.run_action("cal_save", "CAL_4PORT")
+    assert "CAL_4PORT" in actions[-1][1]
+    assert rec.values["cal.set"] == "CAL_4PORT" and rec.values["cal.state"] is True
+
+    # Response THRU калибровка напрямую для S41
+    drv.run_action("cal_start_thru", "S41")
+    steps, done = actions[-1][1]
+    assert len(steps) == 1 and "S41" in steps[0]
+    drv.run_action("cal_measure", 1)
+    drv.poll()
+    drv.run_action("cal_save", "CAL_THRU_41")
+    assert "CAL_THRU_41" in actions[-1][1]
+    assert rec.values["cal.set"] == "CAL_THRU_41"
+    assert not rec.errors
+
+
+# ============================================================ 9. Состояния (.csa) и Reset
+def test_state_save_recall_and_reset(vna):
+    drv, sim, rec = vna
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+
+    assert setp(drv, rec, "freq.start", 1.5e9) is PStatus.WRITTEN
+    drv.run_action("state_save", "bench_4p")
+    drv.run_action("state_list")
+    assert "bench_4p" in actions[-1][1]
+
+    assert setp(drv, rec, "freq.start", 4.0e9) is PStatus.WRITTEN
+    drv.run_action("state_recall", "bench_4p")
+    assert rec.values["freq.start"] == pytest.approx(1.5e9)
+
+    drv.run_action("reset")
+    assert rec.values["s.active"] == "S11"
+    assert not rec.errors
+
+
+# ============================================================ 10. Proxy & Instrument (Слои 3 и 4)
+def test_proxy_and_coord_instrument_sparam_api_and_sweep_signal(qtbot):
+    sim = KeysightPNASim(ports=4)
+    proxy = InstrumentProxy(KeysightPNA, SimTransport(sim))
+    inst = Instrument(proxy)
+    COORD.links.add(inst)
+    mon = ActivityMonitor()
+    sweeps: list[dict[str, Trace]] = []
+    s41_updates: list[Trace | None] = []
+    inst.sweep_updated.connect(sweeps.append)
+    inst.subscribe_sparam("S41", s41_updates.append)
+
+    try:
+        inst.open()
+        _wait(qtbot, lambda: inst.is_connected and inst.value("ports") == 4)
+        assert inst.ports == 4
+        assert inst.active_sparams() == ["S11"]
+
+        inst.set_sparams(["S11", "S41"])
+        _wait(qtbot, lambda: inst.active_sparams() == ["S11", "S41"] and inst.sparam_trace("S41") is not None)
+
+        traces = inst.sparam_traces()
+        assert set(traces) == {"S11", "S41"}
+        assert traces["S11"].is_complex and traces["S41"].is_complex
+        assert any("S41" in sw and "S11" in sw for sw in sweeps)
+        assert any(isinstance(t, Trace) and t.name == "S41" for t in s41_updates)
+
+        # ActivityMonitor видит 4-портовый сигнал S41 и отдаёт трассы
+        assert mon.vna_has_signal(inst) is True
+        labels = [lbl for lbl, _tr in mon.vna_traces(inst)]
+        assert labels == ["1·S11", "1·S41"]
+
+        # enable_sparam выключает S41
+        inst.enable_sparam("S41", False)
+        _wait(qtbot, lambda: inst.active_sparams() == ["S11"] and inst.sparam_trace("S41") is None)
+        assert set(inst.sparam_traces()) == {"S11"}
+    finally:
+        mon.stop()
+        COORD.links.remove(inst)
+        inst.shutdown()

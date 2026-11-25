@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 from bisect import bisect_left
+from dataclasses import dataclass
 import math
 from typing import Any, Callable
 
@@ -25,6 +26,8 @@ __all__ = [
     "ANALYSIS_KEYS",
     "MATH_MODES",
     "MATH_LABELS",
+    "XRangeSet",
+    "parse_x_range_expr",
     "analyze_trace",
     "format_analysis",
     "validate_math_expr",
@@ -41,10 +44,10 @@ ANALYSIS_METRICS: tuple[tuple[str, str, str], ...] = (
     ("max", "MAX", "Maximum value and its X coordinate"),
     ("std", "STD", "Standard deviation (RMS spread around the mean)"),
     ("pp", "P-P", "Peak-to-peak span (Max − Min)"),
-    ("flatness", "FLAT", "Flatness: ±(Max − Min) / 2"),
+    ("flatness", "FLAT", "Flatness: ±(Max − Min)/2 relative to the linear best-fit line"),
     ("nonlin", "NONLIN", "Nonlinearity: max deviation from the linear best-fit line"),
     ("slope", "SLOPE", "Linear regression slope (dY / dX)"),
-    ("rms", "RMS", "Root mean square value"),
+    ("rms", "RMS", "Root mean square value (power-domain average for dB/dBm)"),
     ("bw3", "BW-3dB", "-3 dB bandwidth around the peak"),
 )
 ANALYSIS_KEYS: tuple[str, ...] = tuple(k for k, _lbl, _tip in ANALYSIS_METRICS)
@@ -264,9 +267,216 @@ def _bw3(xs: list[float], ys: list[float]) -> float | None:
     return right_x - left_x
 
 
+@dataclass(frozen=True)
+class XRangeSet:
+    """Множество точек и отрезков по оси X вида ``[x,y]+5-[a,b]`` (поддерживает и ``{...}``)."""
+
+    raw: str
+    ops: tuple[tuple[str, tuple[tuple[float, float], ...]], ...]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.ops
+
+    def contains(self, value: float | None) -> bool:
+        if self.is_empty:
+            return True
+        if value is None or not math.isfinite(value):
+            return False
+        x = float(value)
+        included = self.ops[0][0] == "-"
+        for op, items in self.ops:
+            hit = False
+            for lo, hi in items:
+                if lo == hi:
+                    tol = max(1e-9, 1e-6 * abs(lo))
+                else:
+                    tol = 1e-9 * max(abs(lo), abs(hi), 1.0)
+                if (lo - tol) <= x <= (hi + tol):
+                    hit = True
+                    break
+            if op == "+" and hit:
+                included = True
+            elif op == "-" and hit:
+                included = False
+        return included
+
+    def intervals(self, full_lo: float, full_hi: float) -> list[tuple[float, float]]:
+        """Вернуть отсортированный список включённых отрезков внутри ``[full_lo, full_hi]``."""
+        if self.is_empty or full_hi < full_lo:
+            return []
+        active: list[tuple[float, float]] = [(full_lo, full_hi)] if self.ops[0][0] == "-" else []
+        for op, items in self.ops:
+            if op == "+":
+                for lo, hi in items:
+                    a, b = max(full_lo, lo), min(full_hi, hi)
+                    if b >= a:
+                        active.append((a, b))
+                active.sort()
+                merged: list[tuple[float, float]] = []
+                for a, b in active:
+                    if merged and a <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+                    else:
+                        merged.append((a, b))
+                active = merged
+            else:
+                for lo, hi in items:
+                    nxt: list[tuple[float, float]] = []
+                    for a, b in active:
+                        if hi < a or lo > b:
+                            nxt.append((a, b))
+                        else:
+                            if a < lo:
+                                nxt.append((a, lo))
+                            if b > hi:
+                                nxt.append((hi, b))
+                    active = nxt
+        return active
+
+
+def _split_range_terms(expr: str) -> list[tuple[str, str]]:
+    terms: list[tuple[str, str]] = []
+    brace = 0
+    bracket = 0
+    op = "+"
+    buf: list[str] = []
+    n = len(expr)
+    for i, ch in enumerate(expr):
+        if ch == "{":
+            brace += 1
+            buf.append(ch)
+        elif ch == "}":
+            brace -= 1
+            if brace < 0:
+                raise ValueError("Unmatched '}'")
+            buf.append(ch)
+        elif ch == "[":
+            bracket += 1
+            buf.append(ch)
+        elif ch == "]":
+            bracket -= 1
+            if bracket < 0:
+                raise ValueError("Unmatched ']'")
+            buf.append(ch)
+        elif ch in ("+", "-") and brace == 0 and bracket == 0:
+            cur = "".join(buf).strip()
+            prev_ch = cur[-1] if cur else ""
+            rest = expr[i + 1:].lstrip()
+            if not cur and not terms and ch == "-" and rest.startswith(("[", "{")):
+                op = "-"
+            elif not cur or prev_ch in ("e", "E", ","):
+                buf.append(ch)
+            else:
+                terms.append((op, cur))
+                op = ch
+                buf = []
+        else:
+            buf.append(ch)
+    if brace != 0:
+        raise ValueError("Unclosed '{'")
+    if bracket != 0:
+        raise ValueError("Unclosed '['")
+    tail = "".join(buf).strip()
+    if tail:
+        terms.append((op, tail))
+    elif terms or op == "-":
+        raise ValueError(f"Trailing '{op}' operator")
+    return terms
+
+
+def _split_range_items(group: str) -> list[str]:
+    s = group.strip()
+    if s.startswith("{"):
+        if not s.endswith("}"):
+            raise ValueError("Expected closing '}'")
+        s = s[1:-1].strip()
+    if not s:
+        return []
+    parts: list[str] = []
+    bracket = 0
+    buf: list[str] = []
+    for ch in s:
+        if ch == "[":
+            bracket += 1
+            buf.append(ch)
+        elif ch == "]":
+            bracket -= 1
+            if bracket < 0:
+                raise ValueError("Unmatched ']'")
+            buf.append(ch)
+        elif ch == "," and bracket == 0:
+            item = "".join(buf).strip()
+            if not item:
+                raise ValueError("Empty element near ','")
+            parts.append(item)
+            buf = []
+        else:
+            buf.append(ch)
+    if bracket != 0:
+        raise ValueError("Unclosed '['")
+    last = "".join(buf).strip()
+    if last:
+        parts.append(last)
+    return parts
+
+
+def _parse_x_scalar(text: str, unit: str) -> float:
+    s = str(text or "").strip().replace(",", ".")
+    if not s:
+        raise ValueError("Empty number")
+    try:
+        val = float(si_parse(s, unit or ""))
+    except ValueError:
+        if unit and s.lower().endswith(unit.lower()):
+            val = float(s[:-len(unit)].strip())
+        else:
+            val = float(s)
+    if not math.isfinite(val):
+        raise ValueError(f"Invalid value: {text!r}")
+    return val
+
+
+def parse_x_range_expr(expr: str, unit: str = "") -> XRangeSet:
+    """Разобрать выражение диапазона X вида ``[x,y]+5-[a,b]`` (или ``{...}``) с SI-префиксами."""
+    raw = str(expr or "").strip()
+    if not raw:
+        return XRangeSet("", ())
+    terms = _split_range_terms(raw)
+    ops: list[tuple[str, tuple[tuple[float, float], ...]]] = []
+    for op, grp in terms:
+        items_str = _split_range_items(grp)
+        if not items_str:
+            raise ValueError(f"Empty term {grp!r}")
+        parsed_items: list[tuple[float, float]] = []
+        for it in items_str:
+            if it.startswith("["):
+                if not it.endswith("]"):
+                    raise ValueError(f"Unclosed interval {it!r}")
+                inner = it[1:-1].strip()
+                if not inner:
+                    raise ValueError("Empty interval []")
+                bounds = [b.strip() for b in inner.split(",")]
+                if len(bounds) == 1:
+                    val = _parse_x_scalar(bounds[0], unit)
+                    parsed_items.append((val, val))
+                elif len(bounds) == 2:
+                    a = _parse_x_scalar(bounds[0], unit)
+                    b = _parse_x_scalar(bounds[1], unit)
+                    parsed_items.append((min(a, b), max(a, b)))
+                else:
+                    raise ValueError(f"Interval must have 1 or 2 bounds: {it!r}")
+            else:
+                val = _parse_x_scalar(it, unit)
+                parsed_items.append((val, val))
+        ops.append((op, tuple(parsed_items)))
+    return XRangeSet(raw, tuple(ops))
+
+
 def analyze_trace(trace: Trace | None, *, x_range: tuple[float, float] | None = None,
+                  x_filter: XRangeSet | Callable[[float], bool] | None = None,
                   y_transform=None) -> dict[str, Any]:
-    """Посчитать набор статистических и ВЧ-метрик трассы в пределах ``x_range``."""
+    """Посчитать набор статистических и ВЧ-метрик трассы в пределах ``x_range`` / ``x_filter``."""
     if trace is None or len(trace) == 0:
         return {}
     xs: list[float] = []
@@ -274,11 +484,18 @@ def analyze_trace(trace: Trace | None, *, x_range: tuple[float, float] | None = 
     x_lo = x_hi = None
     if x_range is not None and math.isfinite(x_range[0]) and math.isfinite(x_range[1]):
         x_lo, x_hi = (x_range[0], x_range[1]) if x_range[0] <= x_range[1] else (x_range[1], x_range[0])
+    check_x = None
+    if isinstance(x_filter, XRangeSet):
+        check_x = x_filter.contains if not x_filter.is_empty else None
+    elif callable(x_filter):
+        check_x = x_filter
     isfinite = math.isfinite
     for x, y in zip(trace.x, trace.y):
         if not (isfinite(x) and isfinite(y)):
             continue
         if x_lo is not None and (x < x_lo or x > x_hi):
+            continue
+        if check_x is not None and not check_x(x):
             continue
         yv = y_transform(y) if y_transform is not None else y
         if not isfinite(yv):
@@ -294,13 +511,18 @@ def analyze_trace(trace: Trace | None, *, x_range: tuple[float, float] | None = 
     y_min, x_min = ys[min_i], xs[min_i]
     y_max, x_max = ys[max_i], xs[max_i]
     pp = y_max - y_min
-    flatness = 0.5 * pp
     var = sum((y - mean) ** 2 for y in ys) / n
     std = math.sqrt(var)
-    rms = math.sqrt(sum(y * y for y in ys) / n)
+    if trace.y_unit in ("dB", "dBm") and y_transform is None:
+        # В логарифмических единицах (dB/dBm) RMS считаем в линейной области мощности
+        lin_mean = sum(10.0 ** (max(-300.0, min(300.0, y)) / 10.0) for y in ys) / n
+        rms = 10.0 * math.log10(lin_mean) if lin_mean > 0.0 else math.nan
+    else:
+        rms = math.sqrt(sum(y * y for y in ys) / n)
 
     slope: float | None = None
     nonlin: float | None = None
+    flatness: float = 0.0
     span_x = abs(xs[-1] - xs[0]) if n >= 2 else 0.0
     if n >= 2:
         mx = sum(xs) / n
@@ -310,10 +532,12 @@ def analyze_trace(trace: Trace | None, *, x_range: tuple[float, float] | None = 
             a = sxy / sxx
             b = mean - a * mx
             slope = a
-            nonlin = max(abs(y - (a * x + b)) for x, y in zip(xs, ys))
+            residuals = [y - (a * x + b) for x, y in zip(xs, ys)]
         else:
             slope = 0.0
-            nonlin = max(abs(y - mean) for y in ys)
+            residuals = [y - mean for y in ys]
+        nonlin = max(abs(r) for r in residuals)
+        flatness = 0.5 * (max(residuals) - min(residuals))
 
     bw3 = _bw3(xs, ys) if trace.y_unit in ("dB", "dBm") and y_transform is None else None
     return {

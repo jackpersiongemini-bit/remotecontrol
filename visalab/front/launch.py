@@ -106,7 +106,9 @@ def remember_windows(opened: list[dict], settings: QSettings) -> None:
         win = cur.get("win")
         if win is None or sip.isdeleted(win):
             continue
-        visible = bool(not win.isHidden()) if getattr(win, "is_docked", False) else bool(win.isVisible())
+        if getattr(win, "_hosted_in_sections", False):
+            continue
+        visible = bool(win.isVisible())
         key = f"WINDOWS/{cur['lab_key']}/VISIBLE"
         if settings.value(key, None, type=bool) != visible or settings.value(key) is None:
             settings.setValue(key, visible)
@@ -163,11 +165,11 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
     def reconnect(kind: str, address: str, model: str) -> None:
         nonlocal delay, poll_pause
         old_proxy, old_win = current["proxy"], current["win"]
-        was_docked = bool(getattr(old_win, "is_docked", False))
-        old_dock = getattr(old_win, "_dock", None) if was_docked else None
-        pos = old_win._floating_pos if was_docked else old_win.pos()
-        visible = bool(not old_win.isHidden()) if was_docked else old_win.isVisible()
-        old_win.save_size()
+        hosted = bool(getattr(old_win, "_hosted_in_sections", False)) or callable(current.get("on_reconnected"))
+        pos = None if hosted else old_win.pos()
+        visible = False if hosted else old_win.isVisible()
+        if not hosted:
+            old_win.save_size()
         old_win.presets.save()
         old_win.hide()
         if hasattr(old_win, "cleanup"):
@@ -177,9 +179,10 @@ def _open(window_cls, lab_key: str, args, settings: QSettings, cli_address: str 
         delay = saved_delay(settings, window_cls.CONNECTION_GROUP)
         poll_pause = saved_poll_pause(settings, window_cls.CONNECTION_GROUP)
         try:
-            build(kind, address, model or None, pos, visible and not was_docked)
-            if was_docked and old_dock is not None and not sip.isdeleted(old_dock):
-                old_dock.attach(current["win"], show=visible, save=True)
+            build(kind, address, model or None, pos, visible)
+            on_reconnected = current.get("on_reconnected")
+            if callable(on_reconnected):
+                on_reconnected(current["win"])
         except Exception:  # noqa: BLE001 - не оставлять в current удалённое окно
             current["win"] = None
             logging.getLogger("visalab").exception("ошибка пересоздания окна %s", window_cls.__name__)

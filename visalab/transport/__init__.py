@@ -30,7 +30,8 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 __all__ = ["TransportError", "TransportTimeout", "TransportNotSupported", "Transport", "PyVisaTransport", "SimTransport",
-           "parse_float_block", "float_block", "lan_endpoint", "list_resources", "strip_response_header"]
+           "binary_block", "parse_binary_block", "double_block", "parse_float_block", "float_block",
+           "lan_endpoint", "list_resources", "strip_response_header"]
 
 
 class TransportError(Exception):
@@ -45,15 +46,32 @@ class TransportNotSupported(TransportError):
     """Интерфейс не умеет эту операцию VISA (VI_ERROR_NSUP_OPER: serial poll, device clear...)."""
 
 
-def float_block(values) -> str:
-    """IEEE 488.2 блок ``#<n><len><данные>`` из float32 big-endian (строка latin-1 - для симуляторов)."""
-    data = struct.pack(f">{len(values)}f", *values)
+def binary_block(values, datatype: str = "d", big_endian: bool = True) -> str:
+    """IEEE 488.2 двоичный блок ``#<n><len><данные>`` из float32 (``"f"``) или float64 (``"d"``)
+    (строка latin-1 - для симуляторов)."""
+    if datatype not in ("f", "d"):
+        raise ValueError(f"неподдерживаемый тип двоичного блока: {datatype!r}")
+    endian = ">" if big_endian else "<"
+    data = struct.pack(f"{endian}{len(values)}{datatype}", *values)
     size = str(len(data))
     return f"#{len(size)}{size}" + data.decode("latin-1")
 
 
-def parse_float_block(raw: bytes) -> list[float]:
-    """Разобрать IEEE 488.2 блок float32 big-endian (``#3400....`` или ``#0....\\n``)."""
+def float_block(values) -> str:
+    """IEEE 488.2 блок ``#<n><len><данные>`` из float32 big-endian (строка latin-1 - для симуляторов)."""
+    return binary_block(values, datatype="f", big_endian=True)
+
+
+def double_block(values, big_endian: bool = True) -> str:
+    """IEEE 488.2 блок ``#<n><len><данные>`` из float64 (строка latin-1 - для симуляторов)."""
+    return binary_block(values, datatype="d", big_endian=big_endian)
+
+
+def parse_binary_block(raw: bytes, datatype: str = "d", big_endian: bool = True) -> list[float]:
+    """Разобрать IEEE 488.2 блок float32 (``"f"``) или float64 (``"d"``) (``#3400....`` или ``#0....\\n``)."""
+    if datatype not in ("f", "d"):
+        raise ValueError(f"неподдерживаемый тип двоичного блока: {datatype!r}")
+    item_size = 8 if datatype == "d" else 4
     start = raw.find(b"#")
     if start < 0 or len(raw) < start + 2:
         raise TransportError("нет двоичного блока в ответе")
@@ -72,9 +90,15 @@ def parse_float_block(raw: bytes) -> list[float]:
             raise TransportError(f"некорректная длина двоичного блока: {size_bytes!r}")
         size = int(size_bytes)
         data = raw[start + 2 + ndig:start + 2 + ndig + size]
-    if len(data) != size or size % 4:
+    if len(data) != size or size % item_size:
         raise TransportError(f"двоичный блок: ждали {size} байт, пришло {len(data)}")
-    return list(struct.unpack(f">{size // 4}f", data))
+    endian = ">" if big_endian else "<"
+    return list(struct.unpack(f"{endian}{size // item_size}{datatype}", data))
+
+
+def parse_float_block(raw: bytes) -> list[float]:
+    """Разобрать IEEE 488.2 блок float32 big-endian (``#3400....`` или ``#0....\\n``)."""
+    return parse_binary_block(raw, datatype="f", big_endian=True)
 
 
 _VISA_LOGGED = False
@@ -163,10 +187,14 @@ class Transport(ABC):
         False - точно нет (узел LAN не отвечает); по умолчанию - пробовать."""
         return True
 
+    def query_binary_floats(self, message: str, datatype: str = "d", big_endian: bool = True) -> list[float]:
+        """Запрос с ответом - двоичным блоком IEEE 488.2 float32 (``"f"``) или float64 (``"d"``)."""
+        self.write(message)
+        return parse_binary_block(self.read().encode("latin-1"), datatype=datatype, big_endian=big_endian)
+
     def query_float_block(self, message: str) -> list[float]:
         """Запрос с ответом - двоичным блоком float32 big-endian (TRAC:DATA? у U2020X)."""
-        self.write(message)
-        return parse_float_block(self.read().encode("latin-1"))
+        return self.query_binary_floats(message, datatype="f", big_endian=True)
 
     def discard_input(self, wait_ms: int = 200, max_reads: int = 50) -> None:
         """Выбросить ответы, пришедшие с опозданием (после таймаута): читать, пока прибор молчит
@@ -314,10 +342,15 @@ class PyVisaTransport(Transport):
     def read(self) -> str:
         return self._call_res("read").strip()
 
-    def query_float_block(self, message: str) -> list[float]:
+    def query_binary_floats(self, message: str, datatype: str = "d", big_endian: bool = True) -> list[float]:
         if self._res is None:
             raise TransportError(f"{self.address}: ресурс не открыт")
-        return list(self._call(lambda: self._res.query_binary_values(message, datatype="f", is_big_endian=True)))
+        return list(self._call(
+            lambda: self._res.query_binary_values(message, datatype=datatype, is_big_endian=big_endian)
+        ))
+
+    def query_float_block(self, message: str) -> list[float]:
+        return self.query_binary_floats(message, datatype="f", big_endian=True)
 
     def read_stb(self) -> int:
         return int(self._call_res("read_stb"))

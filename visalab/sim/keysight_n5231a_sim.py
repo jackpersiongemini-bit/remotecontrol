@@ -1,16 +1,23 @@
-"""Симулятор ВАЦ Keysight PNA-L N5231A с моделью полосового фильтра на входе.
+"""Симулятор ВАЦ Keysight PNA / PNA-L (2 или 4 порта, по умолчанию 4 порта N5230C-420).
 
-DUT: резонатор с центральной частотой ``f0``, нагруженной добротностью ``q`` и потерями
-``il_db``: S21 = S12 = k/(1 + jQ(f/f0 - f0/f)), S11 = S22 = 1 - S21/k*(1 - r) (отражение
-вне полосы ~1); ``dut = None`` - на портах ничего (S21 ~ -100 dB, S11 ~ 0 dB). Этого достаточно, чтобы проверять форматы, маркеры и развёртки.
-Измерения - как на приборе: каталог «имя,S-параметр», выбор ``CALC:PAR:SEL``.
+DUT: резонатор с центральной частотой ``f0``, нагруженной добротностью ``q`` и потерями ``il_db``:
+* S21 = S12 = k / (1 + jQ(f/f0 - f0/f));
+* для остальных пар передачи (S31, S41, S32, S42, S43...) — тот же резонатор с добавочными потерями
+  и фазовым сдвигом, зависящим от пары портов (удобно проверять чтение S41, S31 и т.д.);
+* для отражения (S11, S22, S33, S44) = 1 - s21/k * 0.98;
+* ``dut = None`` — открытые порты (передача ~ -100 dB, отражение ~ 0 dB).
+
+Поддерживает двоичную передачу IEEE 488.2 (``FORM:DATA REAL,64|REAL,32|ASC``, ``FORM:BORD NORM|SWAP``)
+для ``CALC#:DATA? SDATA|FDATA``, ``SENS#:X?``, ``CALC#:X?`` и ``CALC#:DATA:SNP:PORT?``.
 """
 from __future__ import annotations
 
 import cmath
 import copy
 import math
+import re
 
+from ..transport import binary_block
 from .base import ESR_EXE, ESR_OPC, SimError, SimInstrument
 
 __all__ = ["KeysightPNASim"]
@@ -19,29 +26,63 @@ _FMT = {"MLOG": "MLOG", "PHAS": "PHAS", "PHASE": "PHAS", "UPH": "UPH", "UPHASE":
         "GDELAY": "GDEL", "SWR": "SWR", "MLIN": "MLIN", "REAL": "REAL", "IMAG": "IMAG", "POL": "POL", "POLAR": "POL",
         "SMIT": "SMIT", "SMITH": "SMIT"}
 
+_SPARAM_RE = re.compile(r"^S(\d)(\d)$")
 
 DEFAULT_DIR = "C:\\Users\\Public\\Documents\\Network Analyzer"
 CONNECTORS = ("APC 3.5 female", "APC 3.5 male", "Type N (50) female", "Type N (50) male", "Not used")
 #: семейство разъёма -> наборы (идеальный - как пользовательское определение набора на приборе)
 KITS = {"APC 3.5": ("85052D", "Ideal 3.5mm", "N4691-60004 ECal"), "Type N": ("85054D", "Ideal Type N")}
 
+
 class KeysightPNASim(SimInstrument):
-    IDN = "Agilent Technologies,N5231A,MY00000001,A.09.90.02"
-    F_MIN, F_MAX = 300e3, 13.5e9
+    IDN = "Keysight Technologies,N5230C,MY00000001,A.09.90.02"
+    F_MIN, F_MAX = 300e3, 20e9
+
+    def __init__(self, ports: int = 4):
+        self.ports = max(1, min(4, int(ports)))
+        if self.ports == 2:
+            self.IDN = "Agilent Technologies,N5231A,MY00000001,A.09.90.02"
+            self.F_MAX = 13.5e9
+        super().__init__()
+
+    def _valid_sparam(self, text: str) -> str:
+        s = text.strip().strip("'\"").upper()
+        m = _SPARAM_RE.match(s)
+        if not m:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        a, b = int(m.group(1)), int(m.group(2))
+        if not (1 <= a <= self.ports and 1 <= b <= self.ports):
+            raise SimError(-224, f"Illegal parameter value; port out of range 1..{self.ports}", ESR_EXE)
+        return s
+
+    def _new_stim(self, start: float = 10e6, stop: float | None = None, poin: int = 201) -> dict:
+        if stop is None:
+            stop = self.F_MAX
+        st: dict = {
+            "start": start, "stop": stop, "poin": poin, "bwid": 35e3,
+            "pow": -5.0,
+            "pow_levels": {p: -5.0 for p in range(1, self.ports + 1)},
+            "pow_modes": {p: "AUTO" for p in range(1, self.ports + 1)},
+            "pow_coup": True, "outp": True,
+            "pow_start": -20.0, "pow_stop": 0.0,
+            "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "gro_coun": 1,
+            "corr": False, "mode": "CONT", "tmode": "CHAN",
+            "type": "LIN", "cw": 1e9, "cset": "", "interp": True,
+        }
+        self._auto_time(st)
+        return st
 
     def reset(self) -> None:
-        self.c = {"start": 10e6, "stop": 13.5e9, "poin": 201, "bwid": 35e3, "pow": -5.0, "pow2": -5.0,
-                  "pow_coup": True, "pow_mode1": "AUTO", "pow_mode2": "AUTO", "outp": True,
-                  "swt": 0.02, "swt_auto": True, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN",
-                  "form": "ASC", "type": "LIN", "cw": 1e9, "cset": "", "interp": True}
+        self.c = self._new_stim(10e6, self.F_MAX, 201)
+        self.form_data = ("ASC", 0)                       # ("ASC", 0) | ("REAL", 32) | ("REAL", 64)
+        self.form_bord = "NORM"                           # "NORM" (big-endian) | "SWAP" (little-endian)
         self.meas = {"CH1_S11_1": {"s": "S11", "fmt": "MLOG", "ch": 1}}
-        self.selected = ""                               # выбранное измерение канала 1
-        self.sel_other: dict[int, str] = {}              # то же у остальных каналов
-        self.other: dict[int, dict] = {}                 # стимул каналов 2...
-        self.marker = {"on": False, "x": 1e9}
+        self.selected = ""                                # выбранное измерение канала 1
+        self.sel_other: dict[int, str] = {}               # то же у остальных каналов
+        self.other: dict[int, dict] = {}                  # стимул каналов 2...
         self.trig = {"sour": "IMM", "scop": "ALL", "slop": "POS", "type": "EDGE", "del": 0.0}
-        self.trig_count = 0                              # триггеров в текущей развёртке (режим POINT)
-        self.windows: dict[int, dict[int, str]] = {1: {1: "CH1_S11_1"}}     # окно -> {номер трейса: измерение}
+        self.trig_count = 0                               # триггеров в текущей развёртке (режим POINT)
+        self.windows: dict[int, dict[int, str]] = {1: {1: "CH1_S11_1"}}
         self.sweeping = True
         self.opc_pending = False
         self.sweeps_done = 0
@@ -49,20 +90,23 @@ class KeysightPNASim(SimInstrument):
         self.oper_ntr = 0
         self.oper_even = 0
         self.oper_cond = 16
-        if not hasattr(self, "dirs"):                    # папки и файлы переживают *RST
+        if not hasattr(self, "dirs"):                     # папки и файлы переживают *RST
             self.dirs: dict[str, dict[str, tuple]] = {DEFAULT_DIR: {}, DEFAULT_DIR + "\\Lab": {}}
             self.cdir = DEFAULT_DIR
-            self.files: dict[str, tuple] = self.dirs[self.cdir]     # "имя.csa" -> состояние, текущая папка
-        if not hasattr(self, "csets"):                   # cal set'ы переживают *RST: имя -> стимул калибровки
+            self.files: dict[str, tuple] = self.dirs[self.cdir]
+        if not hasattr(self, "csets"):                    # cal set'ы переживают *RST
             self.csets: dict[str, dict] = {
                 "CAL_1-3G": {"start": 1e9, "stop": 3e9, "poin": 201, "type": "LIN", "cw": 1e9, "bwid": 1e3,
                              "pow": -10.0},
-                "CAL_FULL": {"start": 10e6, "stop": 13.5e9, "poin": 401, "type": "LIN", "cw": 1e9, "bwid": 10e3,
+                "CAL_FULL": {"start": 10e6, "stop": self.F_MAX, "poin": 401, "type": "LIN", "cw": 1e9, "bwid": 10e3,
                              "pow": -5.0}}
         self.snp_form = "MA"
-        self.coll: dict = {}                             # калибровка без мастера: метод, канал, что измерено
-        self.guid = {"conn": {1: "Not used", 2: "Not used"}, "kit": {1: "", 2: ""}, "steps": [], "done": set(),
-                     "ch": 1}
+        self.coll: dict = {}
+        self.guid = {
+            "conn": {p: "Not used" for p in range(1, self.ports + 1)},
+            "kit": {p: "" for p in range(1, self.ports + 1)},
+            "steps": [], "done": set(), "ch": 1,
+        }
         if not hasattr(self, "dut"):
             self.dut = {"f0": 2e9, "q": 20.0, "il_db": 1.0}
             self.hold_sweeps = False
@@ -76,33 +120,61 @@ class KeysightPNASim(SimInstrument):
 
     def s(self, name: str, f: float) -> complex:
         d = self.dut
-        if d is None:                                    # порты открыты: передачи нет, полное отражение
-            return complex(1e-5, 0) if name in ("S21", "S12") else complex(0.999, 0)
+        m = _SPARAM_RE.match(name.upper())
+        a, b = (int(m.group(1)), int(m.group(2))) if m else (1, 1)
+        if d is None:                                     # порты открыты: передачи нет, полное отражение
+            return complex(0.999, 0) if a == b else complex(1e-5, 0)
         k = 10 ** (-d["il_db"] / 20)
         s21 = k / complex(1, d["q"] * (f / d["f0"] - d["f0"] / f))
-        if name in ("S21", "S12"):
+        if a == b:
+            return 1 - s21 / k * 0.98
+        if {a, b} == {1, 2}:
             return s21
-        return 1 - s21 / k * 0.98
+        # для портов 3 и 4 — реалистично отличимая передача (доп. потери и фазовый сдвиг)
+        extra_db = 2.0 * (abs(a - b) - 1) + 0.5 * (max(a, b) - 2)
+        phase_rad = 0.25 * (a + b)
+        return s21 * (10 ** (-extra_db / 20)) * cmath.exp(1j * phase_rad)
 
     def stim(self, ch: int) -> dict:
         """Стимул канала: канал 1 - ``self.c``, остальные создаются при первом обращении."""
         if ch == 1:
             return self.c
         if ch not in self.other:
-            st = {"start": 1e9, "stop": 2e9, "poin": 101, "type": "LIN", "cw": 1e9, "bwid": 35e3, "pow": -5.0,
-                  "pow2": -5.0, "pow_coup": True, "pow_mode1": "AUTO", "pow_mode2": "AUTO",
-                  "swt_auto": True, "swt": 0.0, "aver": False, "coun": 1, "corr": False, "mode": "CONT", "tmode": "CHAN",
-                  "cset": "", "interp": True}
-            self._auto_time(st)
-            self.other[ch] = st
+            self.other[ch] = self._new_stim(1e9, 2e9, 101)
         return self.other[ch]
 
-    def freqs(self, ch: int = 1) -> list[float]:
+    def x_axis(self, ch: int = 1) -> list[float]:
+        """Точная ось X канала (SENS#:X?): частоты (LIN/LOG/SEGM), мощность (POW) или время (CW)."""
         st = self.stim(ch)
-        n, a, b = st["poin"], st["start"], st["stop"]
-        if st["type"] == "CW":
-            return [st["cw"]] * n
+        n = st["poin"]
+        typ = st["type"]
+        if typ == "CW":
+            swt = st["swt"]
+            return [swt * i / (n - 1) if n > 1 else 0.0 for i in range(n)]
+        if typ == "POW":
+            a, b = st["pow_start"], st["pow_stop"]
+            return [a + (b - a) * i / (n - 1) if n > 1 else a for i in range(n)]
+        a, b = st["start"], st["stop"]
+        if typ == "LOG" and a > 0 and b > 0 and n > 1:
+            ratio = b / a
+            return [a * (ratio ** (i / (n - 1))) for i in range(n)]
         return [a + (b - a) * i / (n - 1) if n > 1 else a for i in range(n)]
+
+    def freqs(self, ch: int = 1) -> list[float]:
+        """Частоты в точках развёртки (для расчёта S(f) DUT)."""
+        st = self.stim(ch)
+        n = st["poin"]
+        if st["type"] in ("CW", "POW"):
+            return [st["cw"]] * n
+        return self.x_axis(ch)
+
+    def _encode_numbers(self, values: list[float]) -> str:
+        """Упаковать массив чисел по текущему ``FORM:DATA`` / ``FORM:BORD``."""
+        kind, bits = self.form_data
+        if kind == "REAL":
+            datatype = "f" if bits == 32 else "d"
+            return binary_block(values, datatype=datatype, big_endian=(self.form_bord == "NORM"))
+        return ",".join(f"{v:+.11E}" for v in values)
 
     def sdata(self, name: str) -> list[float]:
         """Комплексные данные измерения: re, im, re, im, ..."""
@@ -113,26 +185,9 @@ class KeysightPNASim(SimInstrument):
         return out
 
     def fdata(self, name: str) -> list[float]:
-        """Данные в формате измерения; сглаживание - скользящее среднее по апертуре (% точек)."""
-        out = self._fdata(name)
-        m = self.meas[name]
-        if not m.get("smo") or m["fmt"] in ("POL", "SMIT") or len(out) < 3:
-            return out
-        half = max(1, round(m.get("aper", 1.5) / 100 * len(out))) // 2 or 1
-        return [sum(out[max(0, i - half):i + half + 1]) / len(out[max(0, i - half):i + half + 1])
-                for i in range(len(out))]
-
-    def _fdata(self, name: str) -> list[float]:
         m = self.meas[name]
         fs = self.freqs(m["ch"])
         vals = [self.s(m["s"], f) for f in fs]
-        if m.get("edel"):                                # электрическая задержка: компенсация набега фазы
-            vals = [v * cmath.exp(2j * math.pi * f * m["edel"]) for v, f in zip(vals, fs)]
-        mem, fn = m.get("mem"), m.get("math", "NORM")
-        if fn != "NORM" and mem is not None and len(mem) == len(vals):
-            op = {"DIV": lambda d, p: d / p if p else 0j, "SUBT": lambda d, p: d - p,
-                  "ADD": lambda d, p: d + p, "MULT": lambda d, p: d * p}[fn]
-            vals = [op(d, p) for d, p in zip(vals, mem)]
         fmt = m["fmt"]
         if fmt == "MLOG":
             return [20 * math.log10(max(abs(v), 1e-15)) for v in vals]
@@ -158,7 +213,7 @@ class KeysightPNASim(SimInstrument):
             return out
         if fmt == "SWR":
             return [(1 + min(abs(v), 0.999999)) / (1 - min(abs(v), 0.999999)) for v in vals]
-        if fmt in ("POL", "SMIT"):                       # комплексные форматы: пары re,im
+        if fmt in ("POL", "SMIT"):
             return [x for v in vals for x in (v.real, v.imag)]
         if fmt == "REAL":
             return [v.real for v in vals]
@@ -175,13 +230,13 @@ class KeysightPNASim(SimInstrument):
         self.oper_cond &= ~16
         if self.oper_ntr & 16:
             self.oper_even |= 16
-        for st in (self.c, *self.other.values()):       # однократные развёртки закончились
-            if st["mode"] == "SING":
+        for st in (self.c, *self.other.values()):       # однократные / групповые развёртки закончились
+            if st["mode"] in ("SING", "GRO"):
                 st["mode"] = "HOLD"
         if self.opc_pending:
             self.opc_pending = False
             self.esr |= ESR_OPC
-        if self._has_cont():                             # непрерывный режим - сразу ждём следующую развёртку
+        if self._has_cont():
             self.sweeping = True
             self.trig_count = 0
             self.oper_cond |= 16
@@ -201,9 +256,11 @@ class KeysightPNASim(SimInstrument):
 
     def register(self) -> None:
         self.on("SYSTem:ERRor[:NEXT]", get=self._err)
+        self.on("SYSTem:CAPabilities:HARDware:PORT:COUNt", get=lambda a, g: str(self.ports))
         self.on("SYSTem:CHANnels:CATalog", get=lambda a, g: '"' + ",".join(
             str(c) for c in sorted({1} | {m["ch"] for m in self.meas.values()} | set(self.other))) + '"')
-        self.on("FORMat[:DATA]", self._form_set, lambda a, g: "ASC,0")
+        self.on("FORMat[:DATA]", self._form_set, self._form_get)
+        self.on("FORMat:BORDer", self._bord_set, lambda a, g: self.form_bord)
         self.on("CALCulate#:PARameter:CATalog:EXTended", get=self._cat)
         self.on("CALCulate#:PARameter:CATalog", get=self._cat)
         self.on("CALCulate#:PARameter:SELect", self._sel, lambda a, g: f'"{self._selected(self._ch(g))}"')
@@ -214,37 +271,14 @@ class KeysightPNASim(SimInstrument):
         self.on("DISPlay:WINDow#:CATalog", get=self._win_cat)
         self.on("DISPlay:WINDow#:TRACe#:FEED", self._feed)
         self.on("CALCulate#:FORMat", self._fmt_set, lambda a, g: self._cur(g)["fmt"])
-        self.on("CALCulate#:PARameter:WNUMber", get=lambda a, g: str(self._place(g)[0]))
-        self.on("CALCulate#:PARameter:TNUMber", get=lambda a, g: str(self._place(g)[1]))
-        for scpi, key, lo, hi, dflt in (("PDIVision", "pdiv", 1e-18, 1e12, 10.0),
-                                        ("RLEVel", "rlev", -1e12, 1e12, 0.0), ("RPOSition", "rpos", 0, 20, 5.0)):
-            self.on(f"DISPlay:WINDow#:TRACe#:Y[:SCALe]:{scpi}", self._scale_set(key, lo, hi),
-                    lambda a, g, k=key, d=dflt: f"{self._wt(g).get(k, d):+.11E}")
-        self.on("DISPlay:WINDow#:TRACe#:Y[:SCALe]:AUTO", self._autoscale)
-        self.on("CALCulate#:CORRection:EDELay[:TIME]", self._meas_num("edel", -10, 10),
-                lambda a, g: f"{self._cur(g).get('edel', 0.0):+.11E}")
-        self.on("CALCulate#:CORRection[:STATe]", self._meas_corr_set, self._meas_corr_get)
-        self.on("CALCulate#:SMOothing:APERture", self._meas_num("aper", 1, 25),
-                lambda a, g: f"{self._cur(g).get('aper', 1.5):+.11E}")
-        self.on("CALCulate#:SMOothing[:STATe]", self._smo_set, lambda a, g: "1" if self._cur(g).get("smo") else "0")
         self.on("CALCulate#:DATA", get=self._data)
-        self.on("CALCulate#:MATH:MEMorize", self._memorize)
-        self.on("CALCulate#:MATH:FUNCtion", self._math_set, lambda a, g: self._cur(g).get("math", "NORM"))
+        self.on("CALCulate#:X", get=lambda a, g: self._encode_numbers(self.x_axis(self._ch(g))))
+        self.on("SENSe#:X[:VALues]", get=lambda a, g: self._encode_numbers(self.x_axis(self._ch(g))))
         self.on("MMEMory:STORe[:FILE]", self._st_store)
         self.on("MMEMory:LOAD[:FILE]", self._st_load)
         self.on("MMEMory:CATalog", get=lambda a, g: '"' + ",".join(sorted(self.files) + self.subdirs()) + '"')
         self.on("MMEMory:DELete", self._file_del)
         self.on("MMEMory:CDIRectory", self._cdir, lambda a, g: f'"{self.cdir}"')
-        self.on("CALCulate#:MARKer#:FUNCtion:EXECute", self._mk_exec)
-        self.on("CALCulate#:MARKer#:X", self._mk_x, self._mk_x_get)
-        self.on("CALCulate#:MARKer:AOFF", self._mk_aoff)
-        self.on("CALCulate#:MARKer#:Y", get=self._mk_y)
-        self.on("CALCulate#:MARKer#[:STATe]", self._mk_state, lambda a, g: "1" if self._mk(g)["on"] else "0")
-        self.on("CALCulate#:LIMit:DISPlay[:STATe]", self._lim_disp, lambda a, g: "1" if self._lim(g)["disp"] else "0")
-        self.on("CALCulate#:LIMit[:STATe]", self._lim_stat, lambda a, g: "1" if self._lim(g)["stat"] else "0")
-        self.on("CALCulate#:LIMit:DATA", self._lim_data_set, self._lim_data_get)
-        self.on("CALCulate#:LIMit:DATA:DELete", self._lim_data_del)
-        self.on("CALCulate#:LIMit:FAIL", get=self._lim_fail)
         self.on("SENSe#:FREQuency:STARt", self._f("start"), self._gs("start"))
         self.on("SENSe#:FREQuency:STOP", self._f("stop"), self._gs("stop"))
         self.on("SENSe#:FREQuency:CENTer", self._f("center"), self._gs("center"))
@@ -256,9 +290,12 @@ class KeysightPNASim(SimInstrument):
         self.on("SENSe#:FREQuency:FIXed", self._cw_set, self._gs("cw"))
         self.on("SENSe#:SWEep:TIME:AUTO", self._b("swt_auto"), self._gb("swt_auto"))
         self.on("SENSe#:SWEep:TIME", self._n("swt", 0, 86400, auto="swt_auto"), self._gs("swt"))
+        self.on("SENSe#:SWEep:GROup:COUNt", self._n("gro_coun", 1, 65536, integer=True),
+                lambda a, g: str(self.stim(self._ch(g))["gro_coun"]))
         self.on("SENSe#:SWEep:MODE", self._mode_set, lambda a, g: self.stim(self._ch(g))["mode"])
         self.on("SENSe#:BWIDth[:RESolution]", self._bwid_set, self._gs("bwid"))
-        self.on("SENSe#:AVERage:COUNt", self._n("coun", 1, 65536, integer=True), lambda a, g: str(self.stim(self._ch(g))["coun"]))
+        self.on("SENSe#:AVERage:COUNt", self._n("coun", 1, 65536, integer=True),
+                lambda a, g: str(self.stim(self._ch(g))["coun"]))
         self.on("SENSe#:AVERage[:STATe]", self._b("aver"), self._gb("aver"))
         self.on("SENSe#:CORRection[:STATe]", self._corr_set, self._gb("corr"))
         self.on("SENSe#:CORRection:INTerpolate[:STATe]", self._b("interp"), self._gb("interp"))
@@ -326,9 +363,6 @@ class KeysightPNASim(SimInstrument):
             return f"{(st[which] if v is None else v):+.11E}"
         return fn
 
-    def _g(self, fn):
-        return lambda a, g: f"{fn():+.11E}"
-
     def _gb(self, k):
         return lambda a, g: "1" if self.stim(self._ch(g))[k] else "0"
 
@@ -345,7 +379,7 @@ class KeysightPNASim(SimInstrument):
 
     def _pow_port(self, g) -> int:
         p = int(g[1]) if len(g) > 1 and g[1] else 1
-        if p not in (1, 2):
+        if not 1 <= p <= self.ports:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
         return p
 
@@ -353,31 +387,28 @@ class KeysightPNASim(SimInstrument):
         v = self.num(a, -90, 20)
         st = self.stim(self._ch(g))
         p = self._pow_port(g)
-        if p == 1:
-            st["pow"] = v
-            if st["pow_coup"]:
-                st["pow2"] = v
+        if st["pow_coup"]:
+            for k in range(1, self.ports + 1):
+                st["pow_levels"][k] = v
         else:
-            st["pow2"] = v
-            if st["pow_coup"]:
-                st["pow"] = v
+            st["pow_levels"][p] = v
+        st["pow"] = st["pow_levels"][1]
 
     def _pow_get(self, a, g):
         st = self.stim(self._ch(g))
         p = self._pow_port(g)
-        v = st["pow"] if p == 1 else st["pow2"]
-        return f"{v:+.11E}"
+        return f"{st['pow_levels'][p]:+.11E}"
 
     def _pow_mode_set(self, a, g):
         tok = a.strip().upper()
         if tok not in ("AUTO", "ON", "OFF"):
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
         st = self.stim(self._ch(g))
-        st[f"pow_mode{self._pow_port(g)}"] = tok
+        st["pow_modes"][self._pow_port(g)] = tok
 
     def _pow_mode_get(self, a, g):
         st = self.stim(self._ch(g))
-        return st[f"pow_mode{self._pow_port(g)}"]
+        return st["pow_modes"][self._pow_port(g)]
 
     def _n(self, k, lo, hi, integer=False, auto=None):
         def fn(a, g):
@@ -393,7 +424,7 @@ class KeysightPNASim(SimInstrument):
         v = self.num(a, 1, 15e6)
         steps = [10 ** e * m for e in range(0, 8) for m in (1, 1.5, 2, 3, 5, 7)]
         st = self.stim(self._ch(g))
-        st["bwid"] = min(steps, key=lambda s: abs(s - v))        # прибор округляет к ряду
+        st["bwid"] = min(steps, key=lambda s: abs(s - v))
         self._auto_time(st)
 
     def _f(self, which):
@@ -415,8 +446,32 @@ class KeysightPNASim(SimInstrument):
         return fn
 
     def _form_set(self, a, g):
-        if not a.strip().upper().startswith("ASC"):
-            raise SimError(-221, "Settings conflict", ESR_EXE)
+        parts = [p.strip().upper() for p in a.split(",") if p.strip()]
+        if not parts:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        if parts[0].startswith("ASC"):
+            self.form_data = ("ASC", 0)
+            return
+        if parts[0].startswith("REAL"):
+            bits = int(parts[1]) if len(parts) > 1 else 64
+            if bits not in (32, 64):
+                raise SimError(-224, "Illegal parameter value", ESR_EXE)
+            self.form_data = ("REAL", bits)
+            return
+        raise SimError(-224, "Illegal parameter value", ESR_EXE)
+
+    def _form_get(self, a, g) -> str:
+        kind, bits = self.form_data
+        return f"{kind},{bits}"
+
+    def _bord_set(self, a, g):
+        t = a.strip().upper()
+        if t.startswith("NORM"):
+            self.form_bord = "NORM"
+        elif t.startswith("SWAP"):
+            self.form_bord = "SWAP"
+        else:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
 
     def _cat(self, a, g):
         mine = {n: m for n, m in self.meas.items() if m["ch"] == self._ch(g)}
@@ -442,54 +497,15 @@ class KeysightPNASim(SimInstrument):
         else:
             self.sel_other[ch] = name
 
-    # ------------------------------------------------------------ масштаб и обработка
-    def _place(self, g) -> tuple[int, int]:
-        """(окно, трейс) выбранного измерения канала; (0, 0) - измерение не показано ни в одном окне."""
-        name = self._cur(g) and self._selected(self._ch(g))
-        for w, traces in self.windows.items():
-            for t, n in traces.items():
-                if n == name:
-                    return w, t
-        return 0, 0
-
-    def _wt(self, g) -> dict:
-        name = self.windows.get(int(g[0]), {}).get(int(g[1]))
-        if name not in self.meas:
-            raise SimError(-221, "Settings conflict; no such trace", ESR_EXE)
-        return self.meas[name]
-
-    def _scale_set(self, key, lo, hi):
-        def fn(a, g):
-            self._wt(g)[key] = self.num(a, lo, hi)
-        return fn
-
-    def _autoscale(self, a, g):
-        m = self._wt(g)
-        name = next(n for n, mm in self.meas.items() if mm is m)
-        data = self.fdata(name)
-        lo, hi = min(data), max(data)
-        step = max((hi - lo) / 8, 1e-12)
-        nice = 10 ** math.floor(math.log10(step))
-        step = next(k * nice for k in (1, 2, 5, 10) if k * nice >= step)
-        m.update(pdiv=step, rlev=round((hi + lo) / 2 / step) * step, rpos=5.0)
-
-    def _meas_num(self, key, lo, hi):
-        def fn(a, g):
-            self._cur(g)[key] = self.num(a, lo, hi)
-        return fn
-
-    def _smo_set(self, a, g):
-        self._cur(g)["smo"] = self.boolean(a)
-
     def _define(self, a, g):
-        name, s = (t.strip().strip("'\"") for t in a.split(","))
-        self.meas[name] = {"s": s.upper(), "fmt": "MLOG", "ch": self._ch(g)}
+        parts = [t.strip().strip("'\"") for t in a.split(",")]
+        if len(parts) != 2 or not parts[0]:
+            raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        name, sp = parts[0], self._valid_sparam(parts[1])
+        self.meas[name] = {"s": sp, "fmt": "MLOG", "ch": self._ch(g)}
 
     def _modify(self, a, g):
-        s = a.strip().strip("'\"").upper()
-        if s not in ("S11", "S21", "S12", "S22"):
-            raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        self._cur(g)["s"] = s
+        self._cur(g)["s"] = self._valid_sparam(a)
 
     def _fmt_set(self, a, g):
         t = a.strip().upper()
@@ -504,7 +520,7 @@ class KeysightPNASim(SimInstrument):
         self._cur(g)
         name = self._selected(self._ch(g))
         data = self.fdata(name) if kind == "FDATA" else self.sdata(name)
-        return ",".join(f"{v:+.10E}" for v in data)
+        return self._encode_numbers(data)
 
     def _oper_even_get(self, a, g) -> str:
         val = self.oper_even
@@ -518,15 +534,20 @@ class KeysightPNASim(SimInstrument):
 
     def _mode_set(self, a, g):
         t = a.strip().upper()
-        mode = {"HOLD": "HOLD", "CONT": "CONT", "CONTINUOUS": "CONT", "SING": "SING", "SINGLE": "SING"}.get(t)
+        mode = {
+            "HOLD": "HOLD",
+            "CONT": "CONT", "CONTINUOUS": "CONT",
+            "SING": "SING", "SINGLE": "SING",
+            "GRO": "GRO", "GROUPS": "GRO",
+        }.get(t)
         if mode is None:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
         self.stim(self._ch(g))["mode"] = mode
-        if mode in ("SING", "CONT"):
+        if mode in ("SING", "CONT", "GRO"):
             self.sweeping = True
             self.trig_count = 0
             self.oper_cond |= 16
-            if not self.hold_sweeps and self.trig["sour"] == "IMM":     # EXT / MAN - ждать триггера
+            if not self.hold_sweeps and self.trig["sour"] == "IMM":
                 self.finish_sweep()
         elif mode == "HOLD":
             self.sweeping = self._has_cont()
@@ -564,130 +585,6 @@ class KeysightPNASim(SimInstrument):
         if self.trig_count >= points and not self.hold_sweeps:
             self.finish_sweep()
 
-    def _mk(self, g) -> dict:
-        """Маркер ``g[1]`` выбранного измерения канала ``g[0]`` (у каждого измерения свои маркеры 1..15)."""
-        ch, n = self._ch(g), int(g[1]) if len(g) > 1 and g[1] else 1
-        name = self._selected(ch)
-        if name not in self.meas or not 1 <= n <= 15:
-            raise SimError(-221, "Settings conflict; no measurement selected", ESR_EXE)
-        return self.meas[name].setdefault("marks", {}).setdefault(n, {"on": False, "x": 1e9})
-
-    def _mk_state(self, a, g):
-        self._mk(g)["on"] = self.boolean(a)
-
-    def _mk_aoff(self, a, g):
-        name = self._selected(self._ch(g))
-        for mk in self.meas.get(name, {}).get("marks", {}).values():
-            mk["on"] = False
-
-    def _mk_x(self, a, g):
-        mk = self._mk(g)
-        if not mk["on"]:
-            raise SimError(-221, "Settings conflict; marker is off", ESR_EXE)
-        mk["x"] = self.num(a, 0, self.F_MAX)
-
-    def _mk_x_get(self, a, g):
-        mk = self._mk(g)
-        if not mk["on"]:
-            raise SimError(-221, "Settings conflict; marker is off", ESR_EXE)
-        return f"{mk['x']:+.11E}"
-
-    def _mk_y(self, a, g):
-        mk = self._mk(g)
-        if not mk["on"]:
-            raise SimError(-221, "Settings conflict", ESR_EXE)
-        ch = self._ch(g)
-        data, fs = self.fdata(self._selected(ch)), self.freqs(ch)
-        i = min(range(len(fs)), key=lambda k: abs(fs[k] - mk["x"]))
-        if len(data) == 2 * len(fs):                      # комплексный формат
-            return f"{data[2 * i]:+.10E},{data[2 * i + 1]:+.10E}"
-        return f"{data[i]:+.10E},+0.00000000000E+000"
-
-    def _mk_exec(self, a, g):
-        mk, ch = self._mk(g), self._ch(g)
-        if not mk["on"]:
-            raise SimError(-221, "Settings conflict; marker is off", ESR_EXE)
-        data, fs = self.fdata(self._selected(ch)), self.freqs(ch)
-        if len(data) == 2 * len(fs):                      # комплексный формат - по модулю
-            data = [math.hypot(a, b) for a, b in zip(data[0::2], data[1::2])]
-        pick = max if a.strip().upper().startswith("MAX") else min
-        i = pick(range(len(data)), key=data.__getitem__)
-        mk.update(on=True, x=fs[i])
-
-    # ------------------------------------------------------- линии пределов (limit lines)
-    def _lim(self, g) -> dict:
-        m = self._cur(g)
-        return m.setdefault("limit", {"disp": False, "stat": False, "segs": []})
-
-    def _lim_disp(self, a, g):
-        self._lim(g)["disp"] = self.boolean(a)
-
-    def _lim_stat(self, a, g):
-        self._lim(g)["stat"] = self.boolean(a)
-
-    def _lim_data_del(self, a, g):
-        self._lim(g)["segs"] = []
-
-    def _lim_data_set(self, a, g):
-        toks = [t.strip() for t in a.split(",") if t.strip()]
-        if len(toks) % 5 != 0:
-            raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        segs = []
-        for i in range(0, len(toks), 5):
-            t = int(round(float(toks[i])))
-            if t not in (0, 1, 2):
-                raise SimError(-224, "Illegal parameter value", ESR_EXE)
-            segs.append((t, float(toks[i + 1]), float(toks[i + 2]), float(toks[i + 3]), float(toks[i + 4])))
-        self._lim(g)["segs"] = segs
-
-    def _lim_data_get(self, a, g):
-        segs = self._lim(g)["segs"]
-        if not segs:
-            return "0"
-        parts = []
-        for t, x1, x2, y1, y2 in segs:
-            parts.extend((str(t), f"{x1:+.11E}", f"{x2:+.11E}", f"{y1:+.11E}", f"{y2:+.11E}"))
-        return ",".join(parts)
-
-    def _lim_fail(self, a, g):
-        lim = self._lim(g)
-        segs = [s for s in lim["segs"] if s[0] in (1, 2)]
-        if not lim["stat"] or not segs:
-            return "0"
-        ch = self._ch(g)
-        name = self._selected(ch)
-        data, fs = self.fdata(name), self.freqs(ch)
-        if len(data) == 2 * len(fs):
-            return "0"
-        for f, y in zip(fs, data):
-            for t, x1, x2, y1, y2 in segs:
-                lo_x, hi_x = (x1, x2) if x1 <= x2 else (x2, x1)
-                if f < lo_x - 1e-9 or f > hi_x + 1e-9:
-                    continue
-                if abs(x2 - x1) < 1e-12:
-                    lim_y = y1
-                else:
-                    lim_y = y1 + (y2 - y1) * (f - x1) / (x2 - x1)
-                if (t == 1 and y > lim_y) or (t == 2 and y < lim_y):
-                    return "1"
-        return "0"
-
-    # ------------------------------------------------------- память, математика
-    def _memorize(self, a, g):
-        m = self._cur(g)
-        m["mem"] = [self.s(m["s"], f) for f in self.freqs(m["ch"])]
-
-    def _math_set(self, a, g):
-        t = a.strip().upper()
-        fn = {"NORM": "NORM", "NORMAL": "NORM", "DIV": "DIV", "DIVIDE": "DIV", "SUBT": "SUBT",
-              "SUBTRACT": "SUBT", "ADD": "ADD", "MULT": "MULT", "MULTIPLY": "MULT"}.get(t)
-        if fn is None:
-            raise SimError(-224, "Illegal parameter value", ESR_EXE)
-        m = self._cur(g)
-        if fn != "NORM" and m.get("mem") is None:
-            raise SimError(-221, "Settings conflict; no memory trace", ESR_EXE)
-        m["math"] = fn
-
     # ----------------------------------------------------------- калибровка без мастера (response THRU)
     def _coll_meth(self, a, g):
         meth = a.strip().upper()
@@ -720,42 +617,26 @@ class KeysightPNASim(SimInstrument):
             raise SimError(-221, "Settings conflict; no cal set", ESR_EXE)
         self.csets[a.strip().strip("'\"")] = dict(self.csets[st["cset"]])
 
-    # ----------------------------------------------------------- Touchstone
+    # ----------------------------------------------------------- Touchstone (1..4 порта)
     def _snp(self, a, g):
-        """Частоты, затем Re и Im каждого S-параметра (S11 S21 S12 S22) - столбцами, как в SnP-файле."""
-        ports = sorted({int(p) for p in a.strip().strip("'\"").split(",") if p.strip()})
-        if not ports or any(p not in (1, 2) for p in ports) or getattr(self, "snp_form", "RI") != "RI":
+        """Частоты, затем Re и Im каждого S-параметра столбцами (порядок Touchstone 1.x):
+        1 порт - S11; 2 порта - S11 S21 S12 S22; 3/4 порта - построчно S{r}{c}."""
+        plist = sorted({int(p) for p in a.strip().strip("'\"").split(",") if p.strip()})
+        if not plist or any(not (1 <= p <= self.ports) for p in plist) or getattr(self, "snp_form", "RI") != "RI":
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
+        if len(plist) == 2:
+            p1, p2 = plist
+            names = [f"S{p1}{p1}", f"S{p2}{p1}", f"S{p1}{p2}", f"S{p2}{p2}"]
+        else:
+            names = [f"S{r}{c}" for r in plist for c in plist]
         fs = self.freqs(self._ch(g))
         out = list(fs)
-        for b in ports:
-            for a_ in ports:
-                vals = [self.s(f"S{a_}{b}", f) for f in fs]
-                out += [v.real for v in vals] + [v.imag for v in vals]
-        return ",".join(f"{v:+.11E}" for v in out)
+        for sp in names:
+            vals = [self.s(sp, f) for f in fs]
+            out += [v.real for v in vals] + [v.imag for v in vals]
+        return self._encode_numbers(out)
 
     # ----------------------------------------------------------- калибровка
-    def _meas_corr_set(self, a, g):
-        ch = self._ch(g)
-        st = self.stim(ch)
-        on = self.boolean(a)
-        if on and not st["cset"]:
-            raise SimError(-221, "Settings conflict; no calibration", ESR_EXE)
-        cur = self._cur(g)
-        # Зафиксировать текущее состояние остальных треков этого канала перед локальным изменением
-        for m in self.meas.values():
-            if m["ch"] == ch and m is not cur and "corr" not in m:
-                m["corr"] = st["corr"]
-        cur["corr"] = on
-        # Канальный флаг коррекции: ON, пока хотя бы на одном треке канала включена коррекция
-        ch_meas = [m for m in self.meas.values() if m["ch"] == ch]
-        st["corr"] = any(m.get("corr", st["corr"]) for m in ch_meas) if ch_meas else on
-
-    def _meas_corr_get(self, a, g) -> str:
-        ch = self._ch(g)
-        m = self._cur(g)
-        return "1" if m.get("corr", self.stim(ch)["corr"]) else "0"
-
     def _corr_set(self, a, g):
         ch = self._ch(g)
         st = self.stim(ch)
@@ -763,9 +644,6 @@ class KeysightPNASim(SimInstrument):
         if on and not st["cset"]:
             raise SimError(-221, "Settings conflict; no calibration", ESR_EXE)
         st["corr"] = on
-        for m in self.meas.values():
-            if m["ch"] == ch:
-                m.pop("corr", None)
 
     def _cset_act(self, a, g):
         name, _, stim = a.rpartition(",")
@@ -779,22 +657,18 @@ class KeysightPNASim(SimInstrument):
         cal = self.csets[name]
         if self.boolean(stim):
             st.update(cal)
+            if "pow" in cal:
+                for p in range(1, self.ports + 1):
+                    st["pow_levels"][p] = cal["pow"]
             self._auto_time(st)
         st["cset"] = name
         same = all(st[k] == cal[k] for k in ("start", "stop", "poin", "type"))
         st["corr"] = same or (st["interp"] and st["type"] == cal["type"]
                               and cal["start"] <= st["start"] and st["stop"] <= cal["stop"])
-        for m in self.meas.values():
-            if m["ch"] == ch:
-                m.pop("corr", None)
 
     def _cset_deact(self, a, g):
-        ch = self._ch(g)
-        st = self.stim(ch)
+        st = self.stim(self._ch(g))
         st["cset"], st["corr"] = "", False
-        for m in self.meas.values():
-            if m["ch"] == ch:
-                m.pop("corr", None)
 
     def _cset_del(self, a, g):
         name = a.strip().strip("'\"")
@@ -805,29 +679,34 @@ class KeysightPNASim(SimInstrument):
             if st.get("cset") == name:
                 st["cset"], st["corr"] = "", False
 
-    # ----------------------------------------------------------- калибровка (guided)
+    # ----------------------------------------------------------- калибровка (guided, 1..4 порта)
     @staticmethod
     def _family(conn: str) -> str:
         return next((f for f in KITS if conn.startswith(f)), "")
 
     def _guid_conn(self, a, g):
+        port = int(g[1])
+        if not 1 <= port <= self.ports:
+            raise SimError(-224, "Illegal parameter value; invalid port", ESR_EXE)
         conn = a.strip().strip("'\"")
         if conn not in CONNECTORS:
             raise SimError(-224, "Illegal parameter value; unknown connector", ESR_EXE)
-        self.guid["conn"][int(g[1])] = conn
+        self.guid["conn"][port] = conn
 
     def _guid_kits(self, a, g):
         return '"' + ",".join(KITS.get(self._family(a.strip().strip("'\"")), ())) + '"'
 
     def _guid_kit(self, a, g):
         port, kit = int(g[1]), a.strip().strip("'\"")
+        if not 1 <= port <= self.ports:
+            raise SimError(-224, "Illegal parameter value; invalid port", ESR_EXE)
         if kit not in KITS.get(self._family(self.guid["conn"][port]), ()):
             raise SimError(-224, "Illegal parameter value; kit does not fit the connector", ESR_EXE)
         self.guid["kit"][port] = kit
 
     def _guid_init(self, a, g):
         gd = self.guid
-        ports = [p for p in (1, 2) if gd["conn"][p] != "Not used"]
+        ports = [p for p in range(1, self.ports + 1) if gd["conn"][p] != "Not used"]
         if not ports or any(not gd["kit"][p] for p in ports):
             raise SimError(-221, "Settings conflict; cal ports not defined", ESR_EXE)
         steps = []
@@ -837,8 +716,11 @@ class KeysightPNASim(SimInstrument):
         else:
             for p in ports:
                 steps += [f"Connect {gd['conn'][p]} {std} to port {p}" for std in ("OPEN", "SHORT", "LOAD")]
-            if len(ports) == 2:
-                steps.append("Connect THRU between port 1 and port 2")
+            if len(ports) >= 2:
+                # для N портов достаточно N-1 перемычек (от первого порта к каждому остальному)
+                p0 = ports[0]
+                for pj in ports[1:]:
+                    steps.append(f"Connect THRU between port {p0} and port {pj}")
         gd.update(steps=steps, done=set(), ch=self._ch(g))
 
     def _guid_desc(self, a, g):
@@ -853,7 +735,7 @@ class KeysightPNASim(SimInstrument):
         if not 1 <= k <= len(self.guid["steps"]):
             raise SimError(-222, "Data out of range", ESR_EXE)
         self.guid["done"].add(k)
-        self.sweeping = True                             # стандарт меряется развёрткой
+        self.sweeping = True
         if not self.hold_sweeps:
             self.finish_sweep()
 
@@ -876,20 +758,18 @@ class KeysightPNASim(SimInstrument):
         return name
 
     def _st_store(self, a, g):
-        self.files[self._file(a)] = copy.deepcopy((self.c, self.meas, self.other, self.marker))
+        self.files[self._file(a)] = copy.deepcopy((self.c, self.meas, self.other, self.windows))
 
     def _st_load(self, a, g):
         name = self._file(a)
         if name not in self.files:
             raise SimError(-256, "File name not found", ESR_EXE)
-        c, self.meas, self.other, self.marker = copy.deepcopy(self.files[name])
-        c["form"] = self.c["form"]
+        c, self.meas, self.other, self.windows = copy.deepcopy(self.files[name])
         self.c = c
         self.selected, self.sel_other = "", {}
         self.sweeping = False
 
     def subdirs(self) -> list[str]:
-        """Имена папок внутри текущей (папки-предки известных папок тоже существуют)."""
         pre, out = self.cdir.lower() + "\\", set()
         for d in self.dirs:
             if d.lower().startswith(pre):
@@ -900,7 +780,7 @@ class KeysightPNASim(SimInstrument):
         path = a.strip().strip("'\"").rstrip("\\")
         key = next((d for d in self.dirs if d.lower() == path.lower()), None)
         if key is None and any(d.lower().startswith(path.lower() + "\\") for d in self.dirs) and path:
-            key = path                                   # папка-предок: есть, файлов в ней нет
+            key = path
             self.dirs[key] = {}
         if key is None:
             raise SimError(-256, "File name not found", ESR_EXE)
@@ -912,7 +792,7 @@ class KeysightPNASim(SimInstrument):
             raise SimError(-256, "File name not found", ESR_EXE)
         del self.files[name]
 
-    # ----------------------------------------------------------------- CW
+    # ----------------------------------------------------------------- CW / тип развёртки
     def _type_set(self, a, g):
         t = {"LIN": "LIN", "LINEAR": "LIN", "LOG": "LOG", "LOGARITHMIC": "LOG", "POW": "POW", "POWER": "POW",
              "CW": "CW", "SEGM": "SEGM", "SEGMENT": "SEGM"}.get(a.strip().upper())

@@ -17,7 +17,7 @@ from PyQt6.QtCore import QPoint, QSettings, Qt
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
-from .params import PLabel, PLineEdit, PNLabel, PSButton, PSpinBox, PanelLine, PanelTable, _Bound
+from .params import PLabel, PLineEdit, PNLabel, PSButton, PSpinBox, PSpinEdit, PanelLine, PanelTable, _Bound
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
                     UI_COLUMN_WIDTH_PX, UI_FONT_SIZE_PT, checkbox_qss, render_qss, scrollbar_qss)
@@ -76,6 +76,12 @@ def clone_bound_widget(orig: QWidget, proxy) -> QWidget | None:
         step = getattr(orig, "step_setting", None)
         if step is not None:
             clone.set_step(step, emit=False)
+    elif isinstance(orig, PSpinEdit):
+        clone = PSpinEdit(proxy, key, unit=getattr(orig, "unit", None), digits=getattr(orig, "digits", 6),
+                          prefixes=getattr(orig, "prefixes", None))
+        step = getattr(orig, "step_setting", None)
+        if step is not None:
+            clone.set_step(step, emit=False)
     elif isinstance(orig, PNLabel):
         clone = PNLabel(proxy, key, unit=getattr(orig, "unit", None), digits=getattr(orig, "digits", 6))
     elif isinstance(orig, PLineEdit):
@@ -89,6 +95,12 @@ def clone_bound_widget(orig: QWidget, proxy) -> QWidget | None:
         clone = PLabel(proxy, key)
     if clone is None:
         return None
+    if getattr(orig, "unit", "") and hasattr(clone, "prefix") and hasattr(clone, "_update_unit"):
+        pref = getattr(orig, "prefix", "")
+        if pref in getattr(clone, "prefixes", ()):
+            clone.prefix = pref
+            clone.pinned = bool(getattr(orig, "pinned", False))
+            clone._update_unit()
     custom_tip = getattr(orig, "_custom_tip", "")
     if custom_tip and hasattr(clone, "set_custom_tip"):
         clone.set_custom_tip(custom_tip)
@@ -97,6 +109,9 @@ def clone_bound_widget(orig: QWidget, proxy) -> QWidget | None:
     cur = proxy.value(key)
     if cur is not None and hasattr(clone, "_on_value"):
         clone._on_value(cur)
+    elif getattr(orig, "_saved_value", None) is not None and hasattr(clone, "show_value"):
+        clone._saved_value = orig._saved_value
+        clone.show_value(orig._saved_value)
     return clone
 
 
@@ -302,6 +317,7 @@ class FavoritesManager:
         self._pinned_lines = list(built_lines)
 
         if self._extra_host is not None and self._extra_layout is not None:
+            self._extra_layout.setContentsMargins(0, 8 if visible_top > 0 else 0, 0, 0)
             if built_lines:
                 extra_table = PanelTable(*built_lines)
                 extra_table.build(UI_COLUMN_WIDTH_PX)

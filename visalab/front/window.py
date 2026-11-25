@@ -16,20 +16,41 @@ from enum import Enum
 from PyQt6.QtCore import (QEasingCurve, QEvent, QLineF, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSettings,
                           QSize, Qt, pyqtProperty, pyqtSignal)
 from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QAbstractButton, QApplication, QLabel, QPushButton, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QAbstractButton, QApplication, QLabel, QLineEdit, QPushButton, QSizePolicy, QWidget
 from qframelesswindow import FramelessWindow, TitleBar
 
-from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_CONTROL, UI_COLOR_ERROR,
-                    UI_COLOR_PANEL, UI_SWITCH_HEIGHT_PX, UI_SWITCH_MARGIN_PX, UI_SWITCH_WIDTH_PX,
-                    UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
-                    UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, checkbox_qss, render_qss, scrollbar_qss)
+from .theme import (OFF, ON, ON_EQV, TITLE_BAR_BUTTON_LINE_WIDTH, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
+                    UI_COLOR_CONTROL, UI_COLOR_ERROR, UI_COLOR_PANEL, UI_SWITCH_HEIGHT_PX, UI_SWITCH_MARGIN_PX,
+                    UI_SWITCH_WIDTH_PX, UI_COLOR_PROCESS, UI_COLOR_SUCCESS, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE,
+                    UI_COLOR_TEXT_MUTED, UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, checkbox_qss, render_qss,
+                    scrollbar_qss)
 
 __all__ = ["WriteState", "Window", "WindowBar", "StatusIndicator", "ErrorIndicator", "AddressLabel", "short_address",
-           "CustomExpandButton", "CustomFullButton", "CustomLockButton", "CustomDockButton", "CustomFavButton",
-           "PanelSettingsButton", "PanelClearButton", "PanelCloseButton",
-           "Switch", "CustomOnButton", "CustomSyncButton", "CustomInitButton", "mark_growing", "QWIDGETSIZE_MAX"]
+           "CustomExpandButton", "ExpandAllButton", "CollapseAllButton", "CustomFullButton", "CustomLockButton",
+           "CustomDockButton", "CustomFavButton", "PinStarButton", "PanelSettingsButton", "PanelClearButton",
+           "PanelCloseButton", "Switch", "CustomOnButton", "CustomSyncButton", "CustomInitButton", "mark_growing",
+           "set_mac_floating_level", "QWIDGETSIZE_MAX"]
 
 QWIDGETSIZE_MAX = (1 << 24) - 1
+
+
+def set_mac_floating_level(widget: QWidget, floating: bool) -> bool:
+    """На macOS задать уровень NSWindow (``NSFloatingWindowLevel`` / ``NSNormalWindowLevel``),
+    чтобы откреплённое окно держалось поверх родительского без 1-кадрового мигания."""
+    if sys.platform != "darwin" or QApplication.platformName() != "cocoa":
+        return False
+    try:
+        import objc
+        from AppKit import NSFloatingWindowLevel, NSNormalWindowLevel
+
+        ns_view = objc.objc_object(c_void_p=int(widget.winId()))
+        ns_win = ns_view.window()
+        if ns_win is not None:
+            ns_win.setLevel_(NSFloatingWindowLevel if floating else NSNormalWindowLevel)
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
 
 
 def mark_growing(widget: QWidget) -> QWidget:
@@ -120,7 +141,7 @@ class WindowBar(TitleBar):
             return False
         child = self.childAt(pos)
         while child is not None and child is not self:
-            if isinstance(child, QAbstractButton):
+            if isinstance(child, (QAbstractButton, QLineEdit)):
                 return False
             child = child.parentWidget()
         return super().canDrag(pos)     # во весь экран, в доке и по кнопкам окно не таскается
@@ -452,6 +473,7 @@ class AddressLabel(QLabel):
 class IconButtonBase(QPushButton):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_LayoutUsesWidgetRect, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.icon_color_normal = QColor(UI_COLOR_TEXT_MUTED)
@@ -681,6 +703,42 @@ class CustomExpandButton(IconButtonBase):
         p.drawLine(QLineF(cx, cy + d, cx + a, cy - d))
 
 
+class ExpandAllButton(IconButtonBase):
+    """Двойной шеврон вниз: развернуть все подразделы."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(26, 24)
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy, a = self.width() / 2, self.height() / 2, 3.8
+        for dy in (-2.4, 2.2):
+            y = cy + dy
+            p.drawLine(QLineF(cx - a, y - 1.6, cx, y + 1.8))
+            p.drawLine(QLineF(cx, y + 1.8, cx + a, y - 1.6))
+
+
+class CollapseAllButton(IconButtonBase):
+    """Двойной шеврон вверх: свернуть все подразделы."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(26, 24)
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        p = QPainter(self)
+        self._pen(p)
+        cx, cy, a = self.width() / 2, self.height() / 2, 3.8
+        for dy in (-2.2, 2.4):
+            y = cy + dy
+            p.drawLine(QLineF(cx - a, y + 1.6, cx, y - 1.8))
+            p.drawLine(QLineF(cx, y - 1.8, cx + a, y + 1.6))
+
+
 class CustomDockButton(IconButtonBase):
     """Прикрепить окно прибора к панели (dock) / открепить в отдельное окно."""
 
@@ -741,6 +799,71 @@ class CustomFavButton(IconButtonBase):
             p.setBrush(self._icon_color)
         else:
             p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+
+class PinStarButton(QPushButton):
+    """Компактная звёздочка закрепления параметра в избранном (появляется при наведении на строку,
+    остаётся видимой, когда параметр закреплён; не сдвигает вёрстку)."""
+
+    def __init__(self, parent=None, *, hover_only: bool = False):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(18, 20)
+        self.setStyleSheet("background: transparent; border: none; padding: 0;")
+        self._row_hovered = False
+        self._hover_only = bool(hover_only)
+
+    def set_row_hovered(self, hovered: bool) -> None:
+        hovered = bool(hovered)
+        if hovered != self._row_hovered:
+            self._row_hovered = hovered
+            self.update()
+
+    def enterEvent(self, e):  # noqa: N802 - Qt
+        super().enterEvent(e)
+        self.update()
+
+    def leaveEvent(self, e):  # noqa: N802 - Qt
+        super().leaveEvent(e)
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        checked = self.isChecked()
+        hovered = self.underMouse()
+        if self._hover_only:
+            if not self._row_hovered and not hovered:
+                return
+        elif not checked and not self._row_hovered and not hovered:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if hovered:
+            col = QColor(UI_COLOR_TEXT)
+        elif checked:
+            col = QColor(UI_COLOR_TEXT_MUTED)
+        else:
+            col = QColor(UI_COLOR_BORDER_LIGHT)
+        pen = QPen(col)
+        pen.setWidthF(1.15)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        cx, cy = self.width() / 2, self.height() / 2
+        r_out, r_in = 5.2, 2.2
+        path = QPainterPath()
+        for i in range(10):
+            ang = math.radians(-90 + i * 36)
+            r = r_out if i % 2 == 0 else r_in
+            pt = QPointF(cx + r * math.cos(ang), cy + r * math.sin(ang))
+            if i == 0:
+                path.moveTo(pt)
+            else:
+                path.lineTo(pt)
+        path.closeSubpath()
+        p.setBrush(col if checked else Qt.BrushStyle.NoBrush)
         p.drawPath(path)
 
 

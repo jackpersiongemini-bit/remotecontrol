@@ -13,9 +13,9 @@ from conftest import attach
 from visalab.coord import ActivityMonitor
 from visalab.core import PStatus
 from visalab.drivers import DRIVERS
-from visalab.front import PowerMeterWindow, PSUWindow, PulseGenWindow, RFGenWindow, SpectrumWindow, VNAWindow
+from visalab.front import (GraphsWindow, InstrumentsWindow, PowerMeterWindow, PSUWindow, PulseGenWindow, RFGenWindow,
+                           SpectrumWindow, VNAWindow)
 from visalab.front.help import HELP, help_text, pattern_key
-from visalab.front.main_window import MainWindow
 from visalab.front.params import PanelLine, PSpinBox
 from visalab.instruments import InstrumentProxy
 from visalab.profiles import PROFILES
@@ -76,9 +76,17 @@ def test_every_control_has_a_tooltip(qtbot, tmp_path, kind, cls):
 
 
 def test_main_window_controls_have_tooltips(qtbot, tmp_path):
-    win = MainWindow(QSettings(str(tmp_path / "m.ini"), QSettings.Format.IniFormat), ActivityMonitor())
-    qtbot.addWidget(win)
-    assert not _without_tip(win)
+    settings = QSettings(str(tmp_path / "m.ini"), QSettings.Format.IniFormat)
+    iw = InstrumentsWindow(settings)
+    gw = GraphsWindow(settings, ActivityMonitor(), instruments_window=iw)
+    qtbot.addWidget(iw)
+    qtbot.addWidget(gw)
+    try:
+        assert not _without_tip(gw)
+        assert not _without_tip(iw)
+    finally:
+        gw.cleanup()
+        iw.cleanup()
 
 
 def test_field_tooltip_and_line_name(qtbot, tmp_path):

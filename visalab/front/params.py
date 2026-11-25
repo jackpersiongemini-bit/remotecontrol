@@ -13,15 +13,16 @@ verified) окрашивает рамку и собирается ``WriteTracker
 """
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
 from PyQt6 import sip
-from PyQt6.QtCore import QEvent, QLocale, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QLocale, QObject, QPointF, QRectF, QSettings, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QMenu, QPushButton, QSizePolicy, QTabBar, QToolButton, QToolTip, QVBoxLayout,
-                             QWidget)
+from PyQt6.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup, QDoubleSpinBox, QFrame, QGridLayout,
+                             QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QTabBar, QToolButton,
+                             QToolTip, QVBoxLayout, QWidget)
 
 from ..core.params import ConnectionState, Kind, PStatus
 from ..coord import Instrument
@@ -32,8 +33,8 @@ from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_INDICATOR_WIDTH_
 from .help import param_help
 from .window import WriteState
 
-__all__ = ["PLineEdit", "PSpinBox", "StepLineEdit", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup", "PTabBar", "PanelLine", "PanelTable", "Panel",
-           "WriteTracker"]
+__all__ = ["PLineEdit", "PSpinEdit", "PSpinBox", "StepLineEdit", "PNLabel", "PSButton", "PChoice", "PLabel", "PBGroup",
+           "PTabBar", "PanelLine", "PanelTable", "Panel", "WriteTracker"]
 
 _WSTATE = {PStatus.WRITING: "process", PStatus.ERROR: "error", PStatus.INVALID: "error",
            PStatus.WRITTEN: "verified", PStatus.COERCED: "verified", PStatus.UNKNOWN: ""}
@@ -57,11 +58,62 @@ class _Bound:
         self.proxy, self.key = proxy, key
         self.spec = proxy.params[key]
         self._value: Any = None
+        self._saved_value: Any = None
+        self._settings: QSettings | None = None
+        self._settings_key: str = ""
+        self._quit_connected: bool = False
         self._status_message = ""
         proxy.subscribe(key, self._on_value, self._on_status)
         proxy.state_changed.connect(self._on_proxy_state)
         self.refresh_tip()
         self._update_enabled()
+
+    def attach_settings(self, settings: QSettings, prefix: str) -> None:
+        """Привязать ``QSettings`` к виджету: сразу восстановить состояние и сохранять при выходе."""
+        self._settings = settings
+        self._settings_key = f"{prefix}/PARAM/{self.key.upper()}"
+        self.load_state()
+        if not self._quit_connected:
+            app = QApplication.instance()
+            if app is not None:
+                app.aboutToQuit.connect(self.save_state)
+                self._quit_connected = True
+
+    def serialize_state(self) -> dict[str, Any]:
+        """Состояние виджета для сохранения при выходе (переопределяется в подклассах)."""
+        val = self._value if self._value is not None else self._saved_value
+        return {"value": val} if val is not None else {}
+
+    def apply_state(self, data: dict[str, Any]) -> None:
+        """Восстановить сохранённое состояние виджета (переопределяется в подклассах)."""
+        if "value" in data and data["value"] is not None:
+            self._saved_value = data["value"]
+            if self._value is None:
+                self.show_value(self._saved_value)
+
+    def save_state(self) -> None:
+        """Сохранить текущие параметры виджета в ``QSettings``."""
+        if sip.isdeleted(self) or self._settings is None or not self._settings_key:
+            return
+        data = self.serialize_state()
+        if data:
+            self._settings.setValue(self._settings_key, json.dumps(data))
+        else:
+            self._settings.remove(self._settings_key)
+
+    def load_state(self) -> None:
+        """Загрузить сохранённые параметры виджета из ``QSettings``."""
+        if sip.isdeleted(self) or self._settings is None or not self._settings_key:
+            return
+        raw = self._settings.value(self._settings_key, "", type=str)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if isinstance(data, dict):
+            self.apply_state(data)
 
     def _on_proxy_state(self, _s) -> None:
         if sip.isdeleted(self):
@@ -71,6 +123,14 @@ class _Bound:
 
     def unbind(self) -> None:
         """Отписаться от прокси (для временных / дублирующих виджетов в избранном)."""
+        if getattr(self, "_quit_connected", False):
+            app = QApplication.instance()
+            if app is not None:
+                try:
+                    app.aboutToQuit.disconnect(self.save_state)
+                except (TypeError, RuntimeError):
+                    pass
+            self._quit_connected = False
         proxy = getattr(self, "proxy", None)
         key = getattr(self, "key", None)
         if proxy is not None and not sip.isdeleted(proxy) and key:
@@ -139,11 +199,12 @@ class PLineEdit(QLineEdit, _Bound):
     setToolTip = _Bound.set_custom_tip
     HOW = "edit"
 
-    def __init__(self, proxy: Instrument, key: str, unit: str | None = None, digits: int = 6, parent=None):
+    def __init__(self, proxy: Instrument, key: str, unit: str | None = None, digits: int = 6,
+                 prefixes: tuple[str, ...] | None = None, parent=None):
         super().__init__(parent)
         self.unit = unit if unit is not None else proxy.params[key].unit
         self.digits = digits
-        self.prefixes = UNIT_PREFIXES.get(self.unit, ("",))
+        self.prefixes = prefixes if prefixes is not None else UNIT_PREFIXES.get(self.unit, ("",))
         self.prefix = "" if "" in self.prefixes else self.prefixes[-1]
         self.pinned = False                       # единица выбрана вручную
         self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -219,7 +280,8 @@ class PLineEdit(QLineEdit, _Bound):
         """Выбрать единицу вручную: значение не меняется, меняется только показ."""
         self.prefix, self.pinned = prefix, True
         self._update_unit()
-        self.show_value(self._value, force=True)
+        val = self._value if self._value is not None else self._saved_value
+        self.show_value(val, force=True)
 
     # -------------------------------------------------------- значение
     def _editing(self) -> bool:
@@ -271,6 +333,7 @@ class PLineEdit(QLineEdit, _Bound):
         try:
             return float(text.strip().replace(",", ".")) * self._factor()
         except ValueError:
+            self.pinned = False
             return si_parse(text, self.unit)        # с префиксом: «30u», «1.5 kHz»
 
     def change_value(self) -> None:
@@ -283,14 +346,300 @@ class PLineEdit(QLineEdit, _Bound):
             self._on_status(PStatus.INVALID, str(exc))
             self.show_value(self._value)
             return
-        self.pinned = False
         self.set_value(value)
         self.show_value(self._value)
+
+    def serialize_state(self) -> dict[str, Any]:
+        data = super().serialize_state()
+        if self.unit:
+            data["prefix"] = self.prefix
+            data["pinned"] = bool(self.pinned)
+        return data
+
+    def apply_state(self, data: dict[str, Any]) -> None:
+        if self.unit and "prefix" in data:
+            pref = str(data["prefix"])
+            if pref in self.prefixes:
+                self.prefix = pref
+                self.pinned = bool(data.get("pinned", False))
+                self._update_unit()
+        super().apply_state(data)
+        if self._value is not None:
+            self.show_value(self._value, force=True)
 
     def set_value(self, value: Any) -> bool:
         """Отправить значение в драйвер (проверку, отличается ли оно от текущего, делает драйвер)."""
         self.proxy.set(self.key, value)
         return True
+
+
+class PSpinEdit(PLineEdit):
+    """Параметр на базе ``PLineEdit`` с шагом по колесу мыши и стрелкам ``↑ / ↓``.
+
+    * Поддерживает всё из ``PLineEdit``: единицу слева с авто-префиксом и меню префиксов,
+      ввод числа с клавиатуры в текущей единице или с SI-префиксом (``1.5G``, ``30u``),
+      применение по ``Enter`` / уходу фокуса и откат по ``Esc``.
+    * Подчёркивает разряд, который изменяется шагом (``AUTO`` = последняя показанная цифра,
+      либо постоянный шаг из меню по правому клику ``STEP``).
+    * Стрелки ``↑ / ↓`` и колесо мыши (когда поле в фокусе) меняют значение на один шаг
+      и сразу отправляют его в прибор.
+    """
+
+    HOW = "spin"
+    step_changed = pyqtSignal(object)  # шаг в базовых единицах параметра (Hz, dBm...) или None (AUTO)
+
+    def __init__(self, proxy: Instrument, key: str, unit: str | None = None, digits: int = 6,
+                 prefixes: tuple[str, ...] | None = None, parent=None):
+        self.step_setting: float | None = None
+        self._step_lock: float | None = None
+        self._wheel_accum: int = 0
+        super().__init__(proxy, key, unit=unit, digits=digits, prefixes=prefixes, parent=parent)
+
+    # -------------------------------------------------------- шаг и отображение
+    @staticmethod
+    def last_digit(text: str) -> float:
+        """Вес последней цифры: «1.25» -> 0.01, «40» -> 1, «0» -> 1."""
+        _whole, dot, frac = text.strip().partition(".")
+        return 10.0 ** -len(frac) if dot and frac else 1.0
+
+    def _shown_step(self) -> float | None:
+        if self.step_setting:
+            return self.step_setting / self._factor()
+        return self._step_lock
+
+    def _current_step(self) -> float:
+        if self.step_setting:
+            return self.step_setting / self._factor()
+        if self._step_lock:
+            return self._step_lock
+        return self.last_digit(self.text() or "0")
+
+    def _format_number(self, value: int | float) -> str:
+        scaled = value / self._factor() if self.unit else float(value)
+        step = self._shown_step()
+        if self.spec.kind is Kind.INT and step is None:
+            return str(int(round(scaled)))
+        if step is not None and math.isfinite(step) and 0 < step < 1:
+            text = f"{scaled:.9f}".rstrip("0").rstrip(".")
+            text = "0" if text in ("", "-0") else text
+            need = min(9, max(0, round(-math.log10(step))))
+            whole, _, frac = text.partition(".")
+            if len(frac) < need:
+                text = f"{whole}.{frac.ljust(need, '0')}"
+            return text
+        if scaled == 0:
+            return "0"
+        if 1e-4 <= abs(scaled) < 1e9:
+            text = f"{scaled:.{self.digits}g}"
+            if "e" not in text and "E" not in text:
+                return text
+        return f"{scaled:.{self.digits}g}"
+
+    def show_value(self, value, force: bool = False):
+        editing = self._editing() and self.isModified() and not force
+        if editing:
+            return
+        if value is None:
+            text = ""
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not self.hasFocus() or force:
+                if not self.hasFocus():
+                    self._auto_prefix(value)
+                    self._update_unit()
+            text = self._format_number(value)
+        else:
+            text = str(value)
+        self.setText(text)
+        self.setModified(False)
+        self.update()
+
+    def step_index(self) -> int:
+        """Индекс подчёркиваемой цифры в ``self.text()`` или ``-1``."""
+        if not self.isEnabled() or self.isReadOnly() or self.isModified():
+            return -1
+        text = self.text()
+        if not text or "e" in text or "E" in text:
+            return -1
+        step = self._current_step()
+        if not math.isfinite(step) or step <= 0:
+            return -1
+        exp = round(math.log10(step))
+        dot = text.find(".")
+        dot = len(text) if dot < 0 else dot
+        idx = dot - 1 - exp if exp >= 0 else dot - exp
+        return idx if 0 <= idx < len(text) and text[idx].isdigit() else -1
+
+    def paintEvent(self, e):  # noqa: N802 - Qt
+        super().paintEvent(e)
+        idx = self.step_index()
+        text = self.text()
+        if not 0 <= idx < len(text):
+            return
+        fm = self.fontMetrics()
+        cur = self.cursorPosition()
+        x0 = self.cursorRect().center().x()
+        left = x0 + fm.horizontalAdvance(text[cur:idx]) if idx >= cur else x0 - fm.horizontalAdvance(text[idx:cur])
+        width = fm.horizontalAdvance(text[idx])
+        y = self.cursorRect().center().y() + fm.ascent() // 2 + 2
+        p = QPainter(self)
+        pen = QPen(QColor(UI_COLOR_TEXT_MUTED if self.step_setting is None else UI_COLOR_TEXT))
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.drawLine(QPointF(left + 0.5, y + 0.5), QPointF(left + width - 0.5, y + 0.5))
+
+    # -------------------------------------------------------- ввод, стрелки, колесо
+    def _release_step(self) -> None:
+        if self._step_lock is not None:
+            self._step_lock = None
+            if not (self.hasFocus() and self.isModified()):
+                self.show_value(self._value, force=True)
+        self.update()
+
+    def focusInEvent(self, e):  # noqa: N802 - Qt
+        # Не очищаем текст в placeholder — оставляем число и подчёркнутый разряд видимыми
+        QLineEdit.focusInEvent(self, e)
+        self._wheel_accum = 0
+        self.update()
+
+    def focusOutEvent(self, e):  # noqa: N802 - Qt
+        self._wheel_accum = 0
+        QLineEdit.focusOutEvent(self, e)
+        self._release_step()
+        self.show_value(self._value, force=True)
+
+    def keyPressEvent(self, e):  # noqa: N802 - Qt
+        key = e.key()
+        if key == Qt.Key.Key_Up:
+            self.step_by(1)
+            e.accept()
+            return
+        if key == Qt.Key.Key_Down:
+            self.step_by(-1)
+            e.accept()
+            return
+        if key == Qt.Key.Key_Escape:
+            self._step_lock = None
+            self.setModified(False)
+            self.show_value(self._value, force=True)
+            self.clearFocus()
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._step_lock = None
+            self.change_value()
+            self.clearFocus()
+            return
+        self._step_lock = None
+        QLineEdit.keyPressEvent(self, e)
+        self.update()
+
+    def wheelEvent(self, e):  # noqa: N802 - Qt
+        if not self.hasFocus() or not self.isEnabled() or self.isReadOnly():
+            e.ignore()
+            return
+        dy = e.angleDelta().y()
+        if not dy:
+            e.ignore()
+            return
+        self._wheel_accum += dy
+        steps = int(self._wheel_accum / 120)
+        if steps == 0 and abs(dy) >= 120:
+            steps = 1 if dy > 0 else -1
+        if steps:
+            self._wheel_accum -= steps * 120
+            self.step_by(steps)
+        e.accept()
+
+    def step_by(self, steps: int) -> None:
+        """Сдвинуть значение на ``steps`` шагов и сразу отправить в прибор."""
+        if not steps or not self.isEnabled() or self.isReadOnly():
+            return
+        base = self._value
+        if self.isModified() and self.text().strip():
+            try:
+                base = self._parse(self.text())
+            except ValueError:
+                base = self._value
+        if not isinstance(base, (int, float)) or isinstance(base, bool):
+            return
+        step_disp = self._current_step()
+        if self.step_setting is None:
+            self._step_lock = step_disp
+        step_si = step_disp * (self._factor() if self.unit else 1.0)
+        raw = base + steps * step_si
+        if self.spec.kind is Kind.INT:
+            raw = round(raw)
+        else:
+            raw = float(f"{raw:.12g}") if raw else 0.0
+        try:
+            value = self.spec.validate(raw)
+        except ValueError as exc:
+            self._on_status(PStatus.INVALID, str(exc))
+            self.show_value(self._value, force=True)
+            return
+        self.setModified(False)
+        self.set_value(value)
+        self.show_value(value, force=True)
+
+    # -------------------------------------------------------- меню выбора шага
+    def step_choices(self) -> list[float]:
+        """Постоянные шаги для меню (в базовых единицах параметра): 1 / 10 / 100 каждого префикса."""
+        if self.spec.kind is Kind.INT and not self.unit:
+            return [1.0, 10.0, 100.0]
+        factors = sorted({SI_PREFIXES[p] if p else 1.0 for p in self.prefixes})
+        if len(factors) == 1:
+            return [factors[0] * m for m in (0.001, 0.01, 0.1, 1.0, 10.0)]
+        return [f * m for f in factors for m in (1.0, 10.0, 100.0)][:-2]
+
+    def step_label(self, step: float | None) -> str:
+        if step is None:
+            return "AUTO"
+        return si_format(step, self.unit, 4) if self.unit else f"{step:g}"
+
+    def help_extra(self) -> str:
+        step = self.step_label(self.step_setting)
+        return f"STEP {step}" + (" (the last shown digit)" if self.step_setting is None else "")
+
+    def set_step(self, step: float | None, emit: bool = True) -> None:
+        """Постоянный шаг (базовые единицы параметра) или ``None`` — ``AUTO``."""
+        if step is not None:
+            try:
+                f = float(step)
+                step = f if (math.isfinite(f) and f > 0) else None
+            except (TypeError, ValueError):
+                step = None
+        changed = step != self.step_setting
+        self.step_setting = step
+        self._step_lock = None
+        val = self._value if self._value is not None else self._saved_value
+        self.show_value(val, force=True)
+        self.update()
+        self.refresh_tip()
+        if changed and emit:
+            self.step_changed.emit(step)
+
+    def serialize_state(self) -> dict[str, Any]:
+        data = super().serialize_state()
+        data["step"] = float(self.step_setting) if self.step_setting is not None else None
+        return data
+
+    def apply_state(self, data: dict[str, Any]) -> None:
+        super().apply_state(data)
+        if "step" in data:
+            self.set_step(data["step"], emit=False)
+
+    def contextMenuEvent(self, e):  # noqa: N802 - Qt
+        """Правый клик — выбор шага для колеса мыши и стрелок."""
+        menu = QMenu(self)
+        menu.setObjectName("psmenu")
+        title = menu.addAction("STEP")
+        title.setEnabled(False)
+        for step in (None, *self.step_choices()):
+            act = menu.addAction(self.step_label(step) + ("  (last digit)" if step is None else ""))
+            act.setCheckable(True)
+            act.setChecked(step == self.step_setting or (step is None and self.step_setting is None))
+            act.triggered.connect(lambda _=False, st=step: self.set_step(st))
+        menu.popup(e.globalPos())
+        e.accept()
 
 
 class StepLineEdit(QLineEdit):
@@ -339,7 +688,9 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self._step_lock: float | None = None    # AUTO: шаг (в единицах префикса), пока крутят колесо
         self._dirty = False                     # QAbstractSpinBox::interpretText() сбрасывает isModified() до editingFinished
         super().__init__(parent)
-        self.setLineEdit(StepLineEdit(self))
+        le_init = StepLineEdit(self)
+        le_init.setStyleSheet("background: transparent; border: none;")
+        self.setLineEdit(le_init)
         self.lineEdit().textEdited.connect(self._mark_dirty)
         self.unit = proxy.params[key].unit
         self.prefixes = prefixes or UNIT_PREFIXES.get(self.unit, ("",))
@@ -397,13 +748,20 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         self._place_unit()
 
     def _place_unit(self) -> None:
+        le = self.lineEdit()
+        if le is not None:
+            le.setGeometry(2, 2, max(self.width() - 4, 0), max(self.height() - 4, 0))
         b = self.unit_button
         if b is None:
+            if le is not None:
+                le.setTextMargins(6, 0, 6, 0)
             return
         b.ensurePolished()
         w = max(b.sizeHint().width(), 26)
         b.setGeometry(2, 2, w, max(self.height() - 4, 0))
-        self.lineEdit().setTextMargins(w, 0, 0, 0)
+        b.raise_()
+        if le is not None:
+            le.setTextMargins(w, 0, 6, 0)
 
     def resizeEvent(self, e):  # noqa: N802 - Qt
         super().resizeEvent(e)
@@ -594,7 +952,8 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         changed = step != self.step_setting
         self.step_setting = step
         self._step_lock = None
-        self.show_value(self._value, force=True)
+        val = self._value if self._value is not None else self._saved_value
+        self.show_value(val, force=True)
         self.lineEdit().update()
         self.refresh_tip()
         if changed and emit:
@@ -631,6 +990,27 @@ class PSpinBox(QDoubleSpinBox, _Bound):
     def set_value(self, value: Any) -> bool:
         self.proxy.set(self.key, value)
         return True
+
+    def serialize_state(self) -> dict[str, Any]:
+        data = super().serialize_state()
+        if self.unit:
+            data["prefix"] = self.prefix
+            data["pinned"] = bool(self.pinned)
+        data["step"] = float(self.step_setting) if self.step_setting is not None else None
+        return data
+
+    def apply_state(self, data: dict[str, Any]) -> None:
+        if self.unit and "prefix" in data:
+            pref = str(data["prefix"])
+            if pref in self.prefixes:
+                self.prefix = pref
+                self.pinned = bool(data.get("pinned", False))
+                self._update_unit()
+        super().apply_state(data)
+        if "step" in data:
+            self.set_step(data["step"], emit=False)
+        elif self._value is not None:
+            self.show_value(self._value, force=True)
 
 
 class PNLabel(PLineEdit):

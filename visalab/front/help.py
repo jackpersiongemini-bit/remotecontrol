@@ -243,7 +243,13 @@ HELP: dict[str, dict[str, str]] = {
         "gen.port": "Output port used in generator mode (Port 1 or Port 2).",
         "gen.channel": "Channel used in generator mode (empty - generator mode off).",
         "bw.if": "IF bandwidth: narrower - lower noise, slower sweep.",
+        "ports": "Number of analyzer test ports (2 or 4).",
+        "s.active": "Currently selected S-parameter trace.",
+        "s{n}.enabled": "Enable reading this S-parameter trace after every sweep.",
+        "s{n}.trace": "Measured S-parameter trace.",
         "source.power": "Source power at the port (or at the DUT when source calibration is active).",
+        "source.power_coupled": "Couple source power across all ports: ON - one level for all ports, OFF - per-port power.",
+        "source.power_p{n}": "Source output power for this test port.",
         "power.offset": "Source path power offset in dB (CAL(f) − GAIN): hardware outputs POW + OFFS to compensate "
                         "cable loss (+) or external amplifier gain (−).",
         "power.offset_state": "Source power calibration on / off.",
@@ -288,8 +294,9 @@ HOW = {
 
 
 def pattern_key(key: str) -> str:
-    """``ch2.voltage`` -> ``ch{n}.voltage``, ``m3.format`` -> ``m{n}.format``."""
-    return re.sub(r"^(ch|m)\d+\.", r"\1{n}.", key)
+    """``ch2.voltage`` -> ``ch{n}.voltage``, ``m3.format`` -> ``m{n}.format``, ``s21.trace`` -> ``s{n}.trace``."""
+    key = re.sub(r"^(ch|m|s)\d+\.", r"\1{n}.", key)
+    return re.sub(r"\.power_p\d+$", ".power_p{n}", key)
 
 
 def help_text(profile: str, key: str) -> str:

@@ -16,8 +16,40 @@ from .trace import Trace
 
 __all__ = ["write_traces_csv", "write_touchstone", "TOUCHSTONE_ORDER"]
 
-#: порядок S-параметров в строке Touchstone 1.x (для 2 портов - S11 S21 S12 S22)
-TOUCHSTONE_ORDER = {1: ("S11",), 2: ("S11", "S21", "S12", "S22")}
+#: порядок S-параметров в Touchstone 1.x:
+#: 1 порт - S11; 2 порта - S11 S21 S12 S22; 3/4 порта - построчно S11 S12 ... S1N, S21 ...
+TOUCHSTONE_ORDER = {
+    1: ("S11",),
+    2: ("S11", "S21", "S12", "S22"),
+    3: tuple(f"S{r}{c}" for r in range(1, 4) for c in range(1, 4)),
+    4: tuple(f"S{r}{c}" for r in range(1, 5) for c in range(1, 5)),
+}
+
+
+def _touchstone_order(sparams: dict[str, Trace]) -> tuple[int, tuple[str, ...]]:
+    """Определить число портов и порядок ключей S-параметров для Touchstone 1.x."""
+    keys = {k.upper(): k for k in sparams}
+    ports_set: set[int] = set()
+    for ku in keys:
+        if len(ku) == 3 and ku[0] == "S" and ku[1].isdigit() and ku[2].isdigit():
+            ports_set.add(int(ku[1]))
+            ports_set.add(int(ku[2]))
+    plist = sorted(ports_set)
+    n_ports = len(plist)
+    if n_ports == 1:
+        p = plist[0]
+        order = (f"S{p}{p}",)
+    elif n_ports == 2:
+        p1, p2 = plist
+        order = (f"S{p1}{p1}", f"S{p2}{p1}", f"S{p1}{p2}", f"S{p2}{p2}")
+    elif n_ports in (3, 4):
+        order = tuple(f"S{a}{b}" for a in plist for b in plist)
+    else:
+        raise ValueError(f"Touchstone поддерживает 1..4 порта, получено {sorted(sparams)}")
+    missing = [k for k in order if k not in keys]
+    if missing:
+        raise ValueError(f"нет S-параметров {missing} для s{n_ports}p")
+    return n_ports, tuple(keys[k] for k in order)
 
 
 def _head(label: str, unit: str) -> str:
@@ -76,20 +108,16 @@ def write_traces_csv(path, traces: Sequence[Trace], labels: Sequence[str] | None
 
 
 def write_touchstone(path, sparams: dict[str, Trace], comments: Iterable[str] = (), z0: float = 50.0) -> Path:
-    """Touchstone 1.x (``.s1p`` / ``.s2p``): ``# HZ S RI R 50``, строка - частота и Re, Im каждого S-параметра.
+    """Touchstone 1.x (``.s1p`` / ``.s2p`` / ``.s3p`` / ``.s4p``): ``# HZ S RI R 50``,
+    частота и Re, Im каждого S-параметра.
 
     ``sparams`` - комплексные трассы {"S11": ..., "S21": ...} с одной осью частот; число портов - по ним.
     """
     if not math.isfinite(z0) or z0 <= 0:
         raise ValueError(f"недопустимое опорное сопротивление z0={z0!r}")
-    if len(sparams) == 1 and next(iter(sparams)) in ("S11", "S22"):
-        order = (next(iter(sparams)),)
-    else:
-        ports = 2 if len(sparams) > 1 else 1
-        order = TOUCHSTONE_ORDER[ports]
-        missing = [k for k in order if k not in sparams]
-        if missing:
-            raise ValueError(f"нет S-параметров {missing} для s{ports}p")
+    if not sparams:
+        raise ValueError("нет S-параметров для Touchstone")
+    n_ports, order = _touchstone_order(sparams)
     traces = [sparams[k] for k in order]
     freqs = traces[0].x
     if not freqs:
@@ -108,7 +136,16 @@ def write_touchstone(path, sparams: dict[str, Trace], comments: Iterable[str] = 
             f.write(f"! {line}\n")
         f.write(f"! columns: freq, {', '.join(f'{k} Re, {k} Im' for k in order)}\n")
         f.write(f"# HZ S RI R {z0:g}\n")
-        for i, fr in enumerate(freqs):
-            vals = " ".join(f"{t.y[i]: .9e} {t.im[i]: .9e}" for t in traces)
-            f.write(f"{fr:.9e} {vals}\n")
+        if n_ports <= 2:
+            for i, fr in enumerate(freqs):
+                vals = " ".join(f"{t.y[i]: .9e} {t.im[i]: .9e}" for t in traces)
+                f.write(f"{fr:.9e} {vals}\n")
+        else:
+            # Touchstone 1.x для 3 и 4 портов: по одной строке матрицы (n_ports пар) на строку текста
+            for i, fr in enumerate(freqs):
+                for row in range(n_ports):
+                    chunk = traces[row * n_ports:(row + 1) * n_ports]
+                    vals = " ".join(f"{t.y[i]: .9e} {t.im[i]: .9e}" for t in chunk)
+                    prefix = f"{fr:.9e} " if row == 0 else " " * 16
+                    f.write(f"{prefix}{vals}\n")
     return path

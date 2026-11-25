@@ -242,38 +242,34 @@ SPECTRUM_ANALYZER = Profile(
 )
 
 # ------------------------------------------------------------------------ ВАЦ
+_VNA_MAX_PORTS = 4
+_VNA_SPARAMS = tuple(f"S{r}{c}" for r in range(1, _VNA_MAX_PORTS + 1) for c in range(1, _VNA_MAX_PORTS + 1))
+
 NETWORK_ANALYZER = Profile(
     "network_analyzer", "Векторный анализатор цепей",
-    doc="""Трасса ``trace`` - Trace(x в Hz, y в единицах формата: MLOG - dB, PHASE/UPHASE - deg,
-    GDELAY - s, SWR/LIN_MAG/REAL/IMAG - без единиц; POLAR/SMITH - комплексная: Re в y, Im в Trace.im), публикуется после каждой ЗАВЕРШЁННОЙ развёртки.
-    Поэтому у ключа ``trace`` единица в профиле пустая, а настоящая - в ``Trace.y_unit``.
+    doc="""Только сырые комплексные данные S-параметров (``SDATA``: Re в ``Trace.y``, Im в ``Trace.im``)
+    и точная ось X стимула (``SENS:X?``: Hz / dBm / s), без чтения и настройки дисплея анализатора
+    (шкал, маркеров, форматов и экранной математики). Поддерживаются 2- и 4-портовые ВАЦ (``S11..S44``).
 
-    Измерения - слоты ``m1..m16``: пользователь сам выбирает, что читать. У слота: ``m{n}.channel``
-    (канал прибора), ``m{n}.name`` (имя измерения на приборе; пустое - слот не назначен) и
-    ``m{n}.enabled``. Читаются только включённые слоты и только нужные им каналы. После каждой
-    развёртки для каждого включённого слота публикуются ``m{n}.trace`` - в формате измерения - и
-    ``m{n}.sdata`` - комплексная (Trace.im - мнимая часть, y - вещественная, единицы нет); у остальных
-    None. ``m{n}.sparam`` / ``m{n}.format`` - S-параметр и формат назначенного измерения.
-    ``meas.count`` - сколько слотов прочитано. Действия: ``meas_catalog`` -> action_done с
-    [(канал, имя, S-параметр), ...] по всем каналам, ``meas_all`` - занять слоты первыми измерениями
-    всех каналов и включить, ``meas_none`` - выключить все. По умолчанию слоты занимают измерения
-    канала 1 по порядку, включён m1. ``trace`` / ``sparam`` / ``format`` и маркер - первое измерение
-    канала 1 (``trace`` = m1.trace). ``meas.complex`` выключает чтение комплексных данных.
-
-    Память трассы: ``mem_store`` копирует данные в память у слотов (аргументы - номера, без них - все
-    включённые) -> action_done с номерами; ``m{n}.math`` - математика с памятью (NORM - без неё),
-    применяется к ``m{n}.trace``, не к ``m{n}.sdata``. Состояния прибора хранятся в его памяти:
-    ``state_list`` -> action_done с именами (без содержимого), ``state_save`` / ``state_recall`` /
-    ``state_delete`` - аргумент имя; после ``state_recall`` слоты собираются заново, как при подключении.""",
+    Управление составом читаемых параметров:
+    * ``ports`` — число физических портов подключённого ВАЦ (2 или 4);
+    * ``s{r}{c}.enabled`` (``s11.enabled``..``s44.enabled``) — включить измерение и чтение параметра;
+    * ``s.active`` — список включённых S-параметров через запятую (например ``"S11,S41"``);
+    * ``s{r}{c}.trace`` — комплексная трасса параметра после завершённой развёртки (``None``, если выключен);
+    * ``trace`` — первая активная комплексная трасса (для совместимости с общими потребителями);
+    * ``meas.count`` — число прочитанных в последней развёртке S-параметров (публикуется последним).
+    """,
     slots=(
-        Slot("trace", T, "", required=True, readonly=True),
-        Slot("meas.continuous", B, required=True),
-        Slot("meas.armed", B, readonly=True),
-        Slot("sparam", E, required=True, choices=("S11", "S21", "S12", "S22")),
-        Slot("format", E, required=True,
-             choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG", "POLAR", "SMITH")),
-        Slot("stim.channel", I, doc="канал, к которому относятся ключи стимула (freq.*, sweep.*, bw.if, avg.*, "
-                                     "cal.state, source.power)"),
+        Slot("ports", I, readonly=True, required=True, doc="число физических портов ВАЦ (2 или 4)"),
+        Slot("s.active", S, required=True, doc="активные S-параметры через запятую (например 'S11,S41')"),
+        *(Slot(f"{sp.lower()}.enabled", B, doc=f"измерять и читать {sp}") for sp in _VNA_SPARAMS),
+        *(Slot(f"{sp.lower()}.trace", T, "", readonly=True, doc=f"комплексная трасса {sp} (Re в y, Im в im)")
+          for sp in _VNA_SPARAMS),
+        Slot("trace", T, "", readonly=True, required=True, doc="первая активная комплексная трасса"),
+        Slot("meas.count", I, readonly=True, doc="сколько S-параметров прочитано в последней развёртке"),
+        Slot("meas.continuous", B, required=True, doc="непрерывные развёртки"),
+        Slot("meas.armed", B, readonly=True, doc="развёртка идёт или ждёт триггер"),
+        Slot("stim.channel", I, doc="активный канал стимула, мощности, калибровки и читаемых S-параметров"),
         Slot("freq.start", F, "Hz", required=True),
         Slot("freq.stop", F, "Hz", required=True),
         Slot("freq.center", F, "Hz"),
@@ -282,82 +278,48 @@ NETWORK_ANALYZER = Profile(
         Slot("sweep.time", F, "s"),
         Slot("sweep.time_auto", B),
         Slot("sweep.type", E, choices=("LIN", "LOG", "POWER", "CW", "SEGMENT"),
-             doc="CW - одна частота freq.cw (ВАЦ как генератор), ось трассы - время, s"),
+             doc="LIN/LOG/SEGMENT - ось X в Hz; POWER - в dBm; CW - время развёртки в s"),
         Slot("freq.cw", F, "Hz", doc="частота в режиме CW"),
-        Slot("trig.source", E, choices=("IMM", "EXT", "MAN"), doc="запуск: внутренний / внешний вход / ручной (trigger)"),
-        Slot("trig.scope", E, choices=("ALL", "CURRENT"), doc="триггер запускает все каналы по очереди или текущий"),
+        Slot("bw.if", F, "Hz", required=True, doc="полоса ПЧ"),
+        Slot("source.power", F, "dBm", required=True, doc="мощность источника (порт 1 или активный gen.port в CW)"),
+        Slot("source.power_coupled", B, doc="связать мощность всех портов канала (SOUR:POW:COUP)"),
+        *(Slot(f"source.power_p{p}", F, "dBm", doc=f"мощность источника порта {p} (без поправки power.offset)")
+          for p in range(1, _VNA_MAX_PORTS + 1)),
+        Slot("power.offset", F, "dB", doc="поправка мощности тракта источника (CAL(f) − GAIN)"),
+        Slot("power.offset_state", B, doc="калибровка мощности источника включена"),
+        Slot("rf.output", B, doc="мощность источника включена (OUTP)"),
+        Slot("gen.state", B, doc="режим CW-генератора: канал stim.channel в CW, остальные в HOLD"),
+        Slot("gen.port", I, doc="выходной порт в режиме CW-генератора (1..ports)"),
+        Slot("gen.channel", I, readonly=True, doc="канал режима генератора (None - выключен)"),
+        Slot("avg.state", B, doc="усреднение включено"),
+        Slot("avg.count", I, doc="число усреднений"),
+        Slot("trig.source", E, choices=("IMM", "EXT", "MAN"),
+             doc="запуск: внутренний / внешний вход / ручной (trigger)"),
+        Slot("trig.scope", E, choices=("ALL", "CURRENT"),
+             doc="триггер запускает все каналы по очереди или текущий"),
         Slot("trig.mode", E, choices=("CHANNEL", "SWEEP", "POINT", "TRACE"),
              doc="что делает один триггер в канале stim.channel: весь канал / развёртку / точку / трассу"),
         Slot("trig.slope", E, choices=("POS", "NEG"), doc="фронт внешнего запуска"),
         Slot("trig.type", E, choices=("EDGE", "LEVEL"), doc="внешний запуск по фронту или по уровню"),
         Slot("trig.delay", F, "s", doc="задержка после внешнего запуска"),
-        Slot("state.dir", S, doc="папка состояний на диске анализатора (MMEM:CDIR); state_list читает её"),
-        Slot("trace.sel", S, doc="трейс «канал:имя» для ключей масштаба и обработки (scale.*, smooth.*)"),
-        Slot("scale.div", F, "", doc="цена деления на экране прибора (единицы формата трейса)"),
-        Slot("scale.ref", F, "", doc="опорный уровень на экране прибора"),
-        Slot("scale.rpos", F, "div", doc="на какой клетке опорный уровень"),
-        Slot("scale.edel", F, "s", doc="электрическая задержка (меняет фазу читаемых данных)"),
-        Slot("smooth.state", B, doc="сглаживание (меняет читаемые данные)"),
-        Slot("smooth.aper", F, "%", doc="апертура сглаживания, % обзора"),
-        Slot("gen.state", B, doc="режим генератора: канал stim.channel в CW, остальные каналы не развёртываются; "
-                                  "выключение возвращает настройки канала, как были до включения"),
-        Slot("gen.port", I, doc="выходной порт в режиме генератора (1 или 2)"),
-        Slot("gen.channel", I, readonly=True, doc="канал режима генератора (None - выключен)"),
-        Slot("bw.if", F, "Hz", required=True, doc="полоса ПЧ"),
-        Slot("source.power", F, "dBm", required=True),
-        Slot("power.offset", F, "dB", doc="поправка мощности тракта источника (CAL(f) − GAIN)"),
-        Slot("power.offset_state", B, doc="калибровка мощности источника включена"),
-        Slot("rf.output", B, doc="мощность источника включена"),
-        Slot("avg.state", B),
-        Slot("avg.count", I),
-        Slot("cal.state", B, readonly=None, doc="коррекция (калибровка) включена"),
+        Slot("cal.state", B, readonly=None, doc="коррекция (калибровка) канала включена (SENS:CORR:STAT)"),
         Slot("cal.set", S, doc="cal set канала stim.channel (пусто - нет); запись применяет cal set к каналу"),
         Slot("cal.stim", B, doc="применять cal set вместе с его стимулом (частоты, точки, полоса, мощность)"),
         Slot("cal.interp", B, doc="интерполяция калибровки при стимуле, отличном от cal set"),
         Slot("cal.busy", B, readonly=True, doc="калибровка: идёт измерение стандарта (cal_measure)"),
-        Slot("mark.n", I, doc="номер маркера (1..10) трейса trace.sel для mark.state / mark.x / mark.y"),
-        Slot("mark.state", B, doc="маркер mark.n трейса trace.sel включён"),
-        Slot("mark.x", F, "Hz", doc="положение маркера (в CW - время, s)"),
-        Slot("mark.y", F, "", readonly=True, doc="значение трейса в маркере (единицы формата трейса), "
-                                                 "перечитывается после каждой развёртки"),
-        Slot("marker.state", B),
-        Slot("marker.freq", F, "Hz"),
-        Slot("marker.value", F, "", readonly=True, doc="значение трассы в маркере, единицы - как у трассы"),
-        Slot("meas.count", I, readonly=True, doc="сколько измерений на канале 1"),
-        Slot("meas.complex", B, doc="читать комплексные данные m{n}.sdata"),
-        Slot("m{n}.channel", I, doc="канал прибора"),
-        Slot("m{n}.name", S, doc="имя измерения на приборе (пусто - слот не назначен)"),
-        Slot("m{n}.enabled", B, doc="читать это измерение после каждой развёртки"),
-        Slot("m{n}.sparam", E, choices=("S11", "S21", "S12", "S22")),
-        Slot("m{n}.format", E, choices=("MLOG", "PHASE", "UPHASE", "GDELAY", "SWR", "LIN_MAG", "REAL", "IMAG",
-                                        "POLAR", "SMITH")),
-        Slot("m{n}.math", E, choices=("NORM", "DIV", "SUBT", "ADD", "MULT"),
-             doc="математика с памятью: данные, Д/П, Д-П, Д+П, Д*П"),
-        Slot("m{n}.trace", T, "", readonly=True, doc="трасса измерения в его формате"),
-        Slot("m{n}.sdata", T, "", readonly=True, doc="комплексная трасса измерения (Re в y, Im в im)"),
+        Slot("state.dir", S, doc="папка состояний на диске анализатора (MMEM:CDIR); state_list читает её"),
     ),
     actions=(
-        ActionSlot("single", doc="одна развёртка"),
-        ActionSlot("abort"),
-        ActionSlot("mark_peak", doc="маркер mark.n трейса trace.sel на максимум -> mark_table"),
-        ActionSlot("mark_min", doc="маркер mark.n трейса trace.sel на минимум -> mark_table"),
-        ActionSlot("mark_aoff", doc="выключить все маркеры трейса trace.sel"),
-        ActionSlot("mark_table", doc="-> action_done('mark_table', [(номер, x, y), ...]) включённые маркеры trace.sel"),
-        ActionSlot("marker_peak", doc="маркер на максимум"),
-        ActionSlot("marker_min", doc="маркер на минимум"),
-        ActionSlot("meas_catalog", doc="каталог измерений -> action_done('meas_catalog', [(канал, имя, S-параметр)])"),
-        ActionSlot("meas_all", doc="занять слоты первыми измерениями всех каналов и включить"),
-        ActionSlot("meas_table", doc="-> action_done('meas_table', [(канал, имя, S-параметр, формат, математика)])"),
-        ActionSlot("meas_config", doc="аргументы (канал, имя, 'sparam'|'format'|'math', значение) -> таблица"),
-        ActionSlot("meas_create", doc="аргументы (канал, S-параметр): новое измерение на приборе -> таблица"),
-        ActionSlot("meas_move", doc="аргументы (канал, имя, новый канал): пересоздать в другом канале -> таблица"),
-        ActionSlot("meas_delete", doc="аргументы (канал, имя): удалить измерение с прибора -> таблица"),
-        ActionSlot("meas_none", doc="выключить чтение всех слотов"),
-        ActionSlot("autoscale", doc="автомасштаб трейса trace.sel на экране прибора"),
-        ActionSlot("trigger", doc="ручной запуск (trig.source = MAN); если ничего не взведено - взводит одну развёртку"),
-        ActionSlot("mem_store", doc="данные -> память: аргументы - номера слотов, без них - все включённые"),
+        ActionSlot("single", doc="одна развёртка (с учётом avg.count при включённом усреднении)"),
+        ActionSlot("abort", doc="остановить развёртку (HOLD)"),
+        ActionSlot("trigger", doc="ручной запуск (trig.source = MAN)"),
+        ActionSlot("sparam_set", doc="задать активные S-параметры (аргументы: 'S11', 'S41', ...) -> [имена]"),
+        ActionSlot("sparam_all", doc="включить все S-параметры по числу портов прибора -> [имена]"),
+        ActionSlot("sparam_none", doc="выключить чтение всех S-параметров -> []"),
+        ActionSlot("snp_read", doc="аргумент - порты (по умолчанию все, напр. '1,2,3,4'): "
+                                   "S-параметры канала stim.channel -> {'S11': Trace(комплексная), ...}"),
         ActionSlot("state_list", doc="имена состояний в памяти прибора -> action_done('state_list', [имя, ...])"),
-        ActionSlot("state_dirs", doc="-> action_done('state_dirs', (текущая папка, [подпапки])) - для выбора папки"),
+        ActionSlot("state_dirs", doc="-> action_done('state_dirs', (текущая папка, [подпапки]))"),
         ActionSlot("state_save", doc="сохранить состояние в памяти прибора: аргумент - имя"),
         ActionSlot("state_recall", doc="вызвать состояние из памяти прибора: аргумент - имя"),
         ActionSlot("state_delete", doc="удалить состояние из памяти прибора: аргумент - имя"),
@@ -365,17 +327,15 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("cal_delete", doc="удалить cal set из памяти прибора: аргумент - имя -> новый список"),
         ActionSlot("cal_conns", doc="разъёмы для калибровки -> action_done('cal_conns', [имя, ...])"),
         ActionSlot("cal_kits", doc="аргумент - разъём -> action_done('cal_kits', [набор, ...]), идеальные первыми"),
-        ActionSlot("cal_start", doc="аргументы (разъём 1, набор 1, разъём 2, набор 2; пусто - порт не нужен): "
-                                    "калибровка канала stim.channel -> (шаги, измеренные)"),
+        ActionSlot("cal_start", doc="аргументы (разъём 1, набор 1, ..., разъём N, набор N; пусто - порт не нужен): "
+                                    "guided-калибровка канала stim.channel -> (шаги, измеренные)"),
+        ActionSlot("cal_start_thru", doc="аргумент - S-параметр передачи (напр. 'S41', 'S21'; по умолчанию первый "
+                                         "активный): калибровка по перемычке (response THRU) -> (шаги, измеренные)"),
         ActionSlot("cal_measure", doc="аргумент - номер шага: измерить стандарт (cal.busy до конца)"),
         ActionSlot("cal_status", doc="-> action_done('cal_status', ([описание шага, ...], [измеренные шаги]))"),
         ActionSlot("cal_save", doc="аргумент - имя: сохранить калибровку в cal set и применить -> список cal set"),
         ActionSlot("cal_abort", doc="прервать калибровку (развёртки продолжаются)"),
-        ActionSlot("cal_start_thru", doc="калибровка по перемычке (response THRU) трейса trace.sel (S21 / S12) "
-                                         "-> (шаги, измеренные); дальше cal_measure 1 и cal_save"),
-        ActionSlot("snp_read", doc="аргумент - порты \"1,2\" | \"1\" | \"2\": S-параметры канала stim.channel -> "
-                                   "{\"S11\": Trace(комплексная), ...} для Touchstone"),
-        ActionSlot("reset"),
+        ActionSlot("reset", doc="сброс *RST"),
     ),
 )
 

@@ -10,7 +10,7 @@ from visalab.coord import ActivityMonitor, ProxyLinks
 from visalab.drivers import DRIVERS, KeysightE8267D, SiglentSDG
 from visalab.front import PowerMeterWindow, PulseGenWindow, RFGenWindow
 from visalab.front.launch import remember_windows
-from visalab.front.main_window import MainWindow
+from visalab.front.widgets import UnitCommitLineEdit
 from visalab.front.window import Window
 from visalab.instruments import InstrumentProxy
 from visalab.sim import KeysightE8267DSim, KeysightU2021XASim, SiglentSDGSim
@@ -191,17 +191,17 @@ def test_lnumber_and_setting_field_commit_on_enter_and_focus_out(qtbot, tmp_path
     finally:
         proxy.shutdown()
 
-    # MainWindow SettingField
-    ms = QSettings(str(tmp_path / "main.ini"), QSettings.Format.IniFormat)
-    mw = MainWindow(ms, ActivityMonitor(ProxyLinks()))
-    qtbot.addWidget(mw)
-    f = mw.fields["pm_floor_dbm"]
+    # UnitCommitLineEdit (Enter and focus-out)
+    committed = []
+    f = UnitCommitLineEdit("dBm", 1.0)
+    qtbot.addWidget(f)
+    f.show_value(-60.0)
+    f.focus_committed.connect(lambda: committed.append(f.parsed()))
     f.setText("-42")
     f.setModified(True)
     _focus_out(f)
-    assert mw.monitor.th.pm_floor_dbm == pytest.approx(-42.0)
+    assert committed[-1] == pytest.approx(-42.0)
     f.setText("-35")
     f.setModified(True)
     f.returnPressed.emit()
-    assert mw.monitor.th.pm_floor_dbm == pytest.approx(-35.0)
-    mw.cleanup()
+    assert committed[-1] == pytest.approx(-35.0)
