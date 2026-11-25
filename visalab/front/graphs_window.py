@@ -613,7 +613,7 @@ class _FloatingGraphWindow(Window):
     def closeEvent(self, event):  # noqa: N802 - Qt
         if not self._closing_for_dock and not sip.isdeleted(self.card):
             self.dock_back_requested.emit(self.card.graph_name)
-            event.ignore()
+            event.accept()
             return
         super().closeEvent(event)
 
@@ -922,6 +922,7 @@ class GraphsWindow(Window):
             sig.connect(self._on_runs)
         self._on_runs()
 
+        self.titleBar.raise_()
         self.setMinimumWidth(760)
         self.setMinimumHeight(460)
         self.recall_size(QSize(1240, 760))

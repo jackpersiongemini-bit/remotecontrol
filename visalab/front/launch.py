@@ -8,11 +8,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
 from PyQt6 import sip
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, QTimer
 from PyQt6.QtWidgets import QApplication
 
 from ..applog import close_logging, default_ini_path, default_log_path, setup_logging
@@ -85,9 +86,25 @@ def run_windows(specs, doc: str = "", argv=None, parser=None, show: bool | None 
     keep = setup(opened, args, settings) if setup else None  # noqa: F841 - держим ссылку до выхода
 
     app.aboutToQuit.connect(lambda: _quit(opened))
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    sigint_timer: QTimer | None = None
+    try:
+        signal.signal(signal.SIGINT, lambda *_a: QTimer.singleShot(0, app.closeAllWindows))
+        sigint_timer = QTimer()
+        sigint_timer.setInterval(200)
+        sigint_timer.timeout.connect(lambda: None)
+        sigint_timer.start()
+    except (ValueError, OSError):
+        pass
     try:
         return app.exec()
     finally:
+        if sigint_timer is not None:
+            sigint_timer.stop()
+        try:
+            signal.signal(signal.SIGINT, prev_sigint)
+        except (ValueError, OSError):
+            pass
         logging.getLogger("visalab").info("выход")
         close_logging(log_file)
 

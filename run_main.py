@@ -71,7 +71,10 @@ def setup(opened, args, settings):
     graphs_win = GraphsWindow(settings, monitor, instruments_window=inst_win)
     inst_win.bind_graphs_window(graphs_win)
     graphs_win.quit_on_close = True
-    QApplication.instance().aboutToQuit.connect(monitor.stop)    # до остановки приборов
+    app = QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(graphs_win.cleanup)
+        app.aboutToQuit.connect(monitor.stop)    # до остановки приборов
 
     # На первом запуске (пока позиции не сохранены) разносим два окна так, чтобы оба были видны
     screen = QGuiApplication.primaryScreen()

@@ -266,6 +266,14 @@ class PLineEdit(QLineEdit, _Bound):
         super().resizeEvent(e)
         self._place_unit()
 
+    def changeEvent(self, e):  # noqa: N802 - Qt
+        super().changeEvent(e)
+        if e.type() in (QEvent.Type.StyleChange, QEvent.Type.FontChange, QEvent.Type.Polish):
+            self._place_unit()
+
+    def refresh_theme(self) -> None:
+        self._place_unit()
+
     def _unit_menu(self) -> None:
         menu = QMenu(self)
         menu.setObjectName("psmenu")
@@ -765,6 +773,14 @@ class PSpinBox(QDoubleSpinBox, _Bound):
 
     def resizeEvent(self, e):  # noqa: N802 - Qt
         super().resizeEvent(e)
+        self._place_unit()
+
+    def changeEvent(self, e):  # noqa: N802 - Qt
+        super().changeEvent(e)
+        if e.type() in (QEvent.Type.StyleChange, QEvent.Type.FontChange, QEvent.Type.Polish):
+            self._place_unit()
+
+    def refresh_theme(self) -> None:
         self._place_unit()
 
     def _unit_menu(self) -> None:

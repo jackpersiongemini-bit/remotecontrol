@@ -253,6 +253,18 @@ def test_run_main_launcher_opens_graphs_and_instruments_windows(qtbot, tmp_path,
         gw.set_instruments_visible(True)
         assert iw.isVisible()
         assert gw.instruments_button.isChecked()
+        # Закрытие InstrumentsWindow по × скрывает его (не убивая и не мешая Cmd+Q)
+        iw.close()
+        assert not iw.isVisible()
+        assert not gw.instruments_button.isChecked()
+        gw.set_instruments_visible(True)
+        assert iw.isVisible()
+        # Системное закрытие всех окон (Cmd+Q / Close all) не блокируется event.ignore()
+        gw.quit_on_close = False
+        app = QApplication.instance()
+        app.closeAllWindows()
+        assert not gw.isVisible()
+        assert not iw.isVisible()
     finally:
         built["graphs"].quit_on_close = False
         built["graphs"].cleanup()

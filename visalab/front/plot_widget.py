@@ -3704,6 +3704,6 @@ class PlotSettingsWindow(Window):
             self.save_size()
             self.hide()
             self.closed.emit()
-            event.ignore()
+            event.accept()
             return
         super().closeEvent(event)

@@ -1299,7 +1299,7 @@ class _FloatingCardWindow(Window):
     def closeEvent(self, event):  # noqa: N802 - Qt
         if not self._closing_for_dock and not sip.isdeleted(self.card):
             self.dock_back_requested.emit(self.card.instrument_name)
-            event.ignore()
+            event.accept()
             return
         super().closeEvent(event)
 
@@ -1689,6 +1689,7 @@ class InstrumentsWindow(Window):
         root.setSpacing(0)
         root.addWidget(self.splitter, 1)
 
+        self.titleBar.raise_()
         self.setMinimumWidth(720)
         self.setMinimumHeight(420)
         self.recall_size(QSize(1120, 720))
@@ -2092,7 +2093,7 @@ class InstrumentsWindow(Window):
             self.save_size()
             self._settings.sync()
             self.hide()
-            event.ignore()
+            event.accept()
             return
         self.search_view.clear_results()
         self._dock_all_floating()
