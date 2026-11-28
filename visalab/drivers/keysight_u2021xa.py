@@ -42,13 +42,15 @@ F, I, B, E = Kind.FLOAT, Kind.INT, Kind.BOOL, Kind.ENUM
 FEEDS = {1: ("meas.power", "POW:AVER"),
          2: ("meas.peak", "POW:PEAK"),
          3: ("meas.ptav", "POW:PTAV")}
-#: по мануалу ``... ON SWEEP<n>`` (строб) разрешён только при TRIG:SOUR INT или EXT, иначе -221
-GATED_SOURCES = ("INT", "EXT")
+#: аппаратный строб ``... ON SWEEP<n>`` включается только для внешнего триггера EXT;
+#: режим INT (LEVEL) реализован программно по точкам TRAC:DATA? поверх свободного запуска IMM
+GATED_SOURCES = ("EXT",)
 RESULT_KEYS = tuple(k for k, _ in FEEDS.values()) + ("trace",)
 #: параметры запуска / строба: их смена в триггерном режиме делает прежний результат неактуальным
 TRIG_REARM_CLEAR_KEYS = frozenset(("trig.level", "trig.level_auto", "trig.slope", "trig.delay", "trig.holdoff",
                                    "gate.start", "gate.length"))
 TRACE_RES = "MRES"                     # 1000 точек
+SW_LEVEL_MIN_TRACE_S = 1.25e-3         # дефолтное окно захвата для программного LEVEL (≥ 1 периода при ≥ 1 кГц, шаг 1.25 мкс)
 CAL_TIMEOUT_MS = 30000
 
 
@@ -63,12 +65,15 @@ class KeysightU2021XA(VISAInstrument):
         self._continuous = True
         self._armed = False
         self._results: dict[str, float | None] = dict.fromkeys(RESULT_KEYS)
-        #: границы TRIG:LEV прибора и сдвигает ли датчик TRIG:LEV на CORR:GAIN2 сам (определяется по TRIG:LEV? MAX)
+        #: программный видео-уровень (LEVEL / INT): хранится в драйвере, без записи TRIG:SOUR INT / TRIG:LEV в датчик
+        self._sw_trig_level: float = 0.0
+        self._sw_trig_level_auto: bool = True
+        self._sw_trig_slope: str = "POS"
+        self._user_tracing: bool = False
+        self._user_trace_time_set: bool = False
+        self._hw_trace_time: float = 100e-6
         self._trig_level_min = -40.0
         self._trig_level_max = 20.0
-        self._hw_base_max = 20.0
-        self._trig_level_offset_in_hw: bool | None = None
-        self._bounds_dirty = True
         self._batch_active = False
         self._batch_mode_changed = False
         super().__init__(transport, parent, command_delay_s, read_pause_s)
@@ -87,20 +92,20 @@ class KeysightU2021XA(VISAInstrument):
             # CORR:GAIN2 на реальных U2020X может сам включить CORR:GAIN2:STAT - перечитываем offset.state до trig.level
             Param("offset", "Поправка", F, "dB", section=sens, query="CORR:GAIN2?",
                   write="CORR:GAIN2 {value}", minimum=-100.0, maximum=100.0, tolerance=1e-3,
-                  also_read=("offset.state", "trig.level")),
+                  also_read=("offset.state",)),
             Param("offset.state", "Поправка вкл.", B, section=sens, query="CORR:GAIN2:STAT?",
-                  write="CORR:GAIN2:STAT {value}", also_read=("trig.level",)),
+                  write="CORR:GAIN2:STAT {value}"),
             Param("trig.source", "Запуск", E, section=trig, query="TRIG:SOUR?", write="TRIG:SOUR {value}",
                   choices=("IMM", "INT", "EXT", "BUS", "HOLD"),
                   labels=("Свободный", "По уровню", "Внешний", "Программный", "Удержание"),
                   enum_map=(("INT", "INT"), ("INT", "INT1"), ("INT", "INTERNAL"),
                             ("EXT", "EXT"), ("EXT", "EXTERNAL"), ("IMM", "IMM"), ("IMM", "IMMEDIATE")),
                   also_read=("detector", "trig.level", "trig.level_auto", "trig.slope")),
-            Param("trig.level", "Уровень запуска", F, "dBm", section=trig, query="TRIG:LEV?",
-                  write="TRIG:LEV {value}", minimum=-140.0, maximum=120.0, tolerance=1e-3,
+            Param("trig.level", "Уровень запуска", F, "dBm", section=trig, query="<virtual>",
+                  write="<virtual>", minimum=-140.0, maximum=120.0, tolerance=1e-3,
                   also_read=("trig.level_auto",)),
-            Param("trig.level_auto", "Уровень авто", B, section=trig, query="TRIG:LEV:AUTO?",
-                  write="TRIG:LEV:AUTO {value}", also_read=("trig.level",)),
+            Param("trig.level_auto", "Уровень авто", B, section=trig, query="<virtual>",
+                  write="<virtual>", also_read=("trig.level",)),
             Param("trig.slope", "Фронт", E, section=trig, query="TRIG:SLOP?", write="TRIG:SLOP {value}",
                   choices=("POS", "NEG"), labels=("Нарастающий", "Спадающий"),
                   enum_map=(("POS", "POS"), ("POS", "POSITIVE"), ("NEG", "NEG"), ("NEG", "NEGATIVE"))),
@@ -147,11 +152,14 @@ class KeysightU2021XA(VISAInstrument):
     def on_connected(self) -> None:
         self._armed = False
         self._results = dict.fromkeys(RESULT_KEYS)
+        self._sw_trig_level = 0.0
+        self._sw_trig_level_auto = True
+        self._sw_trig_slope = "POS"
+        self._user_tracing = False
+        self._user_trace_time_set = False
+        self._hw_trace_time = 100e-6
         self._trig_level_min = -40.0
         self._trig_level_max = 20.0
-        self._hw_base_max = 20.0
-        self._trig_level_offset_in_hw = None
-        self._bounds_dirty = True
         self._batch_active = False
         self._batch_mode_changed = False
         self.write("INIT:CONT OFF")
@@ -160,20 +168,25 @@ class KeysightU2021XA(VISAInstrument):
             self.write(f"UNIT{n}:POW DBM")
         self.write("TRAC:UNIT DBM")
         det = "NORMAL" if self.query("DET:FUNC?").strip().upper().startswith("NORM") else "AVERAGE"
-        src = self._params["trig.source"].from_scpi(self.query("TRIG:SOUR?"))
+        hw_src = self._params["trig.source"].from_scpi(self.query("TRIG:SOUR?"))
+        if hw_src == "INT":
+            # Аппаратный INT не используем: переводим физический датчик в IMM, оставляя режим LEVEL (INT) программным
+            if det != "NORMAL":
+                self.write("DET:FUNC NORM")
+                det = "NORMAL"
+            self.write("TRIG:SOUR IMM")
         self._values["detector"] = det
-        self._values["trig.source"] = src
-        self._configure_feeds(det, src)
+        self._values["trig.source"] = hw_src
+        self._configure_feeds(det, hw_src)
         self.opc_latched = False
 
     def on_closed(self) -> None:
         self._armed = False
         self._results = dict.fromkeys(RESULT_KEYS)
+        self._user_tracing = False
+        self._user_trace_time_set = False
         self._trig_level_min = -40.0
         self._trig_level_max = 20.0
-        self._hw_base_max = 20.0
-        self._trig_level_offset_in_hw = None
-        self._bounds_dirty = True
         self._batch_active = False
         self._batch_mode_changed = False
 
@@ -184,8 +197,8 @@ class KeysightU2021XA(VISAInstrument):
 
     def _configure_feeds(self, detector: str, source: str) -> None:
         """Назначение CALC1..3 под режим (правила мануала U2020X):
-        PEAK/PTAV - только при DET NORM; ``ON SWEEP1`` (строб) - только при TRIG:SOUR INT/EXT.
-        В свободном счёте NORMAL даёт среднее и пик без строба."""
+        PEAK/PTAV - только при DET NORM; ``ON SWEEP1`` (аппаратный строб) - только при TRIG:SOUR EXT.
+        В свободном счёте и в программном LEVEL датчик стоит без ``ON SWEEP1``."""
         gate = " ON SWEEP1" if source in GATED_SOURCES else ""
         for n, (_, feed) in FEEDS.items():
             if detector != "NORMAL" and n > 1:
@@ -197,8 +210,12 @@ class KeysightU2021XA(VISAInstrument):
         return self._values.get("detector") == "NORMAL"
 
     @property
+    def _sw_level(self) -> bool:
+        return self._values.get("trig.source") == "INT"
+
+    @property
     def _tracing(self) -> bool:
-        return self._values.get("trace.state") is True
+        return (self._values.get("trace.state") is True) or self._sw_level
 
     @property
     def _free_run(self) -> bool:
@@ -213,8 +230,9 @@ class KeysightU2021XA(VISAInstrument):
         was_cont_free = self._free_run and self._continuous and not self._tracing
         if was_cont_free:
             self.write("INIT:CONT OFF")
-        if was_armed or was_cont_free:
+        if (was_armed and not self._sw_level) or was_cont_free:
             self.write("ABOR")
+        if was_armed or was_cont_free:
             self._set_armed(False)
         return was_armed, was_cont_free
 
@@ -226,27 +244,32 @@ class KeysightU2021XA(VISAInstrument):
                 return float(off)
         return 0.0
 
-    def _refresh_trig_bounds(self) -> None:
-        """Узнать у прибора границы TRIG:LEV? MIN/MAX и понять, сдвигает ли датчик TRIG:LEV на CORR:GAIN2 сам."""
-        self._bounds_dirty = False
-        off = self._active_offset()
-        lo, hi = self._trig_level_min, self._trig_level_max
-        queried = False
-        try:
-            q_lo = self.query_float("TRIG:LEV? MIN")
-            q_hi = self.query_float("TRIG:LEV? MAX")
-            if math.isfinite(q_lo) and math.isfinite(q_hi) and q_lo < q_hi:
-                lo, hi = q_lo, q_hi
-                queried = True
-        except ValueError:
-            self._check_errors(context="trig.level bounds")
-        if queried:
-            self._trig_level_min, self._trig_level_max = lo, hi
-            if abs(off) < 0.1:
-                self._hw_base_max = hi
-            else:
-                base_max = self._hw_base_max
-                self._trig_level_offset_in_hw = abs(hi - (base_max + off)) < abs(hi - base_max)
+    def _desired_sw_trace_time(self) -> float:
+        """Длительность захвата SENS:TRAC:TIME на датчике в режиме программного LEVEL."""
+        user_t = float(self._values.get("trace.time") or 100e-6)
+        delay = abs(float(self._values.get("trig.delay") or 0.0))
+        g_start = abs(float(self._values.get("gate.start") or 0.0))
+        g_len = max(0.0, float(self._values.get("gate.length") or 0.0))
+        need = (delay + g_start + g_len) * 2.2
+        base = user_t if self._user_trace_time_set else max(user_t, SW_LEVEL_MIN_TRACE_S)
+        return min(1.0, max(25e-9, base, need))
+
+    def _sync_hw_trace_for_mode(self) -> None:
+        """Поддерживать аппаратные TRAC:STAT и SENS:TRAC:TIME для текущего режима."""
+        if not self._normal:
+            self._hw_trace_time = float(self._values.get("trace.time") or 100e-6)
+            return
+        if self._sw_level:
+            target_t = self._desired_sw_trace_time()
+            self.write(f"SENS:TRAC:TIME {self._params['trace.time'].to_scpi(target_t)}")
+            self._hw_trace_time = target_t
+            self.write("TRAC:STAT ON")
+        else:
+            user_t = float(self._values.get("trace.time") or 100e-6)
+            if abs(self._hw_trace_time - user_t) > 1e-12:
+                self.write(f"SENS:TRAC:TIME {self._params['trace.time'].to_scpi(user_t)}")
+                self._hw_trace_time = user_t
+            self.write(f"TRAC:STAT {'ON' if self._user_tracing else 'OFF'}")
 
     def _clear_results(self) -> None:
         """Сбросить устаревшие результаты измерения и уведомить GUI (до нового запуска - пусто)."""
@@ -259,9 +282,6 @@ class KeysightU2021XA(VISAInstrument):
         if self._state is not ConnectionState.CONNECTED or not self._pending:
             super()._flush_pending()
             return
-        # Останавливаем измерение один раз на всю пачку: validate_param, write_param, проверка ошибок
-        # (*ESR?) и обратное чтение (_read_keys / TRIG:LEV? MIN/MAX) идут при остановленном датчике,
-        # без гонки с активным INIT / *OPC.
         was_armed, was_cont_free = self._stop_acquisition()
         self._batch_active = True
         self._batch_mode_changed = False
@@ -279,16 +299,12 @@ class KeysightU2021XA(VISAInstrument):
 
     def _trig_level_bounds(self) -> tuple[float, float]:
         """Допустимый диапазон trig.level в шкале показаний (с учётом активной поправки)."""
-        if self._trig_level_offset_in_hw is False:
-            off = self._active_offset()
-            return self._trig_level_min + off, self._trig_level_max + off
-        return self._trig_level_min, self._trig_level_max
+        off = self._active_offset()
+        return self._trig_level_min + off, self._trig_level_max + off
 
     def validate_param(self, spec: Param, value: Any) -> Any:
         value = super().validate_param(spec, value)
         if spec.key == "trig.level":
-            if self._bounds_dirty and self.transport.is_open:
-                self._refresh_trig_bounds()
             lo, hi = self._trig_level_bounds()
             if value < lo - 1e-6 or value > hi + 1e-6:
                 off = self._active_offset()
@@ -319,16 +335,27 @@ class KeysightU2021XA(VISAInstrument):
             return
         try:
             if key == "trig.level":
-                if self._bounds_dirty:
-                    self._refresh_trig_bounds()
-                off = self._active_offset()
-                hw_value = value - off if self._trig_level_offset_in_hw is False else value
-                self.write("TRIG:LEV:AUTO OFF")               # ручной уровень не должен конфликтовать с AUTO
-                self.write(spec.write.format(value=spec.to_scpi(hw_value)))
+                self._sw_trig_level = float(value)
+                self._sw_trig_level_auto = False
+            elif key == "trig.level_auto":
+                self._sw_trig_level_auto = bool(value)
+            elif key == "trig.slope":
+                self._sw_trig_slope = str(value)
+                if self._values.get("trig.source") == "EXT":
+                    super().write_param(spec, value)
+            elif key == "trace.time":
+                self._user_trace_time_set = True
+                super().write_param(spec, value)
+                self._values["trace.time"] = float(value)
+                self._hw_trace_time = float(value)
+                if self._sw_level:
+                    self._sync_hw_trace_for_mode()
             else:
                 super().write_param(spec, value)
-                if key in ("offset", "offset.state"):
-                    self._bounds_dirty = True
+                if key in ("trig.delay", "gate.start", "gate.length"):
+                    self._values[key] = value
+                    if self._sw_level:
+                        self._sync_hw_trace_for_mode()
             if not self._free_run and key in TRIG_REARM_CLEAR_KEYS:
                 self._clear_results()
         finally:
@@ -341,14 +368,16 @@ class KeysightU2021XA(VISAInstrument):
     def _set_tracing(self, on: bool, rearm: bool = True) -> None:
         """Трасса требует DET NORM и INIT:CONT OFF: режим датчика переключается сам."""
         try:
+            self._user_tracing = bool(on)
             if on and not self._normal:
                 self._change_mode(self._params["detector"], "NORMAL", rearm=False)
                 self._publish("detector", "NORMAL")
             self.write("INIT:CONT OFF")
             self._abort()
-            super().write_param(self._params["trace.state"], on)
-            self._values["trace.state"] = on
-            if not on:
+            hw_on = bool(on) or self._sw_level
+            super().write_param(self._params["trace.state"], hw_on)
+            self._values["trace.state"] = bool(on)
+            if not hw_on:
                 self._results["trace"] = None
                 self._publish("trace", None)
         finally:
@@ -356,8 +385,8 @@ class KeysightU2021XA(VISAInstrument):
                 self._apply_run_mode()
 
     def _change_mode(self, spec: Param, value: Any, rearm: bool = True) -> None:
-        """Смена запуска/режима в порядке, при котором прибор не даёт -221:
-        INT требует DET NORM; AVER требует запуск не INT; строб в FEED требует INT/EXT."""
+        """Смена запуска/режима без аппаратного TRIG:SOUR INT:
+        для LEVEL (INT) физический датчик ставится в DET NORM + TRIG:SOUR IMM + TRAC:STAT ON."""
         det = self._values.get("detector", "NORMAL")
         src = self._values.get("trig.source", "IMM")
         if spec.key == "detector":
@@ -366,20 +395,25 @@ class KeysightU2021XA(VISAInstrument):
         else:
             new_src = value
             new_det = "NORMAL" if value == "INT" else det
+        hw_new_src = "IMM" if new_src == "INT" else new_src
         try:
             if src in GATED_SOURCES and new_src not in GATED_SOURCES:
-                self._configure_feeds(det, new_src)  # снять строб, пока источник ещё INT/EXT
-            if new_det == "AVERAGE" and self._tracing:   # трасса только в NORMal
-                self.write("TRAC:STAT OFF")
+                self._configure_feeds(det, new_src)  # снять строб, пока источник ещё EXT
+            if new_det == "AVERAGE":
+                if self._user_tracing or src == "INT":
+                    self.write("TRAC:STAT OFF")
+                self._user_tracing = False
                 self._values["trace.state"] = False
                 self._publish("trace.state", False)
-            if spec.key == "detector" and new_src != src:
-                self.write("TRIG:SOUR IMM")
-            if spec.key == "trig.source" and new_det != det:
-                self.write("DET:FUNC NORM")
-            super().write_param(spec, value)
+            if new_det != det:
+                self.write(f"DET:FUNC {'NORM' if new_det == 'NORMAL' else 'AVER'}")
+            self.write(f"TRIG:SOUR {hw_new_src}")
+            if new_src == "EXT":
+                self.write(f"TRIG:SLOP {self._sw_trig_slope}")
             self._values["detector"], self._values["trig.source"] = new_det, new_src
             self._configure_feeds(new_det, new_src)
+            if new_det == "NORMAL":
+                self._sync_hw_trace_for_mode()
             self._clear_results()
         finally:
             if rearm:
@@ -390,19 +424,35 @@ class KeysightU2021XA(VISAInstrument):
             return self._continuous
         if spec.key == "meas.armed":
             return self._armed
-        if spec.key in ("trace.time", "trace.offset") and not self._normal:
-            return None
-        if spec.key == "trig.level":
-            if self._bounds_dirty:
-                self._refresh_trig_bounds()
+        if spec.key == "trig.source":
             hw = super().read_param_raw(spec)
-            if self._trig_level_offset_in_hw is False:
-                return hw + self._active_offset()
+            if self._sw_level and hw == "IMM":
+                return "INT"
             return hw
-        val = super().read_param_raw(spec)
-        if spec.key in ("offset", "offset.state") and val != self._values.get(spec.key):
-            self._bounds_dirty = True
-        return val
+        if spec.key == "trig.level":
+            return self._sw_trig_level
+        if spec.key == "trig.level_auto":
+            return self._sw_trig_level_auto
+        if spec.key == "trig.slope":
+            if self._values.get("trig.source") == "EXT":
+                self._sw_trig_slope = super().read_param_raw(spec)
+            return self._sw_trig_slope
+        if spec.key == "trace.state":
+            hw = super().read_param_raw(spec)
+            if not self._sw_level:
+                self._user_tracing = bool(hw)
+            return self._user_tracing
+        if spec.key == "trace.time":
+            if not self._normal:
+                return None
+            hw_t = super().read_param_raw(spec)
+            self._hw_trace_time = float(hw_t)
+            if self._sw_level and not self._user_trace_time_set:
+                return float(self._values.get("trace.time") or 100e-6)
+            return hw_t
+        if spec.key == "trace.offset" and not self._normal:
+            return None
+        return super().read_param_raw(spec)
 
     def read_group(self, group: str) -> dict[str, Any]:
         # Результаты не запрашиваются при синхронизации: FETC? без готового измерения
@@ -411,6 +461,8 @@ class KeysightU2021XA(VISAInstrument):
 
     def _sync_all(self) -> None:
         super()._sync_all()
+        if self._sw_level:
+            self._sync_hw_trace_for_mode()
         self._apply_run_mode()
 
     # ------------------------------------------------------ цикл измерения
@@ -426,12 +478,16 @@ class KeysightU2021XA(VISAInstrument):
         self._sync_poll_timer()
 
     def _arm(self) -> None:
+        if self._sw_level:
+            self._set_armed(True)
+            return
         self.arm_opc("INIT")
         self._set_armed(True)
 
     def _abort(self) -> None:
         if self._armed:
-            self.write("ABOR")
+            if not self._sw_level:
+                self.write("ABOR")
             self._set_armed(False)
         self._opc_pending = False
         self.opc_latched = False
@@ -446,7 +502,161 @@ class KeysightU2021XA(VISAInstrument):
         """SCPI-сентинелы (9.91E+37) и NaN/Inf не публикуются как валидная мощность."""
         return v if math.isfinite(v) and abs(v) < 9.9e36 else None
 
+    @staticmethod
+    def _integrate_window_mw(ts: list[float], mw: list[float], w0: float, w1: float) -> tuple[float, float] | None:
+        """Средняя и пиковая линейная мощность (мВт) на отрезке ``[w0, w1]`` методом трапеций с интерполяцией краёв."""
+        n = len(ts)
+        if n == 0 or w1 < ts[0] or w0 > ts[-1]:
+            return None
+        a = max(w0, ts[0])
+        b = min(w1, ts[-1])
+        if b < a:
+            return None
+        dt = (ts[-1] - ts[0]) / (n - 1) if n > 1 else 0.0
+        if dt <= 0.0 or abs(b - a) <= 1e-15:
+            idx = min(max(0, int(round((a - ts[0]) / dt))) if dt > 0 else 0, n - 1)
+            val = mw[idx]
+            return (val, val) if math.isfinite(val) else None
+
+        def interp_at(t: float) -> float:
+            pos = (t - ts[0]) / dt
+            i0 = min(max(0, int(math.floor(pos))), n - 1)
+            i1 = min(i0 + 1, n - 1)
+            frac = pos - i0
+            v0, v1 = mw[i0], mw[i1]
+            if not (math.isfinite(v0) and math.isfinite(v1)):
+                return v0 if math.isfinite(v0) else v1
+            return v0 + frac * (v1 - v0)
+
+        pts_t = [a]
+        pts_v = [interp_at(a)]
+        i_first = max(0, int(math.ceil((a - ts[0]) / dt + 1e-12)))
+        i_last = min(n - 1, int(math.floor((b - ts[0]) / dt - 1e-12)))
+        for idx in range(i_first, i_last + 1):
+            if math.isfinite(mw[idx]):
+                pts_t.append(ts[idx])
+                pts_v.append(mw[idx])
+        pts_t.append(b)
+        pts_v.append(interp_at(b))
+        finite_v = [v for v in pts_v if math.isfinite(v)]
+        if not finite_v:
+            return None
+        area = 0.0
+        span = 0.0
+        for i in range(len(pts_t) - 1):
+            seg = pts_t[i + 1] - pts_t[i]
+            if seg > 0 and math.isfinite(pts_v[i]) and math.isfinite(pts_v[i + 1]):
+                area += 0.5 * (pts_v[i] + pts_v[i + 1]) * seg
+                span += seg
+        avg = area / span if span > 0 else sum(finite_v) / len(finite_v)
+        return avg, max(finite_v)
+
+    def _process_sw_level(self, y: list[float]) -> tuple[dict[str, Any], float | None]:
+        """Программный запуск по видео-уровню (LEVEL) по массиву TRAC:DATA?."""
+        out: dict[str, Any] = dict.fromkeys(RESULT_KEYS)
+        n = len(y)
+        start = float(self._values.get("trace.offset") or 0.0)
+        cap_len = float(self._hw_trace_time or self._values.get("trace.time") or 100e-6)
+        dt = cap_len / (n - 1) if n > 1 else 0.0
+        ts_raw = [start + i * dt for i in range(n)]
+        meta = {
+            "trigger": "INT",
+            "delay": self._values.get("trig.delay"),
+            "gate": (self._values.get("gate.start"), self._values.get("gate.length")),
+        }
+
+        finite = [v for v in y if math.isfinite(v)]
+        if not finite or n < 2:
+            out["trace"] = Trace.linear(start, start + cap_len, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
+            return out, None
+
+        off = self._active_offset()
+        detected_auto_lvl: float | None = None
+        if self._sw_trig_level_auto:
+            y_min, y_max = min(finite), max(finite)
+            floor_dbm = -40.0 + off
+            if y_max < floor_dbm or (y_max - y_min) < 1.0:
+                out["trace"] = Trace.linear(start, start + cap_len, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
+                return out, None
+            lo_ref = max(y_min, floor_dbm)
+            lvl = round(max(floor_dbm, min(20.0 + off, 0.5 * (y_max + lo_ref))), 1)
+            detected_auto_lvl = lvl
+        else:
+            lvl = self._sw_trig_level
+
+        slope = self._sw_trig_slope
+        crossings: list[tuple[int, float]] = []
+        for i in range(1, n):
+            y0, y1 = y[i - 1], y[i]
+            if not (math.isfinite(y0) and math.isfinite(y1)):
+                continue
+            if slope == "NEG":
+                if y0 > lvl >= y1:
+                    crossings.append((i, 0.5 * (ts_raw[i - 1] + ts_raw[i])))
+            else:
+                if y0 < lvl <= y1:
+                    crossings.append((i, 0.5 * (ts_raw[i - 1] + ts_raw[i])))
+
+        if not crossings:
+            out["trace"] = Trace.linear(start, start + cap_len, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
+            return out, None
+
+        delay = float(self._values.get("trig.delay") or 0.0)
+        g_start = float(self._values.get("gate.start") or 0.0)
+        g_len = max(0.0, float(self._values.get("gate.length") or 0.0))
+        win_rel_end = delay + g_start + g_len
+
+        chosen_idx, t_trig = crossings[0]
+        for idx_c, tc in crossings:
+            if tc + delay + g_start >= ts_raw[0] and tc + win_rel_end <= ts_raw[-1]:
+                chosen_idx, t_trig = idx_c, tc
+                break
+
+        mw = [10.0 ** (v / 10.0) if math.isfinite(v) else math.nan for v in y]
+        if g_len > 0.0:
+            w0 = t_trig + delay + g_start
+            w1 = w0 + g_len
+            res = self._integrate_window_mw(ts_raw, mw, w0, w1)
+        else:
+            # Если длина строба = 0, усредняем саму полку импульса от найденного фронта
+            j = chosen_idx
+            if slope == "NEG":
+                while j < n and math.isfinite(y[j]) and y[j] <= lvl:
+                    j += 1
+            else:
+                while j < n and math.isfinite(y[j]) and y[j] >= lvl:
+                    j += 1
+            seg = [mw[k] for k in range(chosen_idx, max(chosen_idx + 1, j)) if math.isfinite(mw[k])]
+            res = (sum(seg) / len(seg), max(seg)) if seg else None
+
+        if res is not None:
+            avg_mw, peak_mw = res
+            p_avg = 10.0 * math.log10(max(avg_mw, 1e-30))
+            p_peak = 10.0 * math.log10(max(peak_mw, 1e-30))
+            out["meas.power"] = self._clean_reading(p_avg)
+            out["meas.peak"] = self._clean_reading(p_peak)
+            if out["meas.power"] is not None and out["meas.peak"] is not None:
+                out["meas.ptav"] = self._clean_reading(p_peak - p_avg)
+
+        # Выравниваем трассу так, чтобы фронт запуска стоял в t = 0 (с учётом trace.offset)
+        x_aligned = [t - t_trig + start for t in ts_raw]
+        out["trace"] = Trace(x_aligned, y, x_unit="s", y_unit="dBm", name="trace", meta=meta)
+        return out, detected_auto_lvl
+
     def _fetch(self) -> None:
+        if self._sw_level:
+            raw = self.query_float_block(f"TRAC:DATA? {TRACE_RES}")
+            y = [v if (math.isfinite(v) and abs(v) < 9.9e36) else math.nan for v in raw] if raw else []
+            out, auto_lvl = self._process_sw_level(y) if y else (dict.fromkeys(RESULT_KEYS), None)
+            self._results = out
+            for k, v in out.items():
+                self._publish(k, v)
+            if auto_lvl is not None:
+                self._sw_trig_level = auto_lvl
+                if not self._params["trig.level"].same(auto_lvl, self._values.get("trig.level")):
+                    self._publish("trig.level", auto_lvl)
+            return
+
         keys = RESULT_KEYS if self._normal else RESULT_KEYS[:1]
         out = dict.fromkeys(RESULT_KEYS)
         for n, (key, _) in FEEDS.items():
@@ -457,13 +667,6 @@ class KeysightU2021XA(VISAInstrument):
         self._results = out
         for k, v in out.items():
             self._publish(k, v)
-        if self._values.get("trig.source") == "INT" and self._values.get("trig.level_auto") is True:
-            try:
-                lvl = self.read_param_raw(self._params["trig.level"])
-                if not self._params["trig.level"].same(lvl, self._values.get("trig.level")):
-                    self._publish("trig.level", lvl)
-            except ValueError:
-                pass
 
     def _read_trace(self) -> Trace | None:
         y = self.query_float_block(f"TRAC:DATA? {TRACE_RES}")
@@ -498,6 +701,16 @@ class KeysightU2021XA(VISAInstrument):
             return
         if not self._armed:
             return
+        if self._sw_level:
+            self.write("INIT")
+            self.query("*OPC?")
+            self._set_armed(False)
+            try:
+                self._fetch()
+            finally:
+                if self._continuous and self._state is ConnectionState.CONNECTED:
+                    self._set_armed(True)
+            return
         if self.opc_done():
             self._set_armed(False)
             try:
@@ -515,7 +728,9 @@ class KeysightU2021XA(VISAInstrument):
             self._publish("meas.continuous", False)
             self._abort()
             self.write("INIT:CONT OFF")
-            if self._free_run:              # IMM: измерение сразу, можно дождаться
+            if self._free_run or self._sw_level:    # IMM / программный LEVEL: захват сразу
+                if self._sw_level:
+                    self._clear_results()
                 self.write("INIT")
                 self.query("*OPC?")
                 self._fetch()

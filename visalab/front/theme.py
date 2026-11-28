@@ -18,8 +18,8 @@ THEMES = ("light", "dark")
 BASE_METRICS = {
     "UI_FONT_FAMILY": '"Segoe UI", "Inter", "DejaVu Sans", sans-serif',
     "UI_MONOSPACE_FONT_FAMILY": '"Consolas", "DejaVu Sans Mono", monospace',
-    "UI_FONT_SIZE_PT": 11,
-    "UI_SEARCH_FONT_SIZE_PT": 12,
+    "UI_FONT_SIZE_PT": 10,
+    "UI_SEARCH_FONT_SIZE_PT": 11,
     "UI_FONT_WEIGHT_SEMIBOLD": 600,
     "UI_BORDER_WIDTH_PX": 1,
     "UI_INDICATOR_WIDTH_PX": 4,            # толстая граница-индикатор «включено / выбрано»

@@ -432,8 +432,9 @@ class CollapsibleSection(QFrame):
         self.set_expanded(not self._expanded)
 
 
-class SincEmblem(QWidget):
-    """Пульсирующая эмблема sinc(x) = sin(πx)/(πx) без рамки в левой части заголовка главного окна."""
+class SincEmblem(QAbstractButton):
+    """Пульсирующая эмблема sinc(x) = sin(πx)/(πx) без рамки в левой части заголовка главного окна.
+    Клик по иконке переключает светлую/тёмную тему."""
 
     WIDTH = 44
     HEIGHT = UI_TITLE_BAR_ITEM_SIZE_PX
@@ -446,9 +447,11 @@ class SincEmblem(QWidget):
         super().__init__(parent)
         self.setObjectName("sincEmblem")
         self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("background: transparent; border: none;")
         self.setFixedSize(self.WIDTH, self.HEIGHT)
-        self.setToolTip("VISALAB")
+        self.setToolTip("VISALAB · Click to switch light / dark theme")
         self._phase = 0.0
         self._xs = [(-self._X_MAX + 2.0 * self._X_MAX * i / (self._SAMPLES - 1)) for i in range(self._SAMPLES)]
         self._ys = [1.0 if abs(x) < 1e-9 else math.sin(math.pi * x) / (math.pi * x) for x in self._xs]

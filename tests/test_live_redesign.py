@@ -136,7 +136,7 @@ def test_graphs_window_two_pane_promote_and_live_feeds(qtbot, tmp_path):
         bench.step()
 
         qtbot.waitUntil(lambda: len(win.card("SA").plot.series) == 1, timeout=10000)
-        qtbot.waitUntil(lambda: len(win.card("PM").plot.series) >= 1, timeout=10000)
+        qtbot.waitUntil(lambda: {s.x_unit for s in win.card("PM").plot.series} >= {"Hz", "s"}, timeout=10000)
 
         # Переводим SA в главный монолитный график слева; VNA уходит в правую ленту
         win.set_main_graph("SA")

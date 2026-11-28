@@ -1,4 +1,4 @@
-"""Тесты графиков ИП (PSU) во времени (V/I/P) и по частоте/мощности генератора (FREQ) в ``GraphsWindow``."""
+"""Тесты графиков тока ИП (PSU) от частоты и мощности генератора в ``GraphsWindow``."""
 from __future__ import annotations
 
 import pytest
@@ -45,7 +45,7 @@ def bench_psu(qtbot):
         p.shutdown()
 
 
-def test_psu_time_and_freq_graphs_and_persistence(qtbot, bench_psu, tmp_path):
+def test_psu_current_vs_frequency_graphs(qtbot, bench_psu, tmp_path):
     links, psu, gen1, gen2, pm = bench_psu
     psu_sim = sim_of(psu)
     mon = ActivityMonitor(links)
@@ -57,12 +57,13 @@ def test_psu_time_and_freq_graphs_and_persistence(qtbot, bench_psu, tmp_path):
     qtbot.waitExposed(gw)
 
     try:
-        # Все 3 канала IT6300 присутствуют в GraphsWindow с переключателем TIME / FREQ
+        # Все 3 канала IT6300 в GraphsWindow строят только график тока от частоты (Hz / A), без режима TIME
         for ch_name in ("PSU CH1", "PSU CH2", "PSU CH3"):
             card = gw.card(ch_name)
             assert card is not None
-            assert card.current_mode == "TIME"
-            assert card.mode_button is not None
+            assert card.mode_button is None
+            assert card.plot.x_unit == "Hz"
+            assert card.plot.y_unit == "A"
 
         # Включаем выходы CH1 и CH2 на ИП (CH3 выключен) и генератор GEN1
         psu.set("ch1.voltage", 5.0)
@@ -75,17 +76,6 @@ def test_psu_time_and_freq_graphs_and_persistence(qtbot, bench_psu, tmp_path):
         gen1.set("rf.power", -10.0)
         gen1.set("rf.output", True)
 
-        # 1) В режиме TIME отображаются кривые V, I, P по времени (s)
-        ch1 = gw.card("PSU CH1")
-        qtbot.waitUntil(
-            lambda: len(ch1.plot.series) == 3 and len(ch1.plot.series[0].x) >= 1,
-            timeout=5000,
-        )
-        assert [s.name for s in ch1.plot.series] == ["CH1 V", "CH1 I", "CH1 P"]
-        assert [s.y_unit for s in ch1.plot.series] == ["V", "A", "W"]
-        assert ch1.plot.x_unit == "s"
-
-        # 2) В ActivityMonitor накапливается матрица тока по частоте и мощности генератора
         qtbot.waitUntil(
             lambda: mon.psu_matrix(psu, 1)[0] == [-10.0] and len(mon.psu_matrix(psu, 1)[1]) == 1,
             timeout=5000,
@@ -105,9 +95,8 @@ def test_psu_time_and_freq_graphs_and_persistence(qtbot, bench_psu, tmp_path):
         assert rows2[0][1][-10.0] == pytest.approx(0.25, abs=0.02)
         assert mon.psu_matrix(psu, 3) == ([], [])
 
-        # 3) Переключаем PSU CH1 в режим FREQ -> кривые тока (A) по частоте (Hz) для каждого уровня генератора
-        ch1.mode_button.click()
-        assert ch1.current_mode == "FREQ"
+        # На графике PSU CH1 отображаются кривые тока (A) по частоте (Hz) для каждого уровня генератора
+        ch1 = gw.card("PSU CH1")
         qtbot.waitUntil(lambda: ch1.plot.x_unit == "Hz" and len(ch1.plot.series) == 2, timeout=5000)
         assert ch1.plot.y_unit == "A"
         assert [s.name for s in ch1.plot.series] == ["-10 dBm", "0 dBm"]
@@ -124,24 +113,10 @@ def test_psu_time_and_freq_graphs_and_persistence(qtbot, bench_psu, tmp_path):
             timeout=5000,
         )
 
-        # Все видимые кнопки имеют подсказки
         for btn in gw.findChildren(QAbstractButton):
             if btn.isVisible():
                 assert btn.toolTip(), f"Missing tooltip on {btn.text()!r} ({type(btn).__name__})"
-
-        # 4) Сохранение режима FREQ в QSettings при перезапуске
+    finally:
         gw.cleanup()
         gw.close()
-        gw2 = GraphsWindow(QSettings(str(ini), QSettings.Format.IniFormat), ActivityMonitor(links))
-        qtbot.addWidget(gw2)
-        try:
-            assert gw2.card("PSU CH1").current_mode == "FREQ"
-            assert gw2.card("PSU CH2").current_mode == "TIME"
-        finally:
-            gw2.cleanup()
-            gw2.close()
-    finally:
-        if not gw.isHidden():
-            gw.cleanup()
-            gw.close()
         mon.stop()

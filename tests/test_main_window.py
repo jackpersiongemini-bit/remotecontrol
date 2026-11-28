@@ -172,12 +172,13 @@ def test_graphs_window_live_receivers_promote_detach_and_persist(qtbot, lab, tmp
         assert gw.main_card.graph_name == "VNA"
         assert set(gw.side_cards) == {"SA", "PM"}
         assert gw.emblem.isVisible()
+        assert gw.card("SA").controls_bar.isHidden()
 
         # Ждём живые трассы VNA и SA
         qtbot.waitUntil(lambda: len(gw.card("VNA").plot.series) >= 1, timeout=10000)
         qtbot.waitUntil(lambda: len(gw.card("SA").plot.series) == 1, timeout=10000)
 
-        # Включаем генератор -> PM накапливает матрицу мощности по частоте (Hz, dBm)
+        # Включаем генератор -> на одном графике PM одновременно и мощность от частоты (Hz), и от времени (s)
         gen = px["e8267d"]
         gen.set("rf.frequency", 1e9)
         gen.set("rf.power", -5.0)
@@ -185,10 +186,11 @@ def test_graphs_window_live_receivers_promote_detach_and_persist(qtbot, lab, tmp
         qtbot.waitUntil(lambda: gen.value("rf.output") is True, timeout=5000)
         bench.step()
         qtbot.waitUntil(
-            lambda: gw.card("PM").plot.x_unit == "Hz" and len(gw.card("PM").plot.series) >= 1,
+            lambda: {s.x_unit for s in gw.card("PM").plot.series} >= {"Hz", "s"},
             timeout=10000,
         )
-        assert gw.card("PM").plot.series[0].name == "-5 dBm"
+        assert any(s.x_unit == "Hz" and "-5 dBm" in s.name for s in gw.card("PM").plot.series)
+        assert any(s.x_unit == "s" for s in gw.card("PM").plot.series)
 
         # Открепление карточки графика и возврат обратно
         gw.detach_card("PM")
@@ -244,19 +246,15 @@ def test_run_main_launcher_opens_graphs_and_instruments_windows(qtbot, tmp_path,
         assert set(iw.cards) == {"VNA", "GEN", "PSU"}
         assert gw.main_card.graph_name == "VNA"
         assert "PSU CH1" in gw.all_cards
-        assert gw.instruments_button.isVisible()
-        assert gw.instruments_button.isChecked()
-        # Кнопка INST скрывает и показывает InstrumentsWindow
+        assert gw.emblem.isVisible()
+        # Управление видимостью InstrumentsWindow
         gw.set_instruments_visible(False)
         assert not iw.isVisible()
-        assert not gw.instruments_button.isChecked()
         gw.set_instruments_visible(True)
         assert iw.isVisible()
-        assert gw.instruments_button.isChecked()
         # Закрытие InstrumentsWindow по × скрывает его (не убивая и не мешая Cmd+Q)
         iw.close()
         assert not iw.isVisible()
-        assert not gw.instruments_button.isChecked()
         gw.set_instruments_visible(True)
         assert iw.isVisible()
         # Системное закрытие всех окон (Cmd+Q / Close all) не блокируется event.ignore()

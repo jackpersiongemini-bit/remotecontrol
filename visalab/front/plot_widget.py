@@ -96,16 +96,17 @@ _POPUP_MENU_QSS = render_qss("""
 
 @dataclass(frozen=True)
 class PlotSeries:
-    """Одна кривая на графике: имя, массивы ``x``/``y``, стиль линии и опциональная единица измерения по Y."""
+    """Одна кривая на графике: имя, массивы ``x``/``y``, стиль линии и опциональные единицы по X/Y."""
 
     name: str
     x: tuple[float, ...]
     y: tuple[float, ...]
     color: str | None = None
     show_points: bool = False
-    line_width: float = 1.6
+    line_width: float = 1.1
     dashed: bool = False
     y_unit: str | None = None
+    x_unit: str | None = None
 
 
 @dataclass
@@ -359,6 +360,7 @@ class PlotWidget(QWidget):
         self.show_point_values: bool = False
         self.show_peaks: bool = False
         self.show_axis_labels: bool = True
+        self.draw_frame: bool = True
         self.top_pad: float = 0.0
         self.divs_y: int = self.DIVS_Y
         self.manual_x_range: tuple[float, float] | None = None
@@ -400,12 +402,15 @@ class PlotWidget(QWidget):
         self._legend_more_text: str = ""
         self._legend_more_hover: bool = False
         self._top_right_pad: float = 0.0
+        self._top_left_pad: float = 0.0
         self._chip_hits: list[tuple[QRectF, str, str, Callable[[], None], QRectF]] = []
         self._chip_hover: str | None = None
         self._chips_strip_rect = QRectF()
         self._chips_scroll_x: float = 0.0
         self._chips_max_scroll: float = 0.0
         self._cur_x_range: tuple[float, float] = (0.0, 1.0)
+        self._cur_x_ranges: list[tuple[float, float]] = []
+        self._cur_x_units: list[str] = []
         self._cur_y_range: tuple[float, float] = (0.0, 1.0)
         self._cur_y_ranges: list[tuple[float, float]] = []
         self._cur_y_units: list[str] = []
@@ -585,8 +590,6 @@ class PlotWidget(QWidget):
     def set_series(self, series: Sequence[PlotSeries], *, x_unit: str | None = None,
                    y_unit: str | None = None) -> None:
         self.series = list(series)
-        if not self._show_points_explicit and any(s.show_points for s in self.series):
-            self.show_points = True
         if x_unit is not None:
             self.x_unit = x_unit
             if self.analysis_x_expr:
@@ -636,6 +639,13 @@ class PlotWidget(QWidget):
         self._bump()
         self.view_changed.emit()
 
+    def set_draw_frame(self, on: bool) -> None:
+        on = bool(on)
+        if self.draw_frame != on:
+            self.draw_frame = on
+            self._cache_key = None
+            self.update()
+
     def set_show_axis_labels(self, on: bool) -> None:
         self.show_axis_labels = bool(on)
         self._bump()
@@ -648,10 +658,17 @@ class PlotWidget(QWidget):
             self._bump()
 
     def set_top_right_pad(self, pad: float) -> None:
-        """Зарезервировать место в правом верхнем углу внутри графика (например под кнопку настроек на главном графике)."""
+        """Зарезервировать место в правом верхнем углу внутри графика (например под кнопки при наведении)."""
         val = max(0.0, float(pad))
         if val != self._top_right_pad:
             self._top_right_pad = val
+            self._bump()
+
+    def set_top_left_pad(self, pad: float) -> None:
+        """Зарезервировать ширину в левом верхнем углу внутри графика под прозрачный заголовок карточки."""
+        val = max(0.0, float(pad))
+        if val != self._top_left_pad:
+            self._top_left_pad = val
             self._bump()
 
     def set_active_series(self, index: int | None) -> None:
@@ -1145,11 +1162,14 @@ class PlotWidget(QWidget):
         self.view_changed.emit()
         return True, ""
 
+    def _series_x_unit(self, s: PlotSeries) -> str:
+        return s.x_unit if s.x_unit is not None else self.x_unit
+
     def current_ranges(self, series_index: int | None = None) -> tuple[tuple[float, float], tuple[float, float]]:
-        xr, yr, _, _, y_ranges, _ = self._compute_ranges()
-        if series_index is not None and 0 <= series_index < len(y_ranges):
-            return xr, y_ranges[series_index]
-        return xr, yr
+        xr, yr, _, _, y_ranges, _, x_ranges, _ = self._compute_ranges()
+        rx = x_ranges[series_index] if (series_index is not None and 0 <= series_index < len(x_ranges)) else xr
+        ry = y_ranges[series_index] if (series_index is not None and 0 <= series_index < len(y_ranges)) else yr
+        return rx, ry
 
     def _bump(self) -> None:
         self._data_version += 1
@@ -1158,46 +1178,70 @@ class PlotWidget(QWidget):
 
     # ------------------------------------------------------------ диапазоны и координаты
     def _compute_ranges(self) -> tuple[tuple[float, float], tuple[float, float], bool,
-                                       list[PlotSeries], list[tuple[float, float]], list[str]]:
+                                       list[PlotSeries], list[tuple[float, float]], list[str],
+                                       list[tuple[float, float]], list[str]]:
         eff, eff_y_units = self._effective_series_and_units()
-        xs: list[float] = []
+        eff_x_units = [self._series_x_unit(s) for s in eff]
+        xs_by_unit: dict[str, list[float]] = {}
         ys_by_unit: dict[str, list[float]] = {}
+        has_any = False
         isfinite = math.isfinite
 
         for idx, s in enumerate(eff):
-            u = eff_y_units[idx]
-            bucket = ys_by_unit.setdefault(u, [])
+            xu = eff_x_units[idx]
+            yu = eff_y_units[idx]
+            xbucket = xs_by_unit.setdefault(xu, [])
+            ybucket = ys_by_unit.setdefault(yu, [])
             n = min(len(s.x), len(s.y))
             for i in range(n):
                 xv, yv = s.x[i], s.y[i]
                 if isfinite(xv) and isfinite(yv):
-                    xs.append(xv)
-                    bucket.append(yv)
+                    xbucket.append(xv)
+                    ybucket.append(yv)
+                    has_any = True
 
         if self.memory and self.memory_visible and self.math_mode == "OFF":
             for idx, ms in enumerate(self.memory):
-                u = eff_y_units[idx] if idx < len(eff_y_units) else self._series_y_unit(ms)
-                bucket = ys_by_unit.setdefault(u, [])
+                xu = eff_x_units[idx] if idx < len(eff_x_units) else self._series_x_unit(ms)
+                yu = eff_y_units[idx] if idx < len(eff_y_units) else self._series_y_unit(ms)
+                xbucket = xs_by_unit.setdefault(xu, [])
+                ybucket = ys_by_unit.setdefault(yu, [])
                 n = min(len(ms.x), len(ms.y))
                 for i in range(n):
                     xv, yv = ms.x[i], ms.y[i]
                     if isfinite(xv) and isfinite(yv):
-                        xs.append(xv)
-                        bucket.append(yv)
+                        xbucket.append(xv)
+                        ybucket.append(yv)
+                        has_any = True
 
-        if not xs:
+        axis_si = self._axis_series_idx(eff)
+        if not has_any:
             xr = self.manual_x_range or (0.0, 1.0)
             default_yr = self.manual_y_range or (0.0, float(self.divs_y))
+            x_ranges = [xr for _ in eff]
             y_ranges = [self.series_y_ranges.get(i, default_yr) for i in range(len(eff))]
-            axis_si = self._axis_series_idx(eff)
             yr = y_ranges[axis_si] if (axis_si is not None and axis_si < len(y_ranges)) else default_yr
-            return xr, yr, False, eff, y_ranges, eff_y_units
+            return xr, yr, False, eff, y_ranges, eff_y_units, x_ranges, eff_x_units
 
-        if self.manual_x_range is not None:
-            xr = self.manual_x_range
-        else:
-            xlo, xhi = min(xs), max(xs)
-            xr = (xlo - 0.5, xhi + 0.5) if xhi <= xlo else (xlo, xhi)
+        same_x_unit = len(set(eff_x_units)) <= 1
+        x_unit_auto: dict[str, tuple[float, float]] = {}
+        for xu, vals in xs_by_unit.items():
+            if vals:
+                xlo, xhi = min(vals), max(vals)
+                x_unit_auto[xu] = (xlo - 0.5, xhi + 0.5) if xhi <= xlo else (xlo, xhi)
+            else:
+                x_unit_auto[xu] = (0.0, 1.0)
+
+        x_ranges: list[tuple[float, float]] = []
+        for xu in eff_x_units:
+            if same_x_unit and self.manual_x_range is not None:
+                x_ranges.append(self.manual_x_range)
+            else:
+                x_ranges.append(x_unit_auto.get(xu, (0.0, 1.0)))
+
+        xr = x_ranges[axis_si] if (axis_si is not None and axis_si < len(x_ranges)) else (
+            self.manual_x_range or (0.0, 1.0)
+        )
 
         same_unit = len(set(eff_y_units)) <= 1
         unit_auto: dict[str, tuple[float, float]] = {}
@@ -1213,33 +1257,138 @@ class PlotWidget(QWidget):
             else:
                 y_ranges.append(unit_auto.get(u, (0.0, float(self.divs_y))))
 
-        axis_si = self._axis_series_idx(eff)
         yr = y_ranges[axis_si] if (axis_si is not None and axis_si < len(y_ranges)) else (
             self.manual_y_range or (0.0, float(self.divs_y))
         )
-        return xr, yr, True, eff, y_ranges, eff_y_units
+        return xr, yr, True, eff, y_ranges, eff_y_units, x_ranges, eff_x_units
 
     def _chip_font(self, *, bold: bool = False):
-        return mono_font(max(9.0, float(UI_FONT_SIZE_PT) - 1.0), bold=bold)
+        return mono_font(max(8.0, float(UI_FONT_SIZE_PT) - 1.0), bold=bold)
 
     def _chip_bar_height(self) -> float:
         cfm = QFontMetricsF(self._chip_font())
         return max(20.0, math.ceil(cfm.height()) + 5.0)
 
     def _calc_plot_rect(self, fm: QFontMetricsF, y_labels: Sequence[str]) -> QRectF:
-        chip_h = self._chip_bar_height()
-        if self.show_axis_labels:
-            y_w = max((fm.horizontalAdvance(lbl) for lbl in y_labels), default=36.0)
-            left = max(52.0, math.ceil(y_w) + 14.0)
-            bottom = math.ceil(fm.height()) + 10.0 + chip_h + 6.0
-        else:
-            left = 10.0
-            bottom = 6.0 + chip_h + 6.0
-        top = 12.0 + self.top_pad
-        right = 14.0
+        del fm, y_labels
+        inset = 0.5 if self.draw_frame else 0.0
+        left = inset
+        top = inset + self.top_pad
+        right = inset
+        bottom = inset
         w = max(20.0, self.width() - left - right)
         h = max(20.0, self.height() - top - bottom)
         return QRectF(left, top, w, h)
+
+    def _measure_axis_insets(self, fm: QFontMetricsF, y_labels: Sequence[str]) -> tuple[float, float]:
+        if not self.show_axis_labels:
+            return 0.0, 0.0
+        y_w = max((fm.horizontalAdvance(lbl) for lbl in y_labels), default=32.0)
+        return math.ceil(y_w) + 12.0, math.ceil(fm.height()) + 8.0
+
+    def _draw_axis_labels(
+        self,
+        p: QPainter,
+        rect: QRectF,
+        fm: QFontMetricsF,
+        y_labels: Sequence[str],
+        y_lbl_col: QColor,
+        x_lbl_col: QColor,
+        c_panel: QColor,
+        x0: float,
+        x1: float,
+        x_step: float,
+        divs_y: int,
+        x_unit: str,
+    ) -> None:
+        """Подписи осей X и Y внутри рамки графика с полупрозрачной подложкой."""
+        if not self.show_axis_labels:
+            return
+        th = fm.height()
+        pad_edge = 5.0
+        pill_bg = QColor(c_panel)
+        pill_bg.setAlpha(205)
+
+        p.save()
+        p.setFont(self._font)
+        p.setClipRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
+
+        # Подписи оси Y вдоль левого края внутри графика (сначала верх и низ, потом промежуточные без наложений)
+        skip_top_y = self._top_left_pad > 0.0 and len(y_labels) > 2
+        y_placed: list[QRectF] = []
+        y0_right: float | None = None
+        y_order: list[int] = []
+        if divs_y >= 0 and y_labels:
+            top_i = (len(y_labels) - 2) if skip_top_y else (len(y_labels) - 1)
+            y_order.append(top_i)
+            if top_i != 0:
+                y_order.append(0)
+            y_order.extend(range(1, top_i))
+
+        for i in y_order:
+            lbl = y_labels[i]
+            if i == len(y_labels) - 1:
+                ty = rect.top() + 3.0
+            elif i == 0:
+                ty = rect.bottom() - th - 3.0
+            else:
+                gy = rect.bottom() - rect.height() * i / max(1, divs_y)
+                ty = max(rect.top() + 3.0, min(gy - th / 2.0, rect.bottom() - th - 3.0))
+            tw = fm.horizontalAdvance(lbl)
+            tr = QRectF(rect.left() + pad_edge, ty, tw + 2.0, th)
+            pill = tr.adjusted(-2.5, -0.5, 2.5, 0.5)
+            if any(pill.intersects(prev) for prev in y_placed):
+                continue
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(pill_bg)
+            p.drawRoundedRect(pill, 2.5, 2.5)
+            p.setPen(y_lbl_col)
+            p.drawText(tr, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, lbl)
+            y_placed.append(pill.adjusted(0.0, -1.5, 0.0, 1.5))
+            if i == 0:
+                y0_right = pill.right()
+
+        # Подписи оси X вдоль нижнего края внутри графика (сдвигая левую за подпись Y0)
+        x_tick_count = 5 if rect.width() >= 320 else 3
+        x_ty = rect.bottom() - th - 3.0
+        x_min_left = (y0_right + 10.0) if y0_right is not None else (rect.left() + pad_edge)
+        x_max_right = rect.right() - pad_edge
+        x_placed: list[QRectF] = []
+        x_order = [0, x_tick_count - 1, *range(1, x_tick_count - 1)] if x_tick_count > 1 else [0]
+        for i in x_order:
+            frac = i / (x_tick_count - 1) if x_tick_count > 1 else 0.0
+            xv = x0 + (x1 - x0) * frac
+            gx = rect.left() + rect.width() * frac
+            lbl = _fmt_value(xv, x_unit, x_step, include_unit=True)
+            tw = fm.horizontalAdvance(lbl)
+            if i == 0:
+                tx = x_min_left
+                align = Qt.AlignmentFlag.AlignLeft
+            elif i == x_tick_count - 1:
+                tx = x_max_right - tw
+                align = Qt.AlignmentFlag.AlignRight
+            else:
+                tx = gx - tw / 2.0
+                align = Qt.AlignmentFlag.AlignHCenter
+            if tx < x_min_left - 0.5 or tx + tw > x_max_right + 0.5:
+                continue
+            tr = QRectF(tx, x_ty, tw + 2.0, th)
+            pill = tr.adjusted(-2.5, -0.5, 2.5, 0.5)
+            if any(pill.intersects(prev) for prev in x_placed):
+                continue
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(pill_bg)
+            p.drawRoundedRect(pill, 2.5, 2.5)
+            p.setPen(x_lbl_col)
+            p.drawText(tr, align | Qt.AlignmentFlag.AlignVCenter, lbl)
+            x_placed.append(pill.adjusted(-4.0, 0.0, 4.0, 0.0))
+
+        p.restore()
+
+    def _x_range_for(self, series_index: int | None) -> tuple[float, float]:
+        if series_index is not None and 0 <= series_index < len(self._cur_x_ranges):
+            return self._cur_x_ranges[series_index]
+        return self._cur_x_range
 
     def _y_range_for(self, series_index: int | None) -> tuple[float, float]:
         if series_index is not None and 0 <= series_index < len(self._cur_y_ranges):
@@ -1248,7 +1397,7 @@ class PlotWidget(QWidget):
 
     def _data_to_screen(self, xv: float, yv: float, *, series_index: int | None = None) -> QPointF:
         r = self._plot_rect
-        x0, x1 = self._cur_x_range
+        x0, x1 = self._x_range_for(series_index)
         y0, y1 = self._y_range_for(series_index)
         px = r.left() + (xv - x0) / (x1 - x0) * r.width() if x1 != x0 else r.left()
         py = r.bottom() - (yv - y0) / (y1 - y0) * r.height() if y1 != y0 else r.bottom()
@@ -1258,7 +1407,7 @@ class PlotWidget(QWidget):
         r = self._plot_rect
         if r.width() <= 1 or r.height() <= 1 or not r.contains(pos):
             return None
-        x0, x1 = self._cur_x_range
+        x0, x1 = self._x_range_for(series_index)
         y0, y1 = self._y_range_for(series_index)
         xv = x0 + (pos.x() - r.left()) / r.width() * (x1 - x0)
         yv = y0 + (r.bottom() - pos.y()) / r.height() * (y1 - y0)
@@ -1300,26 +1449,23 @@ class PlotWidget(QWidget):
         eff, _ = self._effective_series_and_units()
         if not eff:
             return None
-        x0, x1 = self._cur_x_range
-        if x1 == x0:
-            return None
 
         px, py = pos.x(), pos.y()
-        sx = r.width() / (x1 - x0)
         left, bottom = r.left(), r.bottom()
-        x_lo = x0 + (px - max_dist_px - left) / sx
-        x_hi = x0 + (px + max_dist_px - left) / sx
-        if x_lo > x_hi:
-            x_lo, x_hi = x_hi, x_lo
-
         best_idx: int | None = None
         best_dist = max_dist_px
         isfinite = math.isfinite
 
         for idx, s in enumerate(eff):
+            x0, x1 = self._x_range_for(idx)
             y0_i, y1_i = self._y_range_for(idx)
-            if y1_i == y0_i:
+            if x1 == x0 or y1_i == y0_i:
                 continue
+            sx = r.width() / (x1 - x0)
+            x_lo = x0 + (px - max_dist_px - left) / sx
+            x_hi = x0 + (px + max_dist_px - left) / sx
+            if x_lo > x_hi:
+                x_lo, x_hi = x_hi, x_lo
             sy = r.height() / (y1_i - y0_i)
             xs, ys = s.x, s.y
             n = min(len(xs), len(ys))
@@ -1453,7 +1599,8 @@ class PlotWidget(QWidget):
         return None
 
     def _draw_in_plot_legend(self, p: QPainter, rect: QRectF, fm: QFontMetricsF, bold_fm: QFontMetricsF,
-                             eff: Sequence[PlotSeries], active_si: int | None) -> None:
+                             eff: Sequence[PlotSeries], active_si: int | None, *,
+                             left_inset: float = 0.0) -> None:
         """Полупрозрачная легенда в левом верхнем углу внутри области графика (выбор кривой колёсиком или кликом)."""
         self._legend_box = QRectF()
         self._legend_hits = []
@@ -1517,7 +1664,8 @@ class PlotWidget(QWidget):
             content_h += 3.0 + foot_h
         box_h = pad_y * 2.0 + content_h
 
-        box = self._place_overlay("legend", rect, box_w, box_h, rect.left() + 8.0, rect.top() + 8.0)
+        leg_top = rect.top() + (38.0 if self._top_left_pad > 0.0 else 8.0)
+        box = self._place_overlay("legend", rect, box_w, box_h, rect.left() + left_inset + 6.0, leg_top)
         self._legend_box = box
 
         bg = _c("UI_COLOR_BACKGROUND")
@@ -1550,7 +1698,7 @@ class PlotWidget(QWidget):
 
     def _draw_analysis_box(self, p: QPainter, rect: QRectF, rows: Sequence[str], *,
                            header_name: str = "", header_col: QColor | None = None,
-                           top_obstacle: float = 0.0) -> None:
+                           top_obstacle: float = 0.0, bottom_inset: float = 0.0) -> None:
         """Полупрозрачная карточка аналитики (в стиле легенды) в левом нижнем углу графика:
         показывает все включённые метрики целиком, при нехватке высоты раскладывая их в 2–3 столбца."""
         if not rows:
@@ -1610,8 +1758,11 @@ class PlotWidget(QWidget):
         per_col, cols_dims, box_w, box_h = chosen
         box_w = min(box_w, avail_w)
         box_h = min(box_h, max(40.0, rect.height() - 16.0))
-        abox = self._place_overlay("analysis", rect, box_w, box_h,
-                                   rect.right() - box_w - 8.0, rect.bottom() - box_h - 8.0)
+        abox = self._place_overlay(
+            "analysis", rect, box_w, box_h,
+            rect.right() - box_w - 8.0,
+            rect.bottom() - bottom_inset - box_h - 6.0,
+        )
         self._analysis_box = abox
 
         bg = _c("UI_COLOR_BACKGROUND")
@@ -1737,21 +1888,34 @@ class PlotWidget(QWidget):
             p.setFont(self._chip_font(bold=True))
             p.setPen(_c("UI_COLOR_TEXT_INVERSE"))
         else:
+            bg = _c("UI_COLOR_BACKGROUND")
+            bg.setAlpha(218)
             p.setPen(QPen(_c("UI_COLOR_BORDER"), float(UI_BORDER_WIDTH_PX)))
-            p.setBrush(_c("UI_COLOR_BACKGROUND"))
+            p.setBrush(bg)
             p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
             p.setFont(self._chip_font())
             p.setPen(_c("UI_COLOR_TEXT_MUTED"))
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
         p.restore()
 
-    def _draw_bottom_chips(self, p: QPainter, rect: QRectF, fm: QFontMetricsF) -> None:
-        """Компактная нижняя полоса активных настроек (``SCALE ×``, ``MEM ×``, ``D−M ×``, ``MK ×``, ``PEAKS ×`` и т.д.)."""
+    def _draw_bottom_chips(self, p: QPainter, rect: QRectF, fm: QFontMetricsF, *,
+                           left_inset: float = 0.0, bottom_inset: float = 0.0) -> None:
+        """Компактная нижняя полоса активных настроек (``SCALE ×``, ``MEM ×``, ``D−M ×``, ``MK ×``, ``PEAKS ×`` и т.д.) внутри рамки графика."""
+        del fm
         self._chip_hits = []
         self._chips_max_scroll = 0.0
         chip_h = self._chip_bar_height()
-        chip_top = rect.bottom() + (math.ceil(fm.height()) + 10.0 if self.show_axis_labels else 6.0)
-        strip_rect = QRectF(rect.left(), chip_top - 1.0, rect.width(), chip_h + 2.0)
+        chip_left = rect.left() + left_inset + 6.0
+        chip_right = rect.right() - 8.0
+        chip_top = rect.bottom() - bottom_inset - chip_h - 6.0
+        if (
+            self._analysis_box.isValid()
+            and self._analysis_box.bottom() > chip_top - 4.0
+            and self._analysis_box.left() > chip_left + 40.0
+        ):
+            chip_right = min(chip_right, self._analysis_box.left() - 6.0)
+        strip_w = max(20.0, chip_right - chip_left)
+        strip_rect = QRectF(chip_left, chip_top - 1.0, strip_w, chip_h + 2.0)
         self._chips_strip_rect = strip_rect
 
         chips = self._active_setting_chips()
@@ -1768,13 +1932,13 @@ class PlotWidget(QWidget):
             measured.append((cid, lbl, cb, tw + 14.0))
 
         total_w = sum(w for *_, w in measured) + gap * max(0, len(measured) - 1)
-        self._chips_max_scroll = max(0.0, total_w - rect.width())
+        self._chips_max_scroll = max(0.0, total_w - strip_w)
         self._chips_scroll_x = max(0.0, min(self._chips_scroll_x, self._chips_max_scroll))
 
         p.save()
         if self._chips_max_scroll > 0.0:
             p.setClipRect(strip_rect)
-        lx = rect.left() - self._chips_scroll_x
+        lx = chip_left - self._chips_scroll_x
         for cid, lbl, cb, cw in measured:
             full_r = QRectF(lx, chip_top, cw, chip_h)
             if full_r.right() > strip_rect.left() and full_r.left() < strip_rect.right():
@@ -1786,7 +1950,8 @@ class PlotWidget(QWidget):
 
         if self._chips_max_scroll > 0.0:
             fade_w = 14.0
-            bg_opaque = _c("UI_COLOR_BACKGROUND")
+            bg_opaque = _c("UI_COLOR_PANEL")
+            bg_opaque.setAlpha(220)
             bg_clear = QColor(bg_opaque)
             bg_clear.setAlpha(0)
             if self._chips_scroll_x > 1.0:
@@ -1811,10 +1976,10 @@ class PlotWidget(QWidget):
         syr_key = tuple(sorted((k, round(v[0], 9), round(v[1], 9)) for k, v in self.series_y_ranges.items()))
         key = (self.width(), self.height(), dpr, current_theme(), self._data_version,
                self.show_grid, self.show_points, self.show_point_values, self.show_peaks,
-               self.show_axis_labels, self.divs_y, self.manual_x_range, self.manual_y_range,
+               self.show_axis_labels, self.draw_frame, self.divs_y, self.manual_x_range, self.manual_y_range,
                syr_key, self.active_series_index,
                self._legend_scroll_idx, round(self._chips_scroll_x, 1),
-               round(self._top_right_pad, 1), round(self.top_pad, 1), ov_key)
+               round(self._top_right_pad, 1), round(self._top_left_pad, 1), round(self.top_pad, 1), ov_key)
         if self._cache is not None and self._cache_key == key:
             return self._cache
 
@@ -1829,8 +1994,10 @@ class PlotWidget(QWidget):
         fm = QFontMetricsF(self._font)
         bold_fm = QFontMetricsF(mono_font(bold=True))
 
-        xr, yr, has_data, eff, y_ranges, eff_y_units = self._compute_ranges()
+        xr, yr, has_data, eff, y_ranges, eff_y_units, x_ranges, eff_x_units = self._compute_ranges()
         self._cur_x_range, self._cur_y_range = xr, yr
+        self._cur_x_ranges = list(x_ranges)
+        self._cur_x_units = list(eff_x_units)
         self._cur_y_ranges = list(y_ranges)
         self._cur_y_units = list(eff_y_units)
         x0, x1 = xr
@@ -1842,23 +2009,41 @@ class PlotWidget(QWidget):
         active_si = self._active_series_idx(eff)
         axis_si = self._axis_series_idx(eff)
         axis_y_unit = eff_y_units[axis_si] if (axis_si is not None and axis_si < len(eff_y_units)) else self.y_unit
+        axis_x_unit = eff_x_units[axis_si] if (axis_si is not None and axis_si < len(eff_x_units)) else self.x_unit
         is_multi_scale = len(set(eff_y_units)) > 1 or bool(self.series_y_ranges)
+        is_multi_x = len(set(eff_x_units)) > 1
 
         y_ticks = [y0 + i * y_step for i in range(divs_y + 1)]
-        y_labels = [_fmt_value(v, axis_y_unit, y_step, include_unit=(i == divs_y)) for i, v in enumerate(y_ticks)]
+        unit_idx = (divs_y - 1) if (self._top_left_pad > 0.0 and divs_y > 1) else divs_y
+        y_labels = [_fmt_value(v, axis_y_unit, y_step, include_unit=(i == unit_idx)) for i, v in enumerate(y_ticks)]
 
         rect = self._calc_plot_rect(fm, y_labels)
         self._plot_rect = rect
+        y_inset, x_inset = self._measure_axis_insets(fm, y_labels)
 
         c_border = _c("UI_COLOR_BORDER")
         c_muted = _c("UI_COLOR_BORDER_LIGHT")
         c_text = _c("UI_COLOR_TEXT_MUTED")
         c_panel = _c("UI_COLOR_PANEL")
+        y_lbl_col = (
+            _series_color(axis_si, eff[axis_si].color)
+            if (is_multi_scale and axis_si is not None and axis_si < len(eff))
+            else c_muted
+        )
+        x_lbl_col = (
+            _series_color(axis_si, eff[axis_si].color)
+            if (is_multi_x and axis_si is not None and axis_si < len(eff))
+            else c_muted
+        )
 
         # Фон области графика
+        frame_r = float(UI_BORDER_RADIUS_PX) if self.draw_frame else 0.0
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(c_panel)
-        p.drawRoundedRect(rect, 3.0, 3.0)
+        if frame_r > 0.0:
+            p.drawRoundedRect(rect, frame_r, frame_r)
+        else:
+            p.drawRect(rect)
 
         # Сетка
         if self.show_grid:
@@ -1870,36 +2055,6 @@ class PlotWidget(QWidget):
             for i in range(1, divs_y):
                 gy = rect.bottom() - rect.height() * i / divs_y
                 p.drawLine(QPointF(rect.left(), gy), QPointF(rect.right(), gy))
-
-        # Подписи осей X и Y (при разных единицах/масштабах ось Y окрашивается в цвет кривой-владельца шкалы)
-        if self.show_axis_labels:
-            y_lbl_col = (
-                _series_color(axis_si, eff[axis_si].color)
-                if (is_multi_scale and axis_si is not None and axis_si < len(eff))
-                else c_muted
-            )
-            p.setPen(y_lbl_col)
-            for i, lbl in enumerate(y_labels):
-                gy = rect.bottom() - rect.height() * i / divs_y
-                p.drawText(QRectF(2.0, gy - fm.height() / 2.0, rect.left() - 8.0, fm.height()),
-                           Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, lbl)
-
-            p.setPen(c_muted)
-            x_tick_count = 5 if rect.width() >= 320 else 3
-            for i in range(x_tick_count):
-                frac = i / (x_tick_count - 1) if x_tick_count > 1 else 0.0
-                xv = x0 + (x1 - x0) * frac
-                gx = rect.left() + rect.width() * frac
-                lbl = _fmt_value(xv, self.x_unit, x_step, include_unit=True)
-                lw = fm.horizontalAdvance(lbl) + 4.0
-                if i == 0:
-                    tx, align = rect.left(), Qt.AlignmentFlag.AlignLeft
-                elif i == x_tick_count - 1:
-                    tx, align = rect.right() - lw, Qt.AlignmentFlag.AlignRight
-                else:
-                    tx, align = gx - lw / 2.0, Qt.AlignmentFlag.AlignHCenter
-                p.drawText(QRectF(tx, rect.bottom() + 4.0, lw, fm.height() + 2.0),
-                           align | Qt.AlignmentFlag.AlignVCenter, lbl)
 
         self._legend_box = QRectF()
         self._markers_box = QRectF()
@@ -1922,8 +2077,9 @@ class PlotWidget(QWidget):
                     mpen = QPen(mcol, 1.3, Qt.PenStyle.DashLine)
                     p.setPen(mpen)
                     p.setBrush(Qt.BrushStyle.NoBrush)
+                    mx0, mx1 = x_ranges[idx] if idx < len(x_ranges) else (x0, x1)
                     my0, my1 = y_ranges[idx] if idx < len(y_ranges) else (y0, y1)
-                    for pts in _decimate_paths(ms.x, ms.y, x0, x1, my0, my1, rect):
+                    for pts in _decimate_paths(ms.x, ms.y, mx0, mx1, my0, my1, rect):
                         if len(pts) >= 2:
                             path = QPainterPath(pts[0])
                             for pt in pts[1:]:
@@ -1961,20 +2117,21 @@ class PlotWidget(QWidget):
                 draw_order.append(active_si)
             for idx in draw_order:
                 s = eff[idx]
+                sx0, sx1 = x_ranges[idx] if idx < len(x_ranges) else (x0, x1)
                 sy0, sy1 = y_ranges[idx] if idx < len(y_ranges) else (y0, y1)
                 col = _series_color(idx, s.color)
                 is_active = (active_si == idx)
                 if is_active:
-                    lw = max(s.line_width * 1.65, s.line_width + 1.0)
-                    pt_r_big, pt_r_small = 3.4, 3.0
+                    lw = max(1.4, min(1.8, s.line_width + 0.5))
+                    pt_r_big, pt_r_small = 2.8, 2.4
                 elif active_si is not None and has_multi:
-                    lw = max(1.0, s.line_width * 0.85)
+                    lw = max(0.8, s.line_width * 0.8)
                     col = QColor(col)
-                    col.setAlpha(195)
-                    pt_r_big, pt_r_small = 2.4, 2.1
+                    col.setAlpha(190)
+                    pt_r_big, pt_r_small = 2.1, 1.8
                 else:
                     lw = s.line_width
-                    pt_r_big, pt_r_small = 2.7, 2.4
+                    pt_r_big, pt_r_small = 2.4, 2.1
                 pen = QPen(col, lw)
                 pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
                 pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -1982,18 +2139,18 @@ class PlotWidget(QWidget):
                     pen.setStyle(Qt.PenStyle.DashLine)
                 p.setPen(pen)
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                segments = _decimate_paths(s.x, s.y, x0, x1, sy0, sy1, rect)
+                segments = _decimate_paths(s.x, s.y, sx0, sx1, sy0, sy1, rect)
                 for pts in segments:
                     if len(pts) >= 2:
                         path = QPainterPath(pts[0])
                         for pt in pts[1:]:
                             path.lineTo(pt)
                         p.drawPath(path)
-                if self.show_points:
+                if self.show_points or len(s.x) == 1:
                     p.setPen(Qt.PenStyle.NoPen)
                     p.setBrush(col)
                     vis_pts: list[QPointF] = []
-                    x_span = x1 - x0
+                    x_span = sx1 - sx0
                     y_span = sy1 - sy0
                     if x_span != 0.0 and y_span != 0.0:
                         rx, rw = rect.left(), rect.width()
@@ -2001,9 +2158,9 @@ class PlotWidget(QWidget):
                         for xv, yv in zip(s.x, s.y):
                             if not (math.isfinite(xv) and math.isfinite(yv)):
                                 continue
-                            if xv < x0 or xv > x1:
+                            if xv < sx0 or xv > sx1:
                                 continue
-                            px = rx + (xv - x0) / x_span * rw
+                            px = rx + (xv - sx0) / x_span * rw
                             py = rb - (yv - sy0) / y_span * rh
                             vis_pts.append(QPointF(px, py))
                     if len(vis_pts) <= 90:
@@ -2183,8 +2340,11 @@ class PlotWidget(QWidget):
                     continue
                 marker_lines.append((mcol, f"{m.name}{trk_tag}: {_fmt_value(mx, self.x_unit)}  {_fmt_value(yv, m_yu)}"))
 
-            # Полупрозрачная легенда выбора кривых (сверху слева внутри графика)
-            self._draw_in_plot_legend(p, rect, fm, bold_fm, eff, active_si)
+            # Подписи значений осей X и Y внутри области графика (поверх кривых, под оверлеями)
+            self._draw_axis_labels(p, rect, fm, y_labels, y_lbl_col, x_lbl_col, c_panel, x0, x1, x_step, divs_y, axis_x_unit)
+
+            # Полупрозрачная легенда выбора кривых (сверху слева внутри графика, правее оси Y)
+            self._draw_in_plot_legend(p, rect, fm, bold_fm, eff, active_si, left_inset=y_inset)
             top_left_bottom = self._legend_box.bottom() if self._legend_box.isValid() else (rect.top() + 8.0)
 
             # Плашка сводки маркеров (сверху слева внутри графика, ниже легенды, переносимая)
@@ -2194,11 +2354,11 @@ class PlotWidget(QWidget):
                 box_h = len(marker_lines) * line_h + 6.0
                 leg_near_tl = (
                     self._legend_box.isValid()
-                    and self._legend_box.left() < rect.left() + 48.0
+                    and self._legend_box.left() < rect.left() + y_inset + 48.0
                     and self._legend_box.top() < rect.top() + 48.0
                 )
                 m_top = (self._legend_box.bottom() + 6.0) if leg_near_tl else (rect.top() + 8.0)
-                box = self._place_overlay("markers", rect, box_w, box_h, rect.left() + 8.0, m_top)
+                box = self._place_overlay("markers", rect, box_w, box_h, rect.left() + y_inset + 6.0, m_top)
                 self._markers_box = box
                 top_left_bottom = box.bottom()
                 bg = _c("UI_COLOR_BACKGROUND")
@@ -2263,30 +2423,33 @@ class PlotWidget(QWidget):
                         header_name=s0.name if show_hdr else "",
                         header_col=_series_color(an_idx, s0.color) if show_hdr else None,
                         top_obstacle=top_right_bottom,
+                        bottom_inset=x_inset,
                     )
 
             p.restore()
         else:
+            self._draw_axis_labels(p, rect, fm, y_labels, y_lbl_col, x_lbl_col, c_panel, x0, x1, x_step, divs_y, axis_x_unit)
             p.setPen(c_muted)
             p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.empty_text)
 
-        # Рамка области графика
-        p.setPen(QPen(c_border, 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(rect, 3.0, 3.0)
+        # Компактная нижняя полоса активных настроек/оверлеев внутри графика (SCALE ×, MEM ×, D−M ×, MK ×, PEAKS ×, …)
+        self._draw_bottom_chips(p, rect, fm, left_inset=y_inset, bottom_inset=x_inset)
 
-        # Компактная нижняя полоса активных настроек/оверлеев (SCALE ×, MEM ×, D−M ×, MK ×, PEAKS ×, …)
-        self._draw_bottom_chips(p, rect, fm)
+        # Рамка области графика по всему окну
+        if self.draw_frame:
+            p.setPen(QPen(c_border, 1.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect, frame_r, frame_r)
 
         p.end()
         self._cache = pix
         self._cache_key = (
             self.width(), self.height(), dpr, current_theme(), self._data_version,
             self.show_grid, self.show_points, self.show_point_values, self.show_peaks,
-            self.show_axis_labels, self.divs_y, self.manual_x_range, self.manual_y_range,
+            self.show_axis_labels, self.draw_frame, self.divs_y, self.manual_x_range, self.manual_y_range,
             syr_key, self.active_series_index,
             self._legend_scroll_idx, round(self._chips_scroll_x, 1),
-            round(self._top_right_pad, 1), round(self.top_pad, 1), ov_key,
+            round(self._top_right_pad, 1), round(self._top_left_pad, 1), round(self.top_pad, 1), ov_key,
         )
         return pix
 
@@ -2299,7 +2462,10 @@ class PlotWidget(QWidget):
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             p.setPen(QPen(_c("UI_COLOR_BORDER_LIGHT"), 1.0))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(self._plot_rect, 3.0, 3.0)
+            if self.draw_frame:
+                p.drawRoundedRect(self._plot_rect, float(UI_BORDER_RADIUS_PX), float(UI_BORDER_RADIUS_PX))
+            else:
+                p.drawRect(self._plot_rect.adjusted(0.5, 0.5, -0.5, -0.5))
 
         if self._legend_hover is not None and self._legend_hover in self._legend_meta:
             l_rect, l_name, l_col, l_dashed = self._legend_meta[self._legend_hover]
@@ -2324,19 +2490,24 @@ class PlotWidget(QWidget):
                     break
 
         if self._mouse is not None and self._plot_rect.contains(self._mouse):
-            data_pt = self._screen_to_data(self._mouse)
+            eff, eff_y_units = self._effective_series_and_units()
+            active_si = self._active_series_idx(eff)
+            axis_si = self._axis_series_idx(eff)
+            data_pt = self._screen_to_data(self._mouse, series_index=active_si if active_si is not None else axis_si)
             if data_pt is not None:
                 p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 r = self._plot_rect
-                eff, eff_y_units = self._effective_series_and_units()
-                axis_si = self._axis_series_idx(eff)
+                readout_x_unit = (
+                    self._cur_x_units[axis_si]
+                    if (axis_si is not None and axis_si < len(self._cur_x_units))
+                    else self.x_unit
+                )
                 readout_y_unit = eff_y_units[axis_si] if (axis_si is not None and axis_si < len(eff_y_units)) else self.y_unit
                 xv, yv = data_pt
                 mx, my = self._mouse.x(), self._mouse.y()
                 snap_col: QColor | None = None
                 snap_name = ""
 
-                active_si = self._active_series_idx(eff)
                 if active_si is not None:
                     s_act = eff[active_si]
                     nearest = _nearest_point(s_act, xv)
@@ -2346,6 +2517,7 @@ class PlotWidget(QWidget):
                         mx, my = sp.x(), sp.y()
                         snap_col = _series_color(active_si, s_act.color)
                         snap_name = s_act.name
+                        readout_x_unit = self._cur_x_units[active_si] if active_si < len(self._cur_x_units) else readout_x_unit
                         readout_y_unit = eff_y_units[active_si] if active_si < len(eff_y_units) else readout_y_unit
 
                 p.save()
@@ -2366,13 +2538,14 @@ class PlotWidget(QWidget):
                 p.restore()
 
                 prefix = f"{snap_name}: " if snap_name else ""
-                badge = f"{prefix}{_fmt_value(xv, self.x_unit)}   {_fmt_value(yv, readout_y_unit)}"
+                badge = f"{prefix}{_fmt_value(xv, readout_x_unit)}   {_fmt_value(yv, readout_y_unit)}"
                 p.setFont(self._font)
                 fm = QFontMetricsF(self._font)
                 bw = fm.horizontalAdvance(badge) + 14.0
                 bh = fm.height() + 6.0
-                # Если справа сверху есть плашка PASS/FAIL — сдвигаем координаты чуть ниже неё
-                top_offset = (fm.height() + 16.0) if self.limits else 6.0
+                # Если сверху есть прозрачный титлбар или плашка PASS/FAIL — сдвигаем координаты ниже
+                base_top = 38.0 if self._top_left_pad > 0.0 else 6.0
+                top_offset = base_top + ((fm.height() + 10.0) if self.limits else 0.0)
                 pill = QRectF(r.right() - bw - 6.0 - self._top_right_pad, r.top() + top_offset, bw, bh)
                 p.setPen(QPen(snap_col if snap_col is not None else _c("UI_COLOR_BORDER"), 1.0))
                 p.setBrush(_c("UI_COLOR_BACKGROUND"))
@@ -2385,7 +2558,7 @@ class PlotWidget(QWidget):
     def mouseDoubleClickEvent(self, e):  # noqa: N802 - Qt
         pos = e.position()
         if e.button() == Qt.MouseButton.LeftButton and self._plot_rect.contains(pos):
-            if self._hit_overlay(pos) is not None:
+            if self._hit_chip(pos) is not None or self._hit_overlay(pos) is not None:
                 e.accept()
                 return
             self.store_memory()
@@ -2551,9 +2724,9 @@ class PlotWidget(QWidget):
                 self._bump()
             e.accept()
             return
-        ov = self._hit_overlay(pos)
-        self._mouse = pos if (self._plot_rect.contains(pos) and ov is None) else None
         chip = self._hit_chip(pos)
+        ov = self._hit_overlay(pos) if chip is None else None
+        self._mouse = pos if (self._plot_rect.contains(pos) and ov is None and chip is None) else None
         self._chip_hover = chip[0] if chip is not None else None
         in_leg = ov is not None and ov[0] == "legend"
         on_more = in_leg and (chip is None) and self._legend_more_hit is not None and self._legend_more_hit.contains(pos)
@@ -2613,7 +2786,7 @@ class PlotWidget(QWidget):
 
     def wheelEvent(self, e):  # noqa: N802 - Qt
         pos = e.position()
-        if self._chips_max_scroll > 0.0 and self._chips_strip_rect.isValid() and pos.y() >= self._chips_strip_rect.top():
+        if self._chips_max_scroll > 0.0 and self._chips_strip_rect.isValid() and self._chips_strip_rect.contains(pos):
             pd = e.pixelDelta()
             ad = e.angleDelta()
             if pd.x() or pd.y():
@@ -2746,14 +2919,14 @@ class PlotSettingsWindow(Window):
             QLabel#markerSub {
                 color: $UI_COLOR_TEXT_MUTED;
                 font-family: $UI_MONOSPACE_FONT_FAMILY;
-                font-size: 9pt;
+                font-size: 8pt;
                 background: transparent;
                 padding-left: 28px;
             }
             QLabel#mathHint {
                 color: $UI_COLOR_TEXT_MUTED;
                 font-family: $UI_MONOSPACE_FONT_FAMILY;
-                font-size: 9pt;
+                font-size: 8pt;
                 background-color: $UI_COLOR_PANEL;
                 border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
                 border-radius: ${UI_BORDER_RADIUS_PX}px;

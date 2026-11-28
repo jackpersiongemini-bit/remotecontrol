@@ -107,11 +107,11 @@ def test_offset_and_gate_partly_outside_pulse(pm):
 
 def test_param_change_rearms(pm):
     drv, sim, rec = pm
-    sim.set_signal(on_dbm=0.0, width=None)            # нет запуска - висит взведённым
+    sim.set_signal(on_dbm=0.0, width=None)            # нет запуска - ждёт в программном LEVEL, не вешая датчик
     setp(drv, rec, "trig.level", -10.0)
     setp(drv, rec, "trig.source", "INT")
     setp(drv, rec, "freq", 1e9)
-    assert sim.history[-1] != "ABOR" and sim.measuring and rec.values["meas.armed"] is True
+    assert sim.cfg["src"] == "IMM" and rec.values["meas.armed"] is True
 
 
 def test_zero_uses_long_timeout(pm):
@@ -135,9 +135,11 @@ def test_gate_feeds_follow_trigger_source(pm):
     drv, sim, rec = pm
     setp(drv, rec, "trig.level", -10.0)
     setp(drv, rec, "trig.source", "INT")
-    assert sim.feeds[1] == "POW:AVER ON SWEEP1" and sim.feeds[3] == "POW:PTAV ON SWEEP1"
+    # Программный LEVEL не включает аппаратный ON SWEEP1 и держит датчик в IMM + TRAC:STAT ON
+    assert sim.cfg["src"] == "IMM" and sim.cfg["trac"] is True
+    assert sim.feeds[1] == "POW:AVER" and sim.feeds[3] == "POW:PTAV"
     setp(drv, rec, "trig.source", "IMM")
-    assert sim.feeds[1] == "POW:AVER" and not rec.errors
+    assert sim.feeds[1] == "POW:AVER" and sim.cfg["trac"] is False and not rec.errors
     setp(drv, rec, "trig.source", "EXT")
     setp(drv, rec, "detector", "AVERAGE")              # EXT + AVER разрешено, строб у среднего остаётся
     assert sim.feeds[1] == "POW:AVER ON SWEEP1" and not rec.errors
@@ -171,50 +173,43 @@ def test_time_domain_trace(pm):
 
 
 def test_level_mode_stops_free_run_and_disables_auto_level(pm):
-    """Переход FREE RUN -> LEVEL сначала выключает INIT:CONT; запись trig.level выключает TRIG:LEV:AUTO."""
+    """Переход FREE RUN -> LEVEL переводит датчик в INIT:CONT OFF + IMM + TRAC:STAT ON без TRIG:SOUR INT / TRIG:LEV."""
     drv, sim, rec = pm
-    sim.cfg["lev_auto"] = True
     del sim.history[:]
     assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
-    i_off = sim.history.index("INIT:CONT OFF")
-    i_src = sim.history.index("TRIG:SOUR INT")
-    assert i_off < i_src and not rec.errors
+    assert "INIT:CONT OFF" in sim.history
+    assert "TRIG:SOUR INT" not in sim.history
+    assert sim.cfg["src"] == "IMM" and sim.cfg["trac"] is True and not rec.errors
     del sim.history[:]
     assert setp(drv, rec, "trig.level", -12.0) is PStatus.WRITTEN
-    i_auto = sim.history.index("TRIG:LEV:AUTO OFF")
-    i_lev = next(i for i, c in enumerate(sim.history) if c.startswith("TRIG:LEV "))
-    assert i_auto < i_lev and rec.values["trig.level"] == pytest.approx(-12.0)
+    assert not any(c.startswith("TRIG:LEV") for c in sim.history)
+    assert rec.values["trig.level"] == pytest.approx(-12.0)
     assert rec.values["trig.level_auto"] is False and not rec.errors
 
 
 def test_level_mode_rearms_after_readbacks_and_clears_stale_reading(pm):
-    """Переход FREE -> LEVEL и смена порога сбрасывают старое показание, а INIT;*OPC идёт ПОСЛЕ обратного чтения."""
+    """Переход FREE -> LEVEL и смена порога сбрасывают старое показание и не оставляют устаревших данных."""
     drv, sim, rec = pm
     sim.set_signal(on_dbm=-10.0, width=None)           # CW: в FREE RUN даёт -10 dBm, в LEVEL фронта нет
     drv.poll()
     assert rec.values["meas.power"] == pytest.approx(-10.0, abs=0.05)
 
-    del sim.history[:]
     assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
     # Старое показание FREE RUN сброшено до прихода запуска
     assert rec.values["meas.power"] is None and rec.values["meas.armed"] is True
-    # INIT и *OPC — в самом конце, после всех обратных запросов (TRIG:SOUR?, TRIG:LEV?, ...)
-    i_init = sim.history.index("INIT")
-    assert sim.history[i_init:] == ["INIT", "*OPC"]
     assert not rec.errors
 
-    # Появились импульсы -> сработал запуск по уровню
+    # Появились импульсы -> сработал программный запуск по уровню
     sim.set_signal(on_dbm=0.0, width=200e-6, period=1e-3, off_dbm=-60.0)
     assert setp(drv, rec, "trig.level", -10.0) is PStatus.WRITTEN
     drv.poll()
     assert rec.values["meas.power"] == pytest.approx(0.0, abs=0.05)
 
-    # Подняли порог выше импульса -> старый результат сброшен, датчик ждёт
-    del sim.history[:]
+    # Подняли порог выше импульса -> старый результат сброшен, датчик ждёт (но трасса всё равно видна!)
     assert setp(drv, rec, "trig.level", 10.0) is PStatus.WRITTEN
     assert rec.values["meas.power"] is None and rec.values["meas.armed"] is True
-    i_init2 = sim.history.index("INIT")
-    assert sim.history[i_init2:] == ["INIT", "*OPC"]
+    drv.poll()
+    assert rec.values["meas.power"] is None and rec.values["trace"] is not None
 
 
 def test_level_auto_triggers_and_updates_detected_level(pm):
@@ -245,14 +240,13 @@ def test_level_negative_slope_triggers_on_falling_edge(pm):
 
 
 def test_batch_write_arms_once_and_resync_aborts_before_init(pm):
-    """Пачка параметров в _pending взводит INIT один раз в конце; after_resync / timeout делают ABOR до INIT."""
+    """Пачка параметров в _pending для EXT взводит INIT один раз в конце; after_resync делает ABOR до INIT."""
     drv, sim, rec = pm
     sim.set_signal(on_dbm=0.0, width=None)
     del sim.history[:]
-    drv.set_param("trig.level", -15.0)
     drv.set_param("gate.start", 10e-6)
     drv.set_param("gate.length", 80e-6)
-    drv.set_param("trig.source", "INT")
+    drv.set_param("trig.source", "EXT")
     flush(drv)
     assert sim.history.count("INIT") == 1
     assert sim.history[-2:] == ["INIT", "*OPC"]
@@ -265,7 +259,7 @@ def test_batch_write_arms_once_and_resync_aborts_before_init(pm):
 
 @pytest.mark.parametrize("hw_shifts", [False, True])
 def test_trig_level_accounts_for_calibration_offset(make, hw_shifts):
-    """Калибровка (CORR:GAIN2) сдвигает диапазон уровня запуска выше +20 дБм (и для сырых, и для сдвинутых датчиков)."""
+    """Калибровка (CORR:GAIN2) сдвигает диапазон уровня запуска выше +20 дБм без обращения к аппаратному TRIG:LEV."""
     drv, sim, rec = make(KeysightU2021XA, KeysightU2021XASim,
                          sim=KeysightU2021XASim(trig_level_includes_offset=hw_shifts))
     # физически на датчике импульс +5 дБм; с калибровкой +40 дБ это +45 дБм (> +20 дБм!)
@@ -274,7 +268,6 @@ def test_trig_level_accounts_for_calibration_offset(make, hw_shifts):
     assert setp(drv, rec, "offset.state", True) is PStatus.WRITTEN
     assert setp(drv, rec, "trig.level", 35.0) is PStatus.WRITTEN
     assert rec.values["trig.level"] == pytest.approx(35.0)
-    assert sim.cfg["lev"] == pytest.approx(-5.0)                # физический порог на датчике: 35 - 40 = -5 дБм
     assert setp(drv, rec, "gate.start", 20e-6) is PStatus.WRITTEN
     assert setp(drv, rec, "gate.length", 100e-6) is PStatus.WRITTEN
     assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
@@ -288,5 +281,19 @@ def test_trig_level_accounts_for_calibration_offset(make, hw_shifts):
     assert setp(drv, rec, "offset", -30.0) is PStatus.WRITTEN
     assert setp(drv, rec, "trig.level", -55.0) is PStatus.WRITTEN
     assert rec.values["trig.level"] == pytest.approx(-55.0)
-    assert sim.cfg["lev"] == pytest.approx(-25.0)
+    assert not rec.errors
+
+
+def test_software_level_10us_pulse(pm):
+    """Программный LEVEL стабильно измеряет короткий импульс 10 мкс и выравнивает фронт трассы в t = 0."""
+    drv, sim, rec = pm
+    sim.set_signal(on_dbm=3.0, width=10e-6, period=1e-3, off_dbm=-65.0)
+    for k, v in (("trig.level", -10.0), ("gate.start", 1e-6), ("gate.length", 7e-6), ("trig.source", "INT")):
+        assert setp(drv, rec, k, v) is PStatus.WRITTEN
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(3.0, abs=0.05)
+    assert rec.values["meas.peak"] == pytest.approx(3.0, abs=0.05)
+    tr = rec.values["trace"]
+    assert tr is not None and len(tr) == 1000
+    assert tr.x[0] < 0.0 < tr.x[-1]
     assert not rec.errors

@@ -11,8 +11,8 @@
     отпускании вне правой части, возвратом обратно перетаскиванием или по ``×``, кликом по шапке —
     переводом в главный график, сохранением порядка и делителя в ``QSettings``.
 * Подключённый ``ActivityMonitor`` автоматически строит карточки для запущенных приёмников
-  (``VNA``, ``SA``, ``PM``) и каналов источников питания (``PSU CH1``..``CHn`` с переключением
-  режима ``TIME`` — V/I/P по времени, и ``FREQ`` — ток по частоте и мощности генератора).
+  (``VNA``, ``SA``, ``PM``) и каналов источников питания (``PSU CH1``..``CHn`` — ток от частоты
+  по уровням мощности генератора).
 """
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ from typing import Any
 from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QPoint, QRect, QSettings, QSize, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QKeySequence, QShortcut
-from PyQt6.QtWidgets import (QAbstractButton, QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-                             QSizePolicy, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractButton, QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                             QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
 from ..coord import COORD, ActivityMonitor, Coordinator, profile_name
 from ..core.trace import Trace
@@ -122,6 +122,7 @@ class GraphCard(QFrame):
     settings_requested = pyqtSignal(str)
     promote_requested = pyqtSignal(str)
     mode_changed = pyqtSignal(str, str)
+    title_changed = pyqtSignal(str, str)
 
     STYLE_SHEET = render_qss("""
         GraphCard {
@@ -134,25 +135,35 @@ class GraphCard(QFrame):
             border: none;
             border-radius: 0px;
         }
-        GraphCard QWidget#cardBar {
-            background-color: $UI_COLOR_CONTROL;
-            border-bottom: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
-            border-top-left-radius: ${UI_BORDER_RADIUS_PX}px;
-            border-top-right-radius: ${UI_BORDER_RADIUS_PX}px;
+        GraphCard QWidget#cardBar, GraphCard QWidget#cardControls {
+            background: transparent;
+            border: none;
         }
         GraphCard QLabel#cardTitle {
+            min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
             color: $UI_COLOR_TEXT;
             font-family: $UI_MONOSPACE_FONT_FAMILY;
             font-size: ${UI_FONT_SIZE_PT}pt;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             background: transparent;
+            border: none;
+            padding: 0 2px;
+        }
+        GraphCard QLineEdit#cardTitleEdit {
+            min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
+            color: $UI_COLOR_TEXT;
+            font-family: $UI_MONOSPACE_FONT_FAMILY;
+            font-size: ${UI_FONT_SIZE_PT}pt;
+            font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
+            background-color: $UI_COLOR_BACKGROUND;
+            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER_LIGHT;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
             padding: 0 4px;
         }
         GraphCard QWidget#cardBody {
-            background-color: $UI_COLOR_BACKGROUND;
+            background-color: transparent;
             border: none;
-            border-bottom-left-radius: ${UI_BORDER_RADIUS_PX}px;
-            border-bottom-right-radius: ${UI_BORDER_RADIUS_PX}px;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
         }
         GraphCard[floating="true"] QWidget#cardBody, GraphCard[monolithic="true"] QWidget#cardBody {
             border-radius: 0px;
@@ -166,20 +177,25 @@ class GraphCard(QFrame):
         GraphCard IconButtonBase {
             min-width: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-width: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
             min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
-            background-color: $UI_COLOR_BACKGROUND;
+            background-color: transparent;
             border: none;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
             padding: 0;
         }
         GraphCard IconButtonBase:hover {
             background-color: $UI_COLOR_INVERT_HOVER;
+            border: none;
+        }
+        GraphCard IconButtonBase:checked {
+            background-color: $UI_COLOR_INVERT;
+            border: none;
         }
         GraphCard QPushButton#modeBtn {
             min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
             padding: 0 8px;
-            background-color: $UI_COLOR_BACKGROUND;
+            background-color: transparent;
             color: $UI_COLOR_TEXT_MUTED;
-            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
+            border: none;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
             font-family: $UI_MONOSPACE_FONT_FAMILY;
             font-size: ${UI_FONT_SIZE_PT}pt;
@@ -188,14 +204,15 @@ class GraphCard(QFrame):
         GraphCard QPushButton#modeBtn:hover {
             background-color: $UI_COLOR_INVERT_HOVER;
             color: $UI_COLOR_TEXT_INVERSE;
-            border-color: $UI_COLOR_INVERT_HOVER;
+            border: none;
         }
     """)
 
     def __init__(self, title: str, *, monolithic: bool = False, min_body_height: int = 240,
-                 modes: tuple[str, ...] = (), initial_mode: str = "", parent=None):
+                 modes: tuple[str, ...] = (), initial_mode: str = "", display_title: str = "", parent=None):
         super().__init__(parent)
         self.graph_name = title
+        self._display_title = (display_title or title).strip() or title
         self.monolithic = bool(monolithic)
         self._min_body_height = int(min_body_height)
         self._modes: tuple[str, ...] = tuple(modes)
@@ -210,67 +227,121 @@ class GraphCard(QFrame):
         else:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        self.bar = QWidget(self)
-        self.bar.setObjectName("cardBar")
-        self.bar.setFixedHeight(WINDOW_BAR_HEIGHT)
-        self._bar_layout = QHBoxLayout(self.bar)
-        self._bar_layout.setContentsMargins(8, 7, 6, 7)
-        self._bar_layout.setSpacing(4)
-
-        self.title_label = QLabel(title, self.bar)
-        self.title_label.setObjectName("cardTitle")
-        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-
-        self.mode_button: QPushButton | None = None
-        if len(self._modes) >= 2:
-            self.mode_button = self._make_mode_button(self.bar)
-
-        self.settings_button = PanelSettingsButton(self.bar)
-        self.settings_button.setToolTip(f"{title} settings")
-        self.settings_button.clicked.connect(lambda: self.settings_requested.emit(self.graph_name))
-        self.clear_button = PanelClearButton(self.bar)
-        self.clear_button.setToolTip(f"Reset {title} view")
-
-        self._bar_layout.addWidget(self.title_label, 1)
-        if self.mode_button is not None:
-            self._bar_layout.addWidget(self.mode_button)
-        self._bar_layout.addWidget(self.settings_button)
-        self._bar_layout.addWidget(self.clear_button)
-
-        self.bar.installEventFilter(self)
-        self.title_label.installEventFilter(self)
-
         self.body = QWidget(self)
         self.body.setObjectName("cardBody")
         self.body_layout = QVBoxLayout(self.body)
-        self.body_layout.setContentsMargins(4, 4, 4, 4)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
         self.body_layout.setSpacing(0)
 
-        self.plot = PlotWidget(empty_text=title, parent=self.body)
+        self.plot = PlotWidget(empty_text=self._display_title, parent=self.body)
         self.body_layout.addWidget(self.plot, 1)
+
+        # Прозрачный титлбар поверх верха графика: имя слева (редактируется по двойному клику),
+        # перетаскивание/клик по всей полосе, кнопки справа появляются только при наведении на титлбар
+        self.bar = QWidget(self)
+        self.bar.setObjectName("cardBar")
+        self._bar_layout = QHBoxLayout(self.bar)
+        self._bar_layout.setContentsMargins(6, 6, 6, 6)
+        self._bar_layout.setSpacing(4)
+
+        self.title_label = QLabel(self._display_title, self.bar)
+        self.title_label.setObjectName("cardTitle")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+
+        self.title_edit = QLineEdit(self._display_title, self.bar)
+        self.title_edit.setObjectName("cardTitleEdit")
+        self.title_edit.setMaximumWidth(220)
+        self.title_edit.hide()
+        self.title_edit.returnPressed.connect(self._commit_title_edit)
+        self.title_edit.editingFinished.connect(self._commit_title_edit)
+        self.title_edit.installEventFilter(self)
+
+        self.controls_bar = QWidget(self)
+        self.controls_bar.setObjectName("cardControls")
+        self._controls_layout = QHBoxLayout(self.controls_bar)
+        self._controls_layout.setContentsMargins(0, 0, 0, 0)
+        self._controls_layout.setSpacing(4)
+
+        self.mode_button: QPushButton | None = None
+        if len(self._modes) >= 2:
+            self.mode_button = self._make_mode_button(self.controls_bar)
+
+        self.settings_button = PanelSettingsButton(self.controls_bar)
+        self.settings_button.setCheckable(False)
+        self.settings_button.setToolTip(f"{self._display_title} settings")
+        self.settings_button.clicked.connect(lambda: self.settings_requested.emit(self.graph_name))
+        self.clear_button = PanelClearButton(self.controls_bar)
+        self.clear_button.setToolTip(f"Reset {self._display_title} view")
         self.clear_button.clicked.connect(self.plot.reset_view)
 
-        hb = PanelSettingsButton(self.body)
-        hb.setToolTip(f"{title} settings")
-        hb.clicked.connect(lambda: self.settings_requested.emit(self.graph_name))
-        hb.hide()
-        self.hover_settings_button: PanelSettingsButton = hb
+        if self.mode_button is not None:
+            self._controls_layout.addWidget(self.mode_button)
+        self._controls_layout.addWidget(self.settings_button)
+        self._controls_layout.addWidget(self.clear_button)
+        self.controls_bar.hide()
 
-        self.hover_mode_button: QPushButton | None = None
-        if len(self._modes) >= 2:
-            hm = self._make_mode_button(self.body)
-            hm.hide()
-            self.hover_mode_button = hm
+        self._bar_layout.addWidget(self.title_label)
+        self._bar_layout.addWidget(self.title_edit)
+        self._bar_layout.addStretch(1)
 
-        self.body.installEventFilter(self)
+        self.bar.installEventFilter(self)
+        self.controls_bar.installEventFilter(self)
+        self.title_label.installEventFilter(self)
+
+        # Совместимость с тестами/внешним кодом
+        self.hover_settings_button: PanelSettingsButton = self.settings_button
+        self.hover_mode_button: QPushButton | None = self.mode_button
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self.bar)
         root.addWidget(self.body, 1)
         self._sync_mode_buttons()
         self.set_monolithic(self.monolithic)
+
+    @property
+    def display_title(self) -> str:
+        return self._display_title
+
+    def set_display_title(self, text: str, *, emit: bool = False) -> None:
+        cleaned = str(text or "").strip() or self.graph_name
+        if cleaned == self._display_title and self.title_label.text() == cleaned:
+            return
+        self._display_title = cleaned
+        self.title_label.setText(cleaned)
+        self.title_edit.setText(cleaned)
+        self.plot.empty_text = cleaned
+        self.settings_button.setToolTip(f"{cleaned} settings")
+        self.clear_button.setToolTip(f"Reset {cleaned} view")
+        self.plot.update()
+        if emit:
+            self.title_changed.emit(self.graph_name, cleaned)
+
+    def _begin_title_edit(self) -> None:
+        if self._floating:
+            return
+        self._drag_start_pos = None
+        self.title_edit.setText(self._display_title)
+        self.title_label.hide()
+        self.title_edit.show()
+        self.title_edit.setFocus()
+        self.title_edit.selectAll()
+
+    def _commit_title_edit(self) -> None:
+        if self.title_edit.isHidden():
+            return
+        new_text = self.title_edit.text().strip() or self.graph_name
+        self.title_edit.hide()
+        self.title_label.show()
+        self.set_display_title(new_text, emit=True)
+
+    def _cancel_title_edit(self) -> None:
+        if self.title_edit.isHidden():
+            return
+        self.title_edit.setText(self._display_title)
+        self.title_edit.hide()
+        self.title_label.show()
 
     def _make_mode_button(self, parent: QWidget) -> QPushButton:
         b = QPushButton(self._mode, parent)
@@ -292,18 +363,16 @@ class GraphCard(QFrame):
         idx = self._modes.index(self._mode) if self._mode in self._modes else 0
         nxt = self._modes[(idx + 1) % len(self._modes)]
         tip = f"Graph mode: {self._mode} (click to switch to {nxt})"
-        for btn in (self.mode_button, self.hover_mode_button):
-            if btn is not None and not sip.isdeleted(btn):
-                btn.setText(self._mode)
-                btn.setToolTip(tip)
+        if self.mode_button is not None and not sip.isdeleted(self.mode_button):
+            self.mode_button.setText(self._mode)
+            self.mode_button.setToolTip(tip)
 
     def set_mode(self, mode: str, *, emit: bool = False) -> None:
         if not self._modes or mode not in self._modes or mode == self._mode:
             return
         self._mode = mode
         self._sync_mode_buttons()
-        if self.monolithic:
-            self._place_hover_settings()
+        self._place_overlays()
         if emit:
             self.mode_changed.emit(self.graph_name, self._mode)
 
@@ -316,114 +385,146 @@ class GraphCard(QFrame):
     def set_monolithic(self, monolithic: bool) -> None:
         self.monolithic = bool(monolithic)
         self._drag_start_pos = None
+        self._cancel_title_edit()
         self.setProperty("monolithic", self.monolithic)
+        self.bar.setVisible(not self.monolithic and not self._floating)
+        self.controls_bar.hide()
+        self.plot.set_draw_frame(self.monolithic)
+        self.plot.set_top_pad(0.0)
         if self.monolithic:
-            self.bar.hide()
-            self.plot.set_top_pad(0.0)
-            extra = 66.0 if self.hover_mode_button is not None else 0.0
-            self.plot.set_top_right_pad(UI_TITLE_BAR_ITEM_SIZE_PX + 8.0 + extra)
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self.body.setMinimumHeight(140)
             self.title_label.setCursor(Qt.CursorShape.ArrowCursor)
             self.bar.setCursor(Qt.CursorShape.ArrowCursor)
+            self.title_label.setToolTip("")
             self.bar.setToolTip("")
-            self.hover_settings_button.hide()
-            if self.hover_mode_button is not None:
-                self.hover_mode_button.hide()
         else:
-            self.bar.setVisible(not self._floating)
-            self.plot.set_top_pad(0.0)
-            self.plot.set_top_right_pad(0.0)
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.body.setMinimumHeight(self._min_body_height)
-            self.title_label.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.bar.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.bar.setToolTip(f"Click to make {self.graph_name} main · Drag to reorder or detach")
-            self.hover_settings_button.hide()
-            if self.hover_mode_button is not None:
-                self.hover_mode_button.hide()
+            self.title_label.setCursor(Qt.CursorShape.IBeamCursor)
+            self.bar.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.title_label.setToolTip("Double-click to rename · Drag to reorder or detach")
+            self.bar.setToolTip(f"Click to make {self._display_title} main · Drag to reorder or detach")
+        self._place_overlays()
         _repolish(self)
 
-    def _place_hover_settings(self) -> None:
-        hb = self.hover_settings_button
-        if hb is None or sip.isdeleted(hb):
+    def _place_overlays(self) -> None:
+        if self._floating or sip.isdeleted(self.bar) or sip.isdeleted(self.controls_bar):
+            self.plot.set_top_left_pad(0.0)
+            self.plot.set_top_right_pad(0.0)
             return
-        sx = max(4, self.body.width() - UI_TITLE_BAR_ITEM_SIZE_PX - 24)
-        hb.setGeometry(sx, 22, UI_TITLE_BAR_ITEM_SIZE_PX, UI_TITLE_BAR_ITEM_SIZE_PX)
-        hb.raise_()
-        hm = self.hover_mode_button
-        if hm is not None and not sip.isdeleted(hm):
-            mw = max(48, hm.sizeHint().width())
-            hm.setGeometry(max(4, sx - mw - 4), 22, mw, UI_TITLE_BAR_ITEM_SIZE_PX)
-            hm.raise_()
+        bar_h = UI_TITLE_BAR_ITEM_SIZE_PX + 12
+        if not self.monolithic:
+            self.bar.setGeometry(0, 0, max(40, self.width()), bar_h)
+            self.bar.raise_()
+            self._bar_layout.activate()
+            self.plot.set_top_left_pad(float(bar_h))
+        else:
+            self.plot.set_top_left_pad(0.0)
+
+        self._controls_layout.activate()
+        sh_r = self.controls_bar.sizeHint()
+        rw = max(28, min(sh_r.width(), max(28, self.width() - 16)))
+        rh = max(UI_TITLE_BAR_ITEM_SIZE_PX, sh_r.height())
+        rx = max(6, self.width() - rw - 6)
+        self.controls_bar.setGeometry(rx, 6, rw, rh)
+        self.controls_bar.raise_()
+        self.plot.set_top_right_pad(float(rw + 8) if (self.monolithic and self.controls_bar.isVisible()) else 0.0)
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt
+        super().resizeEvent(event)
+        self._place_overlays()
+
+    def enterEvent(self, event):  # noqa: N802 - Qt
+        super().enterEvent(event)
+        if self.monolithic and not self._floating and not sip.isdeleted(self.controls_bar):
+            self.controls_bar.show()
+            self._place_overlays()
+
+    def leaveEvent(self, event):  # noqa: N802 - Qt
+        super().leaveEvent(event)
+        if not self._floating and not sip.isdeleted(self.controls_bar):
+            self.controls_bar.hide()
+            self.plot.set_top_right_pad(0.0)
 
     def set_floating(self, floating: bool) -> None:
         floating = bool(floating)
         self._floating = floating
         self.setProperty("floating", floating)
-        self.bar.setVisible(not floating)
+        self._cancel_title_edit()
+        self.bar.setVisible(not floating and not self.monolithic)
+        self.controls_bar.hide()
+        self.plot.set_draw_frame(self.monolithic)
         if floating:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self.body.setMinimumHeight(140)
             self.title_label.setCursor(Qt.CursorShape.ArrowCursor)
+            self.plot.set_top_left_pad(0.0)
+            self.plot.set_top_right_pad(0.0)
         else:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.body.setMinimumHeight(self._min_body_height)
-            self.title_label.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.title_label.setCursor(Qt.CursorShape.IBeamCursor)
+            self._place_overlays()
         _repolish(self)
 
     def take_bar_widgets(self) -> tuple[QLabel, QPushButton | None, PanelSettingsButton, PanelClearButton]:
-        widgets = [self.title_label, self.settings_button, self.clear_button]
+        self._cancel_title_edit()
+        self._bar_layout.removeWidget(self.title_label)
+        ctrl_widgets = [self.settings_button, self.clear_button]
         if self.mode_button is not None:
-            widgets.append(self.mode_button)
-        for w in widgets:
-            self._bar_layout.removeWidget(w)
+            ctrl_widgets.append(self.mode_button)
+        for w in ctrl_widgets:
+            self._controls_layout.removeWidget(w)
         return (self.title_label, self.mode_button, self.settings_button, self.clear_button)
 
     def restore_bar_widgets(self) -> None:
-        widgets = [self.title_label]
+        self.title_label.setParent(self.bar)
+        self.title_label.show()
+        self._bar_layout.insertWidget(0, self.title_label)
+        ctrl_widgets = [self.settings_button, self.clear_button]
         if self.mode_button is not None:
-            widgets.append(self.mode_button)
-        widgets.extend([self.settings_button, self.clear_button])
-        for w in widgets:
-            w.setParent(self.bar)
+            ctrl_widgets.insert(0, self.mode_button)
+        for w in ctrl_widgets:
+            w.setParent(self.controls_bar)
             w.show()
-        self._bar_layout.addWidget(self.title_label, 1)
-        if self.mode_button is not None:
-            self._bar_layout.addWidget(self.mode_button)
-        self._bar_layout.addWidget(self.settings_button)
-        self._bar_layout.addWidget(self.clear_button)
+            self._controls_layout.addWidget(w)
+        self.controls_bar.hide()
         _repolish(self.title_label)
+        self._place_overlays()
 
     def _is_drag_target(self, obj, pos: QPoint) -> bool:
+        if not self.title_edit.isHidden():
+            return False
         if obj is self.title_label:
             return True
         if obj is self.bar:
             child = self.bar.childAt(pos)
             while child is not None and child is not self.bar:
-                if isinstance(child, QAbstractButton) or child is self.title_label:
+                if isinstance(child, (QAbstractButton, QLineEdit)) or child is self.title_label:
                     return False
                 child = child.parentWidget()
             return True
         return False
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt
-        if obj is self.body and self.hover_settings_button is not None:
-            if not self.monolithic:
-                return super().eventFilter(obj, event)
-            et = event.type()
-            if et == QEvent.Type.Resize:
-                self._place_hover_settings()
-            elif et == QEvent.Type.Enter:
-                self._place_hover_settings()
-                self.hover_settings_button.show()
-                if self.hover_mode_button is not None:
-                    self.hover_mode_button.show()
-            elif et == QEvent.Type.Leave:
-                self.hover_settings_button.hide()
-                if self.hover_mode_button is not None:
-                    self.hover_mode_button.hide()
+        et = event.type()
+        if obj is self.title_edit:
+            if et == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+                self._cancel_title_edit()
+                return True
             return super().eventFilter(obj, event)
+        if obj in (self.bar, self.controls_bar) and not self._floating and not self.monolithic:
+            if et == QEvent.Type.Enter:
+                self.controls_bar.show()
+                self._place_overlays()
+            elif et == QEvent.Type.Leave:
+                if not (self.bar.underMouse() or self.controls_bar.underMouse()):
+                    self.controls_bar.hide()
+        if obj is self.title_label and not self._floating:
+            if et == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
+                self._begin_title_edit()
+                return True
         if self.monolithic or self._floating:
             return super().eventFilter(obj, event)
         et = event.type()
@@ -431,7 +532,7 @@ class GraphCard(QFrame):
             if self._is_drag_target(obj, event.position().toPoint()):
                 gpos = event.globalPosition().toPoint()
                 self._drag_start_pos = gpos
-                self._drag_hotspot = self.bar.mapFromGlobal(gpos)
+                self._drag_hotspot = self.mapFromGlobal(gpos)
                 return True
         elif et == QEvent.Type.MouseMove and self._drag_start_pos is not None:
             if event.buttons() & Qt.MouseButton.LeftButton:
@@ -446,7 +547,7 @@ class GraphCard(QFrame):
         elif et == QEvent.Type.MouseButtonRelease:
             was_click = self._drag_start_pos is not None and event.button() == Qt.MouseButton.LeftButton
             self._drag_start_pos = None
-            if was_click:
+            if was_click and obj is not self.title_label:
                 self.promote_requested.emit(self.graph_name)
                 return True
         return super().eventFilter(obj, event)
@@ -465,7 +566,13 @@ class _FloatingGraphBar(WindowBar):
             font-size: ${UI_FONT_SIZE_PT}pt;
             font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
             background: transparent;
+            border: none;
             padding: 0 4px;
+        }
+        WindowBar QLabel#cardTitle:hover {
+            color: $UI_COLOR_TEXT;
+            background: transparent;
+            border: none;
         }
         WindowBar QPushButton#modeBtn {
             min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
@@ -777,6 +884,10 @@ class GraphsWindow(Window):
             border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
         }
+        QFrame#leftPane {
+            background-color: transparent;
+            border: none;
+        }
         QFrame#dropIndicator {
             background-color: $UI_COLOR_INVERT;
             border: none;
@@ -828,29 +939,12 @@ class GraphsWindow(Window):
         if app is not None:
             app.applicationStateChanged.connect(self._on_app_state_changed)
 
-        # WindowBar: слева SincEmblem, INST, DARK/LIGHT; справа ScenarioChip, minimize, maximize, close
+        # WindowBar: слева SincEmblem (клик меняет тему); справа ScenarioChip, minimize, maximize, close
         self.titleBar.title_label.hide()
 
         self.emblem = SincEmblem(self.titleBar)
+        self.emblem.clicked.connect(self.toggle_theme)
         self.titleBar.insert_widget(self.emblem, 0)
-
-        self.instruments_button = self._bar_chip(
-            "INST", "Show / bring instruments window to front", checkable=True,
-        )
-        self.instruments_button.clicked.connect(self._on_instruments_button)
-        self.titleBar.insert_widget(self.instruments_button, 1)
-        if self.instruments_window is None:
-            self.instruments_button.hide()
-        else:
-            self.instruments_window.visibility_changed.connect(self._on_instruments_visibility_changed)
-            self._on_instruments_visibility_changed(self.instruments_window.isVisible())
-
-        self.theme_button = self._bar_chip(
-            "DARK" if current_theme() == "light" else "LIGHT",
-            "Switch between light and dark theme",
-        )
-        self.theme_button.clicked.connect(self.toggle_theme)
-        self.titleBar.insert_widget(self.theme_button, 2)
 
         self.scenario_chip = ScenarioChip(self.titleBar)
         self.scenario_chip.setStyleSheet(_SCENARIO_CHIP_QSS)
@@ -865,11 +959,11 @@ class GraphsWindow(Window):
         self._full_key = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
         self._full_key.activated.connect(self.toggle_maximized)
 
-        # Левая часть: монолитный главный график на всю высоту БЕЗ скроллов
+        # Левая часть: монолитный главный график на всю высоту БЕЗ скроллов (рамка графика на всю панель)
         self.left_frame = QFrame()
-        self.left_frame.setObjectName("paneFrame")
+        self.left_frame.setObjectName("leftPane")
         self._left_layout = QVBoxLayout(self.left_frame)
-        self._left_layout.setContentsMargins(6, 6, 6, 6)
+        self._left_layout.setContentsMargins(0, 0, 0, 0)
         self._left_layout.setSpacing(0)
 
         # Правая часть: вертикальный скролл с перетаскиваемыми/открепляемыми карточками графиков
@@ -913,7 +1007,7 @@ class GraphsWindow(Window):
             mg = DEFAULT_MAIN_GRAPH if main_graph is None else main_graph
             sg = DEFAULT_SIDE_GRAPHS if side_graphs is None else side_graphs
             specs = [
-                (n, ("TIME", "FREQ") if n.startswith("PSU") else (("FREQ", "TIME") if n == "PM" else ()))
+                (n, ())
                 for n in [mg, *[s for s in sg if s != mg]]
             ]
             self._sync_cards(specs, preferred_main=mg)
@@ -1032,15 +1126,24 @@ class GraphsWindow(Window):
     def _make_card(self, name: str, *, mono: bool, parent_w: QWidget, modes: tuple[str, ...] = ()) -> GraphCard:
         initial_mode = self._load_mode(name, modes)
         default_mode = modes[0] if modes else ""
+        saved_title = str(self._settings.value(f"GRAPHS/TITLE/{name}", "", type=str) or "").strip()
         card = GraphCard(name, monolithic=mono, min_body_height=240, modes=modes, initial_mode=initial_mode,
-                         parent=parent_w)
+                         display_title=saved_title, parent=parent_w)
         card.plot.attach_settings(self._settings, self._plot_settings_group(name, initial_mode, default_mode))
         card.drag_started.connect(self._on_card_drag_started)
         card.settings_requested.connect(self.open_plot_settings)
         card.promote_requested.connect(self.set_main_graph)
         card.mode_changed.connect(self._on_card_mode_changed)
+        card.title_changed.connect(self._on_card_title_changed)
         self.all_cards[name] = card
         return card
+
+    def _on_card_title_changed(self, name: str, title: str) -> None:
+        if title == name:
+            self._settings.remove(f"GRAPHS/TITLE/{name}")
+        else:
+            self._settings.setValue(f"GRAPHS/TITLE/{name}", title)
+        self._settings.sync()
 
     def _remove_card(self, name: str) -> None:
         if name in self._floating_windows:
@@ -1151,10 +1254,10 @@ class GraphsWindow(Window):
                 continue
             name = self.monitor.name(p)
             sources[name] = (kind, p, None)
-            specs.append((name, ("FREQ", "TIME") if kind == "pm" else ()))
+            specs.append((name, ()))
         for p, ch, label in self.monitor.psu_channels():
             sources[label] = ("psu", p, ch)
-            specs.append((label, ("TIME", "FREQ")))
+            specs.append((label, ()))
 
         self._card_sources = sources
         self._sync_cards(specs)
@@ -1232,104 +1335,57 @@ class GraphsWindow(Window):
                 card.plot.clear()
 
         elif kind == "pm":
-            trace_on = proxy.value("trace.state") is True
-            was_trace_on = bool(getattr(card, "_last_pm_trace_on", False))
-            card._last_pm_trace_on = trace_on
-            if trace_on and not was_trace_on and card.current_mode != "TIME":
-                card.set_mode("TIME", emit=True)
-                return
-
-            if card.current_mode == "TIME":
-                if trace_on:
-                    tr = proxy.value("trace")
-                    if isinstance(tr, Trace) and len(tr) > 0:
-                        card.plot.set_series(
-                            [PlotSeries("TRACE", tuple(tr.x), tuple(tr.y))],
-                            x_unit=tr.x_unit or "s",
-                            y_unit=tr.y_unit or "dBm",
-                        )
-                    else:
-                        card.plot.set_axes(x_unit="s", y_unit="dBm")
-                        card.plot.clear()
-                else:
-                    hist = list(self.monitor.history.get(proxy, ()))
-                    if hist:
-                        t0 = hist[0][0]
-                        xs = tuple(t - t0 for t, _ in hist)
-                        ys = tuple(v for _, v in hist)
-                        card.plot.set_series([PlotSeries("PM", xs, ys, show_points=True)], x_unit="s", y_unit="dBm")
-                    else:
-                        card.plot.set_axes(x_unit="s", y_unit="dBm")
-                        card.plot.clear()
+            series: list[PlotSeries] = []
+            # 1. Мощность от частоты (Hz, dBm) — по уровням мощности ВЧ-генератора
+            cols, rows = self.monitor.pm_matrix(proxy)
+            if rows:
+                for col in cols:
+                    xs = tuple(f for f, vals in rows if col in vals)
+                    ys = tuple(vals[col] for f, vals in rows if col in vals)
+                    if xs:
+                        label = f"{col:g} dBm (Hz)" if col is not None else "FREQ"
+                        series.append(PlotSeries(label, xs, ys, show_points=True, x_unit="Hz", y_unit="dBm"))
+            # 2. Мощность от времени (s, dBm) — трасса импульса (LEVEL / TRAC) или история замеров
+            tr = proxy.value("trace")
+            if isinstance(tr, Trace) and len(tr) > 0:
+                series.append(PlotSeries(
+                    "TIME (s)",
+                    tuple(tr.x),
+                    tuple(tr.y),
+                    x_unit=tr.x_unit or "s",
+                    y_unit=tr.y_unit or "dBm",
+                ))
             else:
-                cols, rows = self.monitor.pm_matrix(proxy)
-                if rows:
-                    series: list[PlotSeries] = []
-                    for col in cols:
-                        xs = tuple(f for f, vals in rows if col in vals)
-                        ys = tuple(vals[col] for f, vals in rows if col in vals)
-                        if xs:
-                            label = f"{col:g} dBm" if col is not None else "MEAS"
-                            series.append(PlotSeries(label, xs, ys, show_points=True))
-                    if series:
-                        card.plot.set_series(series, x_unit="Hz", y_unit="dBm")
-                    else:
-                        card.plot.set_axes(x_unit="Hz", y_unit="dBm")
-                        card.plot.clear()
-                else:
-                    card.plot.set_axes(x_unit="Hz", y_unit="dBm")
-                    card.plot.clear()
+                hist = list(self.monitor.history.get(proxy, ()))
+                if hist:
+                    t0 = hist[0][0]
+                    xs_t = tuple(t - t0 for t, _ in hist)
+                    ys_t = tuple(v for _, v in hist)
+                    series.append(PlotSeries("TIME (s)", xs_t, ys_t, show_points=True, x_unit="s", y_unit="dBm"))
+            if series:
+                card.plot.set_series(series, x_unit=series[0].x_unit or "Hz", y_unit="dBm")
+            else:
+                card.plot.set_axes(x_unit="Hz", y_unit="dBm")
+                card.plot.clear()
 
         elif kind == "psu" and ch is not None:
-            if card.current_mode == "FREQ":
-                cols, rows = self.monitor.psu_matrix(proxy, ch)
-                if rows:
-                    series = []
-                    for col in cols:
-                        xs = tuple(f for f, vals in rows if col in vals)
-                        ys = tuple(vals[col] for f, vals in rows if col in vals)
-                        if xs:
-                            label = f"{col:g} dBm" if col is not None else "MEAS"
-                            series.append(PlotSeries(label, xs, ys, show_points=True, y_unit="A"))
-                    if series:
-                        card.plot.set_series(series, x_unit="Hz", y_unit="A")
-                    else:
-                        card.plot.set_axes(x_unit="Hz", y_unit="A")
-                        card.plot.clear()
+            cols, rows = self.monitor.psu_matrix(proxy, ch)
+            if rows:
+                series = []
+                for col in cols:
+                    xs = tuple(f for f, vals in rows if col in vals)
+                    ys = tuple(vals[col] for f, vals in rows if col in vals)
+                    if xs:
+                        label = f"{col:g} dBm" if col is not None else "MEAS"
+                        series.append(PlotSeries(label, xs, ys, show_points=True, y_unit="A"))
+                if series:
+                    card.plot.set_series(series, x_unit="Hz", y_unit="A")
                 else:
                     card.plot.set_axes(x_unit="Hz", y_unit="A")
                     card.plot.clear()
             else:
-                samples = self.monitor.psu_time_series(proxy, ch)
-                if samples:
-                    xs_v, ys_v = [], []
-                    xs_i, ys_i = [], []
-                    xs_p, ys_p = [], []
-                    for t, v, i, p in samples:
-                        if v is not None:
-                            xs_v.append(t)
-                            ys_v.append(v)
-                        if i is not None:
-                            xs_i.append(t)
-                            ys_i.append(i)
-                        if p is not None:
-                            xs_p.append(t)
-                            ys_p.append(p)
-                    series = []
-                    if xs_v:
-                        series.append(PlotSeries(f"CH{ch} V", tuple(xs_v), tuple(ys_v), y_unit="V"))
-                    if xs_i:
-                        series.append(PlotSeries(f"CH{ch} I", tuple(xs_i), tuple(ys_i), y_unit="A"))
-                    if xs_p:
-                        series.append(PlotSeries(f"CH{ch} P", tuple(xs_p), tuple(ys_p), y_unit="W"))
-                    if series:
-                        card.plot.set_series(series, x_unit="s", y_unit=series[0].y_unit or "V")
-                    else:
-                        card.plot.set_axes(x_unit="s", y_unit="V")
-                        card.plot.clear()
-                else:
-                    card.plot.set_axes(x_unit="s", y_unit="V")
-                    card.plot.clear()
+                card.plot.set_axes(x_unit="Hz", y_unit="A")
+                card.plot.clear()
 
     # ------------------------------------------------------------ сценарии, тема и окно инструментов
     def _on_runs(self, *_args) -> None:
@@ -1347,7 +1403,6 @@ class GraphsWindow(Window):
         theme = apply_theme(name)
         if save:
             self._settings.setValue(f"{self.SETTINGS_GROUP}/THEME", theme)
-        self.theme_button.setText("DARK" if theme == "light" else "LIGHT")
 
     def toggle_theme(self) -> None:
         self.set_theme("dark" if current_theme() == "light" else "light")
@@ -1366,30 +1421,6 @@ class GraphsWindow(Window):
         else:
             iw.save_size()
             iw.hide()
-        self._on_instruments_visibility_changed(on)
-
-    def _on_instruments_button(self) -> None:
-        iw = self.instruments_window
-        if iw is None or sip.isdeleted(iw):
-            return
-        if not iw.isVisible() or iw.isMinimized():
-            self.set_instruments_visible(True)
-            return
-        # Если окна пересекаются (на экране ноутбука GraphsWindow закрыло собой InstrumentsWindow),
-        # клик по INST выводит InstrumentsWindow на передний план вместо скрытия.
-        if self.frameGeometry().intersects(iw.frameGeometry()):
-            iw.raise_()
-            iw.activateWindow()
-            self._on_instruments_visibility_changed(True)
-            return
-        self.set_instruments_visible(False)
-
-    def _on_instruments_visibility_changed(self, visible: bool) -> None:
-        if sip.isdeleted(self):
-            return
-        self.instruments_button.blockSignals(True)
-        self.instruments_button.setChecked(bool(visible))
-        self.instruments_button.blockSignals(False)
 
     # ------------------------------------------------------------ управление карточками
     def card(self, name: str) -> GraphCard | None:
@@ -1664,10 +1695,6 @@ class GraphsWindow(Window):
                 card.plot.detach_settings()
         iw = self.instruments_window
         if iw is not None and not sip.isdeleted(iw):
-            try:
-                iw.visibility_changed.disconnect(self._on_instruments_visibility_changed)
-            except (TypeError, RuntimeError):
-                pass
             if self.quit_on_close:
                 iw.hide_on_close = False
                 iw.save_size()

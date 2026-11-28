@@ -245,8 +245,6 @@ class ActivityMonitor(QObject):
         self.pm_points: dict[Any, dict[tuple[float, float | None], tuple[float, float]]] = {}
         #: (источник питания, канал) -> {(частота генератора Hz, мощность генератора dBm | None): (время, ток A)}
         self.psu_points: dict[tuple[Any, int], dict[tuple[float, float | None], tuple[float, float]]] = {}
-        #: (источник питания, канал) -> история по времени [(monotonic_s, V | None, I | None, P | None)]
-        self.psu_history: dict[tuple[Any, int], deque[tuple[float, float | None, float | None, float | None]]] = {}
         #: (источник питания, канал) -> выбранный RF-источник (None = AUTO)
         self.psu_rf_source: dict[tuple[Any, int], Any] = {}
         self._mag_cache: dict[tuple[Any, str], tuple[Trace, Trace]] = {}
@@ -320,8 +318,6 @@ class ActivityMonitor(QObject):
                 d.pop(p, None)
             for k in [k for k in self.psu_points if k[0] is p]:
                 self.psu_points.pop(k, None)
-            for k in [k for k in self.psu_history if k[0] is p]:
-                self.psu_history.pop(k, None)
             for k in [k for k in self.psu_rf_source if k[0] is p or self.psu_rf_source[k] is p]:
                 self.psu_rf_source.pop(k, None)
             self._purge_mag_cache(p)
@@ -366,8 +362,6 @@ class ActivityMonitor(QObject):
             self._sa.pop(proxy, None)
             if proxy in self.history:
                 self.history[proxy].clear()
-            for k in [k for k in self.psu_history if k[0] is proxy]:
-                self.psu_history[k].clear()
             self._purge_mag_cache(proxy)
         if profile_name(proxy) in ("signal_generator", "network_analyzer"):
             for r in self.receivers():
@@ -394,7 +388,6 @@ class ActivityMonitor(QObject):
                 cur = _num(value)
                 self._updated[proxy] = now
                 self._last_data[proxy] = now
-                self._record_psu_sample(proxy, ch, now)
                 if cur is not None and proxy.value(f"ch{ch}.output") is not False:
                     src = self.psu_source(proxy, ch)
                     if src is not None:
@@ -407,16 +400,7 @@ class ActivityMonitor(QObject):
                             points.pop(next(iter(points)))
                 self.changed.emit(proxy)
                 return
-            m_live = _PSU_LIVE_RE.match(key)
-            if m_live:
-                if m_live.group(2) in ("meas_v", "meas_p"):
-                    ch = int(m_live.group(1))
-                    self._updated[proxy] = now
-                    self._last_data[proxy] = now
-                    self._record_psu_sample(proxy, ch, now)
-                self.changed.emit(proxy)
-                return
-            if key == "output_all":
+            if _PSU_LIVE_RE.match(key) or key == "output_all":
                 self.changed.emit(proxy)
                 return
             return
@@ -718,36 +702,6 @@ class ActivityMonitor(QObject):
         for (f, p), (_t, v) in pts.items():
             by_freq.setdefault(f, {})[p] = v
         return cols, sorted(by_freq.items())
-
-    def _record_psu_sample(self, proxy, channel: int, now: float) -> None:
-        v = _num(proxy.value(f"ch{channel}.meas_v"))
-        i = _num(proxy.value(f"ch{channel}.meas_i"))
-        p = _num(proxy.value(f"ch{channel}.meas_p"))
-        if p is None and v is not None and i is not None:
-            p = v * i
-        if v is None and i is None and p is None:
-            return
-        hist = self.psu_history.setdefault((proxy, int(channel)), deque(maxlen=HISTORY))
-        if hist and abs(now - hist[-1][0]) < 0.05:
-            prev_t, prev_v, prev_i, prev_p = hist[-1]
-            nv = v if v is not None else prev_v
-            ni = i if i is not None else prev_i
-            np = p if p is not None else (nv * ni if nv is not None and ni is not None else prev_p)
-            hist[-1] = (prev_t, nv, ni, np)
-        else:
-            hist.append((now, v, i, p))
-
-    def psu_time_series(self, proxy, channel: int) -> list[tuple[float, float | None, float | None, float | None]]:
-        """История измерений канала ИП во времени: ``[(t_rel_s, V, I, P), ...]``."""
-        hist = self.psu_history.get((proxy, int(channel)))
-        if not hist:
-            return []
-        t0 = hist[0][0]
-        return [(t - t0, v, i, p) for t, v, i, p in hist]
-
-    def clear_psu_history(self, proxy, channel: int) -> None:
-        self.psu_history.pop((proxy, int(channel)), None)
-        self.changed.emit(proxy)
 
     def clear_psu_table(self, proxy, channel: int) -> None:
         self.psu_points.pop((proxy, int(channel)), None)

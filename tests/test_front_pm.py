@@ -110,9 +110,15 @@ def test_correction_written_as_offset(qtbot, pm):
     win.gain.set_value(10.0)
     _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(-8.0, abs=1e-3))
     win.duty_src.set_value("MAN")
-    win.duty.set_value(10.0)                          # 10 % -> +10 dB
+    win.duty.set_value(10.0)                          # 10 % -> +10 dB в FREE RUN
     _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(2.0, abs=1e-3))
     assert win.readout.cal_button.text() == "CAL +2.00 dB"
+    # В LEVEL и EXT поправка 10·lg(100/DUTY) не прибавляется, чтобы не удваивать скважность
+    proxy.set("trig.source", "INT")
+    _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(-8.0, abs=1e-3))
+    assert win.readout.cal_button.text() == "CAL -8.00 dB"
+    proxy.set("trig.source", "IMM")
+    _wait(qtbot, proxy, "offset", lambda v: v == pytest.approx(2.0, abs=1e-3))
     assert settings.value(f"{win._prefix}/CAL_FILE") == "cable.csv"
     assert win.cal_plot.trace is not None and win.cal_plot.marker() == pytest.approx(2e9)
     proxy.set("freq", 3e9)                            # частота датчика -> новая точка таблицы

@@ -164,18 +164,16 @@ def test_light_and_dark_theme_live_switch(qtbot, tmp_path):
     try:
         assert theme.current_theme() == "light"
         assert QColor(theme.UI_COLOR_BACKGROUND).lightness() > 220
-        assert gw.theme_button.text() == "DARK"
         assert theme.LIGHT_COLORS["UI_COLOR_BACKGROUND"] in gw.styleSheet()
 
-        gw.theme_button.click()
+        gw.emblem.click()
         assert theme.current_theme() == "dark"
         assert QColor(theme.UI_COLOR_BACKGROUND).lightness() < 60
-        assert gw.theme_button.text() == "LIGHT"
         assert s.value("MAIN/THEME") == "dark"
         assert theme.DARK_COLORS["UI_COLOR_BACKGROUND"] in gw.styleSheet()
         assert theme.DARK_COLORS["UI_COLOR_BACKGROUND"] in iw.styleSheet()
 
-        gw.theme_button.click()
+        gw.emblem.click()
         assert theme.current_theme() == "light"
         assert s.value("MAIN/THEME") == "light"
         assert theme.LIGHT_COLORS["UI_COLOR_BACKGROUND"] in gw.styleSheet()

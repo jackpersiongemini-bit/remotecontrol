@@ -1027,7 +1027,7 @@ class PowerMeterWindow(InstrumentWindow):
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
 
         # TRIG: настройка запуска (источник + фронт, уровень, задержка + блокировка) и строба (Gate)
-        trig_src = lambda p, k: PSButton(p, k, [("FREE", "IMM"), ("LEVEL", "INT"), ("EXT", "EXT"), ("BUS", "BUS")])  # noqa: E731
+        trig_src = lambda p, k: PSButton(p, k, [("FREE", "IMM"), ("LEVEL", "INT"), ("EXT", "EXT")])  # noqa: E731
         trig_auto = lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)])  # noqa: E731
         trig_row1 = add((("SRC", "trig.source", trig_src), ("SLOP", "trig.slope", None)))
         if "trigger" in proxy.actions:
@@ -1257,13 +1257,19 @@ class PowerMeterWindow(InstrumentWindow):
         if swp_idx >= 0 and hasattr(self, "sweep"):
             self.tabs.set_on(swp_idx, self.sweep.running)
 
+    def _duty_applies(self) -> bool:
+        """Поправка 10·lg(100/DUTY) применяется только в FREE (IMM), где измеряется средняя мощность за весь период."""
+        src = self.proxy.value("trig.source")
+        return src in (None, "IMM")
+
     def _sweep_offset(self, freq: float) -> float | None:
         """Суммарная поправка окна на частоте ``freq`` для sweep-режима (None, если поправки не заданы)."""
-        if not self.cal_points and not self.gain_on.value and self.duty_src.value == "OFF":
+        use_duty = self._duty_applies()
+        if not self.cal_points and not self.gain_on.value and (not use_duty or self.duty_src.value == "OFF"):
             return None
         cal = interpolate(self.cal_points, freq)
         gain = -self.gain.value if self.gain_on.value else 0.0
-        duty = self.duty_value()
+        duty = self.duty_value() if use_duty else None
         total = cal + gain + (10.0 * math.log10(100.0 / duty) if duty else 0.0)
         return round(min(max(total, -OFFSET_LIMIT), OFFSET_LIMIT), 3)
 
@@ -1293,6 +1299,8 @@ class PowerMeterWindow(InstrumentWindow):
         elif key in ("trig.source", "trig.slope"):
             self._update_tabs()
             self._update_trig_enabled()
+            if key == "trig.source":
+                self.apply_correction()
 
     # ------------------------------------------------------------ таблицы калибровки (CSV)
     def table_files(self) -> list[str]:
@@ -1460,11 +1468,11 @@ class PowerMeterWindow(InstrumentWindow):
         return float(duty) if isinstance(duty, (int, float)) and duty > 0 else None
 
     def correction_parts(self, freq_override: float | None = None) -> dict[str, float]:
-        """Слагаемые поправки, dB: CAL(f), −GAIN, 10·lg(100 / DUTY)."""
+        """Слагаемые поправки, dB: CAL(f), −GAIN, и (только в FREE / IMM) 10·lg(100 / DUTY)."""
         freq = self.proxy.value("freq") if freq_override is None else freq_override
         cal = interpolate(self.cal_points, freq)
         gain = -self.gain.value if self.gain_on.value else 0.0
-        duty = self.duty_value()
+        duty = self.duty_value() if self._duty_applies() else None
         return {"cal": cal, "gain": gain, "duty": 10 * math.log10(100.0 / duty) if duty else 0.0}
 
     def total_correction(self, freq_override: float | None = None) -> float:

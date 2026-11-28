@@ -1565,33 +1565,6 @@ class InstrumentsWindow(Window):
         self.sync_all_button.clicked.connect(self.sync_all)
         self.titleBar.insert_widget(self.sync_all_button, 0)
 
-        self.graphs_button = QPushButton("GRAPHS", self.titleBar)
-        self.graphs_button.setObjectName("barChip")
-        self.graphs_button.setFixedHeight(UI_TITLE_BAR_ITEM_SIZE_PX)
-        self.graphs_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.graphs_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.graphs_button.setToolTip("Show / bring graphs window to front")
-        self.graphs_button.setStyleSheet(render_qss("""
-            QPushButton {
-                min-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px; max-height: ${UI_TITLE_BAR_ITEM_SIZE_PX}px;
-                padding: 0 10px;
-                background-color: $UI_COLOR_BACKGROUND;
-                color: $UI_COLOR_TEXT_MUTED;
-                border: none;
-                border-radius: ${UI_BORDER_RADIUS_PX}px;
-                font-family: $UI_MONOSPACE_FONT_FAMILY;
-                font-size: ${UI_FONT_SIZE_PT}pt;
-                font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-            }
-            QPushButton:hover {
-                background-color: $UI_COLOR_INVERT_HOVER;
-                color: $UI_COLOR_TEXT_INVERSE;
-            }
-        """))
-        self.graphs_button.clicked.connect(self._show_graphs_window)
-        self.graphs_button.hide()
-        self.titleBar.insert_widget(self.graphs_button, 1)
-
         self.search_edit = _SearchLineEdit(self.titleBar)
         self.search_edit.setObjectName("windowSearch")
         self.search_edit.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
@@ -1780,9 +1753,8 @@ class InstrumentsWindow(Window):
             fw.activateWindow()
 
     def bind_graphs_window(self, graphs_win) -> None:
-        """Связать с главным окном графиков (показывает кнопку ``GRAPHS`` в заголовке)."""
+        """Связать с главным окном графиков."""
         self._graphs_window = graphs_win
-        self.graphs_button.setVisible(graphs_win is not None)
 
     def _show_graphs_window(self) -> None:
         gw = self._graphs_window
