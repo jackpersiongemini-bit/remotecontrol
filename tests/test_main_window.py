@@ -290,3 +290,61 @@ def test_delay_on_address_page(qtbot, tmp_path):
         win.cleanup()
     finally:
         proxy.shutdown()
+
+
+def test_right_settings_no_spinboxes_favorites_spinboxes_and_button_line_order(qtbot, tmp_path):
+    """Правое меню настроек и поиск не содержат спинбоксов (только PLineEdit);
+    в избранном числовые поля становятся PSpinBox; пары (edit, button) идут как (button, edit)."""
+    from PyQt6.QtWidgets import QAbstractButton, QLineEdit
+    from visalab.front import InstrumentsWindow, PowerMeterWindow, SpectrumWindow
+    from visalab.front.params import PLineEdit, PSpinBox, PSpinEdit
+
+    settings = QSettings(str(tmp_path / "inst_ui.ini"), QSettings.Format.IniFormat)
+    iw = InstrumentsWindow(settings=settings)
+    qtbot.addWidget(iw)
+    p_pm = _proxy("u2021xa")
+    p_sa = _proxy("e4446a")
+    p_gen = _proxy("e8267d")
+    try:
+        pm_win = PowerMeterWindow(p_pm, settings)
+        sa_win = SpectrumWindow(p_sa, settings)
+        gen_win = RFGenWindow(p_gen, settings)
+        iw.attach_instrument("PM", pm_win)
+        iw.attach_instrument("SA", sa_win)
+        iw.attach_instrument("GEN", gen_win)
+
+        # 1. В правом меню настроек нет ни одного PSpinBox / PSpinEdit
+        for name in ("PM", "SA", "GEN"):
+            view = iw.settings_views[name]
+            assert not view.findChildren(PSpinBox), f"{name}: found PSpinBox in right settings"
+            assert not view.findChildren(PSpinEdit), f"{name}: found PSpinEdit in right settings"
+
+        # 2. В результатах поиска справа также нет спинбоксов
+        iw.search_edit.setText("FREQ")
+        assert not iw.search_view.findChildren(PSpinBox)
+        assert not iw.search_view.findChildren(PSpinEdit)
+        iw.search_edit.clear()
+
+        # 3. Закрепление числового параметра из правого меню в избранное превращает его в PSpinBox
+        freq_item = next(it for it in pm_win.favorites.items if not it.is_default_top and "freq" in it.keys)
+        pm_win.favorites.set_enabled(freq_item.item_id, True)
+        pinned = pm_win.favorites.pinned_lines()
+        assert len(pinned) == 1
+        assert any(isinstance(w, PSpinBox) for w in pinned[0].widgets)
+        assert not any(isinstance(w, PLineEdit) for w in pinned[0].widgets)
+
+        # 4. Порядок button -> line в строках с кнопкой и полем ввода
+        freq_ln = next(ln for ln in pm_win.pages[0].lines if ln.name == "FREQ" or "freq" in [getattr(w, "key", "") for w in ln.widgets])
+        assert isinstance(freq_ln.widgets[0], QAbstractButton) and isinstance(freq_ln.widgets[-1], QLineEdit)
+        lvl_ln = next(ln for ln in pm_win.pages[1].lines if "trig.level" in [getattr(w, "key", "") for w in ln.widgets])
+        assert isinstance(lvl_ln.widgets[0], QAbstractButton) and isinstance(lvl_ln.widgets[-1], QLineEdit)
+        pow_top = next(ln for ln in gen_win.top_lines if ln.name == "POW")
+        assert isinstance(pow_top.widgets[0], QAbstractButton) and isinstance(pow_top.widgets[-1], PSpinBox)
+        rbw_ln = next(ln for ln in sa_win.pages[1].lines if "bw.res" in [getattr(w, "key", "") for w in ln.widgets])
+        assert isinstance(rbw_ln.widgets[0], QAbstractButton) and isinstance(rbw_ln.widgets[-1], QLineEdit)
+    finally:
+        iw.hide_on_close = False
+        iw.cleanup()
+        iw.close()
+        for p in (p_pm, p_sa, p_gen):
+            p.shutdown()

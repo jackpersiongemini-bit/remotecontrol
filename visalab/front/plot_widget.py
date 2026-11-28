@@ -15,7 +15,7 @@ from __future__ import annotations
 from bisect import bisect_left
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 from PyQt6 import sip
@@ -38,9 +38,10 @@ from .theme import (UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND
 from .widgets import CollapsibleSection, CommitLineEdit
 from .window import CollapseAllButton, ExpandAllButton, PanelCloseButton, Window
 
-__all__ = ["PlotSeries", "PlotMarker", "PlotLimit", "PlotWidget", "PlotSettingsWindow"]
+__all__ = ["PlotSeries", "PlotMarker", "PlotLimit", "CurveConfig", "PlotWidget", "PlotSettingsWindow"]
 
 _SI_UNITS = frozenset(("Hz", "s", "W", "V", "A"))
+_UNSET: Any = object()
 
 
 def _c(name: str) -> QColor:
@@ -136,13 +137,15 @@ def _fmt_signed_value(v: float, unit: str) -> str:
 
 @dataclass
 class PlotLimit:
-    """Локальная линия предела (``MAX`` или ``MIN``; если ``x1/x2 is None`` — на весь диапазон X)."""
+    """Локальная линия предела (``MAX`` или ``MIN``; если ``x1/x2 is None`` — на весь диапазон X).
+    ``series_index is None`` — общий лимит (режим All), иначе привязан к конкретной кривой."""
 
     kind: str  # "MAX" | "MIN"
     y1: float
     y2: float | None = None
     x1: float | None = None
     x2: float | None = None
+    series_index: int | None = None
 
     def y_at(self, x: float, x_lo: float, x_hi: float) -> float | None:
         a = x_lo if self.x1 is None else self.x1
@@ -155,6 +158,35 @@ class PlotLimit:
         if b == a or y_end == self.y1:
             return self.y1
         return self.y1 + (y_end - self.y1) * (x - a) / (b - a)
+
+
+@dataclass
+class CurveConfig:
+    """Индивидуальные настройки одной кривой (``None`` = наследовать общую настройку графика)."""
+
+    name: str = ""
+    show_points: bool | None = None
+    show_point_values: bool | None = None
+    show_peaks: bool | None = None
+    memory: PlotSeries | None = None
+    memory_visible: bool | None = None
+    math_mode: str | None = None
+    math_expr: str | None = None
+    analysis_metrics: list[str] | None = None
+    analysis_x_expr: str | None = None
+    analysis_x_set: XRangeSet | None = None
+
+    def has_persistent_state(self) -> bool:
+        return (
+            self.show_points is not None
+            or self.show_point_values is not None
+            or self.show_peaks is not None
+            or self.memory_visible is not None
+            or self.math_mode is not None
+            or self.math_expr is not None
+            or self.analysis_metrics is not None
+            or self.analysis_x_expr is not None
+        )
 
 
 def _nearest_point(s: PlotSeries, target_x: float) -> tuple[float, float] | None:
@@ -365,10 +397,12 @@ class PlotWidget(QWidget):
         self.divs_y: int = self.DIVS_Y
         self.manual_x_range: tuple[float, float] | None = None
         self.manual_y_range: tuple[float, float] | None = None
+        self.series_x_ranges: dict[int, tuple[float, float]] = {}
         self.series_y_ranges: dict[int, tuple[float, float]] = {}
 
-        # Локальная память (MEM), математика (MATH), маркеры, лимиты и анализ
-        self.memory: list[PlotSeries] = []
+        # Индивидуальные настройки кривых (CurveConfig) и общие значения по умолчанию (режим All)
+        self.curve_configs: dict[int, CurveConfig] = {}
+        self._stashed_curves: dict[str, tuple[CurveConfig, tuple[float, float] | None, tuple[float, float] | None]] = {}
         self.memory_visible: bool = True
         self.math_mode: str = "OFF"
         self.math_expr: str = ""
@@ -403,7 +437,7 @@ class PlotWidget(QWidget):
         self._legend_more_hover: bool = False
         self._top_right_pad: float = 0.0
         self._top_left_pad: float = 0.0
-        self._chip_hits: list[tuple[QRectF, str, str, Callable[[], None], QRectF]] = []
+        self._chip_hits: list[tuple[QRectF, str, str, Callable[[], None], QRectF, QColor | None]] = []
         self._chip_hover: str | None = None
         self._chips_strip_rect = QRectF()
         self._chips_scroll_x: float = 0.0
@@ -415,7 +449,14 @@ class PlotWidget(QWidget):
         self._cur_y_ranges: list[tuple[float, float]] = []
         self._cur_y_units: list[str] = []
         self._mouse: QPointF | None = None
-        self._pan_origin: tuple[QPointF, tuple[float, float], tuple[float, float], list[tuple[float, float]], int | None] | None = None
+        self._pan_origin: tuple[
+            QPointF,
+            tuple[float, float],
+            tuple[float, float],
+            list[tuple[float, float]],
+            list[tuple[float, float]],
+            int | None,
+        ] | None = None
         self._dragging_marker: PlotMarker | None = None
         self._font = mono_font()
 
@@ -425,6 +466,11 @@ class PlotWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setToolTip("Legend wheel / click: select curve · Double-click: DATA → MEM · Wheel (focused / Cmd): zoom Y · Shift+drag: pan · R: reset")
+
+    @property
+    def memory(self) -> list[PlotSeries]:
+        """Снимки памяти всех кривых (для обратной совместимости)."""
+        return [cfg.memory for _, cfg in sorted(self.curve_configs.items()) if cfg.memory is not None]
 
     # ------------------------------------------------------------ сохранение состояния
     def attach_settings(self, settings: QSettings, key: str) -> None:
@@ -450,6 +496,22 @@ class PlotWidget(QWidget):
     def save_state(self) -> None:
         if sip.isdeleted(self) or self._settings is None or not self._settings_key:
             return
+        curve_cfgs_out: dict[str, dict[str, Any]] = {}
+        for idx, cfg in self.curve_configs.items():
+            if not cfg.has_persistent_state():
+                continue
+            name = cfg.name or (self.series[idx].name if 0 <= idx < len(self.series) else "")
+            curve_cfgs_out[str(idx)] = {
+                "name": name,
+                "show_points": cfg.show_points,
+                "show_point_values": cfg.show_point_values,
+                "show_peaks": cfg.show_peaks,
+                "memory_visible": cfg.memory_visible,
+                "math_mode": cfg.math_mode,
+                "math_expr": cfg.math_expr,
+                "analysis_metrics": list(cfg.analysis_metrics) if cfg.analysis_metrics is not None else None,
+                "analysis_x_expr": cfg.analysis_x_expr,
+            }
         payload = {
             "show_grid": self.show_grid,
             "show_points": self.show_points,
@@ -459,17 +521,20 @@ class PlotWidget(QWidget):
             "divs_y": self.divs_y,
             "manual_x_range": list(self.manual_x_range) if self.manual_x_range else None,
             "manual_y_range": list(self.manual_y_range) if self.manual_y_range else None,
+            "series_x_ranges": {str(k): [v[0], v[1]] for k, v in self.series_x_ranges.items()},
             "series_y_ranges": {str(k): [v[0], v[1]] for k, v in self.series_y_ranges.items()},
             "memory_visible": self.memory_visible,
             "math_mode": self.math_mode,
             "math_expr": self.math_expr,
+            "curve_configs": curve_cfgs_out,
             "markers": [
                 {"name": m.name, "x": m.x, "series_index": m.series_index,
                  "delta_ref": m.delta_ref, "track": m.track}
                 for m in self.markers
             ],
             "limits": [
-                {"kind": lim.kind, "y1": lim.y1, "y2": lim.y2, "x1": lim.x1, "x2": lim.x2}
+                {"kind": lim.kind, "y1": lim.y1, "y2": lim.y2, "x1": lim.x1, "x2": lim.x2,
+                 "series_index": lim.series_index}
                 for lim in self.limits
             ],
             "analysis_metrics": list(self.analysis_metrics),
@@ -513,6 +578,17 @@ class PlotWidget(QWidget):
         my = data.get("manual_y_range")
         if isinstance(my, list) and len(my) == 2 and my[1] > my[0]:
             self.manual_y_range = (float(my[0]), float(my[1]))
+        raw_sxr = data.get("series_x_ranges")
+        self.series_x_ranges = {}
+        if isinstance(raw_sxr, dict):
+            for k, v in raw_sxr.items():
+                if isinstance(v, list) and len(v) == 2 and v[1] > v[0]:
+                    try:
+                        idx = int(k)
+                        if idx >= 0:
+                            self.series_x_ranges[idx] = (float(v[0]), float(v[1]))
+                    except (TypeError, ValueError):
+                        pass
         raw_syr = data.get("series_y_ranges")
         self.series_y_ranges = {}
         if isinstance(raw_syr, dict):
@@ -530,6 +606,38 @@ class PlotWidget(QWidget):
         if mm in MATH_MODES:
             self.math_mode = mm
         self.math_expr = str(data.get("math_expr", "") or "")
+        valid_metrics = {k for k, _, _ in ANALYSIS_METRICS}
+        raw_cfgs = data.get("curve_configs")
+        self.curve_configs = {}
+        if isinstance(raw_cfgs, dict):
+            for k, item in raw_cfgs.items():
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(k)
+                    if idx < 0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                c_mm = item.get("math_mode")
+                c_mm_val = str(c_mm) if (isinstance(c_mm, str) and c_mm in MATH_MODES) else None
+                c_me = item.get("math_expr")
+                c_me_val = str(c_me) if isinstance(c_me, str) else None
+                c_am = item.get("analysis_metrics")
+                c_am_val = [str(m) for m in c_am if str(m) in valid_metrics] if isinstance(c_am, list) else None
+                c_ax = item.get("analysis_x_expr")
+                c_ax_val = str(c_ax).strip() if isinstance(c_ax, str) else None
+                self.curve_configs[idx] = CurveConfig(
+                    name=str(item.get("name", "") or ""),
+                    show_points=bool(item["show_points"]) if item.get("show_points") is not None else None,
+                    show_point_values=bool(item["show_point_values"]) if item.get("show_point_values") is not None else None,
+                    show_peaks=bool(item["show_peaks"]) if item.get("show_peaks") is not None else None,
+                    memory_visible=bool(item["memory_visible"]) if item.get("memory_visible") is not None else None,
+                    math_mode=c_mm_val,
+                    math_expr=c_me_val,
+                    analysis_metrics=c_am_val,
+                    analysis_x_expr=c_ax_val,
+                )
         if isinstance(data.get("markers"), list):
             loaded_markers: list[PlotMarker] = []
             for i, item in enumerate(data["markers"]):
@@ -549,28 +657,26 @@ class PlotWidget(QWidget):
             loaded_markers.sort(key=_marker_sort_key)
             self.markers = loaded_markers
         if isinstance(data.get("limits"), list):
-            self.limits = [
-                PlotLimit(
+            loaded_limits: list[PlotLimit] = []
+            for item in data["limits"]:
+                if not (isinstance(item, dict) and "y1" in item):
+                    continue
+                lsi_raw = item.get("series_index")
+                lsi = int(lsi_raw) if isinstance(lsi_raw, int) and lsi_raw >= 0 else None
+                loaded_limits.append(PlotLimit(
                     kind="MIN" if str(item.get("kind", "MAX")).upper() == "MIN" else "MAX",
                     y1=float(item["y1"]),
                     y2=float(item["y2"]) if item.get("y2") is not None else None,
                     x1=float(item["x1"]) if item.get("x1") is not None else None,
                     x2=float(item["x2"]) if item.get("x2") is not None else None,
-                )
-                for item in data["limits"]
-                if isinstance(item, dict) and "y1" in item
-            ]
-        valid_metrics = {k for k, _, _ in ANALYSIS_METRICS}
+                    series_index=lsi,
+                ))
+            self.limits = loaded_limits
         if isinstance(data.get("analysis_metrics"), list):
             self.analysis_metrics = [str(k) for k in data["analysis_metrics"] if str(k) in valid_metrics]
         ax_expr = str(data.get("analysis_x_expr", "") or "").strip()
         self.analysis_x_expr = ax_expr
-        self._analysis_x_set = None
-        if ax_expr:
-            try:
-                self._analysis_x_set = parse_x_range_expr(ax_expr, self.x_unit)
-            except ValueError:
-                self._analysis_x_set = None
+        self._reparse_analysis_x_sets()
         asi = data.get("active_series_index")
         self.active_series_index = int(asi) if isinstance(asi, int) and asi >= 0 else None
         raw_ov = data.get("overlay_pos")
@@ -586,30 +692,127 @@ class PlotWidget(QWidget):
                         pass
         self._bump()
 
+    def _reparse_analysis_x_sets(self) -> None:
+        self._analysis_x_set = None
+        if self.analysis_x_expr:
+            try:
+                self._analysis_x_set = parse_x_range_expr(self.analysis_x_expr, self.x_unit)
+            except ValueError:
+                self._analysis_x_set = None
+        for idx, cfg in self.curve_configs.items():
+            if cfg.analysis_x_expr:
+                xu = self.active_x_unit(idx)
+                try:
+                    cfg.analysis_x_set = parse_x_range_expr(cfg.analysis_x_expr, xu)
+                except ValueError:
+                    cfg.analysis_x_set = None
+            else:
+                cfg.analysis_x_set = None
+
+    def _remap_series_state(self, new_series: Sequence[PlotSeries]) -> None:
+        """Сохранить привязку per-curve настроек при перестановке, скрытии или повторном появлении кривых по имени."""
+        new_names = [s.name for s in new_series]
+        if not new_names or not all(new_names) or len(set(new_names)) != len(new_names):
+            return
+        old_names = [s.name for s in self.series]
+        new_by_name = {nm: i for i, nm in enumerate(new_names)}
+
+        if old_names and all(old_names) and len(set(old_names)) == len(old_names):
+            if old_names == new_names:
+                for i, nm in enumerate(new_names):
+                    cfg = self.curve_configs.get(i)
+                    if cfg is not None:
+                        cfg.name = nm
+                return
+            old_by_name = {nm: i for i, nm in enumerate(old_names)}
+            # Убираем в stash настройки скрытых кривых, чтобы вернуть их при повторном появлении
+            for old_i, nm in enumerate(old_names):
+                if nm not in new_by_name:
+                    cfg = self.curve_configs.get(old_i)
+                    yr = self.series_y_ranges.get(old_i)
+                    xr = self.series_x_ranges.get(old_i)
+                    if cfg is not None or yr is not None or xr is not None:
+                        self._stashed_curves[nm] = (cfg or CurveConfig(name=nm), yr, xr)
+            new_cfgs: dict[int, CurveConfig] = {}
+            new_y: dict[int, tuple[float, float]] = {}
+            new_x: dict[int, tuple[float, float]] = {}
+            for new_i, nm in enumerate(new_names):
+                if nm in old_by_name:
+                    old_i = old_by_name[nm]
+                    if old_i in self.curve_configs:
+                        cfg = self.curve_configs[old_i]
+                        cfg.name = nm
+                        new_cfgs[new_i] = cfg
+                    if old_i in self.series_y_ranges:
+                        new_y[new_i] = self.series_y_ranges[old_i]
+                    if old_i in self.series_x_ranges:
+                        new_x[new_i] = self.series_x_ranges[old_i]
+                elif nm in self._stashed_curves:
+                    cfg, yr, xr = self._stashed_curves.pop(nm)
+                    cfg.name = nm
+                    new_cfgs[new_i] = cfg
+                    if yr is not None:
+                        new_y[new_i] = yr
+                    if xr is not None:
+                        new_x[new_i] = xr
+            self.curve_configs = new_cfgs
+            self.series_y_ranges = new_y
+            self.series_x_ranges = new_x
+            if self.active_series_index is not None and 0 <= self.active_series_index < len(old_names):
+                self.active_series_index = new_by_name.get(old_names[self.active_series_index])
+            for m in self.markers:
+                if 0 <= m.series_index < len(old_names):
+                    nm = old_names[m.series_index]
+                    if nm in new_by_name:
+                        m.series_index = new_by_name[nm]
+            for lim in self.limits:
+                if lim.series_index is not None and 0 <= lim.series_index < len(old_names):
+                    nm = old_names[lim.series_index]
+                    if nm in new_by_name:
+                        lim.series_index = new_by_name[nm]
+        elif not old_names and self.curve_configs:
+            # Первый приход данных после load_state(): сопоставляем сохранённые конфиги по имени, если имена уникальны
+            saved_named = [(idx, cfg.name) for idx, cfg in self.curve_configs.items() if cfg.name]
+            if saved_named and len({nm for _, nm in saved_named}) == len(saved_named):
+                if any(nm in new_by_name and new_by_name[nm] != idx for idx, nm in saved_named):
+                    new_cfgs = {}
+                    new_y = {}
+                    new_x = {}
+                    idx_map: dict[int, int] = {}
+                    for old_i, cfg in self.curve_configs.items():
+                        dst = new_by_name.get(cfg.name, old_i) if cfg.name else old_i
+                        idx_map[old_i] = dst
+                        new_cfgs[dst] = cfg
+                    for old_i, yr in self.series_y_ranges.items():
+                        new_y[idx_map.get(old_i, old_i)] = yr
+                    for old_i, xr in self.series_x_ranges.items():
+                        new_x[idx_map.get(old_i, old_i)] = xr
+                    self.curve_configs = new_cfgs
+                    self.series_y_ranges = new_y
+                    self.series_x_ranges = new_x
+
     # ------------------------------------------------------------ публичный API: данные и масштаб
     def set_series(self, series: Sequence[PlotSeries], *, x_unit: str | None = None,
                    y_unit: str | None = None) -> None:
-        self.series = list(series)
+        new_list = list(series)
+        self._remap_series_state(new_list)
+        self.series = new_list
+        for i, s in enumerate(self.series):
+            cfg = self.curve_configs.get(i)
+            if cfg is not None and s.name:
+                cfg.name = s.name
         if x_unit is not None:
             self.x_unit = x_unit
-            if self.analysis_x_expr:
-                try:
-                    self._analysis_x_set = parse_x_range_expr(self.analysis_x_expr, self.x_unit)
-                except ValueError:
-                    self._analysis_x_set = None
         if y_unit is not None:
             self.y_unit = y_unit
+        self._reparse_analysis_x_sets()
         self._bump()
         self.view_changed.emit()
 
     def set_axes(self, x_unit: str = "", y_unit: str = "") -> None:
         self.x_unit = x_unit
         self.y_unit = y_unit
-        if self.analysis_x_expr:
-            try:
-                self._analysis_x_set = parse_x_range_expr(self.analysis_x_expr, self.x_unit)
-            except ValueError:
-                self._analysis_x_set = None
+        self._reparse_analysis_x_sets()
         self._bump()
 
     def clear(self) -> None:
@@ -617,25 +820,151 @@ class PlotWidget(QWidget):
         self._bump()
         self.view_changed.emit()
 
+    # ------------------------------------------------------------ per-curve хелперы
+    def _curve_cfg(self, idx: int) -> CurveConfig:
+        cfg = self.curve_configs.get(idx)
+        if cfg is None:
+            name = self.series[idx].name if 0 <= idx < len(self.series) else ""
+            cfg = CurveConfig(name=name)
+            self.curve_configs[idx] = cfg
+        elif not cfg.name and 0 <= idx < len(self.series) and self.series[idx].name:
+            cfg.name = self.series[idx].name
+        return cfg
+
+    def _resolve_target_si(self, series_index: Any = _UNSET) -> int | None:
+        if series_index is _UNSET:
+            return self._active_series_idx(self.series)
+        if series_index is None:
+            return None
+        idx = int(series_index)
+        if self.series:
+            return idx if (0 <= idx < len(self.series)) else None
+        return idx if idx >= 0 else None
+
+    def curve_show_points(self, idx: int) -> bool:
+        cfg = self.curve_configs.get(idx)
+        return cfg.show_points if (cfg is not None and cfg.show_points is not None) else self.show_points
+
+    def curve_show_point_values(self, idx: int) -> bool:
+        cfg = self.curve_configs.get(idx)
+        return cfg.show_point_values if (cfg is not None and cfg.show_point_values is not None) else self.show_point_values
+
+    def curve_show_peaks(self, idx: int) -> bool:
+        cfg = self.curve_configs.get(idx)
+        return cfg.show_peaks if (cfg is not None and cfg.show_peaks is not None) else self.show_peaks
+
+    def curve_memory(self, idx: int) -> PlotSeries | None:
+        cfg = self.curve_configs.get(idx)
+        return cfg.memory if cfg is not None else None
+
+    def curve_memory_visible(self, idx: int) -> bool:
+        cfg = self.curve_configs.get(idx)
+        return cfg.memory_visible if (cfg is not None and cfg.memory_visible is not None) else self.memory_visible
+
+    def curve_math_mode(self, idx: int) -> str:
+        cfg = self.curve_configs.get(idx)
+        return cfg.math_mode if (cfg is not None and cfg.math_mode is not None) else self.math_mode
+
+    def curve_math_expr(self, idx: int) -> str:
+        cfg = self.curve_configs.get(idx)
+        return cfg.math_expr if (cfg is not None and cfg.math_expr is not None) else self.math_expr
+
+    def curve_analysis_metrics(self, idx: int) -> list[str]:
+        cfg = self.curve_configs.get(idx)
+        if cfg is not None and cfg.analysis_metrics is not None:
+            return list(cfg.analysis_metrics)
+        return list(self.analysis_metrics)
+
+    def curve_analysis_x_expr(self, idx: int) -> str:
+        cfg = self.curve_configs.get(idx)
+        if cfg is not None and cfg.analysis_x_expr is not None:
+            return cfg.analysis_x_expr
+        return self.analysis_x_expr
+
+    def curve_analysis_x_set(self, idx: int, x_unit: str | None = None) -> XRangeSet | None:
+        cfg = self.curve_configs.get(idx)
+        if cfg is not None and cfg.analysis_x_expr is not None:
+            if not cfg.analysis_x_expr:
+                return None
+            if cfg.analysis_x_set is not None:
+                return cfg.analysis_x_set
+            xu = x_unit if x_unit is not None else self.active_x_unit(idx)
+            try:
+                cfg.analysis_x_set = parse_x_range_expr(cfg.analysis_x_expr, xu)
+                return cfg.analysis_x_set
+            except ValueError:
+                return None
+        if not self.analysis_x_expr:
+            return None
+        xu = x_unit if x_unit is not None else self.active_x_unit(idx)
+        if xu == self.x_unit and self._analysis_x_set is not None:
+            return self._analysis_x_set
+        try:
+            return parse_x_range_expr(self.analysis_x_expr, xu)
+        except ValueError:
+            return None
+
+    def any_show_points(self) -> bool:
+        return any(self.curve_show_points(i) for i in range(len(self.series))) if self.series else self.show_points
+
+    def any_show_point_values(self) -> bool:
+        return any(self.curve_show_point_values(i) for i in range(len(self.series))) if self.series else self.show_point_values
+
+    def any_show_peaks(self) -> bool:
+        return any(self.curve_show_peaks(i) for i in range(len(self.series))) if self.series else self.show_peaks
+
+    def has_memory(self, series_index: Any = _UNSET) -> bool:
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            return self.curve_memory(target_si) is not None
+        return any(cfg.memory is not None for cfg in self.curve_configs.values())
+
+    def is_memory_visible(self, series_index: Any = _UNSET) -> bool:
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            return self.curve_memory(target_si) is not None and self.curve_memory_visible(target_si)
+        return any(cfg.memory is not None and self.curve_memory_visible(i) for i, cfg in self.curve_configs.items())
+
     def set_show_grid(self, on: bool) -> None:
         self.show_grid = bool(on)
         self._bump()
         self.view_changed.emit()
 
-    def set_show_points(self, on: bool) -> None:
-        self.show_points = bool(on)
+    def set_show_points(self, on: bool, *, series_index: Any = _UNSET) -> None:
+        val = bool(on)
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            self._curve_cfg(target_si).show_points = val
+        else:
+            self.show_points = val
+            for cfg in self.curve_configs.values():
+                cfg.show_points = None
         self._show_points_explicit = True
         self._bump()
         self.view_changed.emit()
 
-    def set_show_point_values(self, on: bool) -> None:
-        self.show_point_values = bool(on)
+    def set_show_point_values(self, on: bool, *, series_index: Any = _UNSET) -> None:
+        val = bool(on)
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            self._curve_cfg(target_si).show_point_values = val
+        else:
+            self.show_point_values = val
+            for cfg in self.curve_configs.values():
+                cfg.show_point_values = None
         self._bump()
         self.view_changed.emit()
 
-    def set_show_peaks(self, on: bool) -> None:
-        """Включить/выключить постоянный режим автопоиска всех пиков (отображает точку и (x, y) без создания маркеров)."""
-        self.show_peaks = bool(on)
+    def set_show_peaks(self, on: bool, *, series_index: Any = _UNSET) -> None:
+        """Включить/выключить постоянный режим автопоиска всех пиков для выбранной кривой (или всех в режиме All)."""
+        val = bool(on)
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            self._curve_cfg(target_si).show_peaks = val
+        else:
+            self.show_peaks = val
+            for cfg in self.curve_configs.values():
+                cfg.show_peaks = None
         self._bump()
         self.view_changed.emit()
 
@@ -672,7 +1001,7 @@ class PlotWidget(QWidget):
             self._bump()
 
     def set_active_series(self, index: int | None) -> None:
-        """Выбрать активную кривую для привязки перекрестья (``None`` = свободный курсор)."""
+        """Выбрать активную кривую для привязки перекрестья и индивидуальных настроек (``None`` = All / Free)."""
         if index is None:
             nxt: int | None = None
         else:
@@ -711,11 +1040,41 @@ class PlotWidget(QWidget):
     def _series_y_unit(self, s: PlotSeries) -> str:
         return s.y_unit if s.y_unit is not None else self.y_unit
 
-    def active_y_unit(self) -> str:
+    def active_x_unit(self, series_index: Any = _UNSET) -> str:
+        """Единица измерения по X для выбранной кривой (или текущей шкалы)."""
+        if series_index is _UNSET:
+            si = self._axis_series_idx(self.series)
+        elif series_index is None:
+            si = 0 if self.series else None
+        else:
+            idx = int(series_index)
+            si = idx if (0 <= idx < len(self.series)) else None
+        if si is not None and si < len(self.series):
+            return self._series_x_unit(self.series[si])
+        return self.x_unit
+
+    def active_y_unit(self, series_index: Any = _UNSET) -> str:
         """Единица измерения по Y для текущей шкалы (выбранной кривой или первой/общей)."""
         eff, eff_units = self._effective_series_and_units()
-        axis_si = self._axis_series_idx(eff)
+        if series_index is _UNSET:
+            axis_si = self._axis_series_idx(eff)
+        elif series_index is None:
+            axis_si = 0 if eff else None
+        else:
+            idx = int(series_index)
+            axis_si = idx if (0 <= idx < len(eff)) else None
         return eff_units[axis_si] if (axis_si is not None and axis_si < len(eff_units)) else self.y_unit
+
+    def is_x_auto(self) -> bool:
+        """``True``, если масштаб X текущей шкалы (выбранной кривой или общий) в режиме AUTO."""
+        eff_x_units = [self._series_x_unit(s) for s in self.series]
+        same_x = len(set(eff_x_units)) <= 1
+        active_si = self._active_series_idx(self.series)
+        if active_si is not None:
+            if active_si in self.series_x_ranges:
+                return False
+            return (not same_x) or (self.manual_x_range is None)
+        return self.manual_x_range is None and not self.series_x_ranges
 
     def is_y_auto(self) -> bool:
         """``True``, если масштаб Y текущей шкалы (выбранной кривой или общий) в режиме AUTO."""
@@ -735,22 +1094,45 @@ class PlotWidget(QWidget):
             self._bump()
             self.view_changed.emit()
 
-    def set_x_range(self, lo: float | None, hi: float | None) -> None:
-        self.manual_x_range = (float(lo), float(hi)) if (lo is not None and hi is not None and hi > lo) else None
+    def set_x_range(self, lo: float | None, hi: float | None, *, series_index: Any = _UNSET) -> None:
+        eff_x_units = [self._series_x_unit(s) for s in self.series]
+        same_x = len(set(eff_x_units)) <= 1
+        valid = lo is not None and hi is not None and hi > lo
+        target_si = self._resolve_target_si(series_index)
+        if not same_x and target_si is not None and 0 <= target_si < len(self.series):
+            if valid:
+                self.series_x_ranges[target_si] = (float(lo), float(hi))
+            else:
+                self.series_x_ranges.pop(target_si, None)
+        elif not same_x and not valid and target_si is None:
+            self.series_x_ranges.clear()
+            self.manual_x_range = None
+        elif not same_x and valid and target_si is None and self.series:
+            self.series_x_ranges[0] = (float(lo), float(hi))
+        else:
+            self.series_x_ranges.clear()
+            self.manual_x_range = (float(lo), float(hi)) if valid else None
         self._bump()
         self.view_changed.emit()
 
-    def set_y_range(self, lo: float | None, hi: float | None, *, series_index: int | None = None) -> None:
+    def set_y_range(self, lo: float | None, hi: float | None, *, series_index: Any = _UNSET) -> None:
         """Задать ручной диапазон Y. Если выбрана активная кривая (или задан ``series_index``) —
-        меняется масштаб только этой кривой; в режиме ``Free`` — общий масштаб всех кривых."""
-        eff, _ = self._effective_series_and_units()
-        target_si = series_index if series_index is not None else self._active_series_idx(eff)
+        меняется масштаб только этой кривой; в режиме ``All`` — общий масштаб всех кривых."""
+        eff, eff_units = self._effective_series_and_units()
+        target_si = self._resolve_target_si(series_index)
         valid = lo is not None and hi is not None and hi > lo
         if target_si is not None and 0 <= target_si < len(eff):
             if valid:
                 self.series_y_ranges[target_si] = (float(lo), float(hi))
             else:
                 self.series_y_ranges.pop(target_si, None)
+                # Если ранее был задан общий manual_y_range, переносим его на остальные кривые, чтобы target_si стал AUTO
+                if len(set(eff_units)) <= 1 and self.manual_y_range is not None:
+                    prev_my = self.manual_y_range
+                    self.manual_y_range = None
+                    for i in range(len(eff)):
+                        if i != target_si and i not in self.series_y_ranges:
+                            self.series_y_ranges[i] = prev_my
         else:
             self.series_y_ranges.clear()
             self.manual_y_range = (float(lo), float(hi)) if valid else None
@@ -758,83 +1140,153 @@ class PlotWidget(QWidget):
         self.view_changed.emit()
 
     def reset_view(self) -> None:
-        if self.manual_x_range is None and self.manual_y_range is None and not self.series_y_ranges:
+        if (self.manual_x_range is None and self.manual_y_range is None
+                and not self.series_y_ranges and not self.series_x_ranges):
             return
         self.manual_x_range = None
         self.manual_y_range = None
+        self.series_x_ranges.clear()
         self.series_y_ranges.clear()
         self._bump()
         self.view_changed.emit()
 
-    # ------------------------------------------------------------ MEM и MATH
-    def store_memory(self) -> bool:
-        """Сохранить текущие кривые в память (``DATA → MEM``)."""
+    # ------------------------------------------------------------ MEM и MATH (per-curve)
+    @staticmethod
+    def _make_memory_snapshot(s: PlotSeries) -> PlotSeries:
+        return PlotSeries(
+            s.name, tuple(s.x), tuple(s.y), s.color, s.show_points, s.line_width,
+            dashed=True, y_unit=s.y_unit, x_unit=s.x_unit,
+        )
+
+    def store_memory(self, *, series_index: Any = _UNSET) -> bool:
+        """Сохранить текущую кривую (или все кривые в режиме All) в память (``DATA → MEM``)."""
         if not self.series:
             return False
-        self.memory = [
-            PlotSeries(s.name, tuple(s.x), tuple(s.y), s.color, s.show_points, s.line_width,
-                       dashed=True, y_unit=s.y_unit)
-            for s in self.series
-        ]
-        self.memory_visible = True
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None and 0 <= target_si < len(self.series):
+            cfg = self._curve_cfg(target_si)
+            cfg.memory = self._make_memory_snapshot(self.series[target_si])
+            cfg.memory_visible = True
+        else:
+            for idx, s in enumerate(self.series):
+                cfg = self._curve_cfg(idx)
+                cfg.memory = self._make_memory_snapshot(s)
+                cfg.memory_visible = None
+            self.memory_visible = True
         self._bump()
         self.view_changed.emit()
         return True
 
-    def clear_memory(self) -> None:
-        if not self.memory and self.math_mode in ("SUB", "ADD", "DIV", "MUL"):
-            return
-        self.memory.clear()
-        if self.math_mode in ("SUB", "ADD", "DIV", "MUL"):
-            self.math_mode = "OFF"
+    def clear_memory(self, *, series_index: Any = _UNSET) -> None:
+        target_si = self._resolve_target_si(series_index)
+        mem_ops = ("SUB", "ADD", "DIV", "MUL")
+        if target_si is not None:
+            cfg = self.curve_configs.get(target_si)
+            cur_mm = self.curve_math_mode(target_si)
+            if (cfg is None or cfg.memory is None) and cur_mm not in mem_ops:
+                return
+            cfg = self._curve_cfg(target_si)
+            cfg.memory = None
+            if cur_mm in mem_ops:
+                cfg.math_mode = "OFF"
+        else:
+            had_any = (
+                any(c.memory is not None for c in self.curve_configs.values())
+                or self.math_mode in mem_ops
+                or any(c.math_mode in mem_ops for c in self.curve_configs.values())
+            )
+            if not had_any:
+                return
+            for cfg in self.curve_configs.values():
+                cfg.memory = None
+                if cfg.math_mode in mem_ops:
+                    cfg.math_mode = "OFF"
+            if self.math_mode in mem_ops:
+                self.math_mode = "OFF"
         self._bump()
         self.view_changed.emit()
 
-    def set_memory_visible(self, on: bool) -> None:
-        self.memory_visible = bool(on)
+    def set_memory_visible(self, on: bool, *, series_index: Any = _UNSET) -> None:
+        val = bool(on)
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            self._curve_cfg(target_si).memory_visible = val
+        else:
+            self.memory_visible = val
+            for cfg in self.curve_configs.values():
+                cfg.memory_visible = None
         self._bump()
         self.view_changed.emit()
 
-    def set_math_mode(self, mode: str) -> None:
+    def set_math_mode(self, mode: str, *, series_index: Any = _UNSET) -> None:
         if mode not in MATH_MODES:
             return
-        if mode in ("SUB", "ADD", "DIV", "MUL") and not self.memory and self.series:
-            self.store_memory()
-        self.math_mode = mode
+        mem_ops = ("SUB", "ADD", "DIV", "MUL")
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            if mode in mem_ops and self.curve_memory(target_si) is None and 0 <= target_si < len(self.series):
+                self._curve_cfg(target_si).memory = self._make_memory_snapshot(self.series[target_si])
+                self._curve_cfg(target_si).memory_visible = True
+            self._curve_cfg(target_si).math_mode = mode
+        else:
+            if mode in mem_ops and self.series:
+                for idx, s in enumerate(self.series):
+                    if self.curve_memory(idx) is None:
+                        cfg = self._curve_cfg(idx)
+                        cfg.memory = self._make_memory_snapshot(s)
+            self.math_mode = mode
+            for cfg in self.curve_configs.values():
+                cfg.math_mode = None
         self._bump()
         self.view_changed.emit()
 
-    def set_math_expr(self, expr: str) -> bool:
+    def set_math_expr(self, expr: str, *, series_index: Any = _UNSET) -> bool:
         expr = expr.strip()
         if expr:
             ok, _ = validate_math_expr(expr)
             if not ok:
                 return False
-        self.math_expr = expr
-        if self.math_mode == "EXPR":
-            self._bump()
-            self.view_changed.emit()
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            self._curve_cfg(target_si).math_expr = expr
+            if self.curve_math_mode(target_si) == "EXPR":
+                self._bump()
+                self.view_changed.emit()
+        else:
+            self.math_expr = expr
+            for cfg in self.curve_configs.values():
+                cfg.math_expr = None
+            if self.math_mode == "EXPR" or any(self.curve_math_mode(i) == "EXPR" for i in range(len(self.series))):
+                self._bump()
+                self.view_changed.emit()
         return True
 
     def _effective_series_and_units(self) -> tuple[list[PlotSeries], list[str]]:
-        if self.math_mode == "OFF" or not self.series:
-            return list(self.series), [self._series_y_unit(s) for s in self.series]
-        mem_by_name = {m.name: m for m in self.memory}
+        if not self.series:
+            return [], []
         out: list[PlotSeries] = []
         units: list[str] = []
         for idx, s in enumerate(self.series):
+            s_xu = self._series_x_unit(s)
             s_yu = self._series_y_unit(s)
-            mem_s = mem_by_name.get(s.name) or (self.memory[idx] if idx < len(self.memory) else None)
-            t_live = Trace(list(s.x), list(s.y), self.x_unit, s_yu)
+            mode = self.curve_math_mode(idx)
+            if mode == "OFF":
+                units.append(s_yu)
+                out.append(s)
+                continue
+            mem_s = self.curve_memory(idx)
+            t_live = Trace(list(s.x), list(s.y), s_xu, s_yu)
             t_mem = (
-                Trace(list(mem_s.x), list(mem_s.y), self.x_unit, self._series_y_unit(mem_s))
+                Trace(list(mem_s.x), list(mem_s.y), self._series_x_unit(mem_s), self._series_y_unit(mem_s))
                 if mem_s is not None else None
             )
-            res = trace_math(t_live, t_mem, self.math_mode, expr=self.math_expr)
+            res = trace_math(t_live, t_mem, mode, expr=self.curve_math_expr(idx))
             if res is not None:
                 units.append(res.y_unit)
-                out.append(PlotSeries(s.name, tuple(res.x), tuple(res.y), s.color, s.show_points,
-                                      s.line_width, y_unit=res.y_unit))
+                out.append(PlotSeries(
+                    s.name, tuple(res.x), tuple(res.y), s.color, s.show_points,
+                    s.line_width, dashed=s.dashed, y_unit=res.y_unit, x_unit=s.x_unit,
+                ))
             else:
                 units.append(s_yu)
                 out.append(s)
@@ -882,12 +1334,13 @@ class PlotWidget(QWidget):
         trk = str(track).upper() if track else None
         if trk not in ("MAX", "MIN"):
             trk = None
+        sx_man = self.series_x_ranges.get(si, self.manual_x_range)
         if trk is not None:
-            ext = self._find_extremum(eff[si], trk == "MAX", self.manual_x_range)
+            ext = self._find_extremum(eff[si], trk == "MAX", sx_man)
             if ext is not None:
                 x = ext[0]
         if x is None:
-            xr, _ = self.current_ranges()
+            xr, _ = self.current_ranges(si)
             x = 0.5 * (xr[0] + xr[1])
         m = PlotMarker(name=self._next_marker_name(), x=float(x), series_index=si,
                        delta_ref=delta_ref, track=trk)
@@ -982,7 +1435,7 @@ class PlotWidget(QWidget):
             return []
         base_si = self.active_series_index if (series_index is None and self.active_series_index is not None) else (series_index or 0)
         si = max(0, min(base_si, len(eff) - 1))
-        xr, _ = self.current_ranges()
+        xr, _ = self.current_ranges(si)
         found = self._find_peaks(eff[si], xr, max_peaks=max_peaks)
         if not found:
             return []
@@ -1019,7 +1472,8 @@ class PlotWidget(QWidget):
                     m.track = trk if trk in ("MAX", "MIN") else None
                 if m.track in ("MAX", "MIN") and eff:
                     si = max(0, min(m.series_index, len(eff) - 1))
-                    ext = self._find_extremum(eff[si], m.track == "MAX", self.manual_x_range)
+                    sx_man = self.series_x_ranges.get(si, self.manual_x_range)
+                    ext = self._find_extremum(eff[si], m.track == "MAX", sx_man)
                     if ext is not None:
                         m.x = ext[0]
                 self._bump()
@@ -1034,10 +1488,20 @@ class PlotWidget(QWidget):
         self._bump()
         self.view_changed.emit()
 
-    def clear_markers(self) -> None:
+    def clear_markers(self, *, series_index: Any = _UNSET) -> None:
         if not self.markers:
             return
-        self.markers.clear()
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            removed = {m.name for m in self.markers if m.series_index == target_si}
+            if not removed:
+                return
+            self.markers = [m for m in self.markers if m.series_index != target_si]
+            for m in self.markers:
+                if m.delta_ref in removed:
+                    m.delta_ref = None
+        else:
+            self.markers.clear()
         self._bump()
         self.view_changed.emit()
 
@@ -1052,7 +1516,8 @@ class PlotWidget(QWidget):
         if not s.x or not s.y:
             return None
         if m.track in ("MAX", "MIN"):
-            ext = self._find_extremum(s, m.track == "MAX", x_range if x_range is not None else self.manual_x_range)
+            xr_use = x_range if x_range is not None else self.series_x_ranges.get(si, self.manual_x_range)
+            ext = self._find_extremum(s, m.track == "MAX", xr_use)
             if ext is not None:
                 m.x = ext[0]
                 return ext
@@ -1063,15 +1528,18 @@ class PlotWidget(QWidget):
         res = self.resolve_marker(m, eff_series)
         return res[1] if res is not None else None
 
-    # ------------------------------------------------------------ локальные лимиты
+    # ------------------------------------------------------------ локальные лимиты (per-curve)
     def add_limit(self, kind: str, y1: float, *, y2: float | None = None,
-                  x1: float | None = None, x2: float | None = None) -> PlotLimit:
+                  x1: float | None = None, x2: float | None = None,
+                  series_index: Any = _UNSET) -> PlotLimit:
+        target_si = self._resolve_target_si(series_index)
         lim = PlotLimit(
             kind="MIN" if str(kind).upper() == "MIN" else "MAX",
             y1=float(y1),
             y2=float(y2) if y2 is not None else None,
             x1=float(x1) if x1 is not None else None,
             x2=float(x2) if x2 is not None else None,
+            series_index=target_si,
         )
         self.limits.append(lim)
         self._bump()
@@ -1084,42 +1552,61 @@ class PlotWidget(QWidget):
             self._bump()
             self.view_changed.emit()
 
-    def clear_limits(self) -> None:
+    def clear_limits(self, *, series_index: Any = _UNSET) -> None:
         if not self.limits:
             return
-        self.limits.clear()
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            kept = [lim for lim in self.limits if lim.series_index != target_si]
+            if len(kept) == len(self.limits):
+                return
+            self.limits = kept
+        else:
+            self.limits.clear()
         self._bump()
         self.view_changed.emit()
 
     def evaluate_limits(self, eff_series: Sequence[PlotSeries] | None = None,
                         x_range: tuple[float, float] | None = None,
-                        eff_y_units: Sequence[str] | None = None) -> bool | None:
-        """Проверить кривые (совпадающие по единице Y с активной шкалой) против ``self.limits``.
+                        eff_y_units: Sequence[str] | None = None,
+                        x_ranges: Sequence[tuple[float, float]] | None = None) -> bool | None:
+        """Проверить кривые против ``self.limits`` (каждый лимит проверяет свою кривую ``series_index``
+        или, если ``series_index is None``, кривые совпадающие по единице Y с активной шкалой).
         ``True`` = PASS, ``False`` = FAIL, ``None`` = нет лимитов."""
         if not self.limits:
             return None
-        if eff_series is None or eff_y_units is None:
-            eff_calc, units_calc = self._effective_series_and_units()
-            eff = eff_series if eff_series is not None else eff_calc
-            units = eff_y_units if eff_y_units is not None else units_calc
+        if eff_series is None or eff_y_units is None or x_ranges is None:
+            xr_c, _, _, eff_c, _, units_c, xrs_c, _ = self._compute_ranges()
+            eff = eff_series if eff_series is not None else eff_c
+            units = eff_y_units if eff_y_units is not None else units_c
+            xrs = list(x_ranges) if x_ranges is not None else xrs_c
+            x_def = x_range if x_range is not None else xr_c
         else:
-            eff, units = eff_series, eff_y_units
+            eff, units, xrs = eff_series, eff_y_units, list(x_ranges)
+            x_def = x_range if x_range is not None else (xrs[0] if xrs else (0.0, 1.0))
         if not eff:
             return None
-        x0, x1 = x_range if x_range is not None else self.current_ranges()[0]
         axis_si = self._axis_series_idx(eff)
         ref_unit = units[axis_si] if (axis_si is not None and axis_si < len(units)) else self.y_unit
         active_si = self._active_series_idx(eff)
-        for idx, s in enumerate(eff):
-            if active_si is not None and len(set(units)) > 1 and idx != active_si:
-                continue
-            if idx < len(units) and units[idx] != ref_unit:
-                continue
-            for xv, yv in zip(s.x, s.y):
-                if not (math.isfinite(xv) and math.isfinite(yv)):
+        for lim in self.limits:
+            if lim.series_index is not None:
+                if not (0 <= lim.series_index < len(eff)):
                     continue
-                for lim in self.limits:
-                    ly = lim.y_at(xv, x0, x1)
+                target_idxs = [lim.series_index]
+            else:
+                target_idxs = [
+                    idx for idx in range(len(eff))
+                    if not (active_si is not None and len(set(units)) > 1 and idx != active_si)
+                    and not (idx < len(units) and units[idx] != ref_unit)
+                ]
+            for idx in target_idxs:
+                s = eff[idx]
+                sx0, sx1 = xrs[idx] if idx < len(xrs) else x_def
+                for xv, yv in zip(s.x, s.y):
+                    if not (math.isfinite(xv) and math.isfinite(yv)):
+                        continue
+                    ly = lim.y_at(xv, sx0, sx1)
                     if ly is None:
                         continue
                     if lim.kind == "MAX" and yv > ly:
@@ -1128,36 +1615,79 @@ class PlotWidget(QWidget):
                         return False
         return True
 
-    # ------------------------------------------------------------ анализ
-    def set_analysis_metrics(self, metrics: Sequence[str]) -> None:
+    # ------------------------------------------------------------ анализ (per-curve)
+    def set_analysis_metrics(self, metrics: Sequence[str], *, series_index: Any = _UNSET) -> None:
         valid = {k for k, _, _ in ANALYSIS_METRICS}
-        self.analysis_metrics = [m for m in metrics if m in valid]
+        cleaned = [m for m in metrics if m in valid]
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            self._curve_cfg(target_si).analysis_metrics = cleaned
+        else:
+            self.analysis_metrics = cleaned
+            for cfg in self.curve_configs.values():
+                cfg.analysis_metrics = None
         self._bump()
         self.view_changed.emit()
 
-    def toggle_analysis_metric(self, key: str, enabled: bool) -> None:
-        if enabled and key not in self.analysis_metrics:
-            self.analysis_metrics.append(key)
-        elif not enabled and key in self.analysis_metrics:
-            self.analysis_metrics.remove(key)
+    def toggle_analysis_metric(self, key: str, enabled: bool, *, series_index: Any = _UNSET) -> None:
+        valid = {k for k, _, _ in ANALYSIS_METRICS}
+        if key not in valid:
+            return
+        target_si = self._resolve_target_si(series_index)
+        if target_si is not None:
+            cur = list(self.curve_analysis_metrics(target_si))
+            if enabled and key not in cur:
+                cur.append(key)
+            elif not enabled and key in cur:
+                cur.remove(key)
+            self._curve_cfg(target_si).analysis_metrics = cur
+        else:
+            if enabled and key not in self.analysis_metrics:
+                self.analysis_metrics.append(key)
+            elif not enabled and key in self.analysis_metrics:
+                self.analysis_metrics.remove(key)
+            for cfg in self.curve_configs.values():
+                if cfg.analysis_metrics is not None:
+                    if enabled and key not in cfg.analysis_metrics:
+                        cfg.analysis_metrics.append(key)
+                    elif not enabled and key in cfg.analysis_metrics:
+                        cfg.analysis_metrics.remove(key)
         self._bump()
         self.view_changed.emit()
 
-    def set_analysis_x_expr(self, expr: str) -> tuple[bool, str]:
+    def set_analysis_x_expr(self, expr: str, *, series_index: Any = _UNSET) -> tuple[bool, str]:
         """Задать диапазон X для анализа в формате ``[x,y]+5-[a,b]`` (пусто = видимый диапазон)."""
         raw = str(expr or "").strip()
+        target_si = self._resolve_target_si(series_index)
+        xu = self.active_x_unit(target_si if target_si is not None else None)
         if not raw:
-            self.analysis_x_expr = ""
-            self._analysis_x_set = None
+            if target_si is not None:
+                cfg = self._curve_cfg(target_si)
+                cfg.analysis_x_expr = ""
+                cfg.analysis_x_set = None
+            else:
+                self.analysis_x_expr = ""
+                self._analysis_x_set = None
+                for cfg in self.curve_configs.values():
+                    cfg.analysis_x_expr = None
+                    cfg.analysis_x_set = None
             self._bump()
             self.view_changed.emit()
             return True, ""
         try:
-            rset = parse_x_range_expr(raw, self.x_unit)
+            rset = parse_x_range_expr(raw, xu)
         except ValueError as exc:
             return False, str(exc)
-        self.analysis_x_expr = raw
-        self._analysis_x_set = rset
+        if target_si is not None:
+            cfg = self._curve_cfg(target_si)
+            cfg.analysis_x_expr = raw
+            cfg.analysis_x_set = rset
+        else:
+            self.analysis_x_expr = raw
+            self._analysis_x_set = rset
+            for cfg in self.curve_configs.values():
+                cfg.analysis_x_expr = None
+                cfg.analysis_x_set = None
         self._bump()
         self.view_changed.emit()
         return True, ""
@@ -1200,28 +1730,31 @@ class PlotWidget(QWidget):
                     ybucket.append(yv)
                     has_any = True
 
-        if self.memory and self.memory_visible and self.math_mode == "OFF":
-            for idx, ms in enumerate(self.memory):
-                xu = eff_x_units[idx] if idx < len(eff_x_units) else self._series_x_unit(ms)
-                yu = eff_y_units[idx] if idx < len(eff_y_units) else self._series_y_unit(ms)
-                xbucket = xs_by_unit.setdefault(xu, [])
-                ybucket = ys_by_unit.setdefault(yu, [])
-                n = min(len(ms.x), len(ms.y))
-                for i in range(n):
-                    xv, yv = ms.x[i], ms.y[i]
-                    if isfinite(xv) and isfinite(yv):
-                        xbucket.append(xv)
-                        ybucket.append(yv)
-                        has_any = True
+        for idx, cfg in self.curve_configs.items():
+            ms = cfg.memory
+            if ms is None or not self.curve_memory_visible(idx) or self.curve_math_mode(idx) != "OFF":
+                continue
+            xu = eff_x_units[idx] if idx < len(eff_x_units) else self._series_x_unit(ms)
+            yu = eff_y_units[idx] if idx < len(eff_y_units) else self._series_y_unit(ms)
+            xbucket = xs_by_unit.setdefault(xu, [])
+            ybucket = ys_by_unit.setdefault(yu, [])
+            n = min(len(ms.x), len(ms.y))
+            for i in range(n):
+                xv, yv = ms.x[i], ms.y[i]
+                if isfinite(xv) and isfinite(yv):
+                    xbucket.append(xv)
+                    ybucket.append(yv)
+                    has_any = True
 
         axis_si = self._axis_series_idx(eff)
         if not has_any:
             xr = self.manual_x_range or (0.0, 1.0)
             default_yr = self.manual_y_range or (0.0, float(self.divs_y))
-            x_ranges = [xr for _ in eff]
+            x_ranges = [self.series_x_ranges.get(i, xr) for i in range(len(eff))]
             y_ranges = [self.series_y_ranges.get(i, default_yr) for i in range(len(eff))]
+            xr_out = x_ranges[axis_si] if (axis_si is not None and axis_si < len(x_ranges)) else xr
             yr = y_ranges[axis_si] if (axis_si is not None and axis_si < len(y_ranges)) else default_yr
-            return xr, yr, False, eff, y_ranges, eff_y_units, x_ranges, eff_x_units
+            return xr_out, yr, False, eff, y_ranges, eff_y_units, x_ranges, eff_x_units
 
         same_x_unit = len(set(eff_x_units)) <= 1
         x_unit_auto: dict[str, tuple[float, float]] = {}
@@ -1233,8 +1766,10 @@ class PlotWidget(QWidget):
                 x_unit_auto[xu] = (0.0, 1.0)
 
         x_ranges: list[tuple[float, float]] = []
-        for xu in eff_x_units:
-            if same_x_unit and self.manual_x_range is not None:
+        for idx, xu in enumerate(eff_x_units):
+            if idx in self.series_x_ranges:
+                x_ranges.append(self.series_x_ranges[idx])
+            elif same_x_unit and self.manual_x_range is not None:
                 x_ranges.append(self.manual_x_range)
             else:
                 x_ranges.append(x_unit_auto.get(xu, (0.0, 1.0)))
@@ -1696,17 +2231,29 @@ class PlotWidget(QWidget):
             self._draw_legend_action_row(p, more_rect, more_txt, hovered=False, muted=True)
         p.restore()
 
-    def _draw_analysis_box(self, p: QPainter, rect: QRectF, rows: Sequence[str], *,
-                           header_name: str = "", header_col: QColor | None = None,
-                           top_obstacle: float = 0.0, bottom_inset: float = 0.0) -> None:
-        """Полупрозрачная карточка аналитики (в стиле легенды) в левом нижнем углу графика:
-        показывает все включённые метрики целиком, при нехватке высоты раскладывая их в 2–3 столбца."""
-        if not rows:
+    def _draw_analysis_box(
+        self,
+        p: QPainter,
+        rect: QRectF,
+        groups: Sequence[tuple[str, QColor | None, Sequence[str]]],
+        *,
+        top_obstacle: float = 0.0,
+        bottom_inset: float = 0.0,
+    ) -> None:
+        """Полупрозрачная карточка аналитики (в стиле легенды) в правом нижнем углу графика:
+        поддерживает как одну кривую (с авторазбивкой на 2–3 столбца при нехватке высоты),
+        так и несколько кривых одновременно (отдельный блок с цветным заголовком на каждую кривую)."""
+        cleaned_groups: list[tuple[str, QColor | None, list[tuple[str, str]]]] = []
+        for hname, hcol, rows in groups:
+            if not rows:
+                continue
+            pairs: list[tuple[str, str]] = []
+            for r in rows:
+                k, _, v = r.partition(" ")
+                pairs.append((k, v))
+            cleaned_groups.append((hname, hcol, pairs))
+        if not cleaned_groups:
             return
-        pairs: list[tuple[str, str]] = []
-        for r in rows:
-            k, _, v = r.partition(" ")
-            pairs.append((k, v))
 
         an_font = self._chip_font()
         an_bold = self._chip_font(bold=True)
@@ -1717,7 +2264,7 @@ class PlotWidget(QWidget):
         pad_y = 5.0
         kv_gap = 8.0
         col_gap = 14.0
-        header_h = (row_h + 4.0) if header_name else 0.0
+        group_gap_y = 6.0
 
         avail_h = (
             max(48.0, rect.height() - 16.0)
@@ -1726,38 +2273,148 @@ class PlotWidget(QWidget):
         )
         avail_w = max(120.0, rect.width() - 16.0)
 
-        def _measure_cols(ncols: int) -> tuple[int, list[tuple[float, float]], float, float]:
-            per_col = max(1, math.ceil(len(pairs) / ncols))
-            cols_dims: list[tuple[float, float]] = []
-            for ci in range(ncols):
-                chunk = pairs[ci * per_col:(ci + 1) * per_col]
-                if not chunk:
-                    continue
-                kw = max(afm.horizontalAdvance(k) for k, _ in chunk)
-                vw = max(afm.horizontalAdvance(v) for _, v in chunk)
-                cols_dims.append((kw, vw))
-            actual_cols = len(cols_dims)
-            w = pad_x * 2.0 + sum(kw + kv_gap + vw for kw, vw in cols_dims) + col_gap * max(0, actual_cols - 1)
-            if header_name:
-                w = max(w, pad_x * 2.0 + 18.0 + abfm.horizontalAdvance(header_name) + 4.0)
-            h = pad_y * 2.0 + header_h + per_col * row_h
-            return per_col, cols_dims, w, h
+        # ---- Вариант 1: одна кривая (авторазбивка длинного списка на 1..3 столбца) ----
+        if len(cleaned_groups) == 1:
+            header_name, header_col, pairs = cleaned_groups[0]
+            header_h = (row_h + 4.0) if header_name else 0.0
 
-        chosen = _measure_cols(1)
-        if chosen[3] > avail_h and len(pairs) > 2:
-            for cand_n in (2, 3):
-                cand = _measure_cols(cand_n)
-                if cand[2] <= avail_w:
-                    chosen = cand
-                    if cand[3] <= avail_h:
+            def _measure_cols(ncols: int) -> tuple[int, list[tuple[float, float]], float, float]:
+                per_col = max(1, math.ceil(len(pairs) / ncols))
+                cols_dims: list[tuple[float, float]] = []
+                for ci in range(ncols):
+                    chunk = pairs[ci * per_col:(ci + 1) * per_col]
+                    if not chunk:
+                        continue
+                    kw = max(afm.horizontalAdvance(k) for k, _ in chunk)
+                    vw = max(afm.horizontalAdvance(v) for _, v in chunk)
+                    cols_dims.append((kw, vw))
+                actual_cols = len(cols_dims)
+                w = pad_x * 2.0 + sum(kw + kv_gap + vw for kw, vw in cols_dims) + col_gap * max(0, actual_cols - 1)
+                if header_name:
+                    w = max(w, pad_x * 2.0 + 18.0 + abfm.horizontalAdvance(header_name) + 4.0)
+                h = pad_y * 2.0 + header_h + per_col * row_h
+                return per_col, cols_dims, w, h
+
+            chosen = _measure_cols(1)
+            if chosen[3] > avail_h and len(pairs) > 2:
+                for cand_n in (2, 3):
+                    cand = _measure_cols(cand_n)
+                    if cand[2] <= avail_w:
+                        chosen = cand
+                        if cand[3] <= avail_h:
+                            break
+                    elif cand_n == 2 and chosen[3] > rect.height() - 20.0:
+                        chosen = cand
                         break
-                elif cand_n == 2 and chosen[3] > rect.height() - 20.0:
-                    chosen = cand
-                    break
 
-        per_col, cols_dims, box_w, box_h = chosen
-        box_w = min(box_w, avail_w)
-        box_h = min(box_h, max(40.0, rect.height() - 16.0))
+            per_col, cols_dims, box_w, box_h = chosen
+            box_w = min(box_w, avail_w)
+            box_h = min(box_h, max(40.0, rect.height() - 16.0))
+            abox = self._place_overlay(
+                "analysis", rect, box_w, box_h,
+                rect.right() - box_w - 8.0,
+                rect.bottom() - bottom_inset - box_h - 6.0,
+            )
+            self._analysis_box = abox
+
+            bg = _c("UI_COLOR_BACKGROUND")
+            bg.setAlpha(196)
+            bdr = _c("UI_COLOR_BORDER")
+            bdr.setAlpha(200)
+            p.save()
+            p.setPen(QPen(bdr, 1.0))
+            p.setBrush(bg)
+            p.drawRoundedRect(abox, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
+
+            p.setClipRect(abox.adjusted(1.0, 1.0, -1.0, -1.0))
+            y0_cur = abox.top() + pad_y
+            if header_name:
+                hx = abox.left() + pad_x
+                if header_col is not None:
+                    sw_pen = QPen(header_col, 2.2)
+                    sw_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                    p.setPen(sw_pen)
+                    hcy = y0_cur + row_h / 2.0
+                    p.drawLine(QPointF(hx, hcy), QPointF(hx + 11.0, hcy))
+                    hx += 17.0
+                p.setFont(an_bold)
+                p.setPen(_c("UI_COLOR_TEXT"))
+                p.drawText(QRectF(hx, y0_cur, max(10.0, abox.right() - hx - pad_x), row_h),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, header_name)
+                sep_y = y0_cur + row_h + 1.5
+                sep_c = _c("UI_COLOR_BORDER")
+                sep_c.setAlpha(130)
+                p.setPen(QPen(sep_c, 1.0))
+                p.drawLine(QPointF(abox.left() + pad_x, sep_y), QPointF(abox.right() - pad_x, sep_y))
+                y0_cur += header_h
+
+            p.setFont(an_font)
+            key_col = _c("UI_COLOR_BORDER_LIGHT")
+            val_col = _c("UI_COLOR_TEXT")
+            cx = abox.left() + pad_x
+            actual_cols = len(cols_dims)
+            avail_inner_w = max(20.0, abox.width() - pad_x * 2.0 - col_gap * max(0, actual_cols - 1))
+            raw_sum = sum(kw + kv_gap + vw for kw, vw in cols_dims) or 1.0
+            scale_w = min(1.0, avail_inner_w / raw_sum)
+
+            for ci, (kw, vw) in enumerate(cols_dims):
+                col_w = (kw + kv_gap + vw) * scale_w
+                kw_s = kw * scale_w
+                vw_s = max(10.0, col_w - kw_s - kv_gap * scale_w)
+                if ci > 0:
+                    div_x = cx - col_gap / 2.0
+                    div_c = _c("UI_COLOR_BORDER")
+                    div_c.setAlpha(95)
+                    p.setPen(QPen(div_c, 1.0))
+                    p.drawLine(QPointF(div_x, y0_cur + 1.0), QPointF(div_x, abox.bottom() - pad_y - 1.0))
+                chunk = pairs[ci * per_col:(ci + 1) * per_col]
+                for ri, (k_lbl, v_lbl) in enumerate(chunk):
+                    ry = y0_cur + ri * row_h
+                    p.setPen(key_col)
+                    p.drawText(QRectF(cx, ry, kw_s + 2.0, row_h),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, k_lbl)
+                    p.setPen(val_col)
+                    v_elided = afm.elidedText(v_lbl, Qt.TextElideMode.ElideRight, vw_s + 2.0)
+                    p.drawText(QRectF(cx + col_w - vw_s - 2.0, ry, vw_s + 2.0, row_h),
+                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, v_elided)
+                cx += col_w + col_gap
+            p.restore()
+            return
+
+        # ---- Вариант 2: несколько кривых — каждая в своём столбце с цветным заголовком ----
+        grp_dims: list[tuple[float, float, float, float]] = []  # (kw, vw, block_w, block_h)
+        for hname, _hcol, pairs in cleaned_groups:
+            kw = max(afm.horizontalAdvance(k) for k, _ in pairs)
+            vw = max(afm.horizontalAdvance(v) for _, v in pairs)
+            hdr_w = (17.0 + abfm.horizontalAdvance(hname) + 4.0) if hname else 0.0
+            bw = max(kw + kv_gap + vw, hdr_w)
+            bh = (row_h + 4.0 if hname else 0.0) + len(pairs) * row_h
+            grp_dims.append((kw, vw, bw, bh))
+
+        # Раскладываем группы в сетку (предпочитаем в ряд, если влезают по ширине; иначе в 2 столбца или стопкой)
+        best_grid: list[list[int]] = [[i for i in range(len(cleaned_groups))]]
+        for ncols in (min(len(cleaned_groups), 3), min(len(cleaned_groups), 2), 1):
+            grid_rows: list[list[int]] = [
+                list(range(r0, min(len(cleaned_groups), r0 + ncols)))
+                for r0 in range(0, len(cleaned_groups), ncols)
+            ]
+            row_ws = [
+                pad_x * 2.0 + sum(grp_dims[gi][2] for gi in r_idxs) + col_gap * max(0, len(r_idxs) - 1)
+                for r_idxs in grid_rows
+            ]
+            w_cand = max(row_ws, default=80.0)
+            best_grid = grid_rows
+            if w_cand <= avail_w or ncols == 1:
+                break
+
+        row_heights = [max(grp_dims[gi][3] for gi in r_idxs) for r_idxs in best_grid]
+        row_widths = [
+            pad_x * 2.0 + sum(grp_dims[gi][2] for gi in r_idxs) + col_gap * max(0, len(r_idxs) - 1)
+            for r_idxs in best_grid
+        ]
+        box_w = min(avail_w, max(row_widths, default=80.0))
+        box_h = min(max(40.0, rect.height() - 16.0),
+                    pad_y * 2.0 + sum(row_heights) + group_gap_y * max(0, len(best_grid) - 1))
         abox = self._place_overlay(
             "analysis", rect, box_w, box_h,
             rect.right() - box_w - 8.0,
@@ -1773,110 +2430,260 @@ class PlotWidget(QWidget):
         p.setPen(QPen(bdr, 1.0))
         p.setBrush(bg)
         p.drawRoundedRect(abox, UI_BORDER_RADIUS_PX, UI_BORDER_RADIUS_PX)
-
         p.setClipRect(abox.adjusted(1.0, 1.0, -1.0, -1.0))
-        y0_cur = abox.top() + pad_y
-        if header_name:
-            hx = abox.left() + pad_x
-            if header_col is not None:
-                sw_pen = QPen(header_col, 2.2)
-                sw_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                p.setPen(sw_pen)
-                hcy = y0_cur + row_h / 2.0
-                p.drawLine(QPointF(hx, hcy), QPointF(hx + 11.0, hcy))
-                hx += 17.0
-            p.setFont(an_bold)
-            p.setPen(_c("UI_COLOR_TEXT"))
-            p.drawText(QRectF(hx, y0_cur, max(10.0, abox.right() - hx - pad_x), row_h),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, header_name)
-            sep_y = y0_cur + row_h + 1.5
-            sep_c = _c("UI_COLOR_BORDER")
-            sep_c.setAlpha(130)
-            p.setPen(QPen(sep_c, 1.0))
-            p.drawLine(QPointF(abox.left() + pad_x, sep_y), QPointF(abox.right() - pad_x, sep_y))
-            y0_cur += header_h
 
-        p.setFont(an_font)
         key_col = _c("UI_COLOR_BORDER_LIGHT")
         val_col = _c("UI_COLOR_TEXT")
-        cx = abox.left() + pad_x
-        actual_cols = len(cols_dims)
-        avail_inner_w = max(20.0, abox.width() - pad_x * 2.0 - col_gap * max(0, actual_cols - 1))
-        raw_sum = sum(kw + kv_gap + vw for kw, vw in cols_dims) or 1.0
-        scale_w = min(1.0, avail_inner_w / raw_sum)
+        sep_c = _c("UI_COLOR_BORDER")
+        sep_c.setAlpha(120)
+        div_c = _c("UI_COLOR_BORDER")
+        div_c.setAlpha(95)
 
-        for ci, (kw, vw) in enumerate(cols_dims):
-            col_w = (kw + kv_gap + vw) * scale_w
-            kw_s = kw * scale_w
-            vw_s = max(10.0, col_w - kw_s - kv_gap * scale_w)
-            if ci > 0:
-                div_x = cx - col_gap / 2.0
-                div_c = _c("UI_COLOR_BORDER")
-                div_c.setAlpha(95)
+        cur_y = abox.top() + pad_y
+        for gr_i, r_idxs in enumerate(best_grid):
+            rh = row_heights[gr_i]
+            if gr_i > 0:
                 p.setPen(QPen(div_c, 1.0))
-                p.drawLine(QPointF(div_x, y0_cur + 1.0), QPointF(div_x, abox.bottom() - pad_y - 1.0))
-            chunk = pairs[ci * per_col:(ci + 1) * per_col]
-            for ri, (k_lbl, v_lbl) in enumerate(chunk):
-                ry = y0_cur + ri * row_h
-                p.setPen(key_col)
-                p.drawText(QRectF(cx, ry, kw_s + 2.0, row_h),
-                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, k_lbl)
-                p.setPen(val_col)
-                v_elided = afm.elidedText(v_lbl, Qt.TextElideMode.ElideRight, vw_s + 2.0)
-                p.drawText(QRectF(cx + col_w - vw_s - 2.0, ry, vw_s + 2.0, row_h),
-                           Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, v_elided)
-            cx += col_w + col_gap
+                p.drawLine(QPointF(abox.left() + pad_x, cur_y - group_gap_y / 2.0),
+                           QPointF(abox.right() - pad_x, cur_y - group_gap_y / 2.0))
+            avail_row_w = max(20.0, abox.width() - pad_x * 2.0 - col_gap * max(0, len(r_idxs) - 1))
+            raw_row_w = sum(grp_dims[gi][2] for gi in r_idxs) or 1.0
+            sc = min(1.0, avail_row_w / raw_row_w)
+            cx = abox.left() + pad_x
+            for ci, gi in enumerate(r_idxs):
+                hname, hcol, pairs = cleaned_groups[gi]
+                kw, vw, bw, _bh = grp_dims[gi]
+                col_w = bw * sc
+                kw_s = kw * sc
+                vw_s = max(10.0, col_w - kw_s - kv_gap * sc)
+                if ci > 0:
+                    div_x = cx - col_gap / 2.0
+                    p.setPen(QPen(div_c, 1.0))
+                    p.drawLine(QPointF(div_x, cur_y + 1.0), QPointF(div_x, cur_y + rh - 1.0))
+                gy = cur_y
+                if hname:
+                    hx = cx
+                    if hcol is not None:
+                        sw_pen = QPen(hcol, 2.2)
+                        sw_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                        p.setPen(sw_pen)
+                        hcy = gy + row_h / 2.0
+                        p.drawLine(QPointF(hx, hcy), QPointF(hx + 10.0, hcy))
+                        hx += 15.0
+                    p.setFont(an_bold)
+                    p.setPen(_c("UI_COLOR_TEXT"))
+                    h_elided = abfm.elidedText(hname, Qt.TextElideMode.ElideRight, max(10.0, cx + col_w - hx))
+                    p.drawText(QRectF(hx, gy, max(10.0, cx + col_w - hx), row_h),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, h_elided)
+                    p.setPen(QPen(sep_c, 1.0))
+                    p.drawLine(QPointF(cx, gy + row_h + 1.5), QPointF(cx + col_w, gy + row_h + 1.5))
+                    gy += row_h + 4.0
+                p.setFont(an_font)
+                for ri, (k_lbl, v_lbl) in enumerate(pairs):
+                    ry = gy + ri * row_h
+                    p.setPen(key_col)
+                    p.drawText(QRectF(cx, ry, kw_s + 2.0, row_h),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, k_lbl)
+                    p.setPen(val_col)
+                    v_elided = afm.elidedText(v_lbl, Qt.TextElideMode.ElideRight, vw_s + 2.0)
+                    p.drawText(QRectF(cx + col_w - vw_s - 2.0, ry, vw_s + 2.0, row_h),
+                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, v_elided)
+                cx += col_w + col_gap
+            cur_y += rh + group_gap_y
         p.restore()
 
-    def _active_setting_chips(self) -> list[tuple[str, str, Callable[[], None]]]:
+    def _short_curve_tag(self, idx: int) -> str:
+        nm = self.series[idx].name if (0 <= idx < len(self.series) and self.series[idx].name) else f"#{idx + 1}"
+        return nm if len(nm) <= 10 else (nm[:9] + "…")
+
+    def _curve_accent(self, idx: int) -> QColor | None:
+        if 0 <= idx < len(self.series):
+            return _series_color(idx, self.series[idx].color)
+        return None
+
+    def _active_setting_chips(self) -> list[tuple[str, str, Callable[[], None], QColor | None]]:
         """Компактные чипы всех активных настроек/оверлеев графика (сброс по клику) для нижней полосы."""
-        chips: list[tuple[str, str, Callable[[], None]]] = []
-        active_si = self._active_series_idx(self.series)
-        if active_si is not None and active_si in self.series_y_ranges:
-            sname = self.series[active_si].name or f"#{active_si + 1}"
-            chips.append((
-                f"scale_{active_si}",
-                f"{sname} Y ×",
-                lambda si=active_si: self.set_y_range(None, None, series_index=si),
-            ))
-        other_y = (
-            self.manual_y_range is not None
-            or any(k != active_si for k in self.series_y_ranges)
-        )
-        if self.manual_x_range is not None or other_y:
-            if self.manual_x_range is not None and (other_y or (active_si in self.series_y_ranges)):
+        chips: list[tuple[str, str, Callable[[], None], QColor | None]] = []
+        n_ser = len(self.series)
+        multi = n_ser > 1
+
+        # 1. Ручной масштаб (per-curve Y / X и общий)
+        for si in sorted(self.series_y_ranges):
+            if si < n_ser or not n_ser:
+                tag = f"{self._short_curve_tag(si)} Y ×" if multi else "Y:MAN ×"
+                chips.append((
+                    f"scale_y_{si}", tag,
+                    lambda idx=si: self.set_y_range(None, None, series_index=idx),
+                    self._curve_accent(si) if multi else None,
+                ))
+        for si in sorted(self.series_x_ranges):
+            if si < n_ser or not n_ser:
+                tag = f"{self._short_curve_tag(si)} X ×" if multi else "X:MAN ×"
+                chips.append((
+                    f"scale_x_{si}", tag,
+                    lambda idx=si: self.set_x_range(None, None, series_index=idx),
+                    self._curve_accent(si) if multi else None,
+                ))
+        if self.manual_x_range is not None or self.manual_y_range is not None:
+            if self.manual_x_range is not None and self.manual_y_range is not None:
                 lbl = "SCALE ×"
             elif self.manual_x_range is not None:
                 lbl = "X:MAN ×"
             else:
                 lbl = "Y:MAN ×"
-            chips.append(("scale", lbl, self.reset_view))
-        if self.memory:
-            chips.append(("mem", "MEM ×" if self.memory_visible else "MEM(off) ×", self.clear_memory))
-        if self.math_mode != "OFF":
-            tag = self.math_expr if (self.math_mode == "EXPR" and self.math_expr) else MATH_LABELS.get(self.math_mode, self.math_mode)
-            if len(tag) > 14:
-                tag = tag[:13] + "…"
-            chips.append(("math", f"{tag} ×", lambda: self.set_math_mode("OFF")))
+            chips.append(("scale_all", lbl, self.reset_view, None))
+
+        # 2. Память (MEM)
+        mem_idxs = [i for i in range(n_ser) if self.curve_memory(i) is not None]
+        if mem_idxs:
+            if multi and len(mem_idxs) == n_ser and len({self.curve_memory_visible(i) for i in mem_idxs}) == 1:
+                vis = self.curve_memory_visible(mem_idxs[0])
+                chips.append(("mem_all", "MEM ×" if vis else "MEM(off) ×",
+                              lambda: self.clear_memory(series_index=None), None))
+            else:
+                for si in mem_idxs:
+                    vis = self.curve_memory_visible(si)
+                    base = "MEM" if vis else "MEM(off)"
+                    lbl = f"{self._short_curve_tag(si)} {base} ×" if multi else f"{base} ×"
+                    chips.append((
+                        f"mem_{si}", lbl,
+                        lambda idx=si: self.clear_memory(series_index=idx),
+                        self._curve_accent(si) if multi else None,
+                    ))
+
+        # 3. Математика (MATH)
+        math_items = [
+            (i, self.curve_math_mode(i), self.curve_math_expr(i))
+            for i in range(n_ser)
+            if self.curve_math_mode(i) != "OFF"
+        ]
+        if math_items:
+            unique_math = {(m, e) for _, m, e in math_items}
+            if multi and len(math_items) == n_ser and len(unique_math) == 1:
+                m0, e0 = math_items[0][1], math_items[0][2]
+                tag = e0 if (m0 == "EXPR" and e0) else MATH_LABELS.get(m0, m0)
+                if len(tag) > 14:
+                    tag = tag[:13] + "…"
+                chips.append(("math_all", f"{tag} ×",
+                              lambda: self.set_math_mode("OFF", series_index=None), None))
+            else:
+                for si, m0, e0 in math_items:
+                    tag = e0 if (m0 == "EXPR" and e0) else MATH_LABELS.get(m0, m0)
+                    if len(tag) > 12:
+                        tag = tag[:11] + "…"
+                    lbl = f"{self._short_curve_tag(si)} {tag} ×" if multi else f"{tag} ×"
+                    chips.append((
+                        f"math_{si}", lbl,
+                        lambda idx=si: self.set_math_mode("OFF", series_index=idx),
+                        self._curve_accent(si) if multi else None,
+                    ))
+
+        # 4. Маркеры (группируем по кривой)
         if self.markers:
-            lbl = f"MK:{len(self.markers)} ×" if len(self.markers) > 1 else f"{self.markers[0].name} ×"
-            chips.append(("markers", lbl, self.clear_markers))
-        if self.show_peaks:
-            chips.append(("peaks", "PEAKS ×", lambda: self.set_show_peaks(False)))
-        if self.show_point_values:
-            chips.append(("values", "VALS ×", lambda: self.set_show_point_values(False)))
+            by_si: dict[int, list[PlotMarker]] = {}
+            for m in self.markers:
+                by_si.setdefault(m.series_index, []).append(m)
+            for si, mlist in sorted(by_si.items()):
+                core = f"MK:{len(mlist)}" if len(mlist) > 1 else mlist[0].name
+                lbl = f"{self._short_curve_tag(si)} {core} ×" if multi else f"{core} ×"
+                chips.append((
+                    f"markers_{si}", lbl,
+                    lambda idx=si: self.clear_markers(series_index=idx),
+                    self._curve_accent(si) if multi else None,
+                ))
+
+        # 5. Пики (PEAKS)
+        pk_idxs = [i for i in range(n_ser) if self.curve_show_peaks(i)]
+        if pk_idxs:
+            if multi and len(pk_idxs) == n_ser:
+                chips.append(("peaks_all", "PEAKS ×",
+                              lambda: self.set_show_peaks(False, series_index=None), None))
+            else:
+                for si in pk_idxs:
+                    lbl = f"{self._short_curve_tag(si)} PEAKS ×" if multi else "PEAKS ×"
+                    chips.append((
+                        f"peaks_{si}", lbl,
+                        lambda idx=si: self.set_show_peaks(False, series_index=idx),
+                        self._curve_accent(si) if multi else None,
+                    ))
+
+        # 6. Подписи значений точек (VALS)
+        val_idxs = [i for i in range(n_ser) if self.curve_show_point_values(i)]
+        if val_idxs:
+            if multi and len(val_idxs) == n_ser:
+                chips.append(("vals_all", "VALS ×",
+                              lambda: self.set_show_point_values(False, series_index=None), None))
+            else:
+                for si in val_idxs:
+                    lbl = f"{self._short_curve_tag(si)} VALS ×" if multi else "VALS ×"
+                    chips.append((
+                        f"vals_{si}", lbl,
+                        lambda idx=si: self.set_show_point_values(False, series_index=idx),
+                        self._curve_accent(si) if multi else None,
+                    ))
+
+        # 7. Лимиты (группируем по кривой)
         if self.limits:
-            lbl = f"LIM:{len(self.limits)} ×" if len(self.limits) > 1 else "LIM ×"
-            chips.append(("limits", lbl, self.clear_limits))
-        if self.analysis_metrics:
-            lbl = f"AN:{len(self.analysis_metrics)} ×" if len(self.analysis_metrics) > 1 else "AN ×"
-            chips.append(("analysis", lbl, lambda: self.set_analysis_metrics([])))
-        if self.analysis_x_expr:
-            tag = self.analysis_x_expr if len(self.analysis_x_expr) <= 14 else (self.analysis_x_expr[:13] + "…")
-            chips.append(("an_x", f"X:{tag} ×", lambda: self.set_analysis_x_expr("")))
+            lim_by_si: dict[int | None, int] = {}
+            for lim in self.limits:
+                lim_by_si[lim.series_index] = lim_by_si.get(lim.series_index, 0) + 1
+            for si, cnt in sorted(lim_by_si.items(), key=lambda kv: (-1 if kv[0] is None else kv[0])):
+                core = f"LIM:{cnt}" if cnt > 1 else "LIM"
+                if si is not None and multi:
+                    lbl = f"{self._short_curve_tag(si)} {core} ×"
+                    chips.append((
+                        f"lim_{si}", lbl,
+                        lambda idx=si: self.clear_limits(series_index=idx),
+                        self._curve_accent(si),
+                    ))
+                else:
+                    chips.append((
+                        "lim_all", f"{core} ×",
+                        lambda: self.clear_limits(series_index=None),
+                        None,
+                    ))
+
+        # 8. Анализ (AN)
+        an_items = [(i, self.curve_analysis_metrics(i)) for i in range(n_ser) if self.curve_analysis_metrics(i)]
+        if an_items:
+            unique_an = {tuple(ms) for _, ms in an_items}
+            if multi and len(an_items) == n_ser and len(unique_an) == 1:
+                cnt = len(an_items[0][1])
+                lbl = f"AN:{cnt} ×" if cnt > 1 else "AN ×"
+                chips.append(("an_all", lbl,
+                              lambda: self.set_analysis_metrics([], series_index=None), None))
+            else:
+                for si, ms in an_items:
+                    core = f"AN:{len(ms)}" if len(ms) > 1 else "AN"
+                    lbl = f"{self._short_curve_tag(si)} {core} ×" if multi else f"{core} ×"
+                    chips.append((
+                        f"an_{si}", lbl,
+                        lambda idx=si: self.set_analysis_metrics([], series_index=idx),
+                        self._curve_accent(si) if multi else None,
+                    ))
+
+        # 9. Диапазон X анализа
+        ax_items = [(i, self.curve_analysis_x_expr(i)) for i in range(n_ser) if self.curve_analysis_x_expr(i)]
+        if ax_items:
+            unique_ax = {ex for _, ex in ax_items}
+            if multi and len(ax_items) == n_ser and len(unique_ax) == 1:
+                ex = ax_items[0][1]
+                tag = ex if len(ex) <= 14 else (ex[:13] + "…")
+                chips.append(("an_x_all", f"X:{tag} ×",
+                              lambda: self.set_analysis_x_expr("", series_index=None), None))
+            else:
+                for si, ex in ax_items:
+                    tag = ex if len(ex) <= 12 else (ex[:11] + "…")
+                    lbl = f"{self._short_curve_tag(si)} X:{tag} ×" if multi else f"X:{tag} ×"
+                    chips.append((
+                        f"an_x_{si}", lbl,
+                        lambda idx=si: self.set_analysis_x_expr("", series_index=idx),
+                        self._curve_accent(si) if multi else None,
+                    ))
         return chips
 
-    def _draw_setting_chip(self, p: QPainter, rect: QRectF, text: str, *, hovered: bool = False) -> None:
+    def _draw_setting_chip(self, p: QPainter, rect: QRectF, text: str, *,
+                           hovered: bool = False, accent_col: QColor | None = None) -> None:
         """Компактный чип активной настройки в нижней полосе графика (единый стиль кнопок)."""
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1895,7 +2702,15 @@ class PlotWidget(QWidget):
             p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
             p.setFont(self._chip_font())
             p.setPen(_c("UI_COLOR_TEXT_MUTED"))
-        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        text_rect = rect
+        if accent_col is not None:
+            p.save()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(accent_col)
+            p.drawEllipse(QPointF(rect.left() + 8.0, rect.center().y()), 2.6, 2.6)
+            p.restore()
+            text_rect = rect.adjusted(10.0, 0.0, -2.0, 0.0)
+        p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
         p.restore()
 
     def _draw_bottom_chips(self, p: QPainter, rect: QRectF, fm: QFontMetricsF, *,
@@ -1926,12 +2741,13 @@ class PlotWidget(QWidget):
         cfm = QFontMetricsF(self._chip_font())
         cb_fm = QFontMetricsF(self._chip_font(bold=True))
         gap = 5.0
-        measured: list[tuple[str, str, Callable[[], None], float]] = []
-        for cid, lbl, cb in chips:
+        measured: list[tuple[str, str, Callable[[], None], float, QColor | None]] = []
+        for cid, lbl, cb, acc in chips:
             tw = max(cfm.horizontalAdvance(lbl), cb_fm.horizontalAdvance(lbl))
-            measured.append((cid, lbl, cb, tw + 14.0))
+            extra = 10.0 if acc is not None else 0.0
+            measured.append((cid, lbl, cb, tw + 14.0 + extra, acc))
 
-        total_w = sum(w for *_, w in measured) + gap * max(0, len(measured) - 1)
+        total_w = sum(w for _, _, _, w, _ in measured) + gap * max(0, len(measured) - 1)
         self._chips_max_scroll = max(0.0, total_w - strip_w)
         self._chips_scroll_x = max(0.0, min(self._chips_scroll_x, self._chips_max_scroll))
 
@@ -1939,13 +2755,13 @@ class PlotWidget(QWidget):
         if self._chips_max_scroll > 0.0:
             p.setClipRect(strip_rect)
         lx = chip_left - self._chips_scroll_x
-        for cid, lbl, cb, cw in measured:
+        for cid, lbl, cb, cw, acc in measured:
             full_r = QRectF(lx, chip_top, cw, chip_h)
             if full_r.right() > strip_rect.left() and full_r.left() < strip_rect.right():
-                self._draw_setting_chip(p, full_r, lbl, hovered=False)
+                self._draw_setting_chip(p, full_r, lbl, hovered=False, accent_col=acc)
                 hit_r = full_r.intersected(strip_rect) if self._chips_max_scroll > 0.0 else full_r
                 if hit_r.width() >= 4.0:
-                    self._chip_hits.append((hit_r, cid, lbl, cb, full_r))
+                    self._chip_hits.append((hit_r, cid, lbl, cb, full_r, acc))
             lx += cw + gap
 
         if self._chips_max_scroll > 0.0:
@@ -1973,11 +2789,12 @@ class PlotWidget(QWidget):
     def _ensure_cache(self) -> QPixmap:
         dpr = max(1.0, float(self.devicePixelRatioF()))
         ov_key = tuple(sorted((k, round(v[0], 4), round(v[1], 4)) for k, v in self._overlay_pos.items()))
+        sxr_key = tuple(sorted((k, round(v[0], 9), round(v[1], 9)) for k, v in self.series_x_ranges.items()))
         syr_key = tuple(sorted((k, round(v[0], 9), round(v[1], 9)) for k, v in self.series_y_ranges.items()))
         key = (self.width(), self.height(), dpr, current_theme(), self._data_version,
                self.show_grid, self.show_points, self.show_point_values, self.show_peaks,
                self.show_axis_labels, self.draw_frame, self.divs_y, self.manual_x_range, self.manual_y_range,
-               syr_key, self.active_series_index,
+               sxr_key, syr_key, self.active_series_index,
                self._legend_scroll_idx, round(self._chips_scroll_x, 1),
                round(self._top_right_pad, 1), round(self._top_left_pad, 1), round(self.top_pad, 1), ov_key)
         if self._cache is not None and self._cache_key == key:
@@ -2011,7 +2828,7 @@ class PlotWidget(QWidget):
         axis_y_unit = eff_y_units[axis_si] if (axis_si is not None and axis_si < len(eff_y_units)) else self.y_unit
         axis_x_unit = eff_x_units[axis_si] if (axis_si is not None and axis_si < len(eff_x_units)) else self.x_unit
         is_multi_scale = len(set(eff_y_units)) > 1 or bool(self.series_y_ranges)
-        is_multi_x = len(set(eff_x_units)) > 1
+        is_multi_x = len(set(eff_x_units)) > 1 or bool(self.series_x_ranges)
 
         y_ticks = [y0 + i * y_step for i in range(divs_y + 1)]
         unit_idx = (divs_y - 1) if (self._top_left_pad > 0.0 and divs_y > 1) else divs_y
@@ -2069,33 +2886,40 @@ class PlotWidget(QWidget):
             p.save()
             p.setClipRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
 
-            # 1. Память (MEM) пунктиром на заднем плане (в масштабе своей кривой)
-            if self.memory and self.memory_visible and self.math_mode == "OFF":
-                for idx, ms in enumerate(self.memory):
-                    mcol = _series_color(idx, ms.color)
-                    mcol.setAlpha(115)
-                    mpen = QPen(mcol, 1.3, Qt.PenStyle.DashLine)
-                    p.setPen(mpen)
-                    p.setBrush(Qt.BrushStyle.NoBrush)
-                    mx0, mx1 = x_ranges[idx] if idx < len(x_ranges) else (x0, x1)
-                    my0, my1 = y_ranges[idx] if idx < len(y_ranges) else (y0, y1)
-                    for pts in _decimate_paths(ms.x, ms.y, mx0, mx1, my0, my1, rect):
-                        if len(pts) >= 2:
-                            path = QPainterPath(pts[0])
-                            for pt in pts[1:]:
-                                path.lineTo(pt)
-                            p.drawPath(path)
+            # 1. Память (MEM) пунктиром на заднем плане (per-curve, в масштабе своей кривой)
+            for idx, cfg in sorted(self.curve_configs.items()):
+                ms = cfg.memory
+                if ms is None or not self.curve_memory_visible(idx) or self.curve_math_mode(idx) != "OFF":
+                    continue
+                mcol = _series_color(idx, ms.color)
+                mcol.setAlpha(115)
+                mpen = QPen(mcol, 1.3, Qt.PenStyle.DashLine)
+                p.setPen(mpen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                mx0, mx1 = x_ranges[idx] if idx < len(x_ranges) else (x0, x1)
+                my0, my1 = y_ranges[idx] if idx < len(y_ranges) else (y0, y1)
+                for pts in _decimate_paths(ms.x, ms.y, mx0, mx1, my0, my1, rect):
+                    if len(pts) >= 2:
+                        path = QPainterPath(pts[0])
+                        for pt in pts[1:]:
+                            path.lineTo(pt)
+                        p.drawPath(path)
 
-            # 2. Линии пределов (LIMIT LINES)
+            # 2. Линии пределов (LIMIT LINES — per-curve, в масштабе своей кривой)
             if self.limits:
-                lim_col = _c("UI_COLOR_ERROR")
-                lim_pen = QPen(lim_col, 1.5, Qt.PenStyle.DashLine)
+                base_lim_col = _c("UI_COLOR_ERROR")
                 for lim in self.limits:
-                    lx1 = x0 if lim.x1 is None else lim.x1
-                    lx2 = x1 if lim.x2 is None else lim.x2
+                    lim_si = lim.series_index if (lim.series_index is not None and 0 <= lim.series_index < len(eff)) else None
+                    lx_lo, lx_hi = x_ranges[lim_si] if lim_si is not None else (x0, x1)
+                    lx1 = lx_lo if lim.x1 is None else lim.x1
+                    lx2 = lx_hi if lim.x2 is None else lim.x2
                     ly2 = lim.y1 if lim.y2 is None else lim.y2
-                    pt1 = self._data_to_screen(lx1, lim.y1)
-                    pt2 = self._data_to_screen(lx2, ly2)
+                    pt1 = self._data_to_screen(lx1, lim.y1, series_index=lim_si)
+                    pt2 = self._data_to_screen(lx2, ly2, series_index=lim_si)
+                    lim_col = QColor(base_lim_col)
+                    if lim_si is not None and active_si is not None and lim_si != active_si and len(eff) > 1:
+                        lim_col.setAlpha(120)
+                    lim_pen = QPen(lim_col, 1.5, Qt.PenStyle.DashLine)
                     p.setPen(lim_pen)
                     p.drawLine(pt1, pt2)
                     if lim.x1 is not None or lim.x2 is not None:
@@ -2110,7 +2934,7 @@ class PlotWidget(QWidget):
                         ty = pt1.y() + (pt2.y() - pt1.y()) * frac
                         p.drawLine(QPointF(tx, ty), QPointF(tx, ty + tick_dir))
 
-            # 3. Основные кривые (каждая в своём диапазоне Y; выбранная — поверх и толще)
+            # 3. Основные кривые (каждая в своём диапазоне X/Y; выбранная — поверх и толще)
             has_multi = len(eff) > 1
             draw_order = [i for i in range(len(eff)) if i != active_si]
             if active_si is not None:
@@ -2146,7 +2970,7 @@ class PlotWidget(QWidget):
                         for pt in pts[1:]:
                             path.lineTo(pt)
                         p.drawPath(path)
-                if self.show_points or len(s.x) == 1:
+                if self.curve_show_points(idx) or len(s.x) == 1:
                     p.setPen(Qt.PenStyle.NoPen)
                     p.setBrush(col)
                     vis_pts: list[QPointF] = []
@@ -2174,8 +2998,9 @@ class PlotWidget(QWidget):
                                 p.drawEllipse(pt, pt_r_small, pt_r_small)
                                 last_x = pt.x()
 
-            # 3b. Подписи значений точек (в единице и масштабе своей кривой)
-            if self.show_point_values and eff and (x1 != x0):
+            # 3b. Подписи значений точек (per-curve, в единице и масштабе своей кривой)
+            val_curve_idxs = [i for i in range(len(eff)) if self.curve_show_point_values(i)]
+            if val_curve_idxs:
                 val_font = self._font
                 p.setFont(val_font)
                 vfm = fm
@@ -2183,14 +3008,16 @@ class PlotWidget(QWidget):
                 placed_rects: list[QRectF] = []
                 rx, rw = rect.left(), rect.width()
                 rb, rh = rect.bottom(), rect.height()
-                x_span = x1 - x0
                 pill_bg = _c("UI_COLOR_BACKGROUND")
                 pill_bg.setAlpha(205)
 
-                for idx, s in enumerate(eff):
+                for idx in val_curve_idxs:
+                    s = eff[idx]
+                    sx0, sx1 = x_ranges[idx] if idx < len(x_ranges) else (x0, x1)
                     sy0, sy1 = y_ranges[idx] if idx < len(y_ranges) else (y0, y1)
+                    x_span = sx1 - sx0
                     y_span = sy1 - sy0
-                    if y_span == 0.0:
+                    if x_span == 0.0 or y_span == 0.0:
                         continue
                     s_yu = eff_y_units[idx] if idx < len(eff_y_units) else axis_y_unit
                     col = _series_color(idx, s.color)
@@ -2198,9 +3025,9 @@ class PlotWidget(QWidget):
                     for xv, yv in zip(s.x, s.y):
                         if not (math.isfinite(xv) and math.isfinite(yv)):
                             continue
-                        if xv < x0 or xv > x1:
+                        if xv < sx0 or xv > sx1:
                             continue
-                        px = rx + (xv - x0) / x_span * rw
+                        px = rx + (xv - sx0) / x_span * rw
                         py = rb - (yv - sy0) / y_span * rh
                         if rect.top() <= py <= rect.bottom():
                             vis_raw.append((px, py, yv))
@@ -2217,6 +3044,7 @@ class PlotWidget(QWidget):
 
                     last_px = -1e9
                     last_py = -1e9
+                    has_pts = self.curve_show_points(idx)
                     for px, py, yv in vis_raw:
                         if math.hypot(px - last_px, py - last_py) < min_dist_px:
                             continue
@@ -2236,7 +3064,7 @@ class PlotWidget(QWidget):
                                 break
                         if chosen is None:
                             continue
-                        if not self.show_points:
+                        if not has_pts:
                             p.setPen(Qt.PenStyle.NoPen)
                             p.setBrush(col)
                             p.drawEllipse(QPointF(px, py), 2.4, 2.4)
@@ -2249,13 +3077,9 @@ class PlotWidget(QWidget):
                         last_px, last_py = px, py
                 p.setFont(self._font)
 
-            # 3c. Режим автопоиска всех пиков (в масштабе и единице активной кривой)
-            if self.show_peaks and eff and (x1 != x0):
-                pk_si = active_si if active_si is not None else 0
-                pk_series = eff[pk_si]
-                pk_yu = eff_y_units[pk_si] if pk_si < len(eff_y_units) else axis_y_unit
-                pk_col = _series_color(pk_si, pk_series.color)
-                found_peaks = self._find_peaks(pk_series, xr)
+            # 3c. Режим автопоиска всех пиков (per-curve, в масштабе и единице своей кривой)
+            pk_curve_idxs = [i for i in range(len(eff)) if self.curve_show_peaks(i)]
+            if pk_curve_idxs:
                 pk_font = self._font
                 p.setFont(pk_font)
                 pfm = fm
@@ -2263,45 +3087,56 @@ class PlotWidget(QWidget):
                 pk_bg = _c("UI_COLOR_BACKGROUND")
                 pk_bg.setAlpha(225)
                 pk_placed: list[QRectF] = []
-                for pk_x, pk_y in found_peaks:
-                    pt = self._data_to_screen(pk_x, pk_y, series_index=pk_si)
-                    if not rect.contains(pt):
+                for pk_si in pk_curve_idxs:
+                    pk_series = eff[pk_si]
+                    pk_xr = x_ranges[pk_si] if pk_si < len(x_ranges) else xr
+                    if pk_xr[1] == pk_xr[0]:
                         continue
-                    p.setPen(QPen(_c("UI_COLOR_BACKGROUND"), 1.4))
-                    p.setBrush(pk_col)
-                    p.drawEllipse(pt, 3.6, 3.6)
-
-                    y_part = _fmt_point_label(pk_y, pk_yu)
-                    if pk_yu and pk_yu not in _SI_UNITS:
-                        y_part = f"{y_part} {pk_yu}"
-                    pk_txt = f"{_fmt_value(pk_x, self.x_unit)}, {y_part}"
-                    lw = pfm.horizontalAdvance(pk_txt) + 10.0
-                    lx = max(rect.left() + 3.0, min(pt.x() - lw / 2.0, rect.right() - lw - 3.0))
-                    above_y = pt.y() - pk_h - 7.0
-                    below_y = pt.y() + 7.0
-                    cand_ys = (above_y, below_y) if above_y >= rect.top() + 2.0 else (below_y, above_y)
-                    chosen_pk: QRectF | None = None
-                    for cy in cand_ys:
-                        if cy < rect.top() + 1.0 or cy + pk_h > rect.bottom() - 1.0:
+                    pk_xu = eff_x_units[pk_si] if pk_si < len(eff_x_units) else axis_x_unit
+                    pk_yu = eff_y_units[pk_si] if pk_si < len(eff_y_units) else axis_y_unit
+                    pk_col = _series_color(pk_si, pk_series.color)
+                    found_peaks = self._find_peaks(pk_series, pk_xr)
+                    for pk_x, pk_y in found_peaks:
+                        pt = self._data_to_screen(pk_x, pk_y, series_index=pk_si)
+                        if not rect.contains(pt):
                             continue
-                        cand = QRectF(lx, cy, lw, pk_h)
-                        if not any(cand.intersects(pr) for pr in pk_placed):
-                            chosen_pk = cand
-                            break
-                    if chosen_pk is None:
-                        continue
-                    p.setPen(QPen(pk_col, 0.9))
-                    p.setBrush(pk_bg)
-                    p.drawRoundedRect(chosen_pk, 4.0, 4.0)
-                    p.setPen(_c("UI_COLOR_TEXT"))
-                    p.drawText(chosen_pk, Qt.AlignmentFlag.AlignCenter, pk_txt)
-                    pk_placed.append(chosen_pk.adjusted(-3.0, -2.0, 3.0, 2.0))
+                        p.setPen(QPen(_c("UI_COLOR_BACKGROUND"), 1.4))
+                        p.setBrush(pk_col)
+                        p.drawEllipse(pt, 3.6, 3.6)
+
+                        y_part = _fmt_point_label(pk_y, pk_yu)
+                        if pk_yu and pk_yu not in _SI_UNITS:
+                            y_part = f"{y_part} {pk_yu}"
+                        pk_txt = f"{_fmt_value(pk_x, pk_xu)}, {y_part}"
+                        lw = pfm.horizontalAdvance(pk_txt) + 10.0
+                        lx = max(rect.left() + 3.0, min(pt.x() - lw / 2.0, rect.right() - lw - 3.0))
+                        above_y = pt.y() - pk_h - 7.0
+                        below_y = pt.y() + 7.0
+                        cand_ys = (above_y, below_y) if above_y >= rect.top() + 2.0 else (below_y, above_y)
+                        chosen_pk: QRectF | None = None
+                        for cy in cand_ys:
+                            if cy < rect.top() + 1.0 or cy + pk_h > rect.bottom() - 1.0:
+                                continue
+                            cand = QRectF(lx, cy, lw, pk_h)
+                            if not any(cand.intersects(pr) for pr in pk_placed):
+                                chosen_pk = cand
+                                break
+                        if chosen_pk is None:
+                            continue
+                        p.setPen(QPen(pk_col, 0.9))
+                        p.setBrush(pk_bg)
+                        p.drawRoundedRect(chosen_pk, 4.0, 4.0)
+                        p.setPen(_c("UI_COLOR_TEXT"))
+                        p.drawText(chosen_pk, Qt.AlignmentFlag.AlignCenter, pk_txt)
+                        pk_placed.append(chosen_pk.adjusted(-3.0, -2.0, 3.0, 2.0))
                 p.setFont(self._font)
 
             # 4. Локальные маркеры на кривых (в масштабе и единице своей кривой)
             resolved: dict[str, tuple[float, float]] = {}
             for m in self.markers:
-                pos_xy = self.resolve_marker(m, eff, xr)
+                m_si = max(0, min(m.series_index, len(eff) - 1))
+                m_xr = x_ranges[m_si] if m_si < len(x_ranges) else xr
+                pos_xy = self.resolve_marker(m, eff, m_xr)
                 if pos_xy is not None:
                     resolved[m.name] = pos_xy
 
@@ -2312,6 +3147,7 @@ class PlotWidget(QWidget):
                     continue
                 mx, yv = pos_xy
                 si = max(0, min(m.series_index, len(eff) - 1))
+                m_xu = eff_x_units[si] if si < len(eff_x_units) else axis_x_unit
                 m_yu = eff_y_units[si] if si < len(eff_y_units) else axis_y_unit
                 mcol = _series_color(si, eff[si].color)
                 pt = self._data_to_screen(mx, yv, series_index=si)
@@ -2333,12 +3169,12 @@ class PlotWidget(QWidget):
                 trk_tag = f" [{m.track}]" if m.track else ""
                 if m.delta_ref and m.delta_ref in resolved:
                     ref_x, ref_y = resolved[m.delta_ref]
-                    dx_txt = _fmt_signed_value(mx - ref_x, self.x_unit)
+                    dx_txt = _fmt_signed_value(mx - ref_x, m_xu)
                     dy_unit = "dB" if m_yu == "dBm" else m_yu
                     dy_txt = _fmt_signed_value(yv - ref_y, dy_unit)
                     marker_lines.append((mcol, f"Δ{m.name}-{m.delta_ref}{trk_tag}: {dx_txt}  {dy_txt}"))
                     continue
-                marker_lines.append((mcol, f"{m.name}{trk_tag}: {_fmt_value(mx, self.x_unit)}  {_fmt_value(yv, m_yu)}"))
+                marker_lines.append((mcol, f"{m.name}{trk_tag}: {_fmt_value(mx, m_xu)}  {_fmt_value(yv, m_yu)}"))
 
             # Подписи значений осей X и Y внутри области графика (поверх кривых, под оверлеями)
             self._draw_axis_labels(p, rect, fm, y_labels, y_lbl_col, x_lbl_col, c_panel, x0, x1, x_step, divs_y, axis_x_unit)
@@ -2372,7 +3208,7 @@ class PlotWidget(QWidget):
                                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
 
             # Плашка PASS / FAIL для лимитов (сверху справа)
-            lim_ok = self.evaluate_limits(eff, xr, eff_y_units)
+            lim_ok = self.evaluate_limits(eff, xr, eff_y_units, x_ranges)
             top_right_bottom = rect.top() + 8.0
             if lim_ok is not None:
                 badge = "PASS" if lim_ok else "FAIL"
@@ -2387,41 +3223,56 @@ class PlotWidget(QWidget):
                 p.setPen(QColor("#ffffff"))
                 p.drawText(pill, Qt.AlignmentFlag.AlignCenter, badge)
 
-            # Плашка анализа (в единице активной кривой) + мягкая подсветка диапазона X
-            if self.analysis_metrics and eff:
-                an_idx = active_si if active_si is not None else 0
-                s0 = eff[an_idx]
-                an_yu = eff_y_units[an_idx] if an_idx < len(eff_y_units) else axis_y_unit
-                t0 = Trace(list(s0.x), list(s0.y), self.x_unit, an_yu)
-                use_xf = self._analysis_x_set is not None and not self._analysis_x_set.is_empty
-                if use_xf:
-                    tint = _c("UI_COLOR_INVERT")
-                    tint.setAlpha(18)
-                    edge = _c("UI_COLOR_BORDER_LIGHT")
-                    edge.setAlpha(120)
-                    for iv_lo, iv_hi in self._analysis_x_set.intervals(x0, x1):
-                        px1 = self._data_to_screen(iv_lo, y0).x()
-                        px2 = self._data_to_screen(iv_hi, y0).x()
-                        if px2 - px1 >= 1.0:
-                            p.setPen(Qt.PenStyle.NoPen)
-                            p.setBrush(tint)
-                            p.drawRect(QRectF(px1, rect.top(), px2 - px1, rect.height()))
-                            p.setPen(QPen(edge, 1.0, Qt.PenStyle.DotLine))
-                            p.drawLine(QPointF(px1, rect.top()), QPointF(px1, rect.bottom()))
-                            p.drawLine(QPointF(px2, rect.top()), QPointF(px2, rect.bottom()))
-                        else:
-                            p.setPen(QPen(edge, 1.2, Qt.PenStyle.DashLine))
-                            p.drawLine(QPointF(px1, rect.top()), QPointF(px1, rect.bottom()))
-                    stats = analyze_trace(t0, x_filter=self._analysis_x_set)
-                else:
-                    stats = analyze_trace(t0, x_range=xr)
-                rows = format_analysis(stats, self.analysis_metrics, self.x_unit, an_yu)
-                if rows:
-                    show_hdr = len(eff) > 1 and (active_si is not None or is_multi_scale) and bool(s0.name)
+            # Плашка анализа (per-curve, со всеми кривыми у которых включён анализ) + мягкая подсветка диапазона X
+            if eff:
+                an_groups: list[tuple[str, QColor | None, list[str]]] = []
+                shaded_keys: set[tuple[tuple[float, float], str]] = set()
+                for idx, s_an in enumerate(eff):
+                    metrics = self.curve_analysis_metrics(idx)
+                    if not metrics:
+                        continue
+                    an_xu = eff_x_units[idx] if idx < len(eff_x_units) else axis_x_unit
+                    an_yu = eff_y_units[idx] if idx < len(eff_y_units) else axis_y_unit
+                    an_xr = x_ranges[idx] if idx < len(x_ranges) else xr
+                    t_an = Trace(list(s_an.x), list(s_an.y), an_xu, an_yu)
+                    x_set = self.curve_analysis_x_set(idx, an_xu)
+                    use_xf = x_set is not None and not x_set.is_empty
+                    if use_xf:
+                        should_shade = (active_si is None or active_si == idx)
+                        shade_key = (an_xr, self.curve_analysis_x_expr(idx))
+                        if should_shade and shade_key not in shaded_keys:
+                            shaded_keys.add(shade_key)
+                            tint = _series_color(idx, s_an.color) if len(eff) > 1 else _c("UI_COLOR_INVERT")
+                            tint.setAlpha(20)
+                            edge = _series_color(idx, s_an.color) if len(eff) > 1 else _c("UI_COLOR_BORDER_LIGHT")
+                            edge.setAlpha(115)
+                            for iv_lo, iv_hi in x_set.intervals(an_xr[0], an_xr[1]):
+                                px1 = self._data_to_screen(iv_lo, y0, series_index=idx).x()
+                                px2 = self._data_to_screen(iv_hi, y0, series_index=idx).x()
+                                if px2 - px1 >= 1.0:
+                                    p.setPen(Qt.PenStyle.NoPen)
+                                    p.setBrush(tint)
+                                    p.drawRect(QRectF(px1, rect.top(), px2 - px1, rect.height()))
+                                    p.setPen(QPen(edge, 1.0, Qt.PenStyle.DotLine))
+                                    p.drawLine(QPointF(px1, rect.top()), QPointF(px1, rect.bottom()))
+                                    p.drawLine(QPointF(px2, rect.top()), QPointF(px2, rect.bottom()))
+                                else:
+                                    p.setPen(QPen(edge, 1.2, Qt.PenStyle.DashLine))
+                                    p.drawLine(QPointF(px1, rect.top()), QPointF(px1, rect.bottom()))
+                        stats = analyze_trace(t_an, x_filter=x_set)
+                    else:
+                        stats = analyze_trace(t_an, x_range=an_xr)
+                    rows = format_analysis(stats, metrics, an_xu, an_yu)
+                    if rows:
+                        show_hdr = len(eff) > 1 and bool(s_an.name)
+                        an_groups.append((
+                            s_an.name if show_hdr else "",
+                            _series_color(idx, s_an.color) if show_hdr else None,
+                            rows,
+                        ))
+                if an_groups:
                     self._draw_analysis_box(
-                        p, rect, rows,
-                        header_name=s0.name if show_hdr else "",
-                        header_col=_series_color(an_idx, s0.color) if show_hdr else None,
+                        p, rect, an_groups,
                         top_obstacle=top_right_bottom,
                         bottom_inset=x_inset,
                     )
@@ -2447,7 +3298,7 @@ class PlotWidget(QWidget):
             self.width(), self.height(), dpr, current_theme(), self._data_version,
             self.show_grid, self.show_points, self.show_point_values, self.show_peaks,
             self.show_axis_labels, self.draw_frame, self.divs_y, self.manual_x_range, self.manual_y_range,
-            syr_key, self.active_series_index,
+            sxr_key, syr_key, self.active_series_index,
             self._legend_scroll_idx, round(self._chips_scroll_x, 1),
             round(self._top_right_pad, 1), round(self._top_left_pad, 1), round(self.top_pad, 1), ov_key,
         )
@@ -2480,12 +3331,12 @@ class PlotWidget(QWidget):
             self._draw_legend_action_row(p, self._legend_more_hit, self._legend_more_text, hovered=True)
 
         if self._chip_hover is not None:
-            for _hit_r, cid, lbl, _cb, full_r in self._chip_hits:
+            for _hit_r, cid, lbl, _cb, full_r, acc in self._chip_hits:
                 if cid == self._chip_hover:
                     p.save()
                     if self._chips_max_scroll > 0.0 and self._chips_strip_rect.isValid():
                         p.setClipRect(self._chips_strip_rect)
-                    self._draw_setting_chip(p, full_r, lbl, hovered=True)
+                    self._draw_setting_chip(p, full_r, lbl, hovered=True, accent_col=acc)
                     p.restore()
                     break
 
@@ -2573,7 +3424,7 @@ class PlotWidget(QWidget):
         return None
 
     def _hit_chip(self, pos: QPointF) -> tuple[str, Callable[[], None]] | None:
-        for hit_r, cid, _lbl, cb, _full_r in self._chip_hits:
+        for hit_r, cid, _lbl, cb, _full_r, _acc in self._chip_hits:
             if hit_r.contains(pos):
                 return cid, cb
         return None
@@ -2659,7 +3510,10 @@ class PlotWidget(QWidget):
                 or (e.button() == Qt.MouseButton.LeftButton and e.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
             if self._plot_rect.contains(pos):
                 active_si = self._active_series_idx(self.series)
-                self._pan_origin = (pos, self._cur_x_range, self._cur_y_range, list(self._cur_y_ranges), active_si)
+                self._pan_origin = (
+                    pos, self._cur_x_range, self._cur_y_range,
+                    list(self._cur_x_ranges), list(self._cur_y_ranges), active_si,
+                )
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 e.accept()
                 return
@@ -2693,7 +3547,7 @@ class PlotWidget(QWidget):
         if self._dragging_marker is not None:
             r = self._plot_rect
             if r.width() > 1:
-                x0, x1 = self._cur_x_range
+                x0, x1 = self._x_range_for(self._dragging_marker.series_index)
                 clamped_x = max(r.left(), min(pos.x(), r.right()))
                 xv = x0 + (clamped_x - r.left()) / r.width() * (x1 - x0)
                 self._dragging_marker.x = xv
@@ -2704,12 +3558,22 @@ class PlotWidget(QWidget):
             e.accept()
             return
         if self._pan_origin is not None:
-            start_pos, (x0, x1), (y0, y1), orig_y_ranges, pan_si = self._pan_origin
+            start_pos, (x0, x1), (y0, y1), orig_x_ranges, orig_y_ranges, pan_si = self._pan_origin
             r = self._plot_rect
             if r.width() > 1 and r.height() > 1:
-                dx = (pos.x() - start_pos.x()) / r.width() * (x1 - x0)
+                dx_frac = (pos.x() - start_pos.x()) / r.width()
                 dy_frac = (pos.y() - start_pos.y()) / r.height()
-                self.manual_x_range = (x0 - dx, x1 - dx)
+                if len(set(self._cur_x_units)) <= 1 and not self.series_x_ranges:
+                    dx = dx_frac * (x1 - x0)
+                    self.manual_x_range = (x0 - dx, x1 - dx)
+                elif pan_si is not None and 0 <= pan_si < len(orig_x_ranges):
+                    sx0, sx1 = orig_x_ranges[pan_si]
+                    dx = dx_frac * (sx1 - sx0)
+                    self.series_x_ranges[pan_si] = (sx0 - dx, sx1 - dx)
+                else:
+                    for idx, (sx0, sx1) in enumerate(orig_x_ranges):
+                        dx = dx_frac * (sx1 - sx0)
+                        self.series_x_ranges[idx] = (sx0 - dx, sx1 - dx)
                 if pan_si is not None and 0 <= pan_si < len(orig_y_ranges):
                     sy0, sy1 = orig_y_ranges[pan_si]
                     dy = dy_frac * (sy1 - sy0)
@@ -2838,8 +3702,19 @@ class PlotWidget(QWidget):
         factor = 0.85 if dy > 0 else 1.0 / 0.85
         cx, cy = data_pt
         if shift_held:
-            x0, x1 = self._cur_x_range
-            self.manual_x_range = (cx - (cx - x0) * factor, cx + (x1 - cx) * factor)
+            active_si = self._active_series_idx(self.series)
+            if len(set(self._cur_x_units)) <= 1 and not self.series_x_ranges:
+                x0, x1 = self._cur_x_range
+                self.manual_x_range = (cx - (cx - x0) * factor, cx + (x1 - cx) * factor)
+            elif active_si is not None and active_si < len(self._cur_x_ranges):
+                sx0, sx1 = self._cur_x_ranges[active_si]
+                scx = sx0 + (pos.x() - self._plot_rect.left()) / self._plot_rect.width() * (sx1 - sx0)
+                self.series_x_ranges[active_si] = (scx - (scx - sx0) * factor, scx + (sx1 - scx) * factor)
+            else:
+                frac_x = (pos.x() - self._plot_rect.left()) / self._plot_rect.width()
+                for idx, (sx0, sx1) in enumerate(self._cur_x_ranges):
+                    scx = sx0 + frac_x * (sx1 - sx0)
+                    self.series_x_ranges[idx] = (scx - (scx - sx0) * factor, scx + (sx1 - scx) * factor)
         else:
             active_si = self._active_series_idx(self.series)
             if active_si is not None and active_si < len(self._cur_y_ranges):
@@ -2888,9 +3763,14 @@ class PlotSettingsWindow(Window):
 
     STYLE_SHEET_EXTRA = (
         render_qss("""
-            QScrollArea#plotSetScroll, QWidget#plotSetHost {
+            QWidget#plotSetRoot, QScrollArea#plotSetScroll, QWidget#plotSetHost {
                 background-color: $UI_COLOR_BACKGROUND;
                 border: none;
+            }
+            QWidget#plotTargetBar {
+                background-color: $UI_COLOR_PANEL;
+                border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
+                border-radius: ${UI_BORDER_RADIUS_PX}px;
             }
             QWidget#plotSecBody {
                 background: transparent;
@@ -2944,19 +3824,19 @@ class PlotSettingsWindow(Window):
                 padding: 4px 2px;
             }
         """)
-        + "\n" + button_qss("QWidget#plotSetHost")
-        + "\n" + input_qss("QWidget#plotSetHost")
+        + "\n" + button_qss("QWidget#plotSetRoot")
+        + "\n" + input_qss("QWidget#plotSetRoot")
         + "\n" + scrollbar_qss("QScrollArea#plotSetScroll ")
         + "\n" + render_qss("""
-            QWidget#plotSetHost QPushButton[compact="true"] {
-                padding: 0 4px;
+            QWidget#plotSetRoot QPushButton[compact="true"] {
+                padding: 0 5px;
             }
-            QWidget#plotSetHost QPushButton[square="true"] {
+            QWidget#plotSetRoot QPushButton[square="true"] {
                 min-width: ${UI_COMPACT_HEIGHT_PX}px; max-width: ${UI_COMPACT_HEIGHT_PX}px;
                 min-height: ${UI_COMPACT_HEIGHT_PX}px; max-height: ${UI_COMPACT_HEIGHT_PX}px;
                 padding: 0;
             }
-            QWidget#plotSetHost PanelCloseButton {
+            QWidget#plotSetRoot PanelCloseButton {
                 min-width: ${UI_COMPACT_HEIGHT_PX}px; max-width: ${UI_COMPACT_HEIGHT_PX}px;
                 min-height: ${UI_COMPACT_HEIGHT_PX}px; max-height: ${UI_COMPACT_HEIGHT_PX}px;
                 background-color: $UI_COLOR_BACKGROUND;
@@ -2964,7 +3844,7 @@ class PlotSettingsWindow(Window):
                 border-radius: ${UI_BORDER_RADIUS_PX}px;
                 padding: 0;
             }
-            QWidget#plotSetHost PanelCloseButton:hover {
+            QWidget#plotSetRoot PanelCloseButton:hover {
                 background-color: $UI_COLOR_INVERT_HOVER;
                 border-color: $UI_COLOR_INVERT_HOVER;
             }
@@ -3005,6 +3885,7 @@ class PlotSettingsWindow(Window):
         self._marker_sig: tuple | None = None
         self._limit_sig: tuple | None = None
         self._trace_sig: tuple | None = None
+        self._last_active_si: int | None | object = _UNSET
         self._size_key = "WINDOW_SIZE/PlotSettingsWindow"
         self._pos_key = "WINDOW_POS/PlotSettingsWindow"
         self._heights_key = "WINDOW_HEIGHTS/PlotSettingsWindow"
@@ -3028,20 +3909,49 @@ class PlotSettingsWindow(Window):
         self.titleBar.insert_control_widget(self.expand_all_button)
         self.titleBar.insert_control_widget(self.collapse_all_button)
 
+        root_host = QWidget(self)
+        root_host.setObjectName("plotSetRoot")
+        root_host.setStyleSheet(self.STYLE_SHEET_EXTRA)
+        rhl = QVBoxLayout(root_host)
+        rhl.setContentsMargins(0, 0, 0, 0)
+        rhl.setSpacing(8)
+
+        # Закреплённый сверху селектор целевой кривой (All / S21 / S11 / ...)
+        self._target_bar = QWidget(root_host)
+        self._target_bar.setObjectName("plotTargetBar")
+        self._target_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        tbl = QHBoxLayout(self._target_bar)
+        tbl.setContentsMargins(8, 6, 8, 6)
+        tbl.setSpacing(6)
+        target_lbl = QLabel("Curve", self._target_bar)
+        target_lbl.setObjectName("rowLbl")
+        target_lbl.setMinimumWidth(46)
+        tbl.addWidget(target_lbl)
+        self._trace_host = self._sec_body()
+        self._trace_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._trace_lay = QGridLayout(self._trace_host)
+        self._trace_lay.setContentsMargins(0, 0, 0, 0)
+        self._trace_lay.setSpacing(4)
+        self._trace_buttons: dict[int | None, QPushButton] = {}
+        self._trace_meta: dict[int, tuple[str | None, bool]] = {}
+        tbl.addWidget(self._trace_host, 1)
+        rhl.addWidget(self._target_bar)
+        _theme.on_theme_changed(self._on_theme_changed)
+
         host = QWidget()
         host.setObjectName("plotSetHost")
         hl = QVBoxLayout(host)
         hl.setContentsMargins(0, 0, 4, 0)
         hl.setSpacing(8)
 
-        scroll = QScrollArea(self)
+        scroll = QScrollArea(root_host)
         scroll.setObjectName("plotSetScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(host)
-        scroll.setStyleSheet(self.STYLE_SHEET_EXTRA)
+        rhl.addWidget(scroll, 1)
 
         self.sections: dict[str, CollapsibleSection] = {}
 
@@ -3061,7 +3971,9 @@ class PlotSettingsWindow(Window):
         self.x_auto_btn = self._toggle_btn("AUTO", self._on_x_auto)
         self.x_min_edit = CommitLineEdit("X axis minimum (supports SI: 1G, 500M)", self._on_x_edit)
         self.x_max_edit = CommitLineEdit("X axis maximum (supports SI: 6G, 2.4G)", self._on_x_edit)
-        sl.addLayout(self._row("X Axis", self.x_min_edit, self.x_max_edit, self.x_auto_btn))
+        x_row = self._row("X Axis", self.x_min_edit, self.x_max_edit, self.x_auto_btn)
+        self._x_axis_lbl: QLabel = x_row.itemAt(0).widget()
+        sl.addLayout(x_row)
 
         self.reset_btn = self._action_btn("Reset View (R)", self._on_reset_view)
         sl.addWidget(self.reset_btn)
@@ -3079,22 +3991,20 @@ class PlotSettingsWindow(Window):
 
         self.grid_btn = self._toggle_btn("Grid", self._on_grid_toggled)
         self.grid_btn.setProperty("compact", True)
-        self.points_btn = self._toggle_btn("Points", self._on_points_toggled)
-        self.points_btn.setProperty("compact", True)
-        self.values_btn = self._toggle_btn("Values", self._on_values_toggled)
-        self.values_btn.setProperty("compact", True)
-        self.values_btn.setToolTip("Show point Y values on curves with automatic anti-overlap spacing")
         self.labels_btn = self._toggle_btn("Labels", self._on_labels_toggled)
         self.labels_btn.setProperty("compact", True)
-        self.labels_btn.setToolTip("Show or hide X and Y axis tick labels")
-        dl.addLayout(self._row("Show", self.grid_btn, self.points_btn, self.values_btn, self.labels_btn))
+        self.labels_btn.setToolTip("Show or hide X and Y axis tick labels (graph-wide)")
+        dl.addLayout(self._row("Plot", self.grid_btn, self.labels_btn))
 
-        self._trace_host = self._sec_body()
-        self._trace_lay = QGridLayout(self._trace_host)
-        self._trace_lay.setContentsMargins(0, 0, 0, 0)
-        self._trace_lay.setSpacing(4)
-        self._trace_buttons: dict[int | None, QPushButton] = {}
-        dl.addLayout(self._row("Cursor", self._trace_host))
+        self.points_btn = self._toggle_btn("Points", self._on_points_toggled)
+        self.points_btn.setProperty("compact", True)
+        self.points_btn.setToolTip("Show data point dots on the selected curve (or all curves in All mode)")
+        self.values_btn = self._toggle_btn("Values", self._on_values_toggled)
+        self.values_btn.setProperty("compact", True)
+        self.values_btn.setToolTip("Show point Y values on the selected curve with anti-overlap spacing")
+        curve_disp_row = self._row("Curve", self.points_btn, self.values_btn)
+        self._curve_disp_lbl: QLabel = curve_disp_row.itemAt(0).widget()
+        dl.addLayout(curve_disp_row)
 
         self.div_buttons: dict[int, QPushButton] = {}
         div_widgets: list[QWidget] = []
@@ -3282,7 +4192,7 @@ class PlotSettingsWindow(Window):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, WINDOW_BAR_HEIGHT + 8, 8, 8)
         root.setSpacing(0)
-        root.addWidget(scroll, 1)
+        root.addWidget(root_host, 1)
 
         self.setMinimumWidth(360)
         self.setMinimumHeight(340)
@@ -3345,6 +4255,7 @@ class PlotSettingsWindow(Window):
         self._marker_sig = None
         self._limit_sig = None
         self._trace_sig = None
+        self._last_active_si = _UNSET
         self.setWindowTitle(f"{name} · SETTINGS")
         plot.view_changed.connect(self.sync_from_plot)
         self.sync_from_plot(force=True)
@@ -3354,70 +4265,155 @@ class PlotSettingsWindow(Window):
         if plot is None or sip.isdeleted(self) or sip.isdeleted(plot):
             return
         (x0, x1), (y0, y1) = plot.current_ranges()
-        eff, eff_y_unit = plot._effective_series_and_unit()
-        y_auto = plot.is_y_auto()
-        x_auto = plot.manual_x_range is None
+        eff, eff_y_units = plot._effective_series_and_units()
+        eff_x_units = [plot._series_x_unit(s) for s in eff]
         active_si = plot._active_series_idx(eff)
+        axis_si = plot._axis_series_idx(eff)
+        eff_y_unit = eff_y_units[axis_si] if (axis_si is not None and axis_si < len(eff_y_units)) else plot.y_unit
+        eff_x_unit = eff_x_units[axis_si] if (axis_si is not None and axis_si < len(eff_x_units)) else plot.x_unit
+        y_auto = plot.is_y_auto()
+        x_auto = plot.is_x_auto()
+        multi_x = len(set(eff_x_units)) > 1
+        curve_changed = (active_si != self._last_active_si)
+        if curve_changed:
+            self._last_active_si = active_si
+            self._marker_sig = None
+            self._limit_sig = None
+            for ed in (self.y_min_edit, self.y_max_edit, self.x_min_edit, self.x_max_edit,
+                       self.math_expr_edit, self.analysis_x_edit):
+                ed.set_invalid(False)
+            self._set_math_hint_error(None)
+        force_fields = force or curve_changed
+        active_name = (
+            eff[active_si].name or f"#{active_si + 1}"
+            if (active_si is not None and active_si < len(eff))
+            else ""
+        )
+
+        # Top pinned curve target selector
+        self._sync_trace_selector(plot, eff)
 
         # Scale
-        if active_si is not None and len(eff) > 1 and eff[active_si].name:
-            self._y_axis_lbl.setText(f"Y {eff[active_si].name}")
+        if active_si is not None and len(eff) > 1 and active_name:
+            self._y_axis_lbl.setText(f"Y {active_name}")
         else:
             self._y_axis_lbl.setText("Y Axis")
         self.y_auto_btn.setChecked(y_auto)
         self.y_auto_btn.setText("AUTO" if y_auto else "MAN")
-        self.y_min_edit.set_committed(_fmt_value(y0, eff_y_unit, include_unit=False), force=force)
-        self.y_max_edit.set_committed(_fmt_value(y1, eff_y_unit, include_unit=False), force=force)
+        self.y_min_edit.set_committed(_fmt_value(y0, eff_y_unit, include_unit=False), force=force_fields)
+        self.y_max_edit.set_committed(_fmt_value(y1, eff_y_unit, include_unit=False), force=force_fields)
 
+        if active_si is not None and multi_x and active_name:
+            self._x_axis_lbl.setText(f"X {active_name}")
+        else:
+            self._x_axis_lbl.setText("X Axis")
         self.x_auto_btn.setChecked(x_auto)
         self.x_auto_btn.setText("AUTO" if x_auto else "MAN")
-        self.x_min_edit.set_committed(_fmt_value(x0, plot.x_unit, include_unit=True), force=force)
-        self.x_max_edit.set_committed(_fmt_value(x1, plot.x_unit, include_unit=True), force=force)
+        self.x_min_edit.set_committed(_fmt_value(x0, eff_x_unit, include_unit=True), force=force_fields)
+        self.x_max_edit.set_committed(_fmt_value(x1, eff_x_unit, include_unit=True), force=force_fields)
 
-        # Display
+        # Display (Plot: Grid/Labels/Y Divs; Curve: Points/Values)
         self.grid_btn.setChecked(plot.show_grid)
-        self.points_btn.setChecked(plot.show_points)
-        self.values_btn.setChecked(plot.show_point_values)
         self.labels_btn.setChecked(plot.show_axis_labels)
-        self._sync_trace_selector(plot, eff)
+        if active_si is not None:
+            self._curve_disp_lbl.setText(active_name if len(active_name) <= 9 else (active_name[:8] + "…"))
+            self.points_btn.setChecked(plot.curve_show_points(active_si))
+            self.values_btn.setChecked(plot.curve_show_point_values(active_si))
+        else:
+            self._curve_disp_lbl.setText("Curve")
+            self.points_btn.setChecked(plot.any_show_points())
+            self.values_btn.setChecked(plot.any_show_point_values())
         for n, b in self.div_buttons.items():
             b.setChecked(n == plot.divs_y)
 
-        # Memory / Math
-        has_mem = bool(plot.memory)
+        # Memory / Math (per-curve)
+        if active_si is not None:
+            has_mem = plot.has_memory(active_si)
+            mem_vis = plot.is_memory_visible(active_si)
+            cur_mm = plot.curve_math_mode(active_si)
+            cur_me = plot.curve_math_expr(active_si)
+            self.mem_store_btn.setToolTip(f"Store {active_name} in memory (same as double-click on plot)")
+            mem_active = has_mem or cur_mm != "OFF"
+        else:
+            has_mem = plot.has_memory(None)
+            mem_vis = plot.is_memory_visible(None)
+            modes = {plot.curve_math_mode(i) for i in range(len(eff))} if eff else {plot.math_mode}
+            cur_mm = next(iter(modes)) if len(modes) == 1 else ""
+            exprs = {plot.curve_math_expr(i) for i in range(len(eff))} if eff else {plot.math_expr}
+            cur_me = next(iter(exprs)) if len(exprs) == 1 else plot.math_expr
+            self.mem_store_btn.setToolTip("Store all traces in memory (same as double-click on plot)")
+            mem_active = has_mem or any(m != "OFF" for m in modes)
         self.mem_show_btn.setEnabled(has_mem)
-        self.mem_show_btn.setChecked(has_mem and plot.memory_visible)
+        self.mem_show_btn.setChecked(has_mem and mem_vis)
         self.mem_clear_btn.setEnabled(has_mem)
         for mode, b in self.math_buttons.items():
-            b.setChecked(mode == plot.math_mode)
-        is_expr = plot.math_mode == "EXPR"
+            b.setChecked(mode == cur_mm)
+        is_expr = cur_mm == "EXPR"
         self.math_expr_edit.setVisible(is_expr)
         self.math_hint_lbl.setVisible(is_expr)
-        self.math_expr_edit.set_committed(plot.math_expr, force=force)
+        self.math_expr_edit.set_committed(cur_me, force=force_fields)
         if not is_expr:
             self._set_math_hint_error(None)
-        self.sections["MEMORY"].set_active(has_mem or plot.math_mode != "OFF")
+        self.sections["MEMORY"].set_active(mem_active)
 
-        # Markers
-        self.marker_peaks_btn.setChecked(plot.show_peaks)
-        self._sync_markers_list(plot, eff, eff_y_unit, force=force)
-        self.sections["MARKERS"].set_active(bool(plot.markers) or plot.show_peaks)
+        # Markers (per-curve)
+        if active_si is not None:
+            peaks_on = plot.curve_show_peaks(active_si)
+            has_mk = any(m.series_index == active_si for m in plot.markers)
+        else:
+            peaks_on = plot.any_show_peaks()
+            has_mk = bool(plot.markers)
+        self.marker_peaks_btn.setChecked(peaks_on)
+        self._sync_markers_list(plot, eff, eff_x_units, active_si, force=force_fields)
+        self.sections["MARKERS"].set_active(has_mk or peaks_on)
 
-        # Limits
-        self._sync_limits_list(plot, eff_y_unit)
-        self.sections["LIMITS"].set_active(bool(plot.limits))
+        # Limits (per-curve)
+        self._sync_limits_list(plot, eff, eff_x_units, eff_y_units, active_si)
+        if active_si is not None:
+            has_lim = any(lim.series_index == active_si for lim in plot.limits)
+        else:
+            has_lim = bool(plot.limits)
+        self.sections["LIMITS"].set_active(has_lim)
 
-        # Analysis
-        self.analysis_x_edit.set_committed(plot.analysis_x_expr, force=force)
-        active_metrics = set(plot.analysis_metrics)
+        # Analysis (per-curve)
+        if active_si is not None:
+            ax_expr = plot.curve_analysis_x_expr(active_si)
+            active_metrics = set(plot.curve_analysis_metrics(active_si))
+        else:
+            ax_exprs = {plot.curve_analysis_x_expr(i) for i in range(len(eff))} if eff else {plot.analysis_x_expr}
+            ax_expr = next(iter(ax_exprs)) if len(ax_exprs) == 1 else ""
+            active_metrics = (
+                set().union(*(plot.curve_analysis_metrics(i) for i in range(len(eff))))
+                if eff else set(plot.analysis_metrics)
+            )
+        self.analysis_x_edit.set_committed(ax_expr, force=force_fields)
         for k, b in self.analysis_buttons.items():
             b.setChecked(k in active_metrics)
-        self.sections["ANALYSIS"].set_active(bool(active_metrics))
+        self.sections["ANALYSIS"].set_active(bool(active_metrics) or bool(ax_expr))
+
+    def _on_theme_changed(self, _theme_name: str) -> None:
+        if sip.isdeleted(self):
+            return
+        self._trace_sig = None
+        if self._plot is not None and not sip.isdeleted(self._plot):
+            self.sync_from_plot()
+
+    @staticmethod
+    def _swatch_for_btn(idx: int, explicit_col: str | None, *, dashed: bool, checked: bool) -> QIcon:
+        col = _series_color(idx, explicit_col)
+        if checked:
+            inv = _c("UI_COLOR_INVERT")
+            lum_c = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue()
+            lum_bg = 0.299 * inv.red() + 0.587 * inv.green() + 0.114 * inv.blue()
+            if abs(lum_c - lum_bg) < 75.0:
+                col = _c("UI_COLOR_TEXT_INVERSE")
+        return _swatch_icon(col, dashed=dashed)
 
     def _sync_trace_selector(self, plot: PlotWidget, eff: Sequence[PlotSeries]) -> None:
-        names = tuple((s.name or f"#{i + 1}") for i, s in enumerate(eff))
-        if names != self._trace_sig:
-            self._trace_sig = names
+        self._target_bar.setVisible(bool(eff))
+        sig = tuple((s.name or f"#{i + 1}", s.color, bool(s.dashed), current_theme()) for i, s in enumerate(eff))
+        if sig != self._trace_sig:
+            self._trace_sig = sig
             while self._trace_lay.count():
                 item = self._trace_lay.takeAt(0)
                 w = item.widget()
@@ -3426,26 +4422,36 @@ class PlotSettingsWindow(Window):
                     w.setParent(None)
                     w.deleteLater()
             self._trace_buttons = {}
+            self._trace_meta = {}
             all_btns: list[QPushButton] = []
-            free_btn = self._toggle_btn("Free", lambda _c=False: self._on_active_series(None))
-            free_btn.setProperty("compact", True)
-            free_btn.setToolTip("Free crosshair cursor (click a trace to snap to its points)")
-            self._trace_buttons[None] = free_btn
-            all_btns.append(free_btn)
-            for idx, nm in enumerate(names):
+            all_btn = self._toggle_btn("All", lambda _c=False: self._on_active_series(None))
+            all_btn.setProperty("compact", True)
+            all_btn.setToolTip("Apply settings to all curves (free crosshair cursor)")
+            self._trace_buttons[None] = all_btn
+            all_btns.append(all_btn)
+            for idx, s in enumerate(eff):
+                nm = s.name or f"#{idx + 1}"
                 b = self._toggle_btn(nm, lambda _c=False, i=idx: self._on_active_series(i))
+                b.setIconSize(QSize(12, 12))
                 b.setProperty("compact", True)
-                b.setToolTip(f"Snap crosshair to {nm} points (also clickable in plot legend)")
+                b.setToolTip(f"Configure {nm} independently and snap crosshair to its points")
                 self._trace_buttons[idx] = b
+                self._trace_meta[idx] = (s.color, bool(s.dashed))
                 all_btns.append(b)
             cols = len(all_btns) if len(all_btns) <= 4 else 3
             for pos, btn in enumerate(all_btns):
                 self._trace_lay.addWidget(btn, pos // cols, pos % cols)
             for c_idx in range(cols):
                 self._trace_lay.setColumnStretch(c_idx, 1)
+            self._trace_host.updateGeometry()
+            self._target_bar.updateGeometry()
         active = plot._active_series_idx(eff)
         for key, b in self._trace_buttons.items():
-            b.setChecked(key == active)
+            is_chk = (key == active)
+            b.setChecked(is_chk)
+            if key is not None and key in self._trace_meta:
+                exp_col, is_dashed = self._trace_meta[key]
+                b.setIcon(self._swatch_for_btn(key, exp_col, dashed=is_dashed, checked=is_chk))
 
     @staticmethod
     def _clear_layout(lay: QVBoxLayout) -> None:
@@ -3457,31 +4463,41 @@ class PlotSettingsWindow(Window):
                 w.setParent(None)
                 w.deleteLater()
 
-    def _sync_markers_list(self, plot: PlotWidget, eff: Sequence[PlotSeries], _eff_y_unit: str,
-                           *, force: bool = False) -> None:
-        xr, _ = plot.current_ranges()
+    def _sync_markers_list(self, plot: PlotWidget, eff: Sequence[PlotSeries], eff_x_units: Sequence[str],
+                           active_si: int | None, *, force: bool = False) -> None:
         for m in plot.markers:
-            plot.resolve_marker(m, eff, xr)
+            m_si = max(0, min(m.series_index, len(eff) - 1)) if eff else None
+            xr_m, _ = plot.current_ranges(m_si)
+            plot.resolve_marker(m, eff, xr_m)
 
+        vis_markers = (
+            [m for m in plot.markers if m.series_index == active_si]
+            if active_si is not None
+            else list(plot.markers)
+        )
         series_names = tuple((s.name or f"#{i + 1}") for i, s in enumerate(eff))
-        sig = (series_names, tuple((m.name, m.series_index, m.delta_ref, m.track) for m in plot.markers))
+        sig = (active_si, series_names, tuple((m.name, m.series_index, m.delta_ref, m.track) for m in vis_markers))
         if sig != self._marker_sig or force:
             self._marker_sig = sig
             self._clear_layout(self._markers_list_lay)
             self._marker_rows: dict[str, CommitLineEdit] = {}
-            if not plot.markers:
-                lbl = QLabel("No markers — click + Add, MAX, MIN or Peaks")
+            if not vis_markers:
+                if active_si is not None and active_si < len(series_names):
+                    stub = f"No markers on {series_names[active_si]} — click + Add, MAX, MIN or Peaks"
+                else:
+                    stub = "No markers — click + Add, MAX, MIN or Peaks"
+                lbl = QLabel(stub)
                 lbl.setObjectName("secStub")
                 self._markers_list_lay.addWidget(lbl)
             else:
                 fm = QFontMetrics(mono_font())
-                name_w = max(24, max(fm.horizontalAdvance(m.name) for m in plot.markers) + 6)
-                has_multi_series = len(eff) > 1
+                name_w = max(24, max(fm.horizontalAdvance(m.name) for m in vis_markers) + 6)
+                show_series_btn = len(eff) > 1 and active_si is None
                 series_w = (max(40, max(fm.horizontalAdvance(n) for n in series_names) + 16)
-                            if has_multi_series else 0)
+                            if show_series_btn else 0)
                 trk_w = max(40, max(fm.horizontalAdvance(t) for t in ("—", "MAX", "MIN")) + 14)
                 can_delta = len(plot.markers) > 1
-                for m in plot.markers:
+                for m in vis_markers:
                     row_w = self._sec_body()
                     rl = QHBoxLayout(row_w)
                     rl.setContentsMargins(0, 0, 0, 0)
@@ -3492,13 +4508,14 @@ class PlotSettingsWindow(Window):
                     name_lbl.setFixedWidth(name_w)
                     rl.addWidget(name_lbl)
 
+                    si = max(0, min(m.series_index, len(eff) - 1)) if eff else 0
+                    m_xu = eff_x_units[si] if si < len(eff_x_units) else plot.x_unit
                     x_edit = CommitLineEdit("Marker X position (supports SI: 3.2G)",
                                             lambda mn=m.name: self._on_marker_x_edit(mn), parent=row_w)
-                    x_edit.set_committed(_fmt_value(m.x, plot.x_unit), force=True)
+                    x_edit.set_committed(_fmt_value(m.x, m_xu), force=True)
                     rl.addWidget(x_edit, 1)
 
-                    if has_multi_series:
-                        si = max(0, min(m.series_index, len(eff) - 1))
+                    if show_series_btn:
                         s_btn = self._action_btn(series_names[si],
                                                  lambda _c=False, mn=m.name, nxt=si + 1: self._on_marker_series(mn, nxt))
                         s_btn.setProperty("compact", True)
@@ -3538,24 +4555,45 @@ class PlotSettingsWindow(Window):
                     self._marker_rows[m.name] = x_edit
                     self._markers_list_lay.addWidget(row_w)
         else:
-            for m in plot.markers:
+            for m in vis_markers:
                 x_edit = getattr(self, "_marker_rows", {}).get(m.name)
                 if x_edit is not None and not sip.isdeleted(x_edit):
-                    x_edit.set_committed(_fmt_value(m.x, plot.x_unit))
-        self.marker_clear_btn.setEnabled(bool(plot.markers))
+                    si = max(0, min(m.series_index, len(eff) - 1)) if eff else 0
+                    m_xu = eff_x_units[si] if si < len(eff_x_units) else plot.x_unit
+                    x_edit.set_committed(_fmt_value(m.x, m_xu))
+        self.marker_clear_btn.setEnabled(bool(vis_markers))
 
-    def _sync_limits_list(self, plot: PlotWidget, eff_y_unit: str) -> None:
-        sig = tuple((lim.kind, lim.y1, lim.y2, lim.x1, lim.x2) for lim in plot.limits)
+    def _sync_limits_list(self, plot: PlotWidget, eff: Sequence[PlotSeries],
+                          eff_x_units: Sequence[str], eff_y_units: Sequence[str],
+                          active_si: int | None) -> None:
+        series_names = tuple((s.name or f"#{i + 1}") for i, s in enumerate(eff))
+        vis_limits = [
+            (idx, lim) for idx, lim in enumerate(plot.limits)
+            if active_si is None or lim.series_index == active_si
+        ]
+        sig = (
+            active_si,
+            series_names,
+            tuple((idx, lim.kind, lim.y1, lim.y2, lim.x1, lim.x2, lim.series_index) for idx, lim in vis_limits),
+        )
         if sig == self._limit_sig:
             return
         self._limit_sig = sig
         self._clear_layout(self._limits_list_lay)
-        if not plot.limits:
-            lbl = QLabel("No limit lines")
+        if not vis_limits:
+            if active_si is not None and active_si < len(series_names):
+                stub = f"No limit lines on {series_names[active_si]}"
+            else:
+                stub = "No limit lines"
+            lbl = QLabel(stub)
             lbl.setObjectName("secStub")
             self._limits_list_lay.addWidget(lbl)
         else:
-            for idx, lim in enumerate(plot.limits):
+            show_series_btn = len(eff) > 1 and active_si is None
+            fm = QFontMetrics(mono_font())
+            series_w = (max(40, max(fm.horizontalAdvance(n) for n in (*series_names, "All")) + 16)
+                        if show_series_btn else 0)
+            for idx, lim in vis_limits:
                 row_w = self._sec_body()
                 rl = QHBoxLayout(row_w)
                 rl.setContentsMargins(0, 0, 0, 0)
@@ -3566,17 +4604,21 @@ class PlotSettingsWindow(Window):
                 kind_btn.setFixedWidth(54)
                 rl.addWidget(kind_btn)
 
-                y1_txt = _fmt_value(lim.y1, eff_y_unit)
+                lsi = lim.series_index if (lim.series_index is not None and 0 <= lim.series_index < len(eff)) else None
+                lim_yu = eff_y_units[lsi] if (lsi is not None and lsi < len(eff_y_units)) else plot.active_y_unit()
+                lim_xu = eff_x_units[lsi] if (lsi is not None and lsi < len(eff_x_units)) else plot.active_x_unit()
+
+                y1_txt = _fmt_value(lim.y1, lim_yu)
                 y2_val = lim.y1 if lim.y2 is None else lim.y2
-                y2_txt = _fmt_value(y2_val, eff_y_unit)
+                y2_txt = _fmt_value(y2_val, lim_yu)
                 if lim.x1 is None and lim.x2 is None:
                     if lim.y2 is None or lim.y2 == lim.y1:
                         line_txt = f"Full · {y1_txt}"
                     else:
                         line_txt = f"Full · {y1_txt} → {y2_txt}"
                 else:
-                    x1_txt = _fmt_value(lim.x1, plot.x_unit) if lim.x1 is not None else "start"
-                    x2_txt = _fmt_value(lim.x2, plot.x_unit) if lim.x2 is not None else "end"
+                    x1_txt = _fmt_value(lim.x1, lim_xu) if lim.x1 is not None else "start"
+                    x2_txt = _fmt_value(lim.x2, lim_xu) if lim.x2 is not None else "end"
                     if y2_val == lim.y1:
                         line_txt = f"{x1_txt}…{x2_txt} · {y1_txt}"
                     else:
@@ -3585,12 +4627,20 @@ class PlotSettingsWindow(Window):
                 desc.setObjectName("valLbl")
                 rl.addWidget(desc, 1)
 
+                if show_series_btn:
+                    s_lbl = series_names[lsi] if lsi is not None else "All"
+                    s_btn = self._action_btn(s_lbl, lambda _c=False, i=idx: self._on_limit_series_cycle(i))
+                    s_btn.setProperty("compact", True)
+                    s_btn.setFixedWidth(series_w)
+                    s_btn.setToolTip("Switch limit target curve (All → curves)")
+                    rl.addWidget(s_btn)
+
                 rm_btn = PanelCloseButton(row_w)
                 rm_btn.setToolTip("Remove limit line")
                 rm_btn.clicked.connect(lambda _c=False, i=idx: self._on_limit_remove(i))
                 rl.addWidget(rm_btn)
                 self._limits_list_lay.addWidget(row_w)
-        self.lim_clear_btn.setEnabled(bool(plot.limits))
+        self.lim_clear_btn.setEnabled(bool(vis_limits))
 
     # ------------------------------------------------------------ обработчики
     def _on_y_auto(self, checked: bool) -> None:
@@ -3631,9 +4681,10 @@ class PlotSettingsWindow(Window):
     def _on_x_edit(self) -> None:
         if self._plot is None:
             return
+        xu = self._plot.active_x_unit()
         try:
-            lo = _parse_axis_input(self.x_min_edit.text(), self._plot.x_unit)
-            hi = _parse_axis_input(self.x_max_edit.text(), self._plot.x_unit)
+            lo = _parse_axis_input(self.x_min_edit.text(), xu)
+            hi = _parse_axis_input(self.x_max_edit.text(), xu)
             if hi <= lo:
                 raise ValueError("max <= min")
         except ValueError:
@@ -3694,8 +4745,10 @@ class PlotSettingsWindow(Window):
         x_edit = getattr(self, "_marker_rows", {}).get(name)
         if x_edit is None:
             return
+        cur_m = next((m for m in self._plot.markers if m.name == name), None)
+        xu = self._plot.active_x_unit(cur_m.series_index if cur_m is not None else _UNSET)
         try:
-            val = _parse_axis_input(x_edit.text(), self._plot.x_unit)
+            val = _parse_axis_input(x_edit.text(), xu)
         except ValueError:
             x_edit.set_invalid(True)
             return
@@ -3723,7 +4776,7 @@ class PlotSettingsWindow(Window):
         cur_m = next((m for m in self._plot.markers if m.name == name), None)
         if cur_m is None:
             return
-        others = [m.name for m in self._plot.markers if m.name != name]
+        others = [m for m in self._plot.markers if m.name != name]
         if not others:
             btn.setChecked(False)
             return
@@ -3733,10 +4786,15 @@ class PlotSettingsWindow(Window):
             off_act = menu.addAction("Off (absolute)")
             off_act.triggered.connect(lambda _c=False, mn=name: self._on_marker_delta(mn, None))
             menu.addSeparator()
-        for ref_name in others:
-            prefix = "✓ " if cur_m.delta_ref == ref_name else "   "
-            act = menu.addAction(f"{prefix}Δ vs {ref_name}")
-            act.triggered.connect(lambda _c=False, mn=name, r=ref_name: self._on_marker_delta(mn, r))
+        n_ser = len(self._plot.series)
+        for om in others:
+            prefix = "✓ " if cur_m.delta_ref == om.name else "   "
+            s_tag = ""
+            if n_ser > 1 and om.series_index != cur_m.series_index and 0 <= om.series_index < n_ser:
+                nm = self._plot.series[om.series_index].name or f"#{om.series_index + 1}"
+                s_tag = f" ({nm})"
+            act = menu.addAction(f"{prefix}Δ vs {om.name}{s_tag}")
+            act.triggered.connect(lambda _c=False, mn=name, r=om.name: self._on_marker_delta(mn, r))
         btn.setChecked(bool(cur_m.delta_ref))
         menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
         if not sip.isdeleted(btn):
@@ -3798,6 +4856,7 @@ class PlotSettingsWindow(Window):
         for ed in (self.lim_x1_edit, self.lim_y1_edit, self.lim_x2_edit, self.lim_y2_edit):
             ed.set_invalid(False)
         yu = self._plot.active_y_unit()
+        xu = self._plot.active_x_unit()
         try:
             y1 = _parse_axis_input(self.lim_y1_edit.text(), yu)
         except ValueError:
@@ -3815,7 +4874,7 @@ class PlotSettingsWindow(Window):
         x1: float | None = None
         if x1_txt:
             try:
-                x1 = _parse_axis_input(x1_txt, self._plot.x_unit)
+                x1 = _parse_axis_input(x1_txt, xu)
             except ValueError:
                 self.lim_x1_edit.set_invalid(True)
                 return
@@ -3823,7 +4882,7 @@ class PlotSettingsWindow(Window):
         x2: float | None = None
         if x2_txt:
             try:
-                x2 = _parse_axis_input(x2_txt, self._plot.x_unit)
+                x2 = _parse_axis_input(x2_txt, xu)
             except ValueError:
                 self.lim_x2_edit.set_invalid(True)
                 return
@@ -3836,6 +4895,20 @@ class PlotSettingsWindow(Window):
             return
         lim = self._plot.limits[index]
         lim.kind = "MIN" if lim.kind == "MAX" else "MAX"
+        self._plot._bump()
+        self._plot.view_changed.emit()
+
+    def _on_limit_series_cycle(self, index: int) -> None:
+        if self._plot is None or not (0 <= index < len(self._plot.limits)) or not self._plot.series:
+            return
+        lim = self._plot.limits[index]
+        n = len(self._plot.series)
+        if lim.series_index is None:
+            lim.series_index = 0
+        elif lim.series_index + 1 < n:
+            lim.series_index += 1
+        else:
+            lim.series_index = None
         self._plot._bump()
         self._plot.view_changed.emit()
 

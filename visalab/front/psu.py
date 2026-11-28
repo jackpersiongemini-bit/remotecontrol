@@ -2,18 +2,18 @@
 
 Избранное - плитки источников, по три в ряд; в неполном ряду плитки растягиваются на всю ширину
 (ряды - QHBoxLayout, не сетка). Плитка - один канал:
-* поля V и I: пока поле не выбрано, в нём ИЗМЕРЕННОЕ значение, слева мелко - уставка;
-  выбор поля = настройка: уставка уходит в подсказку, слева мелко - измерение; Enter - записать,
-  Esc - отменить (как у всех полей окна);
-* клик по плитке вне полей - включить / выключить выход; включённый выход - индикатор
-  (рамка и толстая нижняя граница), как у остальных кнопок;
+* поля V и I только для отображения; левый клик в любое место плитки включает / выключает выход
+  (включённый выход - индикатор: рамка и толстая нижняя граница);
+* когда канал ВЫКЛЮЧЕН: справа крупно уставка (как настроено), снизу слева мелко - измерение;
+* когда канал ВКЛЮЧЁН: наоборот — справа крупно измерение, снизу слева мелко - уставка;
 * в заголовке плитки - имя канала и режим (CV / CC, OVP - сработала защита).
 
 Правила (вкладка RULES): строки вида ``IF CH2.I < 5m OR CH2 OFF THEN CH1 OFF AND BLOCK ELSE UNBLOCK``
 (синтаксис и семантика - в rules.py). BLOCK запрещает включать выход (плитка показывает причину в
 подсказке), OFF выключает. Enter в строке - применить и сохранить, ошибка - красная рамка и подсказка.
 Правило по умолчанию - лабораторное: CH1 только когда CH2 и CH3 включены и потребляют ток.
-Ниже плиток - OFF ALL. Вкладки: PROT (OVP, предел уставки по каналам), OUT (объединение), RULES.
+Ниже плиток - OFF ALL. Вкладки: CH (уставки V/I по каналам), PROT (OVP, предел уставки по каналам),
+OUT (объединение), RULES.
 
 ``SourceGrid`` принимает любой набор каналов [(прокси, номер, подпись)], в том числе с нескольких
 приборов: окно отдаёт ему каналы своего прибора.
@@ -29,11 +29,11 @@ from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core.params import ConnectionState
-from ..core.units import si_format
+from ..core.units import SI_PREFIXES
 from ..coord import Instrument
 from . import instrument_window as _iw
 from .instrument_window import InstrumentWindow
-from .params import PLabel, PLineEdit, PSButton, PanelLine, PanelTable, _repolish, paint_indicator
+from .params import PLabel, PLineEdit, PSButton, PanelLine, PanelTable, UNIT_PREFIXES, _repolish, paint_indicator
 from .power_meter import ActionButton, LToggle
 from .rules import Rule, RuleError, parse_rule, resolve
 from .theme import UI_COLUMN_WIDTH_PX, render_qss
@@ -49,125 +49,72 @@ def saved_connection(settings: QSettings) -> dict[str, str]:
     return _iw.saved_connection(settings, CONNECTION_GROUP)
 
 
-class SourceField(PLineEdit):
-    """Поле уставки, которое в покое показывает измерение.
-
-    Привязано к ключу уставки (запись, проверка, цвет рамки - как у PLineEdit); ``meas_key`` -
-    измеренное значение для показа. ``side`` - мелкий текст внутри поля, снизу слева, в тех же
-    единицах, что и основной: уставка в покое, измерение во время настройки."""
-
-    side: QLabel | None = None
-
-    def __init__(self, proxy: Instrument, key: str, meas_key: str, parent=None):
-        self.meas_key, self._meas = meas_key, None
-        super().__init__(proxy, key, digits=5, parent=parent)
-        self.side = QLabel("", self)
-        self.side.setObjectName("side")
-        self.side.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        f = self.side.font()
-        f.setPointSizeF(max(6.0, f.pointSizeF() * 0.75))
-        self.side.setFont(f)
-        self.setMinimumHeight(46)
-        self.setCursor(Qt.CursorShape.IBeamCursor)
-        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)   # не захватывать фокус при показе окна
-        proxy.subscribe(meas_key, self._on_meas)
-        self._place_side()
-
-    def _side_text(self, value) -> str:
-        if not isinstance(value, (int, float)):
-            return "---"
-        return f"{value / self._factor():.{self.digits}g}"
-
-    def _place_unit(self) -> None:
-        """Единица - сверху слева, мелкий текст - под ней; число справа на всю высоту."""
-        b = self.unit_button
-        if b is None:
-            return
-        b.setStyleSheet("text-align: left;")             # единица и мелкий текст - от одной линии
-        b.ensurePolished()
-        w = max(b.sizeHint().width(), 26)
-        b.setGeometry(2, 2, w, max(int(self.height() * 0.5) - 2, 0))
-        self.setTextMargins(w, 0, 0, 0)
-
-    def _set_side(self, value) -> None:
-        if self.side is not None:
-            self.side.setText(self._side_text(value))
-            self._place_side()
-
-    def _place_side(self) -> None:
-        if self.side is None:
-            return
-        self.side.adjustSize()
-        self.side.move(6, self.height() - self.side.height() - 2)
-
-    def resizeEvent(self, e):  # noqa: N802 - Qt
-        super().resizeEvent(e)
-        self._place_side()
-
-    @property
-    def measured(self):
-        return self._meas
-
-    def _on_meas(self, value: Any) -> None:
-        self._meas = value
-        self.show_value(self._value)
-
-    def show_value(self, value, force: bool = False):
-        if self._editing() and not force:          # настройка: уставка - в подсказке, слева - измерение
-            self.setPlaceholderText("" if value is None else f"{value / self._factor():.{self.digits}g}")
-            self._set_side(self._meas)
-            return
-        shown = self._meas if self._meas is not None else None
-        self._auto_prefix(shown)
-        self._update_unit()
-        self.setText("" if shown is None else f"{shown / self._factor():.{self.digits}g}")
-        self.setModified(False)
-        self._set_side(value)
-
-    def focusInEvent(self, e):  # noqa: N802 - Qt
-        QLineEdit.focusInEvent(self, e)
-        self.clear()
-        self.setModified(False)
-        self.show_value(self._value)               # подсказка - уставка, слева - измерение
+def _is_num(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _fmt_psu_value(value: float | None, unit: str, ref: float | None = None) -> str:
-    """Формат показания ИП: ≥ 1 всегда в базовой единице (10 000 mV -> 10 V); < 1 следует масштабу уставки."""
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-        return "---"
-    val = float(value)
-    if abs(val) >= 1.0 - 1e-9:
-        return f"{val:.4g} {unit}"
-    has_ref = isinstance(ref, (int, float)) and not isinstance(ref, bool) and math.isfinite(ref) and abs(ref) > 1e-12
-    if has_ref and abs(float(ref)) >= 1.0 - 1e-9:
-        return f"0 {unit}" if abs(val) < 1e-9 else f"{val:.4g} {unit}"
-    if has_ref and 1e-3 - 1e-12 <= abs(float(ref)) < 1.0:
-        return f"0 m{unit}" if abs(val) < 1e-9 else f"{val * 1e3:.4g} m{unit}"
-    if abs(val) < 1e-9:
-        return f"0 {unit}"
-    if abs(val) >= 1e-3 - 1e-12:
-        return f"{val * 1e3:.4g} m{unit}"
-    return si_format(val, unit, 4)
+class SourceField(QFrame):
+    """Индикатор V / I на плитке канала (только отображение; клики проходят плитке).
 
+    * Канал ВЫКЛЮЧЕН: справа крупно — уставка (как настроено), снизу слева мелко — измерение.
+    * Канал ВКЛЮЧЁН: справа крупно — измерение, снизу слева мелко — уставка.
+    * Сверху слева — единица (``V``/``mV``, ``A``/``mA``), общая для обоих чисел.
+    """
 
-class SourceReadout(QLabel):
-    """Только чтение: текущее измеренное напряжение / ток на плитке избранного (клики проходят плитке)."""
-
-    def __init__(self, proxy: Instrument, set_key: str, meas_key: str, unit: str, *, primary: bool = True, parent=None):
-        super().__init__("---", parent)
+    def __init__(self, proxy: Instrument, key: str, meas_key: str, out_key: str = "", digits: int = 5, parent=None):
+        super().__init__(parent)
         self.proxy = proxy
-        self.set_key = set_key
+        self.key = key
         self.meas_key = meas_key
-        self.unit = unit
-        self._meas: float | None = None
+        self.out_key = out_key
+        self.digits = digits
+        self.unit = proxy.params[key].unit if proxy.supports(key) else ""
+        self.prefixes = UNIT_PREFIXES.get(self.unit, ("",))
+        self.prefix = "" if "" in self.prefixes else self.prefixes[-1]
         self._setpoint: float | None = None
-        self.setObjectName("measPrimary" if primary else "measSecondary")
-        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._meas: float | None = None
+        self._output: bool = False
+
+        self.setObjectName("sourceField")
+        self.setFixedHeight(32)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        proxy.subscribe(meas_key, self._on_meas)
-        if proxy.supports(set_key):
-            proxy.subscribe(set_key, self._on_setpoint)
+
+        self.unit_label = QLabel(self.unit, self)
+        self.unit_label.setObjectName("unit")
+        self.unit_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.unit_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self.side = QLabel("---", self)
+        self.side.setObjectName("side")
+        self.side.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
+        self.side.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self.main = QLabel("---", self)
+        self.main.setObjectName("main")
+        self.main.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.main.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        left = QVBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(0)
+        left.addWidget(self.unit_label)
+        left.addStretch(1)
+        left.addWidget(self.side)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 2, 6, 2)
+        lay.setSpacing(4)
+        lay.addLayout(left, 0)
+        lay.addWidget(self.main, 1)
+
+        if proxy.supports(key):
+            proxy.subscribe(key, self._on_setpoint)
+        if proxy.supports(meas_key):
+            proxy.subscribe(meas_key, self._on_meas)
+        if out_key and proxy.supports(out_key):
+            proxy.subscribe(out_key, self._on_output)
+        self._refresh()
 
     @property
     def measured(self) -> float | None:
@@ -177,70 +124,57 @@ class SourceReadout(QLabel):
     def setpoint(self) -> float | None:
         return self._setpoint
 
-    def _refresh(self) -> None:
-        self.setText(_fmt_psu_value(self._meas, self.unit, self._setpoint))
+    def text(self) -> str:
+        return self.main.text()
 
-    def _on_meas(self, value: Any) -> None:
-        self._meas = float(value) if isinstance(value, (int, float)) else None
-        self._refresh()
+    def _factor(self) -> float:
+        return SI_PREFIXES[self.prefix] if self.prefix else 1.0
+
+    def _pick_prefix(self, primary: Any, secondary: Any) -> str:
+        ref = primary if (_is_num(primary) and abs(float(primary)) > 1e-12) else secondary
+        if not _is_num(ref) or abs(float(ref)) <= 1e-12:
+            return "" if "" in self.prefixes else self.prefixes[-1]
+        val = abs(float(ref))
+        chosen = self.prefixes[0]
+        for p in self.prefixes:
+            if val >= (SI_PREFIXES[p] if p else 1.0) * 0.9999999:
+                chosen = p
+        return chosen
+
+    def _fmt(self, value: Any) -> str:
+        if not _is_num(value):
+            return "---"
+        scaled = float(value) / self._factor()
+        if abs(scaled) < 1e-12:
+            scaled = 0.0
+        return f"{scaled:.{self.digits}g}"
+
+    def _refresh(self) -> None:
+        if self._output:
+            primary, secondary = self._meas, self._setpoint
+        else:
+            primary, secondary = self._setpoint, self._meas
+        self.prefix = self._pick_prefix(primary, secondary)
+        self.unit_label.setText(f"{self.prefix}{self.unit}")
+        self.main.setText(self._fmt(primary))
+        self.side.setText(self._fmt(secondary))
 
     def _on_setpoint(self, value: Any) -> None:
-        self._setpoint = float(value) if isinstance(value, (int, float)) else None
+        self._setpoint = float(value) if _is_num(value) else None
         self._refresh()
 
-
-class PowerReadoutTile(QLabel):
-    """Только чтение: измеренная мощность канала ИП (meas_p или meas_v × meas_i)."""
-
-    def __init__(self, proxy: Instrument, n: int, parent=None):
-        super().__init__("---", parent)
-        self.proxy, self.n = proxy, n
-        self._meas_p: float | None = None
-        self._meas_v: float | None = None
-        self._meas_i: float | None = None
-        self.setObjectName("measPower")
-        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        if proxy.supports(f"ch{n}.meas_p"):
-            proxy.subscribe(f"ch{n}.meas_p", self._on_p)
-        if proxy.supports(f"ch{n}.meas_v"):
-            proxy.subscribe(f"ch{n}.meas_v", self._on_v)
-        if proxy.supports(f"ch{n}.meas_i"):
-            proxy.subscribe(f"ch{n}.meas_i", self._on_i)
-
-    @property
-    def measured(self) -> float | None:
-        if self._meas_p is not None:
-            return self._meas_p
-        if self._meas_v is not None and self._meas_i is not None:
-            return self._meas_v * self._meas_i
-        return None
-
-    def _refresh(self) -> None:
-        self.setText(_fmt_psu_value(self.measured, "W"))
-
-    def _on_p(self, value: Any) -> None:
-        self._meas_p = float(value) if isinstance(value, (int, float)) else None
+    def _on_meas(self, value: Any) -> None:
+        self._meas = float(value) if _is_num(value) else None
         self._refresh()
 
-    def _on_v(self, value: Any) -> None:
-        self._meas_v = float(value) if isinstance(value, (int, float)) else None
-        if self._meas_p is None:
-            self._refresh()
-
-    def _on_i(self, value: Any) -> None:
-        self._meas_i = float(value) if isinstance(value, (int, float)) else None
-        if self._meas_p is None:
-            self._refresh()
+    def _on_output(self, value: Any) -> None:
+        self._output = value is True
+        self._refresh()
 
 
 class SourceTile(QFrame):
-    """Плитка канала в избранном: только индикация текущих V / I / P и вкл/выкл по клику.
-
-    Ведёт себя как привязанный к ``chN.output`` виджет (key / proxy / spec / set_value),
-    поэтому журнал ошибок и цвет рамки при записи работают как у кнопок.
-    """
+    """Плитка канала. Ведёт себя как привязанный к ``chN.output`` виджет (key / proxy / spec /
+    set_value), поэтому журнал ошибок и цвет рамки при записи работают как у кнопок."""
 
     STYLE = render_qss("""
         SourceTile { background-color: $UI_COLOR_BACKGROUND; border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BACKGROUND;
@@ -252,31 +186,14 @@ class SourceTile(QFrame):
         SourceTile QLabel#name { color: $UI_COLOR_TEXT; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
         SourceTile QLabel#mode[mode="CC"] { color: $UI_COLOR_PROCESS; }
         SourceTile QLabel#mode[mode="OVP"] { color: $UI_COLOR_ERROR; font-weight: $UI_FONT_WEIGHT_SEMIBOLD; }
-        SourceTile QLabel#measPrimary {
+        SourceTile QFrame#sourceField {
             background-color: $UI_COLOR_PANEL;
-            color: $UI_COLOR_TEXT;
+            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_PANEL;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
-            font-family: $UI_MONOSPACE_FONT_FAMILY;
-            font-size: ${UI_FONT_SIZE_PT}pt;
-            font-weight: $UI_FONT_WEIGHT_SEMIBOLD;
-            padding: 4px 8px;
         }
-        SourceTile QLabel#measSecondary {
-            background-color: $UI_COLOR_PANEL;
-            color: $UI_COLOR_BORDER_LIGHT;
-            border-radius: ${UI_BORDER_RADIUS_PX}px;
-            font-family: $UI_MONOSPACE_FONT_FAMILY;
-            font-size: ${UI_FONT_SIZE_PT}pt;
-            padding: 2px 8px;
-        }
-        SourceTile QLabel#measPower {
-            background-color: $UI_COLOR_PANEL;
-            color: $UI_COLOR_TEXT_MUTED;
-            border-radius: ${UI_BORDER_RADIUS_PX}px;
-            font-family: $UI_MONOSPACE_FONT_FAMILY;
-            font-size: ${UI_FONT_SIZE_PT}pt;
-            padding: 2px 8px;
-        }
+        SourceTile QFrame#sourceField QLabel#unit { color: $UI_COLOR_BORDER_LIGHT; font-size: 8pt; }
+        SourceTile QFrame#sourceField QLabel#side { color: $UI_COLOR_BORDER_LIGHT; font-size: 8pt; }
+        SourceTile QFrame#sourceField QLabel#main { color: $UI_COLOR_TEXT; }
     """)
 
     def __init__(self, proxy: Instrument, n: int, title: str = "", parent=None):
@@ -289,7 +206,7 @@ class SourceTile(QFrame):
         self.locked = False                         # блокировка (CH1 без потребления CH2/CH3)
         self.lock_reason = ""
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumWidth(120)
+        self.setMinimumWidth(96)
 
         self.name = QLabel(title or f"CH{n}")
         self.name.setObjectName("name")
@@ -304,20 +221,14 @@ class SourceTile(QFrame):
         self.head.addStretch(1)
         self.head.addWidget(self.mode)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 6, 8, 10)
-        lay.setSpacing(4)
+        lay.setContentsMargins(6, 5, 6, 8)
+        lay.setSpacing(3)
         lay.addLayout(self.head)
-        self.fields: dict[str, QLabel] = {}
-        for q, set_key, meas_key, unit, primary in (
-            ("V", "voltage", "meas_v", "V", True),
-            ("I", "current", "meas_i", "A", False),
-        ):
-            r = SourceReadout(proxy, f"ch{n}.{set_key}", f"ch{n}.{meas_key}", unit, primary=primary)
-            self.fields[q] = r
-            lay.addWidget(r)
-        p_lbl = PowerReadoutTile(proxy, n)
-        self.fields["P"] = p_lbl
-        lay.addWidget(p_lbl)
+        self.fields: dict[str, SourceField] = {}
+        for q, set_key, meas_key in (("V", "voltage", "meas_v"), ("I", "current", "meas_i")):
+            f = SourceField(proxy, f"ch{n}.{set_key}", f"ch{n}.{meas_key}", self.key)
+            self.fields[q] = f
+            lay.addWidget(f)
 
         proxy.subscribe(self.key, self._on_value, self._on_status)
         for k in (f"ch{n}.mode", f"ch{n}.ovp_tripped"):
@@ -527,9 +438,9 @@ class PSUWindow(InstrumentWindow):
         for n in self.tiles:
             for k in ("output", "meas_v", "meas_i", "meas_p"):
                 if proxy.supports(f"ch{n}.{k}"):
-                    proxy.subscribe(f"ch{n}.{k}", lambda _v: self._on_meas_update())
-        proxy.state_changed.connect(lambda _s: self._on_meas_update())
-        self._on_meas_update()
+                    proxy.subscribe(f"ch{n}.{k}", lambda _v: self.apply_rules())
+        proxy.state_changed.connect(lambda _s: self.apply_rules())
+        self.apply_rules()
 
     # ------------------------------------------------------------ сборка
     def build(self) -> None:
@@ -542,26 +453,15 @@ class PSUWindow(InstrumentWindow):
         grid_line = PanelLine("", self.grid)
         grid_line._name.hide()
         self.top_lines = [grid_line]
-
-        self.total_power_label = QLabel("TOTAL ---")
-        self.total_power_label.setObjectName("heading")
-        self.total_power_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.total_power_label.setToolTip("Total measured output power across all channels")
-        footer_ws: list[QWidget] = [self.total_power_label]
         if "all_off" in proxy.actions:
             self.all_off = ActionButton(proxy, "all_off", "OFF ALL", "Switch all outputs off")
-            self.all_off.setSizePolicy(QSizePolicy.Policy.Fixed, self.all_off.sizePolicy().verticalPolicy())
-            footer_ws.append(self.all_off)
-        footer_line = PanelLine("", *footer_ws)
-        footer_line._name.hide()
-        footer_line.line_layout.setStretchFactor(self.total_power_label, 1)
-        if "all_off" in proxy.actions:
-            footer_line.line_layout.setStretchFactor(self.all_off, 0)
-        self.top_lines.append(footer_line)
+            line = PanelLine("", self.all_off)
+            line._name.hide()
+            self.top_lines.append(line)
 
         chans = sorted(self.tiles)
 
-        # CH: уставки напряжения и тока по каналам (в избранном плитки только отображают и вкл/выкл)
+        # CH: уставки напряжения и тока по каналам (на плитках - только индикация и вкл/выкл)
         ch_heads = []
         for n in chans:
             h = PLabel(text=f"CH{n}")
@@ -651,31 +551,8 @@ class PSUWindow(InstrumentWindow):
             if n in self.tiles and self.proxy.value(f"ch{n}.output") is False:
                 self.proxy.set(f"ch{n}.output", True)
 
-    @property
-    def total_power(self) -> float | None:
-        """Суммарная измеренная мощность по всем каналам, Вт (или None если нет измерений)."""
-        if not self.proxy.is_connected:
-            return None
-        total = 0.0
-        any_val = False
-        for tile in self.tiles.values():
-            p_field = tile.fields.get("P")
-            val = getattr(p_field, "measured", None)
-            if isinstance(val, (int, float)) and math.isfinite(val):
-                total += float(val)
-                any_val = True
-        return total if any_val else None
-
-    def _update_total_power(self) -> None:
-        if hasattr(self, "total_power_label"):
-            self.total_power_label.setText(f"TOTAL {_fmt_psu_value(self.total_power, 'W')}")
-
-    def _on_meas_update(self) -> None:
-        self._update_total_power()
-        self.apply_rules()
-
     def _on_state(self, state: ConnectionState) -> None:
         super()._on_state(state)
-        self._on_meas_update()
+        self.apply_rules()
         for t in (self.grid.tiles if hasattr(self, "grid") else ()):
             t._update_tip()

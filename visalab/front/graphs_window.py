@@ -1314,11 +1314,11 @@ class GraphsWindow(Window):
             traces = self.monitor.vna_traces(proxy)
             if traces:
                 series = [
-                    PlotSeries(label, tuple(tr.x), tuple(tr.y), y_unit=tr.y_unit or "dB")
+                    PlotSeries(label, tuple(tr.x), tuple(tr.y), y_unit=tr.y_unit)
                     for label, tr in traces
                 ]
                 x_u = traces[0][1].x_unit or "Hz"
-                y_u = traces[0][1].y_unit or "dB"
+                y_u = traces[0][1].y_unit
                 card.plot.set_series(series, x_unit=x_u, y_unit=y_u)
             else:
                 card.plot.clear()

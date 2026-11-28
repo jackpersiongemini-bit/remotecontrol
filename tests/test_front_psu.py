@@ -59,11 +59,15 @@ def test_field_shows_measurement_and_setpoint(qtbot, psu):
     proxy.set("ch2.current", 1.0)
     proxy.set("ch2.output", True)
     _wait(qtbot, proxy, "ch2.meas_v", lambda v: v == pytest.approx(5.0, abs=1e-3))
-    f = win.tiles[2].fields["V"]
-    qtbot.waitUntil(lambda: f.text() == "5 V", timeout=5000)      # плитка избранного: только текущее напряжение
-    assert f.setpoint == pytest.approx(5.0)
+    fv = win.tiles[2].fields["V"]
+    fi = win.tiles[2].fields["I"]
+    # Канал включён: справа измерение, снизу слева - уставка
+    qtbot.waitUntil(lambda: fv.text() == "5" and fv.side.text() == "5", timeout=5000)
+    qtbot.waitUntil(lambda: fi.text() == "500" and fi.unit_label.text() == "mA" and fi.side.text() == "1000", timeout=5000)
+    # Канал выключен: наоборот — справа уставка, снизу слева - измерение
     proxy.set("ch2.output", False)
-    qtbot.waitUntil(lambda: f.text() == "0 V", timeout=5000)      # выход выключен: измерено 0 V
+    qtbot.waitUntil(lambda: fv.text() == "5" and fv.side.text() == "0", timeout=5000)
+    qtbot.waitUntil(lambda: fi.text() == "1" and fi.unit_label.text() == "A" and fi.side.text() == "0", timeout=5000)
     # Уставки напряжения и тока редактируются на вкладке CH в настройках
     win.show()
     qtbot.waitExposed(win)
@@ -74,6 +78,7 @@ def test_field_shows_measurement_and_setpoint(qtbot, psu):
     v_edit.setModified(True)
     v_edit.returnPressed.emit()
     _wait(qtbot, proxy, "ch2.voltage", lambda v: v == pytest.approx(7.5))
+    qtbot.waitUntil(lambda: fv.text() == "7.5" and fv.side.text() == "0", timeout=5000)
 
 
 def test_tile_click_toggles_output(qtbot, psu):
@@ -85,7 +90,7 @@ def test_tile_click_toggles_output(qtbot, psu):
     _click_tile(qtbot, t)
     _wait(qtbot, proxy, "ch3.output", lambda v: v is True)
     qtbot.waitUntil(lambda: t.is_on() and t.mode.text() == "CV", timeout=5000)
-    # Клик прямо по индикации напряжения внутри плитки тоже переключает выход (плитка только чтение + вкл/выкл)
+    # Левый клик прямо по полю V/I внутри плитки тоже переключает выход
     qtbot.mouseClick(t, Qt.MouseButton.LeftButton, pos=t.fields["V"].geometry().center())
     _wait(qtbot, proxy, "ch3.output", lambda v: v is False)
     qtbot.waitUntil(lambda: t.mode.text() == "OFF", timeout=5000)

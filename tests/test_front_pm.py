@@ -45,8 +45,8 @@ def test_interpolate():
 def test_layout_and_readout(qtbot, pm):
     proxy, win, _s = pm
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["MAIN", "TRIG", "CAL", "TIME", "SWP", "SET"]
-    avg = next(ln for ln in win.pages[0].lines if ln.name == "AVG")       # усреднение - одной строкой
-    assert [w.key for w in avg.widgets] == ["avg.state", "avg.count", "avg.auto"]
+    avg = next(ln for ln in win.pages[0].lines if ln.name == "AVG")       # усреднение - одной строкой (button line)
+    assert [w.key for w in avg.widgets] == ["avg.state", "avg.auto", "avg.count"]
     assert not any(ln.name in ("ACNT", "AAUT") for ln in win.pages[0].lines)
     # Настройки запуска и строба (Gate) - на отдельной вкладке TRIG
     trig_names = [ln.name for ln in win.pages[1].lines]

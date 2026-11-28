@@ -25,6 +25,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from ..core.params import Action, ConnectionState, Param, PStatus
 from ..core.trace import Trace
+from ..core.vna_traces import VNATraceSpec
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ class Instrument(QObject):
     reconnect_pending = pyqtSignal(float)
     #: завершена развёртка ВАЦ: ``{sparam: Trace(комплексная)}`` для всех активных S-параметров
     sweep_updated = pyqtSignal(dict)
+    #: изменился список или настройки пользовательских трасс ВАЦ на ПК (``tuple[VNATraceSpec, ...]``)
+    trace_specs_changed = pyqtSignal(object)
     #: действие или команда SCPI от UI не отправлены: прибор ведёт сценарий координатора (текст - для журнала
     #: окна); отказ записи ключа приходит как ``param_status`` ERROR этого ключа
     refused = pyqtSignal(str)
@@ -81,6 +84,7 @@ class Instrument(QObject):
         self.capabilities: frozenset[str] = proxy.capabilities
         self._subs: dict[str, list[Callable]] = defaultdict(list)
         self._status_subs: dict[str, list[Callable]] = defaultdict(list)
+        self._vna_trace_specs: tuple[VNATraceSpec, ...] = ()
         self._conns: list[tuple[Any, Any]] = []
         for name in self._FORWARDED:
             sig, slot = getattr(proxy, name), getattr(self, name)
@@ -126,8 +130,44 @@ class Instrument(QObject):
         return self._proxy.sparam_trace(name)
 
     def sparam_traces(self) -> dict[str, Trace]:
-        """Последний снимок комплексных трасс всех активных S-параметров."""
+        """Последний снимок комплексных трасс всех активных S-параметров канала ``stim.channel``."""
         return self._proxy.sparam_traces()
+
+    def channels_list(self) -> list[int]:
+        """Существующие каналы ВАЦ, например ``[1, 2]``."""
+        return self._proxy.channels_list()
+
+    def channel_trace(self, channel: int, name: str) -> Trace | None:
+        """Последняя комплексная трасса пары ``(channel, sparam)`` или ``None``."""
+        return self._proxy.channel_trace(channel, name)
+
+    def channel_traces(self) -> dict[tuple[int, str], Trace]:
+        """Последний снимок комплексных трасс всех активных пар ``(канал, S-параметр)``."""
+        return self._proxy.channel_traces()
+
+    def set_channel_sparams(self, pairs: Iterable[tuple[int, str]]) -> None:
+        """Задать активные пары ``(канал, S-параметр)`` по всем каналам сразу (через арбитраж)."""
+        norm: list[tuple[int, str]] = []
+        seen: set[tuple[int, str]] = set()
+        for ch, sp in pairs:
+            c = int(ch)
+            s = _norm_sparam(sp)
+            if (c, s) not in seen:
+                seen.add((c, s))
+                norm.append((c, s))
+        norm.sort(key=lambda p: (p[0], int(p[1][1]), int(p[1][2])))
+        self.set("s.all_active", ",".join(f"{c}:{s}" for c, s in norm))
+
+    def vna_trace_specs(self) -> tuple[VNATraceSpec, ...]:
+        """Пользовательские трассы ВАЦ на стороне ПК (формат, EDEL, сглаживание)."""
+        return self._vna_trace_specs
+
+    def set_vna_trace_specs(self, specs: Iterable[VNATraceSpec]) -> None:
+        """Обновить настройки пользовательских трасс ВАЦ на ПК и уведомить графики."""
+        new_specs = tuple(specs)
+        if new_specs != self._vna_trace_specs:
+            self._vna_trace_specs = new_specs
+            self.trace_specs_changed.emit(new_specs)
 
     def set_sparams(self, sparams: Iterable[str] | str) -> None:
         """Задать набор S-параметров для измерения и чтения (через арбитраж координатора)."""

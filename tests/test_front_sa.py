@@ -42,7 +42,7 @@ def test_layout_settings_only(qtbot, sa):
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["FREQ", "BW", "AMPL", "SWP", "TRAC", "TRIG", "SET"]
     assert len(win.preset_panel.table.lines) == 1 and win.preset_panel.table.lines[0].name == "PRST"
     names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages if p is not win.connection_page for ln in p.lines}
-    assert names["RBW"] == ["bw.res", "bw.res_auto"] and names["CENT"] == ["freq.center"]
+    assert names["RBW"] == ["bw.res_auto", "bw.res"] and names["CENT"] == ["freq.center"]
     assert not any(k == "trace" or k.startswith("marker") for ks in names.values() for k in ks)   # вывода информации нет
 
 
@@ -141,7 +141,7 @@ def test_sa_launcher(qtbot, tmp_path, monkeypatch):
 def test_zero_span_button_and_trigger_tabs(qtbot, sa):
     proxy, win, settings = sa
     names = {ln.name: [w.key for w in ln.widgets if hasattr(w, "key")] for p in win.pages if p is not win.connection_page for ln in p.lines}
-    assert names["MODE"][:1] == ["trace.mode"] and names["DLY"] == ["trig.delay", "trig.delay_state"]
+    assert names["MODE"][:1] == ["trace.mode"] and names["DLY"] == ["trig.delay_state", "trig.delay"]
     assert names["SRC"] == ["trig.source"] and names["TYPE"] == ["sweep.type"] and names["PRE"] == ["preamp"]
     win.widgets["freq.center"].set_value(1e9)
     win.widgets["freq.span"].set_value(50e6)

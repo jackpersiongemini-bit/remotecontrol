@@ -104,7 +104,7 @@ class RFGenWindow(InstrumentWindow):
         if sup("rf.power"):
             spin, prst = self.power_widgets("rf.power", "Preset mode: the wheel and arrows step the power "
                                                         "through the PRST list (RF tab)")
-            self.top_lines.append(PanelLine("POW", spin, prst))
+            self.top_lines.append(PanelLine("POW", prst, spin))
         self.freq_spin = PSpinBox(proxy, "rf.frequency", ("k", "M", "G"))
         self.top_lines.append(PanelLine("FREQ", self.freq_spin))
 

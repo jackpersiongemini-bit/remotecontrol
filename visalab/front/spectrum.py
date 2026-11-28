@@ -243,17 +243,22 @@ class SpectrumWindow(InstrumentWindow):
                     if not sup(key):
                         continue
                     w = make(key)
-                    ws = [w]
+                    pairs = [(key, w)]
                     if extra and sup(extra):
                         if proxy.params[extra].kind.name == "BOOL":
-                            ws.append(PSButton(proxy, extra, AUTO if extra.endswith("_auto") else ONOFF))
+                            ex = PSButton(proxy, extra, AUTO if extra.endswith("_auto") else ONOFF)
                         else:
-                            ws.append(make(extra))
-                    for x, k in zip(ws, (key, extra)):
+                            ex = make(extra)
+                        # Кнопка перед полем ввода (button line)
+                        if isinstance(ex, PSButton) and not isinstance(w, PSButton):
+                            pairs.insert(0, (extra, ex))
+                        else:
+                            pairs.append((extra, ex))
+                    for k, x in pairs:
                         self.widgets[k] = x
                         if k not in NOT_SAVED:
                             self.saved_widgets.append(x)
-                    row.append(PanelLine(name, *ws))
+                    row.append(PanelLine(name, *(x for _, x in pairs)))
                 if row:
                     lines.append(tuple(row))
             if title_ == "FREQ" and sup("freq.span"):

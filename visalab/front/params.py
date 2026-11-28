@@ -883,6 +883,8 @@ class PSpinBox(QDoubleSpinBox, _Bound):
         le = self.lineEdit()
         from_end = len(le.text()) - le.cursorPosition()
         step = self._digit_step()
+        if self.spec.kind is Kind.INT:
+            step = max(1.0, round(step))
         if self.step_setting is None:
             self._step_lock = step                # пока крутят - тот же разряд («1.29» + 0.01 = «1.30»)
         self.blockSignals(True)
@@ -943,6 +945,8 @@ class PSpinBox(QDoubleSpinBox, _Bound):
     # -------------------------------------------------------- настройка шага
     def step_choices(self) -> list[float]:
         """Постоянные шаги для меню (в единицах параметра): 1 / 10 / 100 каждого префикса."""
+        if self.spec.kind is Kind.INT:
+            return [1.0, 5.0, 10.0, 50.0, 100.0]
         factors = sorted({SI_PREFIXES[p] if p else 1.0 for p in self.prefixes})
         if len(factors) == 1:                     # без префиксов (dBm, %): от 0.001 до 10
             return [factors[0] * m for m in (0.001, 0.01, 0.1, 1.0, 10.0)]

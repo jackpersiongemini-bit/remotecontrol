@@ -8,6 +8,8 @@
 from .params import Action, ConnectionState, Kind, Param, PStatus
 from .profile import ActionSlot, Profile, ProfileError, Slot
 from .trace import Trace
+from .vna_traces import VNA_FORMAT_LABELS, VNA_FORMAT_UNITS, VNA_FORMATS, VNATraceSpec, format_sparam_trace
 
 __all__ = ["Param", "Action", "Trace", "Profile", "Slot", "ActionSlot", "ProfileError", "Kind", "PStatus",
-           "ConnectionState"]
+           "ConnectionState", "VNA_FORMATS", "VNA_FORMAT_LABELS", "VNA_FORMAT_UNITS", "VNATraceSpec",
+           "format_sparam_trace"]

@@ -1006,10 +1006,24 @@ class PowerMeterWindow(InstrumentWindow):
                     lines.append(PanelLine(t, *ws))
             return lines
 
-        # MAIN: частота, усреднение; режим детектора, видеополоса и непрерывный счёт - в три столбца
+        # MAIN: частота, аппаратное и программное (скользящее окно) усреднение; детектор, видеополоса и счёт
         main_top = add((("FREQ", "freq", lambda p, k: PSpinBox(p, k, ("k", "M", "G"))),
-                        ("AVG", "avg.state", None, ("avg.count", None),         # усреднение: вкл, число, авто
-                         ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)])))))
+                        ("AVG", "avg.state", None,
+                         ("avg.auto", lambda p, k: PSButton(p, k, [("MAN", False), ("AUTO", True)])),
+                         ("avg.count", None)),
+                        ("SAVG", "sw_avg.state", None,
+                         ("sw_avg.reset_on_change", lambda p, k: PSButton(p, k, [("KEEP", False), ("ARST", True)])),
+                         ("sw_avg.trace", lambda p, k: PSButton(p, k, [("SCAL", False), ("TRAC", True)])),
+                         ("sw_avg.count", None))))
+        if "sw_avg_reset" in proxy.actions:
+            self.sw_avg_reset_button = ActionButton(proxy, "sw_avg_reset", "RST", "Clear software averaging window")
+            for ln in main_top:
+                if ln.name == "SAVG":
+                    # Кнопки перед полем ввода (button line)
+                    idx = max(0, len(ln.widgets) - 1)
+                    ln.widgets.insert(idx, self.sw_avg_reset_button)
+                    ln.line_layout.insertWidget(1 + idx, self.sw_avg_reset_button)
+                    break
         main_flags = add((("DET", "detector", lambda p, k: PSButton(p, k, [("AVG", "AVERAGE"), ("NORM", "NORMAL")])),
                           ("VBW", "video_bw", None), ("CONT", "meas.continuous", None)))
         # FREQ следует за генератором / ВАЦ в CW (координатор); кнопка - вкл / выкл, видно за кем
@@ -1022,7 +1036,8 @@ class PowerMeterWindow(InstrumentWindow):
         self.follow_button.toggled.connect(self._set_follow)
         for ln in main_top:
             if ln.name == "FREQ":
-                ln.add_widget(self.follow_button)
+                ln.widgets.insert(0, self.follow_button)
+                ln.line_layout.insertWidget(1, self.follow_button)
         main = [*main_top, *([tuple(main_flags)] if main_flags else [])]
         self.page_specs.append(("MAIN", (), PanelTable(*main)))
 
@@ -1036,7 +1051,7 @@ class PowerMeterWindow(InstrumentWindow):
                 if ln.name == "SRC":
                     ln.add_widget(self.trig_bus_button)
                     break
-        trig_lvl = add((("LVL", "trig.level", lambda p, k: PSpinBox(p, k, ("",)), ("trig.level_auto", trig_auto)),))
+        trig_lvl = add((("LVL", "trig.level_auto", trig_auto, ("trig.level", lambda p, k: PSpinBox(p, k, ("",)))),))
         trig_time = add((("DLY", "trig.delay", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
                          ("HOLD", "trig.holdoff", lambda p, k: PSpinBox(p, k, ("µ", "m", "")))))
         trig_gate = add((("GSTR", "gate.start", lambda p, k: PSpinBox(p, k, ("n", "µ", "m", ""))),
@@ -1106,7 +1121,7 @@ class PowerMeterWindow(InstrumentWindow):
         tabl_row = [PanelLine("TABL", self.cal_choice)]
         if sup("offset"):
             off = PNLabel(proxy, "offset")
-            off.setToolTip("Total correction written to the meter (CORR:GAIN2)")
+            off.setToolTip("Total correction applied to meter readings (CAL − GAIN + DUTY)")
             self.widgets["offset"] = off
             tabl_row.append(PanelLine("OFFS", off))
         cal: list = [plot_line, tuple(tabl_row),

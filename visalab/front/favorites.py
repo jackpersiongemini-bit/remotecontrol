@@ -17,6 +17,7 @@ from PyQt6.QtCore import QPoint, QSettings, Qt
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
+from ..core.params import Kind
 from .params import PLabel, PLineEdit, PNLabel, PSButton, PSpinBox, PSpinEdit, PanelLine, PanelTable, _Bound
 from .theme import (UI_BORDER_RADIUS_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER, UI_COLOR_BORDER_LIGHT,
                     UI_COLOR_INVERT_HOVER, UI_COLOR_PANEL, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
@@ -64,13 +65,35 @@ def _is_cloneable_bound(w: QWidget, proxy) -> bool:
     return isinstance(w, (PSpinBox, PNLabel, PLineEdit, PSButton, PLabel))
 
 
-def clone_bound_widget(orig: QWidget, proxy) -> QWidget | None:
-    """Создать синхронизированную копию привязанного к ``proxy`` виджета."""
+def clone_bound_widget(orig: QWidget, proxy, *, as_spinbox: bool | None = None) -> QWidget | None:
+    """Создать синхронизированную копию привязанного к ``proxy`` виджета.
+
+    ``as_spinbox=True`` (избранное): любое редактируемое числовое поле (``PLineEdit``/``PSpinEdit``/``PSpinBox``)
+    клонируется как ``PSpinBox``.
+    ``as_spinbox=False`` (правое меню настроек / поиск): любые спинбоксы клонируются как обычный ``PLineEdit``.
+    """
     key = getattr(orig, "key", None)
     if not key or not proxy.supports(key):
         return None
+    spec = proxy.params.get(key)
+    is_num_input = (
+        isinstance(orig, (PSpinBox, PSpinEdit, PLineEdit))
+        and not isinstance(orig, PNLabel)
+        and spec is not None
+        and spec.kind in (Kind.FLOAT, Kind.INT)
+        and not spec.readonly
+    )
     clone: QWidget | None = None
-    if isinstance(orig, PSpinBox):
+    if as_spinbox is True and is_num_input:
+        prefixes = getattr(orig, "prefixes", None)
+        clone = PSpinBox(proxy, key, prefixes=prefixes)
+        step = getattr(orig, "step_setting", None)
+        if step is not None:
+            clone.set_step(step, emit=False)
+    elif as_spinbox is False and isinstance(orig, (PSpinBox, PSpinEdit, PLineEdit)) and not isinstance(orig, PNLabel):
+        clone = PLineEdit(proxy, key, unit=getattr(orig, "unit", None), digits=getattr(orig, "digits", 6),
+                          prefixes=getattr(orig, "prefixes", None))
+    elif isinstance(orig, PSpinBox):
         prefixes = getattr(orig, "prefixes", None)
         clone = PSpinBox(proxy, key, prefixes=prefixes)
         step = getattr(orig, "step_setting", None)
@@ -85,7 +108,8 @@ def clone_bound_widget(orig: QWidget, proxy) -> QWidget | None:
     elif isinstance(orig, PNLabel):
         clone = PNLabel(proxy, key, unit=getattr(orig, "unit", None), digits=getattr(orig, "digits", 6))
     elif isinstance(orig, PLineEdit):
-        clone = PLineEdit(proxy, key, unit=getattr(orig, "unit", None), digits=getattr(orig, "digits", 6))
+        clone = PLineEdit(proxy, key, unit=getattr(orig, "unit", None), digits=getattr(orig, "digits", 6),
+                          prefixes=getattr(orig, "prefixes", None))
     elif isinstance(orig, PSButton):
         pairs = list(zip(getattr(orig, "_names", ()), getattr(orig, "_data", ())))
         if not pairs:
@@ -304,7 +328,7 @@ class FavoritesManager:
             clones: list[QWidget] = []
             for orig in item.source_line.widgets:
                 if _is_cloneable_bound(orig, win.proxy):
-                    c = clone_bound_widget(orig, win.proxy)
+                    c = clone_bound_widget(orig, win.proxy, as_spinbox=True)
                     if c is not None:
                         clones.append(c)
                         self._pinned_widgets.append(c)

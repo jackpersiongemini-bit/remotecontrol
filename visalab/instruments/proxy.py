@@ -99,6 +99,7 @@ class InstrumentProxy(QObject):
         self.reconnecting = False
         self.idn = ""
         self._values: dict[str, Any] = {}
+        self._channel_traces: dict[tuple[int, str], Trace] = {}
         self._statuses: dict[str, PStatus] = {}
         self._in_flight: set[str] = set()
         self._actions_in_flight = 0
@@ -187,6 +188,10 @@ class InstrumentProxy(QObject):
         if key == "cal.set" and value and self._values.get("cal.state") is not True:
             return False                              # повторный выбор cal set включает коррекцию
         if key == "s.active":
+            wanted = {t.strip().upper() for t in re.split(r"[,\s;]+", str(value or "").strip()) if t.strip()}
+            cur_set = {t.strip().upper() for t in re.split(r"[,\s;]+", str(current or "").strip()) if t.strip()}
+            return wanted == cur_set
+        if key == "s.all_active":
             wanted = {t.strip().upper() for t in re.split(r"[,\s;]+", str(value or "").strip()) if t.strip()}
             cur_set = {t.strip().upper() for t in re.split(r"[,\s;]+", str(current or "").strip()) if t.strip()}
             return wanted == cur_set
@@ -291,13 +296,52 @@ class InstrumentProxy(QObject):
         return tr if isinstance(tr, Trace) else None
 
     def sparam_traces(self) -> dict[str, Trace]:
-        """Последний снимок комплексных трасс всех активных S-параметров: ``{'S11': Trace, 'S41': Trace}``."""
+        """Последний снимок комплексных трасс всех активных S-параметров канала ``stim.channel``."""
         out: dict[str, Trace] = {}
+        ch = int(self._values.get("stim.channel") or 1)
         for sp in self.active_sparams():
-            tr = self._values.get(f"{sp.lower()}.trace")
+            tr = self._channel_traces.get((ch, sp)) or self._values.get(f"{sp.lower()}.trace")
             if isinstance(tr, Trace):
                 out[sp] = tr
         return out
+
+    def channels_list(self) -> list[int]:
+        """Существующие каналы ВАЦ, например ``[1, 2]``."""
+        raw = self._values.get("channels.list")
+        if isinstance(raw, str) and raw.strip():
+            chs = sorted({int(t) for t in re.findall(r"\d+", raw)})
+            if chs:
+                return chs
+        cur = self._values.get("stim.channel")
+        return [int(cur)] if isinstance(cur, int) and cur >= 1 else [1]
+
+    def channel_trace(self, channel: int, name: str) -> Trace | None:
+        """Последняя комплексная трасса пары ``(channel, sparam)`` или ``None``."""
+        sp = _norm_sparam(name)
+        tr = self._channel_traces.get((int(channel), sp))
+        if isinstance(tr, Trace):
+            return tr
+        if int(channel) == int(self._values.get("stim.channel") or 1):
+            t = self._values.get(f"{sp.lower()}.trace")
+            return t if isinstance(t, Trace) else None
+        return None
+
+    def channel_traces(self) -> dict[tuple[int, str], Trace]:
+        """Последний снимок комплексных трасс всех активных пар ``(канал, S-параметр)``."""
+        return dict(self._channel_traces)
+
+    def set_channel_sparams(self, pairs: Iterable[tuple[int, str]]) -> None:
+        """Задать активные пары ``(канал, S-параметр)`` по всем каналам сразу (через ``s.all_active``)."""
+        norm: list[tuple[int, str]] = []
+        seen: set[tuple[int, str]] = set()
+        for ch, sp in pairs:
+            c = int(ch)
+            s = _norm_sparam(sp)
+            if (c, s) not in seen:
+                seen.add((c, s))
+                norm.append((c, s))
+        norm.sort(key=lambda p: (p[0], int(p[1][1]), int(p[1][2])))
+        self.set("s.all_active", ",".join(f"{c}:{s}" for c, s in norm))
 
     def set_sparams(self, sparams: Iterable[str] | str) -> None:
         """Задать набор S-параметров для измерения и чтения (напр. ``['S11', 'S41']`` или ``'S11,S41'``)."""
@@ -364,6 +408,7 @@ class InstrumentProxy(QObject):
         self._status_subs.clear()
         self.reconnecting = False
         self._values.clear()
+        self._channel_traces.clear()
         self._statuses.clear()
         self._in_flight.clear()
         self._actions_in_flight = 0
@@ -445,6 +490,23 @@ class InstrumentProxy(QObject):
         if self._shut_down:
             return
         self._values[key] = value
+        if key.startswith("s") and key.endswith(".trace") and len(key) == 9:
+            sp = key[:3].upper()
+            if isinstance(value, Trace):
+                ch = int((value.meta or {}).get("channel") or self._values.get("stim.channel") or 1)
+                self._channel_traces[(ch, sp)] = value
+            elif value is None:
+                ch = int(self._values.get("stim.channel") or 1)
+                self._channel_traces.pop((ch, sp), None)
+        elif key == "s.all_active" and isinstance(value, str):
+            allowed: set[tuple[int, str]] = set()
+            for tok in re.split(r"[,\s;]+", value.strip()):
+                if ":" in tok:
+                    c_s, _, sp_s = tok.partition(":")
+                    if c_s.isdigit():
+                        allowed.add((int(c_s), sp_s.upper()))
+            for k in [k for k in self._channel_traces if k not in allowed]:
+                self._channel_traces.pop(k, None)
         dead: list[Callable] = []
         for cb in list(self._subs.get(key, ())):
             try:

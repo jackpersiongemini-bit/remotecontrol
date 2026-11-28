@@ -163,8 +163,9 @@ def test_favorites_customize_sync_and_persist(qtbot, settings):
         pinned = win.favorites.pinned_lines()
         assert len(pinned) == 2
 
+        from visalab.front.params import PSpinBox
         cent_pinned = next(w for ln in pinned for w in ln.widgets if getattr(w, "key", None) == "freq.center")
-        assert isinstance(cent_pinned, PLineEdit)
+        assert isinstance(cent_pinned, PSpinBox)
         p.set("freq.center", 2.5e9)
         qtbot.waitUntil(lambda: p.value("freq.center") == pytest.approx(2.5e9), timeout=5000)
         qtbot.waitUntil(lambda: "2.5" in cent_pinned.text(), timeout=5000)

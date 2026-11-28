@@ -484,6 +484,8 @@ class InstrumentWindow(Window):
         self._fav_popup: FavoritesPopup | None = None
         self.saved_widgets: list = []
         self.top_lines: list[PanelLine] = []
+        self.settings_header_lines: list[PanelLine] = []
+        self.settings_header_table: PanelTable | None = None
         self.page_specs: list[tuple[str, tuple[str, ...], PanelTable]] = []
         _INSTRUMENT_WINDOWS.append(self)
 
@@ -550,6 +552,10 @@ class InstrumentWindow(Window):
         bl = QVBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(8)
+        if self.settings_header_lines:
+            self.settings_header_table = PanelTable(*self.settings_header_lines)
+            self.settings_header_table.build()
+            bl.addWidget(self.settings_header_table)
         self.fav_button = CustomFavButton()
         self.fav_button.setToolTip("Configure favorites (choose what is shown in the top panel)")
         self.fav_button.clicked.connect(self.show_favorites_editor)

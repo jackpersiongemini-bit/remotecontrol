@@ -34,6 +34,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from ..core.params import ConnectionState
 from ..core.trace import Trace
+from ..core.vna_traces import VNATraceSpec, format_sparam_trace
 from .registry import LINKS, ProxyLinks, profile_name
 
 __all__ = ["ActivityMonitor", "Activity", "Source", "Thresholds", "RECEIVERS", "SHORT_NAMES",
@@ -248,6 +249,7 @@ class ActivityMonitor(QObject):
         #: (источник питания, канал) -> выбранный RF-источник (None = AUTO)
         self.psu_rf_source: dict[tuple[Any, int], Any] = {}
         self._mag_cache: dict[tuple[Any, str], tuple[Trace, Trace]] = {}
+        self._fmt_cache: dict[tuple[Any, str], tuple[Trace, VNATraceSpec, Trace]] = {}
         links.changed.connect(self._sync_roster)
         self._timer = QTimer(self)
         self._timer.setInterval(500)
@@ -334,6 +336,11 @@ class ActivityMonitor(QObject):
                 on_retry = (lambda _s, p=p: self._emit(p))
                 pending.connect(on_retry)
                 self._conns[p].append((pending, on_retry))
+            specs_sig = getattr(p, "trace_specs_changed", None)  # пользовательские трассы ВАЦ на ПК
+            if specs_sig is not None:
+                on_specs = (lambda _sp, p=p: (self._purge_mag_cache(p), self._emit(p)))
+                specs_sig.connect(on_specs)
+                self._conns[p].append((specs_sig, on_specs))
             self.history[p] = deque(maxlen=HISTORY)
             if p.state is ConnectionState.CONNECTED:
                 prof, now = profile_name(p), self.clock()
@@ -351,6 +358,8 @@ class ActivityMonitor(QObject):
     def _purge_mag_cache(self, proxy) -> None:
         for k in [k for k in self._mag_cache if k[0] is proxy]:
             self._mag_cache.pop(k, None)
+        for k in [k for k in self._fmt_cache if k[0] is proxy]:
+            self._fmt_cache.pop(k, None)
 
     # ------------------------------------------------------------ события приборов
     def _on_state(self, proxy, state) -> None:
@@ -456,7 +465,7 @@ class ActivityMonitor(QObject):
                 self._last_signal[proxy] = now
             self._emit(proxy)
         elif prof == "network_analyzer" and (
-            key == "s.active"
+            key in ("s.active", "s.all_active")
             or (key.startswith("s") and key.endswith((".enabled", ".trace")))
             or (key.startswith("m") and key.endswith((".enabled", ".trace")))
         ):
@@ -472,6 +481,9 @@ class ActivityMonitor(QObject):
     def _has_vna_traces(self, proxy) -> bool:
         """Есть ли хотя бы одна непустая трасса у ВАЦ (без конвертации в dB)."""
         if proxy.supports("s.active"):
+            ch_traces = proxy.channel_traces() if hasattr(proxy, "channel_traces") else {}
+            if any(isinstance(tr, Trace) and len(tr) >= 2 for tr in ch_traces.values()):
+                return True
             for sp in _VNA_SPARAM_KEYS:
                 if proxy.value(f"{sp}.enabled") is not True:
                     continue
@@ -496,6 +508,13 @@ class ActivityMonitor(QObject):
     def vna_has_signal(self, proxy) -> bool:
         """Хоть один активный S-параметр показывает по уровню, что на портах что-то есть."""
         if proxy.supports("s.active"):
+            ch_traces = proxy.channel_traces() if hasattr(proxy, "channel_traces") else {}
+            if ch_traces:
+                for (_ch, sp), tr in ch_traces.items():
+                    if isinstance(tr, Trace) and len(tr):
+                        if _trace_has_signal(tr, sp.upper(), self.th.vna_thru_db, self.th.vna_refl_db):
+                            return True
+                return False
             for sp in _VNA_SPARAM_KEYS:
                 if proxy.value(f"{sp}.enabled") is not True:
                     continue
@@ -718,10 +737,38 @@ class ActivityMonitor(QObject):
         self._mag_cache[key] = (trace, res)
         return res
 
+    def _format_vna_cached(self, proxy, raw: Trace, spec: VNATraceSpec) -> Trace:
+        key = (proxy, spec.id)
+        entry = self._fmt_cache.get(key)
+        if entry is not None and entry[0] is raw and entry[1] == spec:
+            return entry[2]
+        res = format_sparam_trace(raw, spec)
+        self._fmt_cache[key] = (raw, spec, res)
+        return res
+
     def vna_traces(self, proxy) -> list[tuple[str, Trace]]:
-        """Трейсы активных S-параметров ВАЦ: [(«1·S41», трасса в dB)]."""
-        out = []
+        """Трейсы ВАЦ: если у прибора заданы пользовательские трассы (``vna_trace_specs``),
+        считает их на ПК из сырых ``SDATA`` (формат, EDEL, сглаживание); иначе — все активные в dB."""
+        out: list[tuple[str, Trace]] = []
         if proxy.supports("s.active"):
+            specs = proxy.vna_trace_specs() if hasattr(proxy, "vna_trace_specs") else ()
+            if specs:
+                for spec in specs:
+                    if not spec.enabled:
+                        continue
+                    raw = (proxy.channel_trace(spec.channel, spec.sparam)
+                           if hasattr(proxy, "channel_trace") else proxy.value(f"{spec.sparam.lower()}.trace"))
+                    if not isinstance(raw, Trace) or len(raw) < 2:
+                        continue
+                    out.append((spec.display_label(), self._format_vna_cached(proxy, raw, spec)))
+                return out
+            ch_traces = proxy.channel_traces() if hasattr(proxy, "channel_traces") else {}
+            if ch_traces:
+                for (ch, sp), tr in sorted(ch_traces.items(), key=lambda it: (it[0][0], it[0][1])):
+                    if not isinstance(tr, Trace) or len(tr) < 2:
+                        continue
+                    out.append((f"{ch}·{sp}", self._magnitude_db_cached(proxy, f"{ch}:{sp}", tr)))
+                return out
             for sp in _VNA_SPARAM_KEYS:
                 if proxy.value(f"{sp}.enabled") is not True:
                     continue

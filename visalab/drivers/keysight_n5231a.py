@@ -72,11 +72,11 @@ SPARAM_TRACE_KEYS = tuple(f"{sp.lower()}.trace" for sp in ALL_SPARAMS)
 STIM_KEYS = (
     *FREQ_KEYS, "freq.cw", "sweep.type", "sweep.points", "sweep.time", "sweep.time_auto", "bw.if",
     "avg.state", "avg.count", "cal.state", "cal.set", "cal.interp",
-    "source.power", "source.power_coupled", *PORT_POWER_KEYS, "trig.mode",
+    "source.power", "source.power_coupled", *PORT_POWER_KEYS, "power.start", "power.stop", "trig.mode",
 )
 #: ключи, запись которых меняет ось X стимула канала
 X_AXIS_KEYS = (*FREQ_KEYS, "freq.cw", "sweep.type", "sweep.points", "sweep.time", "sweep.time_auto",
-               "cal.set", "gen.state", "stim.channel")
+               "power.start", "power.stop", "cal.set", "gen.state", "stim.channel")
 #: что режим генератора запоминает и возвращает (в этом порядке)
 GEN_KEYS = ("sweep.type", "freq.start", "freq.stop", "sweep.points", "bw.if", "sweep.time_auto", "sweep.time",
             "avg.state", "avg.count", "cal.state", "source.power", "rf.output")
@@ -135,7 +135,7 @@ class KeysightPNA(VISAInstrument):
         #: идущая калибровка: {"channel", "steps": [описание], "done": {шаг}, "busy": шаг | None, "kind": ...}
         self._cal: dict | None = None
         self._sweep: dict[str, Any] = {}          # последняя завершённая развёртка: s{r}{c}.trace, trace, meas.count
-        self._active_sparams: set[str] = set()    # активные S-параметры для чтения на канале _stim_ch
+        self._ch_sparams: dict[int, set[str]] = {}       # канал -> активные S-параметры для чтения
         self._owned_meas: set[tuple[int, str]] = set()   # измерения, созданные самим драйвером (VL_CH...)
         self._armed_channels: list[int] = [1]
         self._stim_ch: int = 1
@@ -151,6 +151,14 @@ class KeysightPNA(VISAInstrument):
         """Число физических портов подключённого ВАЦ (2 или 4)."""
         return self._ports
 
+    @property
+    def _active_sparams(self) -> set[str]:
+        return self._ch_sparams.setdefault(self._stim_ch, set())
+
+    @_active_sparams.setter
+    def _active_sparams(self, val: set[str]) -> None:
+        self._ch_sparams[self._stim_ch] = set(val)
+
     # ------------------------------------------------------------ описание
     def build_params(self):
         m = self.model
@@ -162,7 +170,7 @@ class KeysightPNA(VISAInstrument):
             lo = sp.lower()
             sparam_params += [
                 Param(f"{lo}.enabled", f"Читать {sp}", B, section=rs, query="<virtual>", write="<virtual>",
-                      also_read=("s.active",)),
+                      also_read=("s.active", "s.all_active")),
                 Param(f"{lo}.trace", f"Трасса {sp}", Kind.TRACE, "", section=rs, group="SWEEP"),
             ]
         port_pow_params = [
@@ -174,14 +182,18 @@ class KeysightPNA(VISAInstrument):
         ]
         return sparam_params + port_pow_params + [
             Param("ports", "Портов", I, section=rs, query="<virtual>"),
+            Param("channels.list", "Каналы", S, section=st, query="<virtual>"),
             Param("s.active", "Активные S-параметры", S, section=rs, query="<virtual>", write="<virtual>",
-                  also_read=SPARAM_ENABLED_KEYS),
+                  also_read=(*SPARAM_ENABLED_KEYS, "s.all_active")),
+            Param("s.all_active", "Активные S-параметры по всем каналам", S, section=rs,
+                  query="<virtual>", write="<virtual>",
+                  also_read=("s.active", *SPARAM_ENABLED_KEYS, "channels.list")),
             Param("trace", "Трасса", Kind.TRACE, "", section="Трасса/Трасса", group="SWEEP"),
             Param("meas.count", "Измерений", I, section=rs, group="SWEEP"),
             Param("meas.armed", "Идёт развёртка", B, section=sw, query="<virtual>"),
             Param("meas.continuous", "Непрерывно", B, section=sw, query="<virtual>", write="<virtual>"),
             Param("stim.channel", "Канал стимула", I, section=st, query="<virtual>", write="<virtual>",
-                  minimum=1, maximum=200, also_read=STIM_KEYS),
+                  minimum=1, maximum=200, also_read=(*STIM_KEYS, "s.active", *SPARAM_ENABLED_KEYS)),
             Param("state.dir", "Папка состояний на анализаторе", S, section="Память",
                   query="MMEM:CDIR?", write='MMEM:CDIR "{value}"'),
             Param("gen.state", "Режим генератора", B, section=st, query="<virtual>", write="<virtual>",
@@ -222,6 +234,12 @@ class KeysightPNA(VISAInstrument):
             Param("source.power_coupled", "Связать мощность портов", B, section=st,
                   query="SOUR1:POW:COUP?", write="SOUR1:POW:COUP {value}",
                   also_read=("source.power", *PORT_POWER_KEYS)),
+            Param("power.start", "Начальная мощность", F, "dBm", section=st,
+                  query="SOUR1:POW:STAR?", write="SOUR1:POW:STAR {value}",
+                  minimum=self._POWER_RAW_MIN, maximum=self._POWER_RAW_MAX, tolerance=1e-3),
+            Param("power.stop", "Конечная мощность", F, "dBm", section=st,
+                  query="SOUR1:POW:STOP?", write="SOUR1:POW:STOP {value}",
+                  minimum=self._POWER_RAW_MIN, maximum=self._POWER_RAW_MAX, tolerance=1e-3),
             Param("rf.output", "Источник вкл.", B, section=st, query="OUTP?", write="OUTP {value}"),
             Param("bw.if", "Полоса ПЧ", F, "Hz", section=sw, query="SENS1:BWID?", write="SENS1:BWID {value}",
                   minimum=1.0, maximum=15e6, tolerance=1e-3, also_read=("sweep.time",)),
@@ -259,6 +277,9 @@ class KeysightPNA(VISAInstrument):
             Action("single", "Одна развёртка"),
             Action("abort", "Стоп"),
             Action("trigger", "Ручной запуск (TRIG:SOUR MAN)"),
+            Action("chan_list", "Список каналов"),
+            Action("chan_create", "Создать канал"),
+            Action("chan_delete", "Удалить канал", confirm="Удалить канал с прибора?"),
             Action("sparam_set", "Задать активные S-параметры"),
             Action("sparam_all", "Читать все S-параметры"),
             Action("sparam_none", "Не читать S-параметры"),
@@ -351,10 +372,10 @@ class KeysightPNA(VISAInstrument):
         valid_in_cat = [sp for sp in cat.values() if self._is_valid_sparam(sp)]
         if not valid_in_cat:
             self._ensure_sparam_meas(1, "S11")
-            self._active_sparams = {"S11"}
+            self._ch_sparams = {1: {"S11"}}
         else:
             # по умолчанию включаем первый существующий S-параметр канала 1 (не удаляя чужие измерения)
-            self._active_sparams = {valid_in_cat[0]}
+            self._ch_sparams = {1: {valid_in_cat[0]}}
 
         self._oper_supported = True
         self._setup_oper_sync()
@@ -380,7 +401,7 @@ class KeysightPNA(VISAInstrument):
         self._gen = None
         self._sweep = {}
         self._x_cache = {}
-        self._active_sparams = set()
+        self._ch_sparams = {}
         self._owned_meas = set()
         self._power_offset = 0.0
         self._power_offset_state = False
@@ -417,7 +438,42 @@ class KeysightPNA(VISAInstrument):
     def _active_channels(self) -> list[int]:
         if self._gen is not None:
             return [self._gen[0]]
-        return [self._stim_ch]
+        chs = sorted(c for c, sps in self._ch_sparams.items() if sps)
+        return chs or [self._stim_ch]
+
+    def _all_active_pairs(self) -> list[tuple[int, str]]:
+        out: list[tuple[int, str]] = []
+        for c in sorted(self._ch_sparams):
+            sps = self._ch_sparams[c]
+            for sp in ALL_SPARAMS:
+                if sp in sps:
+                    out.append((c, sp))
+        return out
+
+    def _all_active_str(self) -> str:
+        return ",".join(f"{c}:{sp}" for c, sp in self._all_active_pairs())
+
+    def _parse_all_active(self, raw: str) -> list[tuple[int, str]]:
+        out: list[tuple[int, str]] = []
+        seen: set[tuple[int, str]] = set()
+        for tok in re.split(r"[,\s;]+", str(raw or "").strip()):
+            if not tok:
+                continue
+            if ":" in tok:
+                ch_s, _, sp_s = tok.partition(":")
+                if not ch_s.strip().isdigit():
+                    raise ValueError(f"некорректный канал в {tok!r}")
+                ch = int(ch_s.strip())
+                if not 1 <= ch <= 200:
+                    raise ValueError(f"канал 1..200, получено {ch}")
+            else:
+                ch, sp_s = self._stim_ch, tok
+            sp = self._check_sparam(sp_s)
+            pair = (ch, sp)
+            if pair not in seen:
+                seen.add(pair)
+                out.append(pair)
+        return sorted(out, key=lambda p: (p[0], ALL_SPARAMS.index(p[1])))
 
     # ------------------------------------------------- прозрачное управление измерениями PNA
     def _ensure_sparam_meas(self, channel: int, sparam: str, cat: dict[str, str] | None = None) -> str:
@@ -472,42 +528,95 @@ class KeysightPNA(VISAInstrument):
                 self._owned_meas.discard((channel, name))
                 cat.pop(name, None)
 
-    def _active_sparams_list(self) -> list[str]:
-        return [sp for sp in ALL_SPARAMS if sp in self._active_sparams]
+    def _active_sparams_list(self, channel: int | None = None) -> list[str]:
+        c = self._stim_ch if channel is None else channel
+        sps = self._ch_sparams.get(c, set())
+        return [sp for sp in ALL_SPARAMS if sp in sps]
 
-    def _set_active_sparams(self, sparams: Iterable[str]) -> list[str]:
+    def _publish_sparam_state(self) -> None:
+        cur_set = self._ch_sparams.get(self._stim_ch, set())
+        for sp in ALL_SPARAMS:
+            en_key = f"{sp.lower()}.enabled"
+            en_val = sp in cur_set
+            if self._values.get(en_key) is not en_val:
+                self._publish(en_key, en_val)
+        active_str = ",".join(self._active_sparams_list())
+        if self._values.get("s.active") != active_str:
+            self._publish("s.active", active_str)
+        all_str = self._all_active_str()
+        if self._values.get("s.all_active") != all_str:
+            self._publish("s.all_active", all_str)
+
+    def _set_active_sparams(self, sparams: Iterable[str], channel: int | None = None) -> list[str]:
+        c = self._stim_ch if channel is None else int(channel)
         wanted = [self._check_sparam(sp) for sp in _canonical_sparams(sparams)]
         wanted_set = set(wanted)
-        old_set = set(self._active_sparams)
+        old_set = set(self._ch_sparams.get(c, set()))
         added = [sp for sp in wanted if sp not in old_set]
         removed = [sp for sp in ALL_SPARAMS if sp in old_set and sp not in wanted_set]
-        c = self._stim_ch
         if added:
             cat = self._catalog(c)
             for sp in added:
                 name = self._ensure_sparam_meas(c, sp, cat)
                 cat[name] = sp
-        self._active_sparams = wanted_set
+        if wanted_set:
+            self._ch_sparams[c] = wanted_set
+        else:
+            self._ch_sparams.pop(c, None)
         for sp in removed:
             self._release_sparam_meas(c, sp)
-            key = f"{sp.lower()}.trace"
-            if self._sweep.get(key) is not None or self._values.get(key) is not None:
-                self._sweep[key] = None
-                self._publish(key, None)
-        for sp in ALL_SPARAMS:
-            en_key = f"{sp.lower()}.enabled"
-            en_val = sp in self._active_sparams
-            if self._values.get(en_key) is not en_val:
-                self._publish(en_key, en_val)
-        active_str = ",".join(wanted)
-        if self._values.get("s.active") != active_str:
-            self._publish("s.active", active_str)
-        if not wanted:
+            if c == self._stim_ch:
+                key = f"{sp.lower()}.trace"
+                if self._sweep.get(key) is not None or self._values.get(key) is not None:
+                    self._sweep[key] = None
+                    self._publish(key, None)
+        self._publish_sparam_state()
+        if not self._all_active_pairs():
             self._sweep["trace"] = None
             self._sweep["meas.count"] = 0
             self._publish("trace", None)
             self._publish("meas.count", 0)
         return wanted
+
+    def _set_all_active_sparams(self, pairs: Iterable[tuple[int, str]]) -> list[tuple[int, str]]:
+        by_ch: dict[int, set[str]] = {}
+        for ch, sp in pairs:
+            c = int(ch)
+            if not 1 <= c <= 200:
+                raise ValueError(f"канал 1..200, получено {c}")
+            by_ch.setdefault(c, set()).add(self._check_sparam(sp))
+        old_chs = set(self._ch_sparams)
+        for c in sorted(old_chs | set(by_ch)):
+            wanted = by_ch.get(c, set())
+            old = set(self._ch_sparams.get(c, set()))
+            added = [sp for sp in ALL_SPARAMS if sp in wanted and sp not in old]
+            removed = [sp for sp in ALL_SPARAMS if sp in old and sp not in wanted]
+            if added:
+                cat = self._catalog(c)
+                for sp in added:
+                    name = self._ensure_sparam_meas(c, sp, cat)
+                    cat[name] = sp
+            if wanted:
+                self._ch_sparams[c] = wanted
+            else:
+                self._ch_sparams.pop(c, None)
+            for sp in removed:
+                self._release_sparam_meas(c, sp)
+                if c == self._stim_ch:
+                    key = f"{sp.lower()}.trace"
+                    if self._sweep.get(key) is not None or self._values.get(key) is not None:
+                        self._sweep[key] = None
+                        self._publish(key, None)
+        ch_str = ",".join(str(x) for x in self._channels())
+        if self._values.get("channels.list") != ch_str:
+            self._publish("channels.list", ch_str)
+        self._publish_sparam_state()
+        if not self._all_active_pairs():
+            self._sweep["trace"] = None
+            self._sweep["meas.count"] = 0
+            self._publish("trace", None)
+            self._publish("meas.count", 0)
+        return self._all_active_pairs()
 
     # ------------------------------------------------------------ валидация и запись
     def validate_param(self, spec: Param, value: Any) -> Any:
@@ -528,6 +637,8 @@ class KeysightPNA(VISAInstrument):
                 for tok in re.split(r"[,\s;]+", raw):
                     if tok:
                         self._check_sparam(tok)
+        elif spec.key == "s.all_active":
+            self._parse_all_active(str(val))
         else:
             m_sp = _SPARAM_KEY_RE.match(spec.key)
             if m_sp and m_sp.group(3) == "enabled" and bool(val):
@@ -603,15 +714,20 @@ class KeysightPNA(VISAInstrument):
             self._x_cache.pop(c, None)
             return
 
-        # управление активными S-параметрами (s.active и s{r}{c}.enabled)
+        # управление активными S-параметрами (s.active, s.all_active и s{r}{c}.enabled)
         m_sp = _SPARAM_KEY_RE.match(key)
-        if key == "s.active" or (m_sp and m_sp.group(3) == "enabled"):
+        if key in ("s.active", "s.all_active") or (m_sp and m_sp.group(3) == "enabled"):
             was_armed = self._armed
             if not self._continuous:
                 self._abort()
             added_any = False
             try:
-                if key == "s.active":
+                if key == "s.all_active":
+                    before_all = set(self._all_active_pairs())
+                    pairs = self._parse_all_active(str(value))
+                    self._set_all_active_sparams(pairs)
+                    added_any = bool(set(self._all_active_pairs()) - before_all)
+                elif key == "s.active":
                     toks = [t for t in re.split(r"[,\s;]+", str(value).strip()) if t]
                     before = set(self._active_sparams)
                     self._set_active_sparams(toks)
@@ -679,8 +795,12 @@ class KeysightPNA(VISAInstrument):
         key = spec.key
         if key == "ports":
             return self._ports
+        if key == "channels.list":
+            return ",".join(str(c) for c in self._channels())
         if key == "s.active":
             return ",".join(self._active_sparams_list())
+        if key == "s.all_active":
+            return self._all_active_str()
         m_sp = _SPARAM_KEY_RE.match(key)
         if m_sp and m_sp.group(3) == "enabled":
             return f"S{m_sp.group(1)}{m_sp.group(2)}" in self._active_sparams
@@ -732,7 +852,7 @@ class KeysightPNA(VISAInstrument):
     def _sync_all(self) -> None:
         self._x_cache.clear()
         self._read_keys(list(self._params))
-        if self._cal is None and not self._is_triggered() and self._active_sparams:
+        if self._cal is None and not self._is_triggered() and self._all_active_pairs():
             self._safe_read_trace()
         if self._continuous:
             if self._is_triggered():
@@ -983,10 +1103,13 @@ class KeysightPNA(VISAInstrument):
         return res
 
     def _read_trace(self) -> None:
-        """Прочитать комплексные ``SDATA`` всех активных S-параметров канала ``stim.channel``."""
-        c = self._stim_ch
-        active = self._active_sparams_list()
-        if not active:
+        """Прочитать комплексные ``SDATA`` всех активных (канал, S-параметр) (в CW — только канал генератора)."""
+        if self._gen is not None:
+            gc = self._gen[0]
+            pairs = [(gc, sp) for sp in self._active_sparams_list(gc)]
+        else:
+            pairs = self._all_active_pairs()
+        if not pairs:
             if self._sweep.get("meas.count") != 0 or self._sweep.get("trace") is not None:
                 for sp in ALL_SPARAMS:
                     k = f"{sp.lower()}.trace"
@@ -1003,25 +1126,30 @@ class KeysightPNA(VISAInstrument):
             k: self._values.get(k)
             for k in ("sweep.type", "bw.if", "source.power", "avg.state", "avg.count", "cal.state", "cal.set")
         }
-        cat = self._catalog(c)
-        out: dict[str, Any] = {}
-        first_trace: Trace | None = None
-        count = 0
+        cats: dict[int, dict[str, str]] = {}
+        # публикуем сначала остальные каналы, а активный stim.channel — последним, чтобы s{r}{c}.trace
+        # в _values всегда принадлежали stim.channel, а proxy._channel_traces получил данные всех каналов
+        ordered_pairs = sorted(pairs, key=lambda p: (1 if p[0] == self._stim_ch else 0, p[0], ALL_SPARAMS.index(p[1])))
+        published_traces: list[tuple[int, str, Trace]] = []
+        stim_keys: set[str] = set()
+        first_stim: Trace | None = None
+        first_any: Trace | None = None
 
-        for sp in active:
+        for c, sp in ordered_pairs:
+            cat = cats.setdefault(c, self._catalog(c))
             meas_name = self._ensure_sparam_meas(c, sp, cat)
             cat[meas_name] = sp
             self.write(f"CALC{c}:PAR:SEL '{meas_name}'")
             raw = self._query_data_block(f"CALC{c}:DATA? SDATA")
-            pairs = len(raw) // 2
-            if not pairs:
+            n_pairs = len(raw) // 2
+            if not n_pairs:
                 continue
-            raw = raw[:2 * pairs]
+            raw = raw[:2 * n_pairs]
             re_vals = tuple(float(v) for v in raw[0::2])
             im_vals = tuple(float(v) for v in raw[1::2])
-            x_vals, x_unit, uniform = self._read_x_axis(c, expected_len=pairs)
+            x_vals, x_unit, uniform = self._read_x_axis(c, expected_len=n_pairs)
             meta = {
-                **stim_meta,
+                **(stim_meta if c == self._stim_ch else {}),
                 "channel": c,
                 "name": meas_name,
                 "sparam": sp,
@@ -1029,24 +1157,28 @@ class KeysightPNA(VISAInstrument):
             }
             tr = Trace(x_vals, re_vals, x_unit=x_unit, y_unit="", name=sp, im=im_vals,
                        uniform=uniform, meta=meta)
-            key = f"{sp.lower()}.trace"
-            out[key] = tr
-            if first_trace is None:
-                first_trace = tr
-            count += 1
+            published_traces.append((c, f"{sp.lower()}.trace", tr))
+            if c == self._stim_ch:
+                stim_keys.add(f"{sp.lower()}.trace")
+                if first_stim is None:
+                    first_stim = tr
+            if first_any is None:
+                first_any = tr
 
-        # очистить трассы выключенных параметров (публикуя None только если было не None)
+        # очистить трассы параметров, неактивных ни на одном читаемом канале
+        all_keys = {k for _c, k, _t in published_traces}
         for sp in ALL_SPARAMS:
             key = f"{sp.lower()}.trace"
-            if key not in out:
+            if key not in all_keys:
                 if self._sweep.get(key) is not None or self._values.get(key) is not None:
                     self._sweep[key] = None
                     self._publish(key, None)
 
-        # публикуем все активные трассы, затем trace и meas.count (последним — триггер sweep_updated)
-        for key, tr in out.items():
+        for _c, key, tr in published_traces:
             self._sweep[key] = tr
             self._publish(key, tr)
+        first_trace = first_stim or first_any
+        count = len(published_traces)
         self._sweep["trace"] = first_trace
         self._sweep["meas.count"] = count
         self._publish("trace", first_trace)
@@ -1142,6 +1274,65 @@ class KeysightPNA(VISAInstrument):
             for c in ([channels[0]] if scope == "ALL" else channels):
                 self.write(f"INIT{c}:IMM")
             return None
+        if name == "chan_list":
+            chs = self._channels()
+            ch_str = ",".join(str(c) for c in chs)
+            if self._values.get("channels.list") != ch_str:
+                self._publish("channels.list", ch_str)
+            return chs
+        if name == "chan_create":
+            if self._gen is not None:
+                raise ValueError("режим генератора: сначала выключите CW")
+            existing = self._channels()
+            ch = int(args[0]) if args and args[0] is not None else max(existing) + 1
+            if not 1 <= ch <= 200:
+                raise ValueError(f"канал 1..200, получено {ch}")
+            was_armed = self._armed
+            if not self._continuous:
+                self._abort()
+            try:
+                if ch not in existing or not self._catalog(ch):
+                    self._ensure_sparam_meas(ch, "S11")
+                self._stim_ch = ch
+                self._x_cache.pop(ch, None)
+                chs = self._channels()
+                self._publish("channels.list", ",".join(str(c) for c in chs))
+                self._publish("stim.channel", ch)
+                self._publish_sparam_state()
+                self._read_keys(STIM_KEYS)
+                self._check_errors(context=name)
+                return chs
+            finally:
+                self._resume_after_write(was_armed)
+        if name == "chan_delete":
+            existing = self._channels()
+            ch = int(args[0]) if args and args[0] is not None else self._stim_ch
+            if self._gen is not None and self._gen[0] == ch:
+                raise ValueError(f"режим генератора на канале {ch}: сначала выключите CW")
+            if ch not in existing:
+                raise ValueError(f"нет канала {ch} (каналы: {existing})")
+            if len(existing) <= 1:
+                raise ValueError("нельзя удалить единственный канал прибора")
+            was_armed = self._armed
+            if not self._continuous:
+                self._abort()
+            try:
+                for mname in list(self._catalog(ch)):
+                    self.write(f"CALC{ch}:PAR:DEL '{mname}'")
+                    self._owned_meas.discard((ch, mname))
+                self._ch_sparams.pop(ch, None)
+                self._x_cache.pop(ch, None)
+                chs = self._channels()
+                if self._stim_ch not in chs:
+                    self._stim_ch = chs[0]
+                    self._publish("stim.channel", self._stim_ch)
+                    self._read_keys(STIM_KEYS)
+                self._publish("channels.list", ",".join(str(c) for c in chs))
+                self._publish_sparam_state()
+                self._check_errors(context=name)
+                return chs
+            finally:
+                self._resume_after_write(was_armed)
         if name in ("sparam_set", "sparam_all", "sparam_none"):
             was_armed = self._armed
             if not self._continuous:

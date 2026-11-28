@@ -101,7 +101,7 @@ def test_panel_line_input_priority_and_no_arrow_on_pm_follow(qtbot, tmp_path):
         p_gen.shutdown()
 
 
-def test_psu_voltage_units_channel_power_and_total_power(qtbot, tmp_path):
+def test_psu_source_field_units_and_on_off_swap(qtbot, tmp_path):
     s = QSettings(str(tmp_path / "psu_pwr.ini"), QSettings.Format.IniFormat)
     p = _proxy("it6300")
     w = PSUWindow(p, s)
@@ -110,36 +110,27 @@ def test_psu_voltage_units_channel_power_and_total_power(qtbot, tmp_path):
         with qtbot.waitSignal(p.sync_done, timeout=5000):
             p.open()
 
+        v2 = w.tiles[2].fields["V"]
         p.set("ch2.voltage", 0.5)
         p.set("ch2.current", 1.0)
         p.set("ch2.output", True)
-        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "500 mV", timeout=5000)
-        qtbot.waitUntil(lambda: w.tiles[2].fields["P"].text() == "25 mW", timeout=5000)
+        qtbot.waitUntil(
+            lambda: v2.text() == "500" and v2.side.text() == "500" and v2.unit_label.text() == "mV",
+            timeout=5000,
+        )
 
         p.set("ch2.output", False)
-        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "0 mV", timeout=5000)
+        qtbot.waitUntil(lambda: v2.text() == "500" and v2.side.text() == "0" and v2.unit_label.text() == "mV", timeout=5000)
 
         v2_edit = w.setpoint_fields[2]["V"]
-        v2_edit.set_prefix("m")
-        v2_edit.setText("10000")
+        v2_edit.setText("10 V")
         v2_edit.setModified(True)
         v2_edit.returnPressed.emit()
         qtbot.waitUntil(lambda: p.value("ch2.voltage") == pytest.approx(10.0), timeout=5000)
+        qtbot.waitUntil(lambda: v2.text() == "10" and v2.side.text() == "0" and v2.unit_label.text() == "V", timeout=5000)
         p.set("ch2.current", 2.0)
         p.set("ch2.output", True)
-        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "10 V", timeout=5000)
-        qtbot.waitUntil(lambda: w.tiles[2].fields["P"].text() == "10 W", timeout=5000)
-
-        p.set("ch2.output", False)
-        qtbot.waitUntil(lambda: w.tiles[2].fields["V"].text() == "0 V", timeout=5000)
-
-        p.set("ch2.voltage", 5.0)
-        p.set("ch2.output", True)
-        p.set("ch3.voltage", 5.0)
-        p.set("ch3.current", 2.0)
-        p.set("ch3.output", True)
-        qtbot.waitUntil(lambda: w.total_power == pytest.approx(5.0, abs=0.05), timeout=5000)
-        qtbot.waitUntil(lambda: w.total_power_label.text() == "TOTAL 5 W", timeout=5000)
+        qtbot.waitUntil(lambda: v2.text() == "10" and v2.side.text() == "10" and v2.unit_label.text() == "V", timeout=5000)
     finally:
         w.cleanup()
         w.close()

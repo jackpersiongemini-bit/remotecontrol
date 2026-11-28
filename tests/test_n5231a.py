@@ -6,7 +6,7 @@ import math
 import pytest
 
 from visalab.coord import COORD, ActivityMonitor, Instrument
-from visalab.core import ConnectionState, PStatus, Trace
+from visalab.core import ConnectionState, PStatus, Trace, VNATraceSpec, format_sparam_trace
 from visalab.core.export import write_touchstone
 from visalab.drivers import KeysightPNA, PNA_MODELS
 from visalab.instruments import InstrumentProxy
@@ -434,6 +434,170 @@ def test_proxy_and_coord_instrument_sparam_api_and_sweep_signal(qtbot):
         inst.enable_sparam("S41", False)
         _wait(qtbot, lambda: inst.active_sparams() == ["S11"] and inst.sparam_trace("S41") is None)
         assert set(inst.sparam_traces()) == {"S11"}
+    finally:
+        mon.stop()
+        COORD.links.remove(inst)
+        inst.shutdown()
+
+
+# ============================================================ 11. Каналы, power.start/stop и мульти-канальные развёртки
+def test_channels_create_switch_delete_and_multi_channel_sweeps(vna):
+    drv, sim, rec = vna
+    actions = []
+    drv.action_done.connect(lambda n, r: actions.append((n, r)))
+
+    assert rec.values["channels.list"] == "1"
+    assert rec.values["stim.channel"] == 1
+
+    # Создаём канал 2
+    drv.run_action("chan_create", 2)
+    assert actions[-1] == ("chan_create", [1, 2])
+    assert rec.values["channels.list"] == "1,2"
+    assert rec.values["stim.channel"] == 2
+
+    # Настраиваем CH2: 3..5 ГГц, 21 точка
+    assert setp(drv, rec, "freq.start", 3e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "freq.stop", 5e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "sweep.points", 21) is PStatus.WRITTEN
+
+    # Возвращаемся на CH1: 1..2 ГГц, 11 точек
+    assert setp(drv, rec, "stim.channel", 1) is PStatus.WRITTEN
+    assert setp(drv, rec, "freq.start", 1e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "freq.stop", 2e9) is PStatus.WRITTEN
+    assert setp(drv, rec, "sweep.points", 11) is PStatus.WRITTEN
+
+    # Включаем чтение из обоих каналов одновременно через s.all_active
+    emitted: list[tuple[int, str, Trace]] = []
+    drv.param_updated.connect(
+        lambda k, v: emitted.append((int(v.meta.get("channel", 1)), v.name, v))
+        if k.endswith(".trace") and isinstance(v, Trace) else None
+    )
+    assert setp(drv, rec, "s.all_active", "1:S11,1:S41,2:S21") is PStatus.WRITTEN
+    drv.poll()
+
+    by_pair = {(ch, sp): tr for ch, sp, tr in emitted}
+    assert (1, "S11") in by_pair and (1, "S41") in by_pair and (2, "S21") in by_pair
+    assert len(by_pair[(1, "S11")]) == 11 and by_pair[(1, "S11")].x[0] == pytest.approx(1e9)
+    assert len(by_pair[(1, "S41")]) == 11 and by_pair[(1, "S41")].x[-1] == pytest.approx(2e9)
+    assert len(by_pair[(2, "S21")]) == 21 and by_pair[(2, "S21")].x[0] == pytest.approx(3e9)
+    assert by_pair[(2, "S21")].x[-1] == pytest.approx(5e9)
+
+    # Power sweep (power.start / power.stop) на CH1
+    assert setp(drv, rec, "sweep.type", "POWER") is PStatus.WRITTEN
+    assert setp(drv, rec, "power.start", -25.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "power.stop", 5.0) is PStatus.WRITTEN
+    emitted.clear()
+    drv.poll()
+    p_tr = next(tr for ch, sp, tr in emitted if ch == 1 and sp == "S11")
+    assert p_tr.x_unit == "dBm"
+    assert p_tr.x[0] == pytest.approx(-25.0) and p_tr.x[-1] == pytest.approx(5.0)
+
+    # Удаляем канал 2
+    drv.run_action("chan_delete", 2)
+    assert rec.values["channels.list"] == "1"
+    assert "2:S21" not in rec.values["s.all_active"]
+
+    # Последний оставшийся канал 1 не удаляется
+    drv.run_action("chan_delete", 1)
+    assert rec.values["channels.list"] == "1"
+    assert not rec.errors
+
+
+# ============================================================ 12. Пользовательские трассы на ПК (VNATraceSpec)
+def test_vna_trace_spec_formatting_edel_and_smoothing():
+    # Синтетическая трасса: |S21| = 0.5 (−6.02 dB), задержка кабеля tau = 2 нс -> S(f) = 0.5 * exp(-j 2pi f tau)
+    tau = 2e-9
+    xs = tuple(1e9 + i * 1e7 for i in range(101))  # 1..2 ГГц, шаг 10 МГц
+    zs = [0.5 * cmath.exp(-2j * math.pi * f * tau) for f in xs]
+    raw = Trace(
+        x=xs,
+        y=tuple(z.real for z in zs),
+        im=tuple(z.imag for z in zs),
+        x_unit="Hz",
+        y_unit="",
+        name="S21",
+        meta={"channel": 1, "fmt": "SDATA"},
+    )
+
+    mlog = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "MLOG"))
+    assert mlog.y_unit == "dB" and mlog.y[0] == pytest.approx(20.0 * math.log10(0.5), abs=1e-6)
+
+    lin = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "LIN_MAG"))
+    assert lin.y_unit == "" and lin.y[0] == pytest.approx(0.5, abs=1e-6)
+
+    swr = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "SWR"))
+    assert swr.y_unit == "" and swr.y[0] == pytest.approx((1.0 + 0.5) / (1.0 - 0.5), abs=1e-6)
+
+    re_tr = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "REAL"))
+    im_tr = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "IMAG"))
+    assert re_tr.y[0] == pytest.approx(zs[0].real, abs=1e-6)
+    assert im_tr.y[0] == pytest.approx(zs[0].imag, abs=1e-6)
+
+    # Групповая задержка = -d(phi)/d(2*pi*f) = +2 нс
+    gd = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "GDELAY"))
+    assert gd.y_unit == "s" and gd.y[50] == pytest.approx(tau, rel=1e-4)
+
+    # Компенсация электрической задержки EDEL = +2 нс выпрямляет фазу в 0°
+    ph_comp = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "PHASE", edel_s=tau))
+    assert ph_comp.y_unit == "deg"
+    assert all(abs(v) < 1e-6 for v in ph_comp.y)
+
+    # Развёрнутая фаза без EDEL монотонно убывает на -720° за 1 ГГц (2 нс * 1 ГГц = 2 периода)
+    uph = format_sparam_trace(raw, VNATraceSpec("t1", 1, "S21", "UPHASE"))
+    assert (uph.y[-1] - uph.y[0]) == pytest.approx(-720.0, abs=1e-3)
+
+    # Сглаживание снижает разброс шума
+    noisy = Trace(
+        x=xs,
+        y=tuple((0.5 + (0.1 if i % 2 else -0.1)) for i in range(len(xs))),
+        im=tuple(0.0 for _ in xs),
+        x_unit="Hz", y_unit="", name="S21", meta={"channel": 1, "fmt": "SDATA"},
+    )
+    raw_lin = format_sparam_trace(noisy, VNATraceSpec("t1", 1, "S21", "LIN_MAG", smooth=False))
+    smo_lin = format_sparam_trace(noisy, VNATraceSpec("t1", 1, "S21", "LIN_MAG", smooth=True, smooth_aper=20.0))
+    assert len(smo_lin) == len(raw_lin)
+    assert (max(smo_lin.y[15:-15]) - min(smo_lin.y[15:-15])) < 0.05
+
+    # Сериализация to_dict / from_dict
+    spec = VNATraceSpec("t9", 2, "s41", "phase", enabled=False, edel_s=1.5e-9, smooth=True, smooth_aper=5.0)
+    restored = VNATraceSpec.from_dict(spec.to_dict())
+    assert restored == VNATraceSpec("t9", 2, "S41", "PHASE", False, 1.5e-9, True, 5.0)
+
+
+def test_coord_instrument_vna_trace_specs_and_activity_monitor(qtbot):
+    sim = KeysightPNASim(ports=4)
+    proxy = InstrumentProxy(KeysightPNA, SimTransport(sim))
+    inst = Instrument(proxy)
+    COORD.links.add(inst)
+    mon = ActivityMonitor()
+    changes = []
+    mon.changed.connect(lambda: changes.append(1))
+
+    try:
+        inst.open()
+        _wait(qtbot, lambda: inst.is_connected and inst.value("ports") == 4)
+        inst.action("chan_create", 2)
+        _wait(qtbot, lambda: 2 in inst.channels_list())
+
+        specs = [
+            VNATraceSpec("t1", 1, "S41", "MLOG", enabled=True),
+            VNATraceSpec("t2", 1, "S41", "PHASE", edel_s=1e-9, enabled=True),
+            VNATraceSpec("t3", 2, "S21", "SWR", enabled=True),
+            VNATraceSpec("t4", 1, "S11", "MLOG", enabled=False),
+        ]
+        inst.set_vna_trace_specs(specs)
+        inst.set_channel_sparams([(1, "S41"), (2, "S21")])
+        _wait(qtbot, lambda: (1, "S41") in inst.channel_traces() and (2, "S21") in inst.channel_traces())
+
+        rendered = mon.vna_traces(inst)
+        assert [lbl for lbl, _tr in rendered] == ["1·S41 MLOG", "1·S41 PHAS", "2·S21 SWR"]
+        assert [tr.y_unit for _lbl, tr in rendered] == ["dB", "deg", ""]
+
+        # Изменение PC-настройки (EDEL / выключение трассы) мгновенно обновляет ActivityMonitor
+        before = len(changes)
+        inst.set_vna_trace_specs([specs[0], specs[2]])
+        assert len(changes) > before
+        assert [lbl for lbl, _tr in mon.vna_traces(inst)] == ["1·S41 MLOG", "2·S21 SWR"]
     finally:
         mon.stop()
         COORD.links.remove(inst)

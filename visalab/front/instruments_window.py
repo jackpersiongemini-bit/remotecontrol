@@ -22,13 +22,13 @@ from PyQt6.QtWidgets import (QAbstractButton, QApplication, QFrame, QHBoxLayout,
                              QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
 from .favorites import clone_bound_widget
-from .params import Panel, PanelLine, PanelTable, _repolish
+from .params import PSpinBox, PSpinEdit, Panel, PanelLine, PanelTable, _repolish
 from .split_layout import GraphSplitter
 from .theme import (OFF, UI_BORDER_RADIUS_PX, UI_BORDER_WIDTH_PX, UI_COLOR_BACKGROUND, UI_COLOR_BORDER,
                     UI_COLOR_BORDER_LIGHT, UI_COLOR_CONTROL, UI_COLOR_ERROR, UI_COLOR_INVERT, UI_COLOR_INVERT_HOVER,
                     UI_COLOR_PANEL, UI_COLOR_PROCESS, UI_COLOR_TEXT, UI_COLOR_TEXT_INVERSE, UI_COLOR_TEXT_MUTED,
-                    UI_FONT_SIZE_PT, UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY, UI_SEARCH_FONT_SIZE_PT,
-                    UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss, scrollbar_qss)
+                    UI_COLUMN_WIDTH_PX, UI_FONT_SIZE_PT, UI_FONT_WEIGHT_SEMIBOLD, UI_MONOSPACE_FONT_FAMILY,
+                    UI_SEARCH_FONT_SIZE_PT, UI_TITLE_BAR_ITEM_SIZE_PX, WINDOW_BAR_HEIGHT, render_qss, scrollbar_qss)
 from .widgets import CollapsibleSection
 from .window import (AddressLabel, CollapseAllButton, CustomFullButton, CustomInitButton, CustomSyncButton,
                      ErrorIndicator, ExpandAllButton, PanelCloseButton, PinStarButton, Switch, Window, WindowBar,
@@ -47,7 +47,7 @@ DEFAULT_INSTRUMENTS: tuple[str, ...] = (
 )
 
 INSTRUMENT_SECTIONS: dict[str, tuple[str, ...]] = {
-    "VNA": ("TRAC", "SCAL", "MARK", "STIM", "TRIG", "PWR", "CAL", "SAVE", "SET"),
+    "VNA": ("TRAC", "CH", "PWR", "TRIG", "CAL", "SAVE", "SET"),
     "SA": ("FREQ", "BW", "AMPL", "SWP", "TRAC", "TRIG", "SET"),
     "PM": ("MAIN", "TRIG", "CAL", "TIME", "SWP", "SET"),
     "GEN": ("RF", "MOD", "PULS", "SWP", "CAL", "SET"),
@@ -99,6 +99,20 @@ PARAM_FULL_NAMES: dict[tuple[str, str], str] = {
     ("SWP", "OPT"): "Dwell / View",
     ("SWP", "TRK"): "SA Track",
     ("TRAC", "MODE"): "Trace Mode",
+    ("TRAC", "CH"): "Channel",
+    ("TRAC", "SPAR"): "S-Param",
+    ("TRAC", "FMT"): "Format",
+    ("TRAC", "EDEL"): "Elec Delay",
+    ("TRAC", "SMO"): "Smoothing",
+    ("CH", "IFBW"): "IF BW",
+    ("CH", "PSTR"): "Power Start",
+    ("CH", "PSTP"): "Power Stop",
+    ("PWR", "COUP"): "Port Couple",
+    ("PWR", "P1"): "Port 1",
+    ("PWR", "P2"): "Port 2",
+    ("PWR", "P3"): "Port 3",
+    ("PWR", "P4"): "Port 4",
+    ("SAVE", "SNP"): "Touchstone",
     ("SET", "DLY"): "Cmd Delay",
 }
 
@@ -123,6 +137,7 @@ PARAM_FULL_NAMES_COMMON: dict[str, str] = {
     "REF": "Reference",
     "MODE": "Mode",
     "AVG": "Average",
+    "SAVG": "Software Avg",
     "SRC": "Source",
     "LVL": "Level",
     "SLOP": "Slope",
@@ -511,6 +526,45 @@ class InstrumentCard(QFrame):
         return super().eventFilter(obj, event)
 
 
+def _replace_spinboxes_with_line_edits(win, table: PanelTable) -> None:
+    """В правом меню настроек не должно быть спинбоксов — заменяем PSpinBox / PSpinEdit на обычный PLineEdit."""
+    replaced = False
+    for ln in table.lines:
+        for idx, w in enumerate(list(ln.widgets)):
+            if sip.isdeleted(w) or not isinstance(w, (PSpinBox, PSpinEdit)):
+                continue
+            key = getattr(w, "key", None)
+            if not key:
+                continue
+            edit = clone_bound_widget(w, win.proxy, as_spinbox=False)
+            if edit is None:
+                continue
+            edit.setEnabled(w.isEnabled())
+            edit.setVisible(not w.isHidden())
+            lay_idx = ln.line_layout.indexOf(w)
+            ln.line_layout.removeWidget(w)
+            if lay_idx >= 0:
+                ln.line_layout.insertWidget(lay_idx, edit)
+            else:
+                ln.line_layout.addWidget(edit)
+            ln.widgets[idx] = edit
+            if isinstance(getattr(win, "widgets", None), dict) and win.widgets.get(key) is w:
+                win.widgets[key] = edit
+            saved = getattr(win, "saved_widgets", None)
+            if isinstance(saved, list):
+                for si, sw in enumerate(saved):
+                    if sw is w:
+                        saved[si] = edit
+            if hasattr(w, "unbind"):
+                w.unbind()
+            w.hide()
+            w.setParent(None)
+            w.deleteLater()
+            replaced = True
+    if replaced:
+        table.build(UI_COLUMN_WIDTH_PX)
+
+
 class InstrumentSettingsView(QFrame):
     """Панель настроек одного прибора в правой половине окна: вертикальный список сворачиваемых
     подразделов (``CollapsibleSection``) без вкладок + кнопки «развернуть всё / свернуть всё»."""
@@ -524,6 +578,11 @@ class InstrumentSettingsView(QFrame):
         }
         InstrumentSettingsView QFrame#settingsHeader {
             background-color: $UI_COLOR_CONTROL;
+            border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
+            border-radius: ${UI_BORDER_RADIUS_PX}px;
+        }
+        InstrumentSettingsView QFrame#settingsPinned {
+            background-color: $UI_COLOR_PANEL;
             border: ${UI_BORDER_WIDTH_PX}px solid $UI_COLOR_BORDER;
             border-radius: ${UI_BORDER_RADIUS_PX}px;
         }
@@ -568,6 +627,7 @@ class InstrumentSettingsView(QFrame):
         self._settings = settings
         self.instrument_window = None
         self.error_section: CollapsibleSection | None = None
+        self.pinned_section: QFrame | None = None
         self.fav_button = None
         self.setStyleSheet(self.STYLE_SHEET)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -616,6 +676,7 @@ class InstrumentSettingsView(QFrame):
     def _clear_sections(self) -> None:
         self.sections.clear()
         self.error_section = None
+        self.pinned_section = None
         while self._sections_layout.count():
             item = self._sections_layout.takeAt(0)
             w = item.widget()
@@ -672,6 +733,22 @@ class InstrumentSettingsView(QFrame):
 
         win._hosted_errors_cb = _toggle_errors
 
+        # Несворачиваемая шапка настроек (например, каналы и трассы VNA — всегда видны сверху настроек)
+        pinned_table = getattr(win, "settings_header_table", None)
+        if pinned_table is not None:
+            pinned = QFrame(self._sections_host)
+            pinned.setObjectName("settingsPinned")
+            pinned.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            pl = QVBoxLayout(pinned)
+            pl.setContentsMargins(8, 8, 8, 8)
+            pl.setSpacing(6)
+            pnl = Panel(pinned_table)
+            pnl.layout().setContentsMargins(0, 0, 0, 0)
+            pinned_table.show()
+            pl.addWidget(pnl)
+            self.pinned_section = pinned
+            self._sections_layout.addWidget(pinned)
+
         # Сопоставляем строки настроек с пунктами FavoritesManager для звёздочек по наведению
         fav_by_line = {
             id(it.source_line): it
@@ -684,6 +761,8 @@ class InstrumentSettingsView(QFrame):
         for i, page in enumerate(win.pages):
             sec_code = win.tabs.tabText(i) or f"SEC {i + 1}"
             sec_title = _full_section_title(sec_code)
+            if isinstance(page, PanelTable):
+                _replace_spinboxes_with_line_edits(win, page)
             _expand_table_labels(sec_code, page)
             if isinstance(page, PanelTable):
                 has_any_pinnable = any(id(ln) in fav_by_line for ln in page.lines)
@@ -1001,7 +1080,7 @@ class SearchResultsView(QFrame):
                         for w in ln.widgets:
                             if sip.isdeleted(w):
                                 continue
-                            c = clone_bound_widget(w, win.proxy)
+                            c = clone_bound_widget(w, win.proxy, as_spinbox=False)
                             if c is not None:
                                 clones.append(c)
                         row_title = full_label or short_label or (" / ".join(btn_texts) if btn_texts else sec_title)

@@ -45,6 +45,7 @@ class KeysightU2021XASim(SimInstrument):
                     "trac": False, "trac_time": 100e-6, "trac_offs": 0.0, "trac_unit": "DBM"}
         self.units = {n: "DBM" for n in range(1, 5)}
         self.feeds = {n: "POW:AVER" for n in range(1, 5)}
+        self.calc_gain_stat = {n: False for n in range(1, 5)}
         self.measuring = False
         self.opc_pending = False
         self.results: dict[int, float] | None = None
@@ -174,13 +175,15 @@ class KeysightU2021XASim(SimInstrument):
         self.on("TRIGger[:SEQuence]:LEVel:AUTO", self._bool("lev_auto"), self._get("lev_auto"))
         self.on("TRIGger[:SEQuence]:LEVel", self._lev_set, self._lev_get)
         self.on("TRIGger[:SEQuence]:SLOPe", self._slop_set, lambda a, g: self.cfg["slop"])
-        self.on("TRIGger[:SEQuence]:DELay", num("del", -1, 1), self._get("del"))
-        self.on("TRIGger[:SEQuence]:HOLDoff", num("hold", 1e-6, 0.4), self._get("hold"))
+        self.on("TRIGger[:SEQuence]:DELay", self._del_set, self._get("del"))
+        self.on("TRIGger[:SEQuence]:HOLDoff", self._hold_set, self._get("hold"))
         self.on("TRIGger[:SEQuence[1]]:IMMediate", lambda a, g: self.measuring and self._complete(True))
         self.on("INITiate[1]:CONTinuous", self._cont_set, self._get("cont"))
         self.on("INITiate[1][:IMMediate]", self._init)
         self.on("ABORt[1]", lambda a, g: setattr(self, "measuring", False))
         self.on("UNIT#:POWer", self._unit_set, lambda a, g: self.units[int(g[0])])
+        self.on("CALCulate#:GAIN:STATe", self._calc_gain_stat_set,
+                lambda a, g: "1" if self.calc_gain_stat[int(g[0])] else "0")
         self.on("CALCulate#:FEED[1]", self._feed_set, lambda a, g: f'"{self.feeds[int(g[0])]}"')
         self.on("FETCh#[:SCALar][:POWer:AC]", get=self._fetch)
         self.on("TRACe[1]:STATe", self._trac_set, self._get("trac"))
@@ -254,6 +257,20 @@ class KeysightU2021XASim(SimInstrument):
         t = a.strip().upper()
         self.cfg["slop"] = {"POS": "POS", "POSITIVE": "POS", "NEG": "NEG", "NEGATIVE": "NEG"}[t]
 
+    def _del_set(self, a, g):
+        val = self.num(a, -1, 1)
+        if val < 0 and self.cfg["src"] == "IMM":
+            raise SimError(-221, "Settings conflict", ESR_EXE)
+        self.cfg["del"] = val
+
+    def _hold_set(self, a, g):
+        if self.cfg["src"] == "IMM":
+            raise SimError(-221, "Settings conflict", ESR_EXE)
+        self.cfg["hold"] = self.num(a, 1e-6, 0.4)
+
+    def _calc_gain_stat_set(self, a, g):
+        self.calc_gain_stat[int(g[0])] = self.boolean(a)
+
     def _lev_offset(self) -> float:
         if self.trig_level_includes_offset and self.cfg["gain2_stat"]:
             return float(self.cfg["gain2"])
@@ -310,7 +327,7 @@ class KeysightU2021XASim(SimInstrument):
 
     def _trac_set(self, a, g):
         on = self.boolean(a)
-        if on and self.cfg["det"] == "AVER":
+        if on and (self.cfg["det"] == "AVER" or self.cfg["cont"]):
             raise SimError(-221, "Settings conflict", ESR_EXE)
         self.cfg["trac"] = on
         self.trace = None

@@ -297,3 +297,126 @@ def test_software_level_10us_pulse(pm):
     assert tr is not None and len(tr) == 1000
     assert tr.x[0] < 0.0 < tr.x[-1]
     assert not rec.errors
+
+
+def test_software_sliding_window_averaging(pm):
+    """Программное скользящее усреднение: аппаратное = 1, веса 1/k при разгоне и 1/N в окне (в линейных мВт),
+    опциональный автосброс и опциональное усреднение трассы."""
+    drv, sim, rec = pm
+    sim.set_signal(on_dbm=0.0, width=None)              # 1.0 mW CW
+
+    assert setp(drv, rec, "sw_avg.count", 3) is PStatus.WRITTEN
+    assert setp(drv, rec, "sw_avg.state", True) is PStatus.WRITTEN
+    assert sim.cfg["coun"] == 1 and sim.cfg["coun_auto"] is False
+    assert rec.values["avg.count"] == 1 and rec.values["avg.auto"] is False
+
+    # k = 1: [1 mW] -> 1.0 mW (0 dBm)
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(0.0, abs=0.01)
+
+    # Переходим на 2.0 mW (+3.0103 dBm)
+    p2_dbm = 10.0 * math.log10(2.0)
+    sim.set_signal(on_dbm=p2_dbm, width=None)
+
+    # k = 2: [1, 2] -> 1.5 mW
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(10.0 * math.log10(1.5), abs=0.01)
+
+    # k = 3: [1, 2, 2] -> 5/3 mW
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(10.0 * math.log10(5.0 / 3.0), abs=0.01)
+
+    # k = 4 (окно N = 3 сдвинулось): [2, 2, 2] -> 2.0 mW
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(p2_dbm, abs=0.01)
+
+    # Опция сброса выключена (KEEP): смена частоты сохраняет окно для плавности
+    assert setp(drv, rec, "sw_avg.reset_on_change", False) is PStatus.WRITTEN
+    sim.set_signal(on_dbm=0.0, width=None)              # 1.0 mW
+    assert setp(drv, rec, "freq", 2e9) is PStatus.WRITTEN
+    drv.poll()                                          # [2, 2, 1] -> 5/3 mW (окно не сброшено!)
+    assert rec.values["meas.power"] == pytest.approx(10.0 * math.log10(5.0 / 3.0), abs=0.01)
+
+    # Опция автосброса включена (ARST): смена частоты сбрасывает окно
+    assert setp(drv, rec, "sw_avg.reset_on_change", True) is PStatus.WRITTEN
+    assert setp(drv, rec, "freq", 3e9) is PStatus.WRITTEN
+    drv.poll()                                          # [1] -> 1.0 mW (0 dBm)
+    assert rec.values["meas.power"] == pytest.approx(0.0, abs=0.01)
+
+    # Ручной сброс окна через action sw_avg_reset
+    sim.set_signal(on_dbm=p2_dbm, width=None)
+    drv.run_action("sw_avg_reset")
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(p2_dbm, abs=0.01)
+
+    # Опциональное поточечное усреднение трассы (в линейных мВт)
+    assert setp(drv, rec, "trace.state", True) is PStatus.WRITTEN
+    assert setp(drv, rec, "sw_avg.trace", True) is PStatus.WRITTEN
+    drv.run_action("sw_avg_reset")
+    sim.set_signal(on_dbm=0.0, width=None)              # 1 mW
+    drv.run_action("single")
+    assert rec.values["trace"].y[0] == pytest.approx(0.0, abs=0.01)
+    sim.set_signal(on_dbm=p2_dbm, width=None)           # 2 mW -> среднее по 2 трассам = 1.5 mW
+    drv.run_action("single")
+    assert rec.values["trace"].y[0] == pytest.approx(10.0 * math.log10(1.5), abs=0.01)
+
+    # Отключаем усреднение трассы -> трасса сразу сырая (2 mW)
+    assert setp(drv, rec, "sw_avg.trace", False) is PStatus.WRITTEN
+    drv.run_action("single")
+    assert rec.values["trace"].y[0] == pytest.approx(p2_dbm, abs=0.01)
+    assert not rec.errors
+
+
+def test_level_no_221_no_blocking_opc_and_single_offset(make):
+    """LEVEL: без -221 (порядок TRAC:STAT ON -> SENS:TRAC:TIME, без TRIG:HOLD/отриц. TRIG:DEL в IMM),
+    без блокирующего *OPC? в poll(), аппаратное AVER выкл. на время LEVEL, и поправка учитывается ровно 1 раз."""
+    sim = KeysightU2021XASim()
+    # Имитируем оставшиеся на датчике аппаратные поправки до подключения
+    sim.cfg["gain2"] = 15.0
+    sim.cfg["gain2_stat"] = True
+    sim.calc_gain_stat[1] = True
+    drv, sim, rec = make(KeysightU2021XA, KeysightU2021XASim, sim=sim)
+
+    # При подключении аппаратные поправки сброшены, чтобы не удваиваться
+    assert sim.cfg["gain2_stat"] is False
+    assert sim.calc_gain_stat[1] is False
+
+    # Импульс 10 мкс / период 1 мс, уровень на входе датчика -5 dBm; программная поправка +25 dB -> +20 dBm
+    sim.set_signal(on_dbm=-5.0, width=10e-6, period=1e-3, off_dbm=-75.0)
+    assert setp(drv, rec, "offset", 25.0) is PStatus.WRITTEN
+    assert setp(drv, rec, "offset.state", True) is PStatus.WRITTEN
+    assert sim.cfg["gain2_stat"] is False              # поправка чисто программная
+
+    # В FREE RUN средняя мощность за период (скважность 1% = -20 dB): -5 - 20 + 25 = 0 dBm (ровно 1× поправка)
+    drv.poll()
+    assert rec.values["meas.power"] == pytest.approx(0.0, abs=0.05)
+
+    # Переход в LEVEL без ручной настройки GLEN: аппаратное AVER выкл., TRAC:STAT ON до SENS:TRAC:TIME
+    del sim.history[:]
+    assert setp(drv, rec, "trig.source", "INT") is PStatus.WRITTEN
+    assert sim.cfg["aver"] is False and sim.cfg["coun"] == 1
+    assert sim.history.index("TRAC:STAT ON") < next(i for i, c in enumerate(sim.history) if c.startswith("SENS:TRAC:TIME"))
+    assert not rec.errors
+
+    # Запись параметров запуска/строба в LEVEL не шлёт конфликтующие команды в IMM (-221)
+    assert setp(drv, rec, "trig.delay", -5e-6) is PStatus.WRITTEN
+    assert setp(drv, rec, "trig.holdoff", 10e-6) is PStatus.WRITTEN
+    assert setp(drv, rec, "trace.offset", -10e-6) is PStatus.WRITTEN
+    assert not rec.errors
+
+    # poll() в LEVEL неблокирующий (INIT + *OPC, без *OPC?), читает FETC1? перед TRAC:DATA?,
+    # измеряет полку 10 мкс импульса (+20 dBm = -5 + 25, ровно 1× поправка)
+    del sim.history[:]
+    drv.poll()
+    assert "*OPC?" not in sim.history
+    assert "INIT" in sim.history and "*OPC" in sim.history
+    assert any(c.startswith("FETC1?") for c in sim.history)
+    assert rec.values["meas.power"] == pytest.approx(20.0, abs=0.1)
+    assert rec.values["meas.peak"] == pytest.approx(20.0, abs=0.1)
+    assert max(rec.values["trace"].y) == pytest.approx(20.0, abs=0.1)
+    assert not rec.errors
+
+    # Выход из LEVEL в FREE восстанавливает аппаратное AVER
+    assert setp(drv, rec, "trig.source", "IMM") is PStatus.WRITTEN
+    assert sim.cfg["aver"] is True
+    assert not rec.errors

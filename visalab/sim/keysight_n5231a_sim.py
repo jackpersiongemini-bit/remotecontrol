@@ -323,6 +323,8 @@ class KeysightPNASim(SimInstrument):
         self.on(g + "ACQuire", self._guid_acq)
         self.on(g + "SAVE:CSET", self._guid_save)
         self.on("SOURce#:POWer:COUPle", self._pow_coup_set, self._gb("pow_coup"))
+        self.on("SOURce#:POWer:STARt", self._n("pow_start", -90, 20), self._gs("pow_start"))
+        self.on("SOURce#:POWer:STOP", self._n("pow_stop", -90, 20), self._gs("pow_stop"))
         self.on("SOURce#:POWer#:MODE", self._pow_mode_set, self._pow_mode_get)
         self.on("SOURce#:POWer#[:LEVel][:IMMediate][:AMPLitude]", self._pow_set, self._pow_get)
         self.on("OUTPut[:STATe]", self._b("outp"), self._gb("outp"))
@@ -805,8 +807,9 @@ class KeysightPNASim(SimInstrument):
 
     # ----------------------------------------------------- создание / удаление
     def _delete(self, a, g):
+        ch = self._ch(g)
         name = a.strip().strip("'\"")
-        if name not in self.meas or self.meas[name]["ch"] != self._ch(g):
+        if name not in self.meas or self.meas[name]["ch"] != ch:
             raise SimError(-224, "Illegal parameter value", ESR_EXE)
         del self.meas[name]
         for traces in self.windows.values():
@@ -815,6 +818,8 @@ class KeysightPNASim(SimInstrument):
         if self.selected == name:
             self.selected = ""
         self.sel_other = {c: n for c, n in self.sel_other.items() if n != name}
+        if ch > 1 and not any(m["ch"] == ch for m in self.meas.values()):
+            self.other.pop(ch, None)
 
     def _win_state(self, a, g):
         w = int(g[0])

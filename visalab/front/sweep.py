@@ -202,8 +202,8 @@ class SweepController(QObject):
         pwr_line = PanelLine("PWR", self.p_start, self.p_stop, self.p_points).set_help(
             "Source power sweep range: START, STOP (dBm), and number of points"
         )
-        opt_line = PanelLine("OPT", self.dwell, self.view).set_help(
-            "Sweep options: dwell time and plot Y axis (POUT / GAIN)"
+        opt_line = PanelLine("OPT", self.view, self.dwell).set_help(
+            "Sweep options: plot Y axis (POUT / GAIN) and dwell time"
         )
         rows = [plot_line, mode_line, run_line, frq_line, pwr_line, opt_line]
         if self.is_sa and self.sa_track is not None and self.sa_span is not None:

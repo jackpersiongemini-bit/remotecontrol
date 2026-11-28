@@ -152,6 +152,10 @@ POWER_METER = Profile(
         Slot("avg.state", B, doc="усреднение включено"),
         Slot("avg.count", I, doc="число усреднений"),
         Slot("avg.auto", B, doc="число усреднений выбирается прибором"),
+        Slot("sw_avg.state", B, doc="программное скользящее усреднение (аппаратное = 1)"),
+        Slot("sw_avg.count", I, doc="размер скользящего окна программного усреднения N"),
+        Slot("sw_avg.reset_on_change", B, doc="сбрасывать окно программного усреднения при смене частоты/режима"),
+        Slot("sw_avg.trace", B, doc="усреднять временную трассу поточечно в скользящем окне"),
         Slot("offset", F, "dB", doc="поправка (аттенюатор/ответвитель) в dB"),
         Slot("offset.state", B),
         Slot("detector", E, choices=("AVERAGE", "NORMAL"),
@@ -179,6 +183,7 @@ POWER_METER = Profile(
         ActionSlot("abort", doc="отменить ожидание запуска"),
         ActionSlot("restart", doc="прервать текущее измерение (ABOR) и перезапустить при CONT"),
         ActionSlot("trigger", doc="программный запуск (trig.source = BUS)"),
+        ActionSlot("sw_avg_reset", doc="сбросить накопленное окно программного усреднения"),
         ActionSlot("reset"),
     ),
 )
@@ -261,7 +266,9 @@ NETWORK_ANALYZER = Profile(
     """,
     slots=(
         Slot("ports", I, readonly=True, required=True, doc="число физических портов ВАЦ (2 или 4)"),
-        Slot("s.active", S, required=True, doc="активные S-параметры через запятую (например 'S11,S41')"),
+        Slot("channels.list", S, readonly=True, doc="существующие каналы прибора через запятую (напр. '1,2')"),
+        Slot("s.active", S, required=True, doc="активные S-параметры канала stim.channel через запятую (напр. 'S11,S41')"),
+        Slot("s.all_active", S, doc="активные пары канал:S-параметр по всем каналам (напр. '1:S11,1:S41,2:S21')"),
         *(Slot(f"{sp.lower()}.enabled", B, doc=f"измерять и читать {sp}") for sp in _VNA_SPARAMS),
         *(Slot(f"{sp.lower()}.trace", T, "", readonly=True, doc=f"комплексная трасса {sp} (Re в y, Im в im)")
           for sp in _VNA_SPARAMS),
@@ -285,6 +292,8 @@ NETWORK_ANALYZER = Profile(
         Slot("source.power_coupled", B, doc="связать мощность всех портов канала (SOUR:POW:COUP)"),
         *(Slot(f"source.power_p{p}", F, "dBm", doc=f"мощность источника порта {p} (без поправки power.offset)")
           for p in range(1, _VNA_MAX_PORTS + 1)),
+        Slot("power.start", F, "dBm", doc="начальная мощность в режиме развёртки по мощности (POWER sweep)"),
+        Slot("power.stop", F, "dBm", doc="конечная мощность в режиме развёртки по мощности (POWER sweep)"),
         Slot("power.offset", F, "dB", doc="поправка мощности тракта источника (CAL(f) − GAIN)"),
         Slot("power.offset_state", B, doc="калибровка мощности источника включена"),
         Slot("rf.output", B, doc="мощность источника включена (OUTP)"),
@@ -313,6 +322,9 @@ NETWORK_ANALYZER = Profile(
         ActionSlot("single", doc="одна развёртка (с учётом avg.count при включённом усреднении)"),
         ActionSlot("abort", doc="остановить развёртку (HOLD)"),
         ActionSlot("trigger", doc="ручной запуск (trig.source = MAN)"),
+        ActionSlot("chan_list", doc="список существующих каналов прибора -> action_done('chan_list', [1, 2, ...])"),
+        ActionSlot("chan_create", doc="создать новый канал на приборе (аргумент - номер или авто) -> [1, 2, ...]"),
+        ActionSlot("chan_delete", doc="удалить канал с прибора (аргумент - номер; последний не удаляется) -> [1, ...]"),
         ActionSlot("sparam_set", doc="задать активные S-параметры (аргументы: 'S11', 'S41', ...) -> [имена]"),
         ActionSlot("sparam_all", doc="включить все S-параметры по числу портов прибора -> [имена]"),
         ActionSlot("sparam_none", doc="выключить чтение всех S-параметров -> []"),
